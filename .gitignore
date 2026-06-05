@@ -1,0 +1,12 @@
+# built binary (root or in-package)
+/am
+/cmd/am/am
+
+# sqlite databases
+*.db
+*.db-wal
+*.db-shm
+
+# macOS
+.DS_Store
+.claude

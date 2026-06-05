@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>agentman</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header>
+    <span class="brand">agentman</span>
+    <nav id="tabs"></nav>
+    <span class="spacer"></span>
+    <button id="newBtn" class="primary">+ Task</button>
+    <span id="status" class="status">connecting…</span>
+  </header>
+
+  <main>
+    <section id="board"></section>
+    <aside id="feed">
+      <h2>Activity</h2>
+      <ul id="feedList"></ul>
+    </aside>
+  </main>
+
+  <div id="modal" class="hidden">
+    <div class="sheet" id="sheet"></div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
