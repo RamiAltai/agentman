@@ -116,6 +116,10 @@ main { flex: 1; display: flex; min-height: 0; position: relative; }
 #board {
   flex: 1; min-width: 0; display: flex; gap: 14px; padding: 14px;
   overflow-x: auto; overflow-y: hidden;
+  /* Columns cap at max-width; center the group so the board doesn't cling to the
+     left on wide/ultrawide screens. `safe` falls back to flex-start when columns
+     overflow, so horizontal scrolling on narrow screens never clips the first column. */
+  justify-content: safe center;
 }
 .col {
   flex: 1 1 var(--col-min); min-width: var(--col-min); max-width: 480px;
@@ -278,7 +282,7 @@ select:hover, .field:hover { border-color: var(--line-strong); }
 /* ===================== responsive ===================== */
 @media (max-width: 720px) {
   header { gap: 8px; padding: 0 10px; }
-  #board { flex-direction: column; overflow-x: hidden; overflow-y: auto; }
+  #board { flex-direction: column; overflow-x: hidden; overflow-y: auto; justify-content: flex-start; }
   .col { flex: none; min-width: 0; max-width: none; max-height: 78vh; }
 
   /* feed becomes an off-canvas overlay drawer */

@@ -66,6 +66,9 @@ project → tasks → comments. **Events are never deleted** (append-only).
 - **Archive (soft, projects only):** a project can be **soft-archived** — `ArchiveProject` sets
   `projects.archived_at` (and `UnarchiveProject` clears it). This is **reversible** and hides the
   project from default lists; it is **not** a hard delete (the row and its tasks/comments stay).
+  An archived project's **tasks are also hidden** from the unfiltered task list/board
+  (`ListTasks` adds `p.archived_at IS NULL` when no project is named); an explicit
+  `?project=<slug>` still returns that archived project's tasks for direct inspection.
 - **Delete:** **No hard-delete endpoint or store method exists** for projects/tasks/comments today —
   the cascade rules are defined but unused via the API (Confirmed: no `DELETE` route in
   `server.go`). Hard removal only happens by editing the DB file directly.

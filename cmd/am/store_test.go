@@ -203,6 +203,65 @@ func TestArchiveUnarchiveProject(t *testing.T) {
 	}
 }
 
+func TestListTasksHidesArchivedProjectTasks(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("alpha", "Alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateProject("beta", "Beta"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateTask(CreateTaskInput{Project: "alpha", Title: "a1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateTask(CreateTaskInput{Project: "beta", Title: "b1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Before archiving: unfiltered list returns both projects' tasks.
+	all, err := st.ListTasks(TaskFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("unfiltered list before archive: want 2 tasks, got %d", len(all))
+	}
+
+	if _, _, err := st.ArchiveProject("alpha", "tester"); err != nil {
+		t.Fatal(err)
+	}
+
+	// After archiving alpha: unfiltered list must hide alpha's task (the reported bug).
+	all, err = st.ListTasks(TaskFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 || all[0].Project != "beta" {
+		t.Fatalf("unfiltered list after archive: want only beta's task, got %+v", all)
+	}
+
+	// Explicit project filter still returns the archived project's tasks (inspection escape hatch).
+	alpha, err := st.ListTasks(TaskFilter{Project: "alpha"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alpha) != 1 || alpha[0].Title != "a1" {
+		t.Fatalf("explicit ?project=alpha after archive: want a1, got %+v", alpha)
+	}
+
+	// Unarchiving restores it to the unfiltered list.
+	if _, _, err := st.UnarchiveProject("alpha", "tester"); err != nil {
+		t.Fatal(err)
+	}
+	all, err = st.ListTasks(TaskFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("unfiltered list after unarchive: want 2 tasks, got %d", len(all))
+	}
+}
+
 func TestEventsCursorStrictlyIncreasing(t *testing.T) {
 	st := openTestStore(t)
 	if _, _, err := st.CreateProject("web", "Web"); err != nil {

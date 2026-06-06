@@ -375,6 +375,11 @@ func (s *Store) ListTasks(f TaskFilter) ([]Task, error) {
 	if f.Project != "" {
 		where = append(where, "p.slug=?")
 		args = append(args, f.Project)
+	} else {
+		// No explicit project: hide tasks belonging to archived projects from the
+		// unfiltered board/list. An explicit project filter still returns that
+		// project's tasks (so an archived project can still be inspected directly).
+		where = append(where, "p.archived_at IS NULL")
 	}
 	if f.Status != "" {
 		// allow comma list, e.g. "todo,doing"

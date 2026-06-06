@@ -18,7 +18,7 @@ GET   /api/projects                 handleListProjects      ?archived=true inclu
 POST  /api/projects                 handleCreateProject     {slug,name}
 POST  /api/projects/{slug}/archive    handleArchiveProject
 POST  /api/projects/{slug}/unarchive  handleUnarchiveProject
-GET   /api/tasks                    handleListTasks         ?project=&status=&assignee=&limit=
+GET   /api/tasks                    handleListTasks         ?project=&status=&assignee=&limit=  (no project ⇒ hides archived-project tasks)
 POST  /api/tasks                    handleCreateTask        {project,title,body?,priority?,assignee?}
 GET   /api/tasks/{id}               handleGetTask           (task + comments + recent events)
 PATCH /api/tasks/{id}               handlePatchTask         {status?,assignee?,title?,body?,priority?}
