@@ -40,6 +40,9 @@ func main() {
 	case "update", "upgrade":
 		cmdUpdate(a)
 		return
+	case "db":
+		cmdDB(a)
+		return
 	}
 
 	c := NewClient()
@@ -155,6 +158,8 @@ func usage() {
   am project new <slug> [name]                create a project
   am version                                  print version
   am update [version]                         reinstall the latest (or a given) version
+  am db export [path] [--db PATH]          export a DB snapshot (prints path)
+  am db import <path> [--db PATH] [--yes]  import a snapshot (stop serve first)
 
 Identity: run 'am init <tasktype>' once per session (or set AGENTMAN_AGENT).
 Env: AGENTMAN_URL (default http://127.0.0.1:8787), AGENTMAN_PROJECT (default project).

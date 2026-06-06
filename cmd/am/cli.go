@@ -11,7 +11,7 @@ import (
 
 // Boolean (valueless) flags; everything else with a leading dash consumes the
 // next token as its value. Aliases are canonicalised in canonFlag.
-var boolFlags = map[string]bool{"json": true, "mine": true, "all": true, "comments": true}
+var boolFlags = map[string]bool{"json": true, "mine": true, "all": true, "comments": true, "yes": true}
 
 type Args struct {
 	pos   []string
