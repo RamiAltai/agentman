@@ -56,9 +56,10 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 - No CI to enforce doc/code sync, so drift is possible. → `architecture/README.md`.
 - Several decisions are **undocumented** (auth model, testing strategy, migrations, deletes, CI,
   versioning) → `decision-records.md` "Missing Decisions".
-- No CHANGELOG despite tagged releases (`v0.1.0`–`v0.3.0`).
-- Roadmap items (auth, remote access, prebuilt binaries, labels/due-dates) live only in
-  conversation, not the repo — unconfirmed.
+- ~~No CHANGELOG despite tagged releases~~ — **added** (`CHANGELOG.md`, Keep a Changelog format);
+  `v0.1.0`–`v0.3.0` predate it and are summarized there.
+- ~~Roadmap items live only in conversation~~ — **captured** in `ROADMAP.md` (phased, checkable plan
+  for the gaps in this doc). Keep the two in sync as items land.
 
 ## Maintainability Concerns
 
