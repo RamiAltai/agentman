@@ -22,7 +22,7 @@ you (browser) ◄──SSE────┘        sole writer · broadcasts every
   pick-up→done cycle is ~65–75 tokens.
 - **Real-time.** Every change streams to the dashboard over SSE — no refresh.
 - **Zero ops.** A single static binary (pure-Go SQLite, no cgo), localhost, no auth, no
-  database server. Back up = copy one file.
+  database server. Back up = copy one file (or `am db export` for a consistent snapshot).
 - **Multi-project & multi-agent.** Group tasks into projects; atomic task claims so two
   agents never grab the same ticket.
 - **Polished dashboard.** A responsive kanban board with drag-and-drop status changes, a
@@ -82,6 +82,7 @@ agent actions both show up live.
 The embedded web UI (no build step, no npm) is a live kanban board:
 
 - **Columns** — Todo / In Progress / Blocked / Done, with per-project tabs and counts.
+  Click multiple project tabs to **filter across several at once**; **All** clears the filter.
 - **Drag a card** between columns to change its status; click a card to open a wide,
   **resizable** ticket with description, comments, and full history.
 - **Activity feed** you can **collapse** or **drag-resize** (it becomes an overlay drawer on
@@ -102,6 +103,8 @@ am ls --status todo   # work to pick up        am ls --mine    # my tasks
 am claim <id>         # take it (exit 4 = already claimed)
 am show <id> -c       # detail + comments       am note <id> "msg"
 am status <id> done   # todo|doing|blocked|done  am new "title" -p <proj>
+am projects --all     # list projects (incl. archived)
+am project archive <slug>   # hide a project    am project unarchive <slug>
 Output is terse text (add --json to parse). Silence = success.
 ```
 
@@ -134,9 +137,12 @@ Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting 
 | `am note <id> "text"` | add a comment (alias: `comment`) |
 | `am edit <id> [--title T] [--body B] [--priority N]` | edit fields |
 | `am drop <id>` | release: unassign + → todo |
-| `am projects` · `am project new <slug> [name]` | list / create projects |
+| `am projects [--all]` · `am project new <slug> [name]` | list (`--all` includes archived) / create projects |
+| `am project archive <slug>` · `am project unarchive <slug>` | soft-archive (hide) / restore a project |
 | `am init <tasktype>` · `am whoami` | identity |
 | `am serve [--port 8787] [--db PATH]` | run the dashboard + API |
+| `am db export [path] [--db PATH]` | write a consistent DB snapshot (prints the path) |
+| `am db import <path> [--db PATH] [--yes]` | restore a snapshot (stop `am serve` first; backs up current DB) |
 | `am version` · `am update [version]` | print version · reinstall the latest (or a given) version |
 
 `<id>` accepts a global id (`13`) or a project ref (`web-3`). `--status` accepts a comma
@@ -171,6 +177,20 @@ curl -s -H 'X-Agent: claude-1' -X POST 127.0.0.1:8787/api/tasks/13/claim
 | `AGENTMAN_PORT` / `--port` | server port (default `8787`) |
 | `AGENTMAN_DB` / `--db` | database path (default `~/.agentman/agentman.db`) |
 | `AGENTMAN_NO_UPDATE_CHECK` | set to `1` to disable the startup "update available" check |
+
+## Backups
+
+The whole board is one SQLite file, so backing up is copying it. For a guaranteed-consistent
+snapshot (even while `am serve` is running), use `am db export`:
+
+```sh
+am db export                     # writes a timestamped snapshot in the cwd, prints the path
+am db export /backups/board.db   # or pick the path
+am db import /backups/board.db   # restore — stop `am serve` first; backs up the current DB
+```
+
+`am db import` validates the snapshot, refuses to run while a server is up, and backs up your
+existing DB before swapping it in. Both commands operate directly on the SQLite file.
 
 ## Updating
 
@@ -220,7 +240,8 @@ go build -ldflags "-X main.injectedVersion=v0.3.0" -o am ./cmd/am   # version-st
 
 Layout: `cmd/am/` holds the single `main` package — `server.go` (API + SSE), `hub.go`
 (broadcast), `store.go` + `schema.sql` (SQLite), `client.go` + `cli.go` (CLI),
-`identity.go`, `version.go`, `update.go`, and `web/` (dashboard).
+`db.go` (`am db` export/import), `identity.go`, `version.go`, `update.go`, and `web/`
+(dashboard).
 
 Contributions welcome — open an issue or PR.
 

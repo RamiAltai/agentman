@@ -5,10 +5,12 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 ## Architecture Risks
 
-- **Schema-migration runner: foundation landed, unexercised** (was High → now Low/Medium). Phase 0
-  added a forward-only runner that reads/bumps `meta.schema_version` (ADR-010), but `schemaMigrations`
-  is empty, so the additive-column path is unproven until Phase 2. Residual: no down-migrations; a DB
-  newer than the binary is accepted silently. → `data-model.md`, `decision-records.md` ADR-010.
+- **Schema-migration runner: forward-only, no rollback path** (was High → now Low). The forward-only
+  runner that reads/bumps `meta.schema_version` (ADR-010) is now exercised end-to-end: Phase 2 shipped
+  the first real step (`ALTER TABLE projects ADD COLUMN archived_at TEXT` at `version: 2`,
+  `currentSchemaVersion = 2`), applied with its version bump in one tx and covered by tests. Residual:
+  no down-migrations; a DB recorded at a version newer than the binary is accepted leniently (its
+  unknown steps are simply skipped, no error). → `data-model.md`, `decision-records.md` ADR-010.
 - **Single-writer throughput ceiling** (Low for stated scope). `SetMaxOpenConns(1)` serializes all
   writes; correct and simple, but caps write concurrency. → ADR-003.
 - **Module boundaries are by convention only** (Medium, maintainability). One flat `main` package
@@ -18,8 +20,9 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 ## Product Risks
 
-- **No delete/archival** (Medium). No API to delete a project/task/comment; `events`/`comments`
-  grow unbounded. Operators must edit the DB file directly. → `data-model.md`.
+- **No hard delete; unbounded history** (Medium). Reversible project soft-archive now exists
+  (`archive`/`unarchive`, `projects.archived_at`); but there is still no API to delete a task or
+  comment and no hard delete of anything, and `events`/`comments` still grow unbounded. → `data-model.md`.
 - **Identity collisions in one directory** (Low). Two agents in the same working dir share the
   per-dir identity unless one sets `AGENTMAN_AGENT`. → ADR-008.
 - **Update bootstrap** (Low). A machine must do one manual `go install …@latest` to get a binary
@@ -39,11 +42,14 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 ## Testing Gaps
 
-- Phase 0 added store/server/migrate tests: the **atomic claim** (race, `-race`-clean), events
-  cursor, store CRUD/validation, validation→status mapping, and the new Host/CSRF/CSP guards are now
-  covered. **Still untested:** SSE streaming/reconnect, the CLI commands, identity, and the entire
-  dashboard (no JS test runner). → `backend.md`, `frontend.md`. Next highest-value: an XSS regression
-  test for the dashboard and CLI-path tests.
+- Coverage now spans store/server/migrate/db tests: the **atomic claim** (race, `-race`-clean), events
+  cursor, store CRUD/validation, validation→status mapping, the Host/CSRF/CSP guards, project
+  archive/unarchive (store round-trip + idempotency and the HTTP endpoints incl. 404), the v2 migration
+  (adds `archived_at` + apply/bump/idempotency/rollback), and DB export/import (roundtrip+perms, backup
+  creation, garbage rejection, liveness probe) are all covered. **Still untested:** SSE
+  streaming/reconnect, identity, most CLI command paths, and the entire dashboard (no JS test runner).
+  → `backend.md`, `frontend.md`. Next highest-value: an XSS regression test for the dashboard and
+  CLI-path tests.
 
 ## Documentation Gaps
 
@@ -58,7 +64,7 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 - ~~`gofmt -l` is non-empty~~ — **fixed in Phase 0** (`cmd/am/update_test.go`, `cmd/am/version.go`
   formatted; `gofmt -l cmd/am` is now empty).
-- `store.go` (~691 lines) and `app.js` (~591 lines) are the largest files and mix several
+- `store.go` (~850 lines) and `app.js` (~615 lines) are the largest files and mix several
   responsibilities; fine now, watch for growth.
 - No linter beyond `gofmt`/`go vet`; no pre-commit hooks.
 
@@ -68,6 +74,8 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   large team or thousands of tasks. No pagination on most reads (list capped only by `limit`/`tail`
   params and a client-side "Done" cap of 50).
 - `events` table is append-only with no retention — long-running instances grow indefinitely.
+- Backup/restore now exists via `am db export` / `am db import` (CLI-only, `VACUUM INTO` snapshot);
+  import still refuses while a server is running, so it requires stopping `am serve` first.
 
 ## Unknowns
 

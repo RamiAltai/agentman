@@ -53,11 +53,19 @@ Evidence:
   (`cmd/am/identity.go`).
 - **Embedded dashboard** (no build step, no npm): kanban board, drag-and-drop status changes,
   collapsible/resizable activity panel, keyboard shortcuts, responsive. Evidence: `cmd/am/web/`.
+- **Multi-select project filter** on the dashboard: pick any number of project tabs to scope the
+  board/feed at once ("All" clears the selection). Evidence: `cmd/am/web/app.js` `toggleProject`.
+- **DB export/import**: `am db export` writes a consistent snapshot (`VACUUM INTO`), and
+  `am db import` restores a validated candidate (integrity/FK checks, refuses while a server is
+  running, backs up the existing DB first). Evidence: `cmd/am/db.go`.
+- **Project archive/hide**: reversible soft-archive (`archived_at`) that hides a project from
+  default views; `am project archive`/`unarchive`. Evidence: `cmd/am/store.go`, `cmd/am/cli.go`.
 - **Self-update**: `am update` + startup "update available" check (`cmd/am/update.go`).
 
 ## Domain Concepts
 
-- **Project** — a named board (`slug`, `name`) grouping tasks.
+- **Project** — a named board (`slug`, `name`) grouping tasks. Can be archived (hidden from
+  default views, reversible) via `archived_at`.
 - **Task** — a ticket. Has a global `id` (`#42`, the cheap wire ref) **and** a per-project `ref`
   (`web-3`, human-friendly). Status + priority + optional assignee.
 - **Comment** — a threaded note on a task.

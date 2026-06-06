@@ -7,7 +7,7 @@ convention is loose, it's called out.
 
 - **One flat `main` package** in `cmd/am/`; modules are separated **by file, not by Go package**:
   `server.go` (HTTP), `hub.go` (SSE), `store.go` (data + domain), `client.go`/`cli.go` (CLI),
-  `identity.go`, `version.go`, `update.go`. The web UI is in `cmd/am/web/`.
+  `db.go` (offline DB export/import), `identity.go`, `version.go`, `update.go`. The web UI is in `cmd/am/web/`.
 - Keep that split: HTTP handling in `server.go`, all SQL in `store.go`, CLI presentation in `cli.go`.
   Do **not** put SQL in handlers or HTTP in the store.
 - There is no `internal/`/`pkg/`; because it's one package, every symbol is mutually visible —
@@ -20,7 +20,8 @@ convention is loose, it's called out.
 - CLI verb implementations: `cmdX` (`cmdClaim`, `cmdNew`); dispatched in `main.go`.
 - Sentinel errors: `ErrNotFound`, `ErrConflict`, `ErrValidation`; typed `*ConflictError`.
 - Event kinds: dotted `noun.verb` strings — `task.created`, `task.claimed`, `task.status`,
-  `task.assign`, `task.patched`, `comment.added`, `project.created`.
+  `task.assign`, `task.patched`, `comment.added`, `project.created`, `project.archived`,
+  `project.unarchived`.
 - Env vars: `AGENTMAN_*` (`AGENTMAN_URL/PROJECT/AGENT/AGENT_FILE/DB/PORT/NO_UPDATE_CHECK`).
 
 ## API Conventions
@@ -69,8 +70,9 @@ convention is loose, it's called out.
 
 ## Testing
 
-- `go test ./...`; table-driven tests (see `cmd/am/update_test.go`). Pure logic is unit-tested;
-  HTTP/store/CLI are currently untested (a gap, not a convention to copy — see `known-risks-and-gaps.md`).
+- `go test ./...` (`go test -race ./cmd/am/` for the race detector); table-driven tests (see
+  `cmd/am/update_test.go`). Coverage spans pure logic plus the store, HTTP, migrations, and the
+  offline DB tooling — `store_test.go`, `server_test.go`, `migrate_test.go`, `db_test.go`.
 
 ## Commands
 
@@ -83,8 +85,7 @@ gofmt -w cmd/am             # auto-format
 ```
 
 **Before submitting:** `gofmt -w`, `go vet ./...`, `go test ./...` all clean, and update the
-matching `architecture/` doc. ⚠️ At time of writing `gofmt -l` flags `cmd/am/update_test.go` and
-`cmd/am/version.go` — run `gofmt -w` to fix existing drift (do this as its own change).
+matching `architecture/` doc. (`gofmt -l cmd/am` is currently empty — no outstanding format drift.)
 
 ## Anti-Patterns
 
@@ -95,7 +96,9 @@ matching `architecture/` doc. ⚠️ At time of writing `gofmt -l` flags `cmd/am
 - ❌ Binding beyond `127.0.0.1` without adding authentication first.
 - ❌ Printing chatter to **stdout** in the CLI (breaks `id=$(am new …)` and token budgets).
 - ❌ Editing `cmd/am/web/*` and forgetting to rebuild — the running server serves stale embedded assets.
-- ❌ Adding a column to `schema.sql` and assuming existing DBs get it (no migration runner).
+- ❌ Adding a column to `schema.sql` and assuming existing DBs get it. A forward-only runner
+  exists (`store.go runMigrations`): for a column change, append a `{version, apply}` step to
+  `schemaMigrations` and bump `currentSchemaVersion`; `schema.sql` still seeds fresh DBs.
 
 ## Unknowns
 

@@ -40,9 +40,20 @@ go test ./...            # or: go test ./cmd/am/
 go test -run TestUpdateAvailable -v ./cmd/am/
 ```
 
-Today the only tests are in `cmd/am/update_test.go` (version-comparison logic). Most of the system
-(HTTP, store, claim, SSE, CLI, UI) is **untested** — see `known-risks-and-gaps.md`. New behavioral
-tests are very welcome; start with the claim/validation paths.
+Tests live next to the code in `cmd/am/`:
+
+- `update_test.go` — version-comparison logic.
+- `store_test.go` — CRUD + validation, the atomic claim race (exactly one winner), archive/unarchive
+  round-trip + idempotency, and the strictly-increasing events cursor.
+- `server_test.go` — HTTP status mapping (404 / 400 / lost-claim 409), the Host/CSRF guards and
+  security headers, and the archive/unarchive endpoints.
+- `migrate_test.go` — the forward-only migration runner (apply + version bump, skip ≤ current,
+  idempotency, rollback) and the v2 `archived_at` column.
+- `db_test.go` — `am db` export/import (roundtrip + perms, backup creation, garbage rejection,
+  server-liveness probe).
+
+The UI, SSE stream, and CLI dispatch are still **untested** — see `known-risks-and-gaps.md`. New
+behavioral tests are welcome.
 
 ## Inspecting Logs / Behavior
 
@@ -61,6 +72,7 @@ tests are very welcome; start with the claim/validation paths.
 | The DB schema | `cmd/am/schema.sql` (+ structs in `store.go`) |
 | A CLI command or its output | `cmd/am/cli.go` (+ dispatch in `cmd/am/main.go`) |
 | CLI ↔ server HTTP / exit codes | `cmd/am/client.go` |
+| DB export/import (`am db`) | `cmd/am/db.go` |
 | The dashboard | `cmd/am/web/{index.html,app.css,app.js}` |
 | Agent identity | `cmd/am/identity.go` |
 | `am update` / version check | `cmd/am/update.go`, `cmd/am/version.go` |
@@ -100,9 +112,12 @@ tests are very welcome; start with the claim/validation paths.
 ## Adding Tests
 
 - Put tests next to code as `*_test.go` in `cmd/am/`. Use table-driven style (`update_test.go`).
-- For HTTP, use `net/http/httptest` against `Server.Handler()` with a temp `--db`. For the store,
-  open an `OpenStore(t.TempDir()+"/x.db")` and assert behavior (great place to lock down the atomic
-  claim).
+- For the store, open an `OpenStore(t.TempDir()+"/x.db")` and assert behavior — see `store_test.go`
+  for the atomic-claim race and events-cursor patterns.
+- For HTTP, use `net/http/httptest` against `Server.Handler()` with a temp `--db` — see
+  `server_test.go` for status-mapping and guard examples.
+- For schema changes, follow `migrate_test.go`: assert the runner applies the step and bumps
+  `meta.schema_version`, and that a fresh DB lands on `currentSchemaVersion`.
 
 ## Common Mistakes
 

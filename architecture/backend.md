@@ -14,8 +14,10 @@
 Routes are registered in one place — `Server.Handler()` (`cmd/am/server.go`):
 
 ```
-GET   /api/projects                 handleListProjects
+GET   /api/projects                 handleListProjects      ?archived=true includes archived
 POST  /api/projects                 handleCreateProject     {slug,name}
+POST  /api/projects/{slug}/archive    handleArchiveProject
+POST  /api/projects/{slug}/unarchive  handleUnarchiveProject
 GET   /api/tasks                    handleListTasks         ?project=&status=&assignee=&limit=
 POST  /api/tasks                    handleCreateTask        {project,title,body?,priority?,assignee?}
 GET   /api/tasks/{id}               handleGetTask           (task + comments + recent events)
@@ -30,6 +32,10 @@ GET   /api/stream                   handleStream            text/event-stream (S
 `{id}` accepts a global id (`13`) or a project ref (`web-3`), resolved by `store.resolveTaskID`.
 Responses are JSON via `writeJSON`; errors via `writeErr`.
 
+`am db export`/`am db import` have **no HTTP route** — they are a CLI-only local-file operation.
+The `db` command is dispatched in `cmd/am/main.go` *before* the HTTP client is built (`cmdDB`,
+ahead of `NewClient()`), so it works directly on the SQLite file (`cmd/am/db.go`).
+
 ## Request Flow
 
 **guardrail middleware** (`securityHeaders(hostGuard(csrfGuard(mux)))`, Phase 0/ADR-011) → `mux` →
@@ -43,8 +49,10 @@ reads, or SSE.
 
 Lives in `cmd/am/store.go` (there is no separate "service" layer — the store *is* the domain
 logic). Each mutating method returns `(result, *Event, error)`; the handler broadcasts the event.
-Key methods: `CreateProject`, `ListTasks`, `GetTask`, `CreateTask`, `PatchTask`, `ClaimTask`,
-`AddComment`, `ListEvents`, `RecentEvents`.
+Key methods: `CreateProject`, `ListProjects(includeArchived bool)`, `ArchiveProject`,
+`UnarchiveProject`, `ListTasks`, `GetTask`, `CreateTask`, `PatchTask`, `ClaimTask`,
+`AddComment`, `ListEvents`, `RecentEvents`. `ArchiveProject`/`UnarchiveProject` are
+transactional and idempotent (no event when already in the target state).
 
 **Atomic claim** (`ClaimTask`) is the most important invariant — a single conditional statement:
 
@@ -122,15 +130,20 @@ fatal listen error. **No structured logging, request logging, metrics, or tracin
 
 ## Testing
 
-As of Phase 0 there are four test files (run `go test ./...`):
+There are six test files (run `go test ./...`):
 - `cmd/am/update_test.go` — version-comparison logic.
 - `cmd/am/store_test.go` — atomic-claim race (concurrent, `-race`-clean), events-cursor monotonicity,
-  store CRUD + validation (`ErrValidation`).
+  store CRUD + validation (`ErrValidation`), and project archive/unarchive round-trip + idempotency.
 - `cmd/am/server_test.go` — validation→status mapping (400/404/409), `hostGuard`, `csrfGuard`,
-  `securityHeaders`, `listenAddr` loopback regression (via `net/http/httptest`).
-- `cmd/am/migrate_test.go` — migration runner (apply/skip/idempotent/rollback).
+  `securityHeaders`, `listenAddr` loopback regression, archive/unarchive endpoints + 404
+  (via `net/http/httptest`).
+- `cmd/am/migrate_test.go` — migration runner (apply/skip/idempotent/rollback), incl. the v2 step
+  that adds `projects.archived_at`.
+- `cmd/am/db_test.go` — `db export`/`import` roundtrip + file perms (0o600), backup creation + perms,
+  garbage rejection, server-liveness check.
 
-**Still untested:** SSE streaming/reconnect, the CLI commands, identity, and the dashboard. (Gap; see
+So the archive and DB export/import paths are now covered. **Still untested:** SSE
+streaming/reconnect, the rest of the CLI commands, identity, and the dashboard. (Gap; see
 `known-risks-and-gaps.md`.)
 
 ## Where to Add New Features
@@ -140,12 +153,14 @@ As of Phase 0 there are four test files (run `go test ./...`):
 - **New task field:** add the column in `schema.sql`, the struct field in `store.go`, thread it
   through `CreateTask`/`PatchTask`/`getTaskTx`, the API, and the dashboard (`web/`).
 - **New event kind:** emit via `insertEvent(...)` and handle it in `web/app.js` `evText`/`describeText`.
+  Current kinds: `task.created`, `task.claimed`, `task.status`, `task.assign`, `task.patched`,
+  `comment.added`, `project.created`, `project.archived`, `project.unarchived`.
 
 ## Risks and Gaps
 
-- **Migration runner exists but is unexercised** — Phase 0 added `runMigrations` (ADR-010), but
-  `schemaMigrations` is empty, so the additive-column path isn't proven end-to-end until Phase 2.
-  A DB newer than the binary is accepted silently today.
+- **Migration runner is now exercised** — Phase 0 added `runMigrations` (ADR-010); Phase 2's first
+  step (`ALTER TABLE projects ADD COLUMN archived_at TEXT`, `currentSchemaVersion = 2`) proves the
+  additive-column path end-to-end. A DB *newer* than the binary is still accepted silently today.
 - **Single-writer** caps write throughput; fine for a personal board, unproven at scale.
 - **500s leak raw error strings** to clients (`writeErr` default branch) — minor info exposure.
 - **No request size/time limits** beyond a 1 MiB body cap and `ReadHeaderTimeout`.

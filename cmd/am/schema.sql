@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS events (
   project_id INTEGER,
   task_id    INTEGER,
   actor      TEXT NOT NULL,
-  kind       TEXT NOT NULL,               -- task.created|claimed|status|assign|patched|comment.added|project.created
+  kind       TEXT NOT NULL,               -- task.created|claimed|status|assign|patched|comment.added|project.created|project.archived|project.unarchived
   data       TEXT NOT NULL DEFAULT '{}',  -- compact JSON delta, e.g. {"status":["todo","doing"]}
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );

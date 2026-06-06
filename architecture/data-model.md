@@ -11,8 +11,8 @@ are ISO-8601 UTC **TEXT** (`strftime('%Y-%m-%dT%H:%M:%fZ','now')`), so they sort
 
 | Entity | Purpose | Source |
 |--------|---------|--------|
-| `meta` | Key/value config; currently only `schema_version='1'` | `schema.sql` |
-| `projects` | Named boards (`slug` unique, `name`) | `schema.sql`, `store.go Project` |
+| `meta` | Key/value config; currently only `schema_version` (the binary migrates to `'2'`) | `schema.sql` |
+| `projects` | Named boards (`slug` unique, `name`, `archived_at`) | `schema.sql`, `store.go Project` |
 | `tasks` | Tickets (status, priority, assignee, dual id) | `schema.sql`, `store.go Task` |
 | `comments` | Threaded notes on a task | `schema.sql`, `store.go Comment` |
 | `events` | Append-only mutation log = activity feed + SSE backbone + cursor | `schema.sql`, `store.go Event` |
@@ -25,9 +25,12 @@ are ISO-8601 UTC **TEXT** (`strftime('%Y-%m-%dT%H:%M:%fZ','now')`), so they sort
 - **`tasks.status`** — `CHECK (status IN ('todo','doing','blocked','done'))`, default `todo`.
 - **`tasks.priority`** — INTEGER, `0=urgent … 3=low`, default `2`.
 - **`tasks.assignee`** — TEXT, **NULL = unclaimed** (the claim guard depends on this).
+- **`projects.archived_at`** — TEXT, **NULL = active**; an ISO-8601 UTC timestamp set when the
+  project is archived (`store.go ArchiveProject`) and cleared back to NULL on unarchive
+  (`UnarchiveProject`). Soft-archive is reversible; default project lists hide archived rows.
 - **`events.id`** — monotonic; doubles as the `?since=` cursor and the SSE `Last-Event-ID`.
 - **`events.kind`** — one of `task.created | task.claimed | task.status | task.assign |
-  task.patched | comment.added | project.created`.
+  task.patched | comment.added | project.created | project.archived | project.unarchived`.
 - **`events.data`** — compact JSON delta, e.g. `{"status":["todo","doing"]}`.
 
 ### Indexes
@@ -60,9 +63,12 @@ project → tasks → comments. **Events are never deleted** (append-only).
   same transaction.
 - **Update:** `tasks` only (status/assignee/title/body/priority); `updated_at` set explicitly in
   each `UPDATE` (no trigger).
-- **Delete:** **No delete endpoint or store method exists** for projects/tasks/comments today —
+- **Archive (soft, projects only):** a project can be **soft-archived** — `ArchiveProject` sets
+  `projects.archived_at` (and `UnarchiveProject` clears it). This is **reversible** and hides the
+  project from default lists; it is **not** a hard delete (the row and its tasks/comments stay).
+- **Delete:** **No hard-delete endpoint or store method exists** for projects/tasks/comments today —
   the cascade rules are defined but unused via the API (Confirmed: no `DELETE` route in
-  `server.go`). Removal only happens by editing the DB file directly.
+  `server.go`). Hard removal only happens by editing the DB file directly.
 - **Growth:** `events` and `comments` grow unbounded; the dashboard caps the "Done" column render
   at 50 and the feed at ~200 nodes (`web/app.js`), but the DB retains everything.
 
@@ -74,14 +80,23 @@ project → tasks → comments. **Events are never deleted** (append-only).
 bumps `meta.schema_version` in one transaction; steps are integer-ordered and idempotent.
 
 To add a column/table change, append a `{version, apply}` step to `schemaMigrations` and raise
-`currentSchemaVersion` (`cmd/am/store.go`). `schemaMigrations` is **currently empty** (no schema
-change has shipped yet; Phase 2 will add `projects.archived_at` as the first real step). Known
-limitations: forward-only (no down-migrations); a DB at a **newer** version than the binary is
-accepted silently today; an unparseable `schema_version` defaults to 1. Backup/restore is still
-file-copy (`README.md`).
+`currentSchemaVersion` (`cmd/am/store.go`, now `2`). `schemaMigrations` is **no longer empty**: its
+first real step is `{version: 2}`, which runs `ALTER TABLE projects ADD COLUMN archived_at TEXT`.
+`schema.sql` still seeds a fresh DB at version 1, so the forward-only runner is now **exercised
+end-to-end** — each step applies its change and commits the `meta.schema_version` bump in the same
+transaction (was foundation-only in Phase 0). Known limitations: forward-only (no down-migrations);
+a DB at a **newer** version than the binary is accepted silently today; an unparseable
+`schema_version` defaults to 1.
 
-Backup/restore is file-copy: copy `agentman.db` (+ `-wal`/`-shm`) while the server is stopped
-(`README.md`).
+Backup/restore:
+
+- **File-copy:** copy `agentman.db` (+ `-wal`/`-shm`) while the server is stopped (`README.md`).
+- **`am db export [path]`** — writes a consistent snapshot via SQLite `VACUUM INTO`, `chmod 0o600`,
+  and prints the output path (`cmd/am/db.go exportDB`).
+- **`am db import <path>`** — validates the candidate (PRAGMA `integrity_check`, `foreign_key_check`,
+  required tables, `schema_version <= currentSchemaVersion`), **refuses while a server is running**,
+  backs up the current DB (`0o600`) into the DB's directory, then atomically replaces it
+  (`cmd/am/db.go importDB`).
 
 ## Diagram
 
@@ -94,6 +109,7 @@ erDiagram
     text slug UK
     text name
     text created_at
+    text archived_at "NULL = active"
   }
   tasks {
     int id PK

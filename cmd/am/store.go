@@ -120,10 +120,10 @@ type migration struct {
 	apply   func(*sql.Tx) error
 }
 
-// schemaMigrations is the ordered, forward-only migration list. It is EMPTY in
-// Phase 0 (no column changes yet); later phases append steps like
-// {version: 2, apply: func(tx *sql.Tx) error { ... }}. Versions must be strictly
-// increasing and start above 1 (the seed version).
+// schemaMigrations is the ordered, forward-only migration list. The first shipped
+// step is v2, which adds the projects.archived_at column for project archiving;
+// further phases append steps like {version: N, apply: func(tx *sql.Tx) error { ... }}.
+// Versions must be strictly increasing and start above 1 (the seed version).
 var schemaMigrations = []migration{
 	{version: 2, apply: func(tx *sql.Tx) error {
 		_, err := tx.Exec("ALTER TABLE projects ADD COLUMN archived_at TEXT")

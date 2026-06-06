@@ -116,6 +116,68 @@ without evidence.
 - Evidence: `cmd/am/server.go` (`hostGuard`/`csrfGuard`/`securityHeaders`, `Handler`);
   `cmd/am/server_test.go`.
 
+### ADR-012: DB export/import as CLI-only file operations, no HTTP route
+- Status: Active
+- Context: "Back up = copy one file" (ADR-001) needs a safe, consistent snapshot while the server may
+  hold the single WAL connection (ADR-003); restore must not corrupt a live DB.
+- Decision: `am db export [path]` / `am db import <path>` operate **directly on the SQLite file**,
+  dispatched in `main.go` before the HTTP client is built — **no server endpoint**. Export uses
+  `VACUUM INTO` for an online, consistent snapshot, then `chmod 0o600`. Import validates the
+  candidate (`PRAGMA integrity_check`, `foreign_key_check`, 5 required tables, `schema_version <=
+  currentSchemaVersion`), **refuses while a server is running** (probes `AGENTMAN_URL /api/projects`),
+  prompts unless `--yes`, backs up the existing DB (`0o600`) into the DB's dir, removes stale
+  `-wal`/`-shm`, then does an atomic copy. The `VACUUM INTO` path is an **escaped string literal**
+  (single-quotes doubled), **not** a bound `?` param — a deliberate, reviewed exception to "all SQL
+  parameterized", because SQLite forbids a bind param there; the destination is always the configured
+  DB path, never caller-supplied.
+- Rationale: keeps backup/restore out of the loopback attack surface (ADR-011); avoids fighting the
+  single-writer connection; refuse-while-serving prevents clobbering a live DB.
+- Consequences: backup/restore is local-only (no remote admin); a malformed snapshot path string is
+  the only place untrusted text reaches SQL, and it is escaped + server-controlled.
+- Evidence: `cmd/am/db.go` (`exportDB` VACUUM INTO + `0o600`, `validateImportCandidate`,
+  `isServerRunning`, `importDB` backup/atomic copy); `cmd/am/main.go` (`db` dispatch before client);
+  `cmd/am/cli.go` (`yes` in boolFlags); `cmd/am/db_test.go`.
+
+### ADR-013: Project archive as a reversible soft-delete (first real migration, v2)
+- Status: Active
+- Context: "Delete / archival semantics" was an open Missing Decision; agents accumulate stale
+  projects but their tasks/comments/events must survive (events are the append-only backbone, ADR-004).
+- Decision: Archive is a **reversible soft-delete** via a nullable `projects.archived_at` TEXT column
+  (NULL = active, ISO-8601 UTC timestamp when archived) — **not** a hard delete or cascade.
+  `ArchiveProject`/`UnarchiveProject` are transactional and idempotent (no event when already in the
+  target state), emitting `project.archived` / `project.unarchived`. `ListProjects(includeArchived)`
+  adds `WHERE p.archived_at IS NULL` when false. Adding this column is the **first real schema
+  migration** (`currentSchemaVersion = 2`): `schemaMigrations` now carries
+  `{version: 2}` running `ALTER TABLE projects ADD COLUMN archived_at TEXT`, which **exercises the
+  Phase-0 forward-only runner end-to-end** (ADR-010 / IADR-003) — each step plus the
+  `meta.schema_version` bump commit in one tx.
+- Rationale: preserves history and is fully reversible; proves the migration runner works on a real
+  additive change rather than leaving it untested.
+- Consequences: archived projects are hidden by default but never garbage-collected; reaching v2
+  requires the runner (a v1 DB is migrated forward on open).
+- Evidence: `cmd/am/store.go` (`currentSchemaVersion = 2`, `schemaMigrations` v2 ALTER,
+  `ArchiveProject`/`UnarchiveProject`/`ListProjects`); `cmd/am/server.go` (`/archive`/`/unarchive`,
+  `?archived=true`); `cmd/am/cli.go` (`am project archive/unarchive`, `am projects --all`);
+  `cmd/am/web/app.js` (`project.archived`/`project.unarchived`); `cmd/am/migrate_test.go`,
+  `cmd/am/store_test.go`, `cmd/am/server_test.go`.
+
+### ADR-014: Multi-select project filter resolved client-side
+- Status: Active
+- Context: The dashboard moved from a single active project to selecting several at once; the
+  `/api/tasks` query filter (`?project`) only accepts one slug.
+- Decision: Frontend tracks `let selected = new Set()` (empty = "All"); `toggleProject(slug)` adds/
+  removes a slug or clears all. Filtering is **client-side except for the single-project case**:
+  `qstr` sets `project=` **only when `selected.size === 1`** (server-side filter); for 0 or 2+
+  selected it loads all tasks and `renderBoard` filters via `selected.has(t.project)`. `card()` shows
+  the project tag whenever `selected.size !== 1`. No multi-project server query was added.
+- Rationale: avoids extending the server query API for a UI concern; the single-project fast path
+  still narrows the payload, and the board is already a debounced full re-render (IADR-002), so
+  client-side filtering is essentially free.
+- Consequences: with 2+ projects selected the client fetches all tasks (capped at `limit: 500`) and
+  filters in memory; large boards inherit the IADR-002 re-render limit.
+- Evidence: `cmd/am/web/app.js` (`selected` Set, `toggleProject`, `qstr` `selected.size === 1`,
+  `renderBoard` `selected.has(t.project)`, `tab()`/`card()`).
+
 ## Inferred Decisions
 
 ### IADR-001: SSE chosen over WebSockets
@@ -136,10 +198,11 @@ without evidence.
 - Confidence: High (now confirmed/resolved by ADR-010)
 - Original inference: relied on `CREATE TABLE IF NOT EXISTS` only; `meta.schema_version` written but
   never read; no `ALTER`/migration runner.
-- Status: **Resolved.** Phase 0 added a forward-only runner (ADR-010) that reads/bumps
-  `meta.schema_version`. `schemaMigrations` is still empty (no column changes yet), so the residual
-  risk is only that the runner is exercised end-to-end starting in Phase 2.
-- Evidence: `cmd/am/store.go` (`runMigrations`), `cmd/am/migrate_test.go`.
+- Status: **Resolved + exercised.** Phase 0 added a forward-only runner (ADR-010) that reads/bumps
+  `meta.schema_version`; Phase 2 supplied its **first real step** — `schemaMigrations` now holds the
+  v2 `ALTER TABLE projects ADD COLUMN archived_at TEXT` (ADR-013), so `currentSchemaVersion = 2` and
+  the runner is exercised end-to-end (no remaining residual risk).
+- Evidence: `cmd/am/store.go` (`runMigrations`, `schemaMigrations` v2), `cmd/am/migrate_test.go`.
 
 ### IADR-004: Native HTML5 drag-and-drop (no library, no touch)
 - Confidence: High
@@ -153,7 +216,8 @@ without evidence.
 These are **undecided/undocumented** in the repo (decide + record before building):
 - **Authentication / remote-access model** — discussed but not chosen or written down.
 - **Testing strategy & coverage targets** — only `update_test.go` exists; no policy.
-- **Schema migration approach** — see IADR-003.
-- **Delete / archival semantics** — no delete endpoint; no `events`/`comments` retention.
+- **Schema migration approach** — resolved + exercised; see IADR-003 / ADR-010 / ADR-013.
+- **Delete / archival semantics** — archive resolved as a reversible soft-delete (ADR-013); hard
+  delete and `events`/`comments` retention remain undecided.
 - **CI/CD & release automation** — no `.github/`; releases are manual `git tag` + push.
 - **Versioning / CHANGELOG policy** — tags exist (`v0.1.0`–`v0.3.0`) but no CHANGELOG or stated scheme.

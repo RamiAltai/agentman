@@ -47,6 +47,9 @@ Then use `am` normally (`am whoami` shows it).
     am note <id> "progress"    # leave a short comment as you work
     am status <id> done        # todo | doing | blocked | done
     am new "title" -p <proj>   # create a task (prints its id)
+    am projects --all          # list projects, incl. archived (marked "(archived)")
+    am project archive <slug>  # hide a project (exit 3 if not found)
+    am project unarchive <slug>
 
 Choose the project with `-p <slug>` (or set AGENTMAN_PROJECT). Output is terse text — add
 `--json` to parse. Silence = success. Exit codes: 0 ok · 3 not found · 4 already claimed ·
@@ -135,6 +138,19 @@ WantedBy=default.target
 ```sh
 systemctl --user enable --now agentman
 ```
+
+### Backup & restore
+
+`am db` operates directly on the SQLite file (no server needed — it's CLI-only):
+
+```sh
+am db export [path]        # VACUUM INTO snapshot (0o600); prints the path written
+am db import <path> [--yes] # validate, back up the current DB, then replace it
+```
+
+Default export path is a timestamped file in the current directory. `import` validates the
+candidate, **refuses while a server is running**, prompts unless `--yes`, and backs up the
+existing DB into the DB's directory first. Stop `am serve` before importing.
 
 ### Updating
 

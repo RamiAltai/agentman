@@ -32,7 +32,11 @@ the port can read and mutate every project/task/comment.
 
 ## Input Validation
 
-- **SQL is fully parameterized** (`?` placeholders throughout `store.go`) → no SQL injection.
+- **SQL is parameterized** (`?` placeholders throughout `store.go`) → no SQL injection. **One
+  deliberate exception:** `VACUUM INTO` cannot take a bind parameter for its target path (SQLite
+  forbids it), so `exportDB` builds the literal by escaping single-quotes — `strings.ReplaceAll(outPath,
+  "'", "''")` (`cmd/am/db.go:65-66`). The input is an operator-supplied local export path, not
+  agent-supplied; reviewed and accepted.
 - Status validated by `validStatus` map **and** a SQL `CHECK` constraint; empty title/slug/body
   rejected (`ErrValidation` → HTTP 400). Unknown `PATCH` fields are ignored (`PatchTask`).
 - Request bodies capped at **1 MiB** (`io.LimitReader` in `server.go decode`); `ReadHeaderTimeout`
@@ -73,6 +77,29 @@ a credential.
   interpolation; args passed as a slice).
 - **Startup update check** fetches a **fixed** `proxy.golang.org` URL → not SSRF-prone.
 - **500 responses leak raw error strings** (`writeErr` default branch) — minor info disclosure.
+- **`am db export`/`am db import`** (`cmd/am/db.go`) are **CLI-only and add no HTTP route or network
+  surface**. Export reads the DB read-only and `VACUUM INTO` a snapshot; import replaces the local DB
+  file. See *Local DB Snapshot & Restore* below for the file-handling and liveness controls.
+
+## Local DB Snapshot & Restore
+
+`am db export` / `am db import` (`cmd/am/db.go`) operate directly on the SQLite file, off-band from
+the server. Their security-relevant properties:
+
+- **CLI-only, no new surface.** Neither subcommand registers an HTTP route; they add no
+  network/listening surface (dispatched before the HTTP client is built).
+- **Restrictive file permissions.** The exported snapshot and the pre-import backup are created
+  `0o600` (`exportDB` chmods the output; `copyFile` opens with `0o600`); the destination directory is
+  created `0o700` (`os.MkdirAll`). Consistent with the unencrypted-at-rest DB — keep snapshots local.
+- **Server-controlled import destination.** The import target is always the configured DB path
+  (`defaultDBPath()` or `--db`), **never the caller-supplied source argument** — the source is only
+  ever read. A malicious source path cannot redirect where the DB is written.
+- **Liveness guard.** Import **refuses to run while a server is up**: it probes
+  `AGENTMAN_URL` (`/api/projects`) via `isServerRunning` and aborts with "stop `am serve` before
+  importing". This avoids replacing a live WAL DB out from under a running process and corrupting it.
+- **Candidate validation.** Before replacing anything, import runs `PRAGMA integrity_check` /
+  `foreign_key_check`, requires the five core tables, and rejects a `schema_version` newer than
+  `currentSchemaVersion` — so a garbage or future-schema file is refused, not imported.
 
 ## Existing Controls
 
@@ -102,12 +129,15 @@ a credential.
 ## Secure Implementation Checklist
 
 Before merging a change, confirm:
-- [ ] No new SQL uses string concatenation with caller input (use `?` placeholders).
+- [ ] No new SQL uses string concatenation with caller input (use `?` placeholders). The only
+      sanctioned exception is the escaped-literal `VACUUM INTO` path in `exportDB` — don't add more.
 - [ ] Any new dashboard rendering uses `el()`/`textContent`, never `innerHTML`/`insertAdjacentHTML`.
 - [ ] The server still binds `127.0.0.1` **unless** you also added authentication.
 - [ ] New endpoints validate inputs and map errors via `writeErr` (no raw 500 text for expected cases).
 - [ ] No secrets added to the repo, logs, or query strings.
 - [ ] If you added remote access: auth + CSRF/`Host` guard + TLS are all present, not just one.
+- [ ] Any new local file written from a DB path (snapshots, backups) is created `0o600` / `0o700`,
+      and a DB-replacing op writes only to the configured DB path and guards against a live server.
 - [ ] `go vet ./...` and `govulncheck ./...` clean.
 
 ## Recommended Security Tests

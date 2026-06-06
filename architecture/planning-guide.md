@@ -56,9 +56,11 @@ Flag the change if it touches any of these invariants:
 
 ## Data Impact Checklist
 
-- [ ] Schema change? A **forward-only migration runner now exists** (ADR-010) — add a `{version,
-  apply}` step to `schemaMigrations` and raise `currentSchemaVersion` in `cmd/am/store.go`; do **not**
-  rely on `CREATE TABLE IF NOT EXISTS` to alter existing tables. Add a migration test.
+- [ ] Schema change? A **forward-only migration runner exists and is exercised** (ADR-010) — append a
+  `{version, apply}` step to `schemaMigrations` and raise `currentSchemaVersion` in `cmd/am/store.go`; do
+  **not** rely on `CREATE TABLE IF NOT EXISTS` to alter existing tables. The shipped v2 step (the
+  `ALTER TABLE projects ADD COLUMN archived_at TEXT` migration) is the template to copy. Add a migration
+  test like `TestMigrationV2AddsArchivedAt` in `cmd/am/migrate_test.go`.
 - [ ] New columns threaded through `schema.sql` → `store.go` structs → `CreateTask`/`PatchTask`/
   `getTaskTx` → API → dashboard?
 - [ ] Cascade/ownership rules considered (project→tasks→comments)?
@@ -75,8 +77,10 @@ Flag the change if it touches any of these invariants:
 ## Testing Checklist
 
 - [ ] Unit tests for new pure logic (table-driven, like `update_test.go`).
-- [ ] If you touch the claim, status, or validation paths, add a behavioral test (these are the
-  highest-value untested areas).
+- [ ] If you touch the claim, status, or validation paths, add a behavioral test (these are
+  high-value paths now covered by `TestClaimRaceExactlyOneWinner` (`store_test.go`),
+  `TestLostClaim409` (`server_test.go`), and the validation tests in `store_test.go` — extend
+  these rather than leaving new behavior uncovered).
 - [ ] `go vet ./...` and `go test ./...` pass; `gofmt -l cmd/am` empty.
 
 ## Approval Gates

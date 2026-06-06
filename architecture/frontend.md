@@ -1,7 +1,7 @@
 # Frontend Architecture
 
 There **is** a frontend: a small single-page dashboard in `cmd/am/web/`
-(`index.html` 50 lines, `app.css` 304 lines, `app.js` 591 lines), embedded into the binary via
+(`index.html` 50 lines, `app.css` 304 lines, `app.js` 616 lines), embedded into the binary via
 `//go:embed web` (`cmd/am/server.go`) and served at `/`. It is the human-facing view; agents do
 not use it.
 
@@ -13,9 +13,10 @@ string children as **text nodes** (never `innerHTML`) so agent-supplied text can
 
 ## Routing
 
-No client-side router. It's a single page; "navigation" is changing the selected project
-(`selectProject`) and opening/closing a modal. No URL/history manipulation except the implicit
-single document.
+No client-side router. It's a single page; "navigation" is toggling project tabs on/off
+(`toggleProject`) and opening/closing a modal. The filter is **multi-select** — several projects
+can be active at once, and "All" clears the selection. No URL/history manipulation except the
+implicit single document.
 
 ## Pages and Components
 
@@ -23,8 +24,12 @@ All built imperatively in `app.js` (no component framework):
 - **Header / tabs** — `renderTabs`, `tab()`: project tabs with open-count badges + an "All" tab + a
   "＋" new-project button.
 - **Board** — `renderBoard`, `card(t)`: four status columns (`COLS`), priority via card left-border
-  + chip, avatar initials, project tag, comment count.
+  + chip, avatar initials, project tag (shown when `selected.size !== 1`, i.e. only when the board
+  isn't already scoped to a single project), comment count.
 - **Activity feed** — `feedItem`, `evText`, `evKind`: color-coded events with clickable `#refs`.
+  Event kinds include the project lifecycle: `project.created`, `project.archived`,
+  `project.unarchived` (the last two render via `evText`/`describeText`; `evKind` colors them as
+  generic "other").
 - **Detail modal** — `renderModal`, plus `openNew` (new task) and `openNewProject`: one reused
   `#sheet` element; auto-growing title `<textarea>`; status/assignee/priority controls; comments;
   history.
@@ -32,7 +37,8 @@ All built imperatively in `app.js` (no component framework):
 ## State Management
 
 Module-level mutable variables in `app.js` (no store/framework):
-`projects` (array), `current` (selected slug, `""`=all), `tasks` (`Map<id,task>`), `cursor`
+`projects` (array), `selected` (`Set<slug>` of active project filters, empty=all), `tasks`
+(`Map<id,task>`), `cursor`
 (highest seen `events.id` for SSE `since=`), `es` (EventSource), `openTaskId`, `dragId`,
 `lastFocus`. Reconciliation is **snapshot-based**: on each SSE event the feed updates immediately
 and a **debounced (250 ms) full `loadBoard()`** re-fetches and re-renders (`onEvent`). Simple and
@@ -42,9 +48,12 @@ correct over clever diffing.
 
 - **`api(method, path, body)`** — `fetch` wrapper; always sends `X-Agent: human`; throws on non-2xx
   with the server's `error` field.
-- **SSE** — `connect()` opens `EventSource('/api/stream?since=<cursor>&project=<current>')`;
-  `onmessage` → `onEvent`; `onerror` → close + reconnect with exponential backoff (1s→10s) and a
-  "reconnecting…" status. `loadFeed()` bootstraps from `/api/events?tail=50`.
+- **SSE** — `connect()` opens `EventSource('/api/stream?since=<cursor>')`, with `&project=<slug>`
+  appended by `qstr()` **only when exactly one project is selected** (`selected.size === 1`); for 0
+  or 2+ selected it streams/loads everything and `renderBoard()` filters client-side
+  (`selected.has(t.project)`). `onmessage` → `onEvent`; `onerror` → close + reconnect with
+  exponential backoff (1s→10s) and a "reconnecting…" status. `loadFeed()` bootstraps from
+  `/api/events?tail=50` (same `qstr` rule).
 - Same-origin only; no CORS, no auth token (the API is unauthenticated).
 
 ## Styling and Design System
@@ -97,6 +106,6 @@ these docs is from source reading and manual verification, not automated tests. 
 - **Native HTML5 drag-and-drop doesn't fire on touch** → mobile relies on the status dropdown /
   `[ ]` keys (documented fallback in code comments).
 - **Full board re-render per event batch** (debounced) — fine at small scale, O(n) at large scale.
-- Single 591-line `app.js`, no module split, no minification, no tests → refactors are unguarded.
+- Single 616-line `app.js`, no module split, no minification, no tests → refactors are unguarded.
 - `localStorage` access is wrapped (`lsGet`/`lsSet`) so a sandboxed/Private-mode browser won't
   break the app — keep that pattern if you add persistence.
