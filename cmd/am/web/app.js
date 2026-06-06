@@ -9,7 +9,7 @@ const PRIO_OPTS = ["0 — Urgent", "1 — High", "2 — Normal", "3 — Low"];
 const FEED_W_KEY = "am.feedW", FEED_COLLAPSED_KEY = "am.feedCollapsed";
 
 let projects = [];
-let current = "";            // selected project slug, "" = all
+let selected = new Set();    // selected project slugs; empty = "All"
 let tasks = new Map();       // id -> task (terse)
 let cursor = 0;              // highest event id seen (SSE since=)
 let es = null, backoff = 1000, refreshTimer = null, openTaskId = null, lastFocus = null, dragId = null;
@@ -52,7 +52,7 @@ async function api(method, path, body) {
 
 function qstr(extra) {
   const p = new URLSearchParams(extra || {});
-  if (current) p.set("project", current);
+  if (selected.size === 1) p.set("project", [...selected][0]);
   const s = p.toString();
   return s ? "?" + s : "";
 }
@@ -96,11 +96,11 @@ function renderTabs() {
 function openCount(c) { c = c || {}; return (c.todo || 0) + (c.doing || 0) + (c.blocked || 0); }
 
 function tab(slug, label, open) {
-  const active = slug === current;
+  const active = slug === "" ? selected.size === 0 : selected.has(slug);
   const b = el("button", {
     class: "tab" + (active ? " active" : ""),
     "aria-pressed": String(active),
-    onclick: () => selectProject(slug),
+    onclick: () => toggleProject(slug),
   }, label);
   if (open) b.append(el("span", { class: "badge" }, String(open)));
   return b;
@@ -109,10 +109,13 @@ function tab(slug, label, open) {
 function renderBoard() {
   const board = $("board");
   board.replaceChildren();
-  if (tasks.size === 0) { board.append(boardEmpty()); return; }
+  const visible = selected.size > 0
+    ? [...tasks.values()].filter(t => selected.has(t.project))
+    : [...tasks.values()];
+  if (visible.length === 0) { board.append(boardEmpty()); return; }
 
   const by = { todo: [], doing: [], blocked: [], done: [] };
-  for (const t of tasks.values()) (by[t.status] || (by[t.status] = [])).push(t);
+  for (const t of visible) (by[t.status] || (by[t.status] = [])).push(t);
 
   for (const [key, label] of COLS) {
     let list = (by[key] || []).sort((a, b) => a.priority - b.priority || b.id - a.id);
@@ -156,7 +159,7 @@ function boardEmpty() {
       el("p", {}, "Create a project to start tracking work."),
       el("button", { class: "save", onclick: openNewProject }, "Create a project"));
   } else {
-    w.append(el("h3", {}, current ? "This project is empty" : "No tasks yet"),
+    w.append(el("h3", {}, selected.size > 0 ? "No tasks in selected projects" : "No tasks yet"),
       el("p", {}, "Add a task and your agents can pick it up."),
       el("button", { class: "save", onclick: openNew }, "+ New task"));
   }
@@ -192,7 +195,7 @@ function card(t) {
   if (t.assignee) who.append(el("span", { class: "avatar" }, initials(t.assignee)), el("span", { class: "name" }, t.assignee));
   else who.append("Unassigned");
   foot.append(who);
-  if (!current) foot.append(el("span", { class: "ptag" }, t.project));
+  if (selected.size !== 1) foot.append(el("span", { class: "ptag" }, t.project));
   if (t.nc > 0) foot.append(el("span", { class: "cc" }, "💬 " + t.nc));
   c.append(foot);
   return c;
@@ -230,8 +233,14 @@ function moveTask(id, status) {
 
 // ---------- project switching ----------
 
-async function selectProject(slug) {
-  current = slug;
+async function toggleProject(slug) {
+  if (slug === "") {
+    selected.clear();            // "All" clears selection
+  } else if (selected.has(slug)) {
+    selected.delete(slug);       // clicking an active tab deselects it
+  } else {
+    selected.add(slug);          // clicking an inactive tab adds it
+  }
   renderTabs();
   try { await loadBoard(); await loadFeed(); } catch (e) { setStatus("error", "warn"); }
   connect();
@@ -361,9 +370,10 @@ function openNew() {
   s.append(el("div", { class: "mhead" }, "New task"));
   const title = el("input", { class: "mtitle field", placeholder: "Task title", "aria-label": "Task title" });
   const psel = el("select", { "aria-label": "Project" });
+  const defaultProj = selected.size === 1 ? [...selected][0] : (projects[0] ? projects[0].slug : "");
   for (const p of projects) {
     const o = el("option", { value: p.slug }, p.name);
-    if (p.slug === current) o.setAttribute("selected", "selected");
+    if (p.slug === defaultProj) o.setAttribute("selected", "selected");
     psel.append(o);
   }
   const pri = prioSelect(2, null);
@@ -376,7 +386,7 @@ function openNew() {
       try {
         const t = await api("POST", "/api/tasks", { project: psel.value, title: title.value.trim(), body: body.value, priority: Number(pri.value) });
         closeModal();
-        if (current && t.project !== current) await selectProject(t.project);
+        if (selected.size === 1 && t.project !== [...selected][0]) await toggleProject(t.project);
         else { await loadBoard().catch(() => {}); loadProjects().catch(() => {}); }
       } catch (e) { err.textContent = e.message; }
     }
@@ -406,7 +416,7 @@ function openNewProject() {
         const p = await api("POST", "/api/projects", { slug: sv, name: name.value.trim() || sv });
         await loadProjects();
         closeModal();
-        selectProject(p.slug);
+        toggleProject(p.slug);
       } catch (e) {
         err.textContent = e.message === "conflict" ? "a project with slug “" + sv + "” already exists" : e.message;
       }
@@ -441,8 +451,15 @@ function onEvent(ev) {
   trimFeed();
   if (ev.kind === "project.created" || ev.kind === "project.unarchived") loadProjects().catch(() => {});
   if (ev.kind === "project.archived") {
-    if (current && (ev.data || {}).slug === current) selectProject("");
-    else loadProjects().catch(() => {});
+    const archivedSlug = (ev.data || {}).slug;
+    if (selected.has(archivedSlug)) {
+      selected.delete(archivedSlug);
+      renderTabs();
+      loadBoard().catch(() => {});
+      loadFeed().catch(() => {});
+      connect();
+    }
+    loadProjects().catch(() => {});
   }
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => loadBoard().catch(() => {}), 250); // debounced reconcile
