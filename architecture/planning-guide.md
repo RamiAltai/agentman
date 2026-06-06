@@ -56,8 +56,9 @@ Flag the change if it touches any of these invariants:
 
 ## Data Impact Checklist
 
-- [ ] Schema change? If it's anything beyond a brand-new table, **there is no migration runner** —
-  design a migration (and bump `meta.schema_version` + add the code that reads it).
+- [ ] Schema change? A **forward-only migration runner now exists** (ADR-010) — add a `{version,
+  apply}` step to `schemaMigrations` and raise `currentSchemaVersion` in `cmd/am/store.go`; do **not**
+  rely on `CREATE TABLE IF NOT EXISTS` to alter existing tables. Add a migration test.
 - [ ] New columns threaded through `schema.sql` → `store.go` structs → `CreateTask`/`PatchTask`/
   `getTaskTx` → API → dashboard?
 - [ ] Cascade/ownership rules considered (project→tasks→comments)?

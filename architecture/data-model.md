@@ -68,10 +68,17 @@ project → tasks → comments. **Events are never deleted** (append-only).
 
 ## Migrations
 
-**No migration runner.** `OpenStore` executes `schema.sql` once with `CREATE TABLE IF NOT EXISTS`
-+ `INSERT OR IGNORE … schema_version`. Adding a column later will **not** alter an existing DB, and
-nothing reads `schema_version`. Any schema change beyond new tables needs a migration strategy that
-does not exist yet. (Risk — see `known-risks-and-gaps.md`; IADR-003 in `decision-records.md`.)
+**A forward-only migration runner exists (Phase 0, ADR-010).** `OpenStore` executes `schema.sql`
+(`CREATE TABLE IF NOT EXISTS` + `INSERT OR IGNORE … schema_version`) and then calls
+`runMigrations(db, currentSchemaVersion, schemaMigrations)`. Each step applies its change **and**
+bumps `meta.schema_version` in one transaction; steps are integer-ordered and idempotent.
+
+To add a column/table change, append a `{version, apply}` step to `schemaMigrations` and raise
+`currentSchemaVersion` (`cmd/am/store.go`). `schemaMigrations` is **currently empty** (no schema
+change has shipped yet; Phase 2 will add `projects.archived_at` as the first real step). Known
+limitations: forward-only (no down-migrations); a DB at a **newer** version than the binary is
+accepted silently today; an unparseable `schema_version` defaults to 1. Backup/restore is still
+file-copy (`README.md`).
 
 Backup/restore is file-copy: copy `agentman.db` (+ `-wal`/`-shm`) while the server is stopped
 (`README.md`).

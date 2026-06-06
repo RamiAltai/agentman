@@ -94,7 +94,7 @@ func runServe(argv []string) {
 	srv := NewServer(store)
 	baseCtx, cancelBase := context.WithCancel(context.Background())
 	httpServer := &http.Server{
-		Addr:              "127.0.0.1:" + port,
+		Addr:              listenAddr(port),
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		BaseContext:       func(net.Listener) context.Context { return baseCtx },
@@ -120,6 +120,11 @@ func runServe(argv []string) {
 	httpServer.Shutdown(shutCtx)
 	store.Close()
 }
+
+// listenAddr is the server bind address. It is pinned to the 127.0.0.1 loopback
+// interface — there is no authentication, so the bind is the only access control
+// (see security.md). Tests guard that this never widens beyond loopback.
+func listenAddr(port string) string { return "127.0.0.1:" + port }
 
 func defaultDBPath() string {
 	home, err := os.UserHomeDir()

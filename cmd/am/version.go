@@ -6,7 +6,8 @@ import (
 )
 
 // injectedVersion can be set at build time for release binaries:
-//   go build -ldflags "-X main.injectedVersion=v0.3.0"
+//
+//	go build -ldflags "-X main.injectedVersion=v0.3.0"
 var injectedVersion string
 
 // version reports the build version. Precedence: -ldflags injection, then the

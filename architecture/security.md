@@ -62,10 +62,12 @@ a credential.
 ## Attack Surface
 
 - **HTTP API on loopback** — full read/write, unauthenticated.
-- **Browser-driven attacks even on loopback:** with no auth, **no CSRF protection, no `Host`-header
-  / DNS-rebinding guard, and default same-origin CORS**, a malicious website you visit can issue
-  writes to `127.0.0.1:8787` (CSRF) or read via DNS rebinding. Because agents *act on* tasks, a
-  poisoned task is an **injection vector into the agent fleet** — the highest-severity surface here.
+- **Browser-driven attacks even on loopback:** historically, with no auth and no CSRF/`Host` guard, a
+  malicious website could issue writes to `127.0.0.1:8787` (CSRF) or read via DNS rebinding — and
+  because agents *act on* tasks, a poisoned task is an **injection vector into the agent fleet**.
+  **As of Phase 0 (ADR-011) this is mitigated** by the Host allowlist (`hostGuard`) and the
+  write-CSRF guard (`csrfGuard`). It is not eliminated: a local non-browser process (no `Origin`/
+  `Sec-Fetch-Site`) is still trusted, and reads are not CSRF-gated.
 - **`am update`** shells out `go install <fixed module>@<version>` via `os/exec` (`update.go`);
   the version comes from a local CLI arg, the module path is a constant → low risk (no shell string
   interpolation; args passed as a slice).
@@ -75,6 +77,12 @@ a credential.
 ## Existing Controls
 
 - Loopback-only bind (the primary control).
+- **Host-header allowlist** (`server.go hostGuard`) — rejects any Host except `127.0.0.1`/`localhost`/
+  `::1`; mitigates DNS rebinding. (Added Phase 0, ADR-011.)
+- **Write-CSRF guard** (`server.go csrfGuard`) — blocks cross-origin browser writes via
+  `Sec-Fetch-Site`/`Origin` while allowing the header-less CLI and the same-origin dashboard;
+  mitigates malicious-website drive-by writes. (Added Phase 0, ADR-011.)
+- **`X-Content-Type-Options: nosniff` + a dashboard-safe CSP** (`server.go securityHeaders`).
 - **Atomic claim** prevents double-claim/race (`store.go ClaimTask`, conditional `UPDATE … RETURNING`).
 - XSS-safe DOM rendering; parameterized SQL; request body size cap.
 - The **`events` table is a de-facto audit log** (actor, kind, timestamp, delta) — but the actor is
@@ -83,7 +91,8 @@ a credential.
 ## Security Gaps
 
 1. No authentication / authorization (by design, but blocks any non-loopback use).
-2. No CSRF protection and no DNS-rebinding (`Host` allowlist) guard.
+2. ~~No CSRF / DNS-rebinding guard~~ — **mitigated in Phase 0** by the Host allowlist + write-CSRF
+   guard (ADR-011). Residual: these are not auth, so any *local* process can still call the API.
 3. No TLS (a token over plain HTTP would be sniffable).
 4. No rate limiting / brute-force protection.
 5. 500s expose internal error text.

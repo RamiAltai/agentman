@@ -5,9 +5,10 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 ## Architecture Risks
 
-- **No schema-migration path** (High). `OpenStore` runs `CREATE TABLE IF NOT EXISTS` only;
-  `meta.schema_version` is written but never read. Any change to an existing table won't apply to
-  existing DBs. → `data-model.md`, `decision-records.md` IADR-003.
+- **Schema-migration runner: foundation landed, unexercised** (was High → now Low/Medium). Phase 0
+  added a forward-only runner that reads/bumps `meta.schema_version` (ADR-010), but `schemaMigrations`
+  is empty, so the additive-column path is unproven until Phase 2. Residual: no down-migrations; a DB
+  newer than the binary is accepted silently. → `data-model.md`, `decision-records.md` ADR-010.
 - **Single-writer throughput ceiling** (Low for stated scope). `SetMaxOpenConns(1)` serializes all
   writes; correct and simple, but caps write concurrency. → ADR-003.
 - **Module boundaries are by convention only** (Medium, maintainability). One flat `main` package
@@ -28,8 +29,9 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 (Full detail in `security.md`.)
 - **No authentication/authorization** (by design for loopback; High if the bind is ever widened).
-- **No CSRF / DNS-rebinding (`Host` allowlist) protection** (Medium) — a malicious website can drive
-  the loopback API, and because agents act on tasks this is an **agent-injection** vector.
+- ~~No CSRF / DNS-rebinding protection~~ — **mitigated in Phase 0** (Host allowlist + write-CSRF
+  guard, ADR-011). Residual (Low): not auth — any local non-browser process is still trusted; reads
+  are not CSRF-gated.
 - **No TLS, no rate limiting** (Medium if exposed).
 - **500 responses leak raw error strings** (Low).
 - **No dependency vulnerability scanning** (Medium, unmonitored) — run `govulncheck ./...` manually.
@@ -37,10 +39,11 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 ## Testing Gaps
 
-- Only `cmd/am/update_test.go` exists (3 tests, version logic). **Untested:** every HTTP handler,
-  the store, the **atomic claim** (the project's most important invariant), SSE/reconnect, the CLI,
-  identity, and the entire dashboard. → `backend.md`, `frontend.md`. Highest-value additions:
-  atomic-claim race, validation/status-code mapping, XSS regression.
+- Phase 0 added store/server/migrate tests: the **atomic claim** (race, `-race`-clean), events
+  cursor, store CRUD/validation, validation→status mapping, and the new Host/CSRF/CSP guards are now
+  covered. **Still untested:** SSE streaming/reconnect, the CLI commands, identity, and the entire
+  dashboard (no JS test runner). → `backend.md`, `frontend.md`. Next highest-value: an XSS regression
+  test for the dashboard and CLI-path tests.
 
 ## Documentation Gaps
 
@@ -53,8 +56,8 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 ## Maintainability Concerns
 
-- **`gofmt -l` is non-empty** (Low, easy fix): `cmd/am/update_test.go` and `cmd/am/version.go`
-  are unformatted as committed. Run `gofmt -w cmd/am`.
+- ~~`gofmt -l` is non-empty~~ — **fixed in Phase 0** (`cmd/am/update_test.go`, `cmd/am/version.go`
+  formatted; `gofmt -l cmd/am` is now empty).
 - `store.go` (~691 lines) and `app.js` (~591 lines) are the largest files and mix several
   responsibilities; fine now, watch for growth.
 - No linter beyond `gofmt`/`go vet`; no pre-commit hooks.

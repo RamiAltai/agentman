@@ -92,9 +92,10 @@ tests are very welcome; start with the claim/validation paths.
 
 - Add the column in `schema.sql` and the field in the relevant `store.go` struct; thread it through
   create/patch/get and the API and UI.
-- ⚠️ **No migration runner exists** — `CREATE TABLE IF NOT EXISTS` won't alter existing DBs. For any
-  change to an existing table, design a migration first (and add the code that reads
-  `meta.schema_version`). Coordinate with `decision-records.md` IADR-003.
+- ✅ A **forward-only migration runner exists** (`runMigrations` in `cmd/am/store.go`, ADR-010). To
+  change an existing table, append a `{version, apply}` step to `schemaMigrations` and raise
+  `currentSchemaVersion`; add a `migrate_test.go` case. `CREATE TABLE IF NOT EXISTS` in `schema.sql`
+  still won't alter existing tables — use the runner for that.
 
 ## Adding Tests
 

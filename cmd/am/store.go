@@ -98,7 +98,85 @@ func OpenStore(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
+	if err := runMigrations(db, currentSchemaVersion, schemaMigrations); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate schema: %w", err)
+	}
 	return &Store{db: db}, nil
+}
+
+// ---------- schema migrations ----------
+
+// currentSchemaVersion is the version OpenStore migrates to. schema.sql seeds a
+// fresh DB at version 1; runMigrations applies any steps with version > the DB's
+// recorded version to reach this target.
+const currentSchemaVersion = 1
+
+// migration is one forward-only, idempotent step. apply runs inside the same tx
+// that bumps meta.schema_version, so a step + its version bump commit atomically.
+type migration struct {
+	version int
+	apply   func(*sql.Tx) error
+}
+
+// schemaMigrations is the ordered, forward-only migration list. It is EMPTY in
+// Phase 0 (no column changes yet); later phases append steps like
+// {version: 2, apply: func(tx *sql.Tx) error { ... }}. Versions must be strictly
+// increasing and start above 1 (the seed version).
+var schemaMigrations = []migration{}
+
+// readSchemaVersion returns the DB's recorded schema version, defaulting to 1 if
+// the meta row is missing or unparseable (a fresh DB is implicitly at version 1).
+func readSchemaVersion(db *sql.DB) (int, error) {
+	var raw string
+	err := db.QueryRow("SELECT value FROM meta WHERE key='schema_version'").Scan(&raw)
+	if err == sql.ErrNoRows {
+		return 1, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	v, perr := strconv.Atoi(strings.TrimSpace(raw))
+	if perr != nil {
+		return 1, nil
+	}
+	return v, nil
+}
+
+// runMigrations applies, in order, every step whose version exceeds the DB's
+// current version, up to target. Each step's apply and the matching
+// meta.schema_version bump run in one tx; on any error the tx is rolled back and
+// the DB is left at the prior version. Re-running is a no-op (integer compare).
+func runMigrations(db *sql.DB, target int, steps []migration) error {
+	cur, err := readSchemaVersion(db)
+	if err != nil {
+		return err
+	}
+	for _, m := range steps {
+		if m.version <= cur || m.version > target {
+			continue
+		}
+		tx, err := db.Begin()
+		if err != nil {
+			return err
+		}
+		if err := m.apply(tx); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if _, err := tx.Exec(
+			"INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?)",
+			strconv.Itoa(m.version)); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			tx.Rollback()
+			return err
+		}
+		cur = m.version
+	}
+	return nil
 }
 
 func (s *Store) Close() error {

@@ -32,9 +32,12 @@ Responses are JSON via `writeJSON`; errors via `writeErr`.
 
 ## Request Flow
 
-`mux` → `handleX(w, r)` → decode JSON body (`decode`, capped at 1 MiB via `io.LimitReader`) →
-call a `store.*` method → on success `hub.Broadcast(event)` **after** the store commits →
-`writeJSON`. The actor for writes comes from the `X-Agent` header (`actorOf`, default `"human"`).
+**guardrail middleware** (`securityHeaders(hostGuard(csrfGuard(mux)))`, Phase 0/ADR-011) → `mux` →
+`handleX(w, r)` → decode JSON body (`decode`, capped at 1 MiB via `io.LimitReader`) → call a
+`store.*` method → on success `hub.Broadcast(event)` **after** the store commits → `writeJSON`. The
+actor for writes comes from the `X-Agent` header (`actorOf`, default `"human"`). The middleware
+rejects non-loopback `Host` (403) and cross-origin browser writes (403) without affecting the CLI,
+reads, or SSE.
 
 ## Business Logic
 
@@ -73,10 +76,11 @@ Go structs in `cmd/am/store.go`: `Project`, `Task`, `Comment`, `Event`, `TaskFil
 
 ## Authentication and Authorization
 
-**None.** There is no auth layer and no authorization checks. The `X-Agent` header is an *actor
-label* for attribution, not a credential — any caller can claim any identity. Access control is
-entirely the `127.0.0.1` bind. See `security.md`. This is a deliberate decision (ADR-002 in
-`decision-records.md`).
+**No authentication.** The `X-Agent` header is an *actor label* for attribution, not a credential —
+any caller can claim any identity. Access control is the `127.0.0.1` bind, now hardened by the
+Phase 0 guardrails (Host allowlist + write-CSRF guard, `server.go`, ADR-011) which block
+browser-driven cross-origin/DNS-rebinding attacks but are **not** auth (any local process is still
+trusted). No per-resource authorization. See `security.md` (ADR-002/ADR-011 in `decision-records.md`).
 
 ## Validation
 
@@ -118,9 +122,16 @@ fatal listen error. **No structured logging, request logging, metrics, or tracin
 
 ## Testing
 
-Only `cmd/am/update_test.go` (3 tests: `TestEscapeModule`, `TestPseudoStamp`,
-`TestUpdateAvailable`) — pure version-comparison logic. **No tests for handlers, the store, the
-atomic claim, SSE, or the CLI.** Run with `go test ./...`. (Gap; see `known-risks-and-gaps.md`.)
+As of Phase 0 there are four test files (run `go test ./...`):
+- `cmd/am/update_test.go` — version-comparison logic.
+- `cmd/am/store_test.go` — atomic-claim race (concurrent, `-race`-clean), events-cursor monotonicity,
+  store CRUD + validation (`ErrValidation`).
+- `cmd/am/server_test.go` — validation→status mapping (400/404/409), `hostGuard`, `csrfGuard`,
+  `securityHeaders`, `listenAddr` loopback regression (via `net/http/httptest`).
+- `cmd/am/migrate_test.go` — migration runner (apply/skip/idempotent/rollback).
+
+**Still untested:** SSE streaming/reconnect, the CLI commands, identity, and the dashboard. (Gap; see
+`known-risks-and-gaps.md`.)
 
 ## Where to Add New Features
 
@@ -132,8 +143,9 @@ atomic claim, SSE, or the CLI.** Run with `go test ./...`. (Gap; see `known-risk
 
 ## Risks and Gaps
 
-- **No migration runner** — `OpenStore` only runs `CREATE TABLE IF NOT EXISTS`; `meta.schema_version`
-  exists but nothing reads it. Adding/altering columns on existing DBs is unhandled. (See ADR/IADR.)
+- **Migration runner exists but is unexercised** — Phase 0 added `runMigrations` (ADR-010), but
+  `schemaMigrations` is empty, so the additive-column path isn't proven end-to-end until Phase 2.
+  A DB newer than the binary is accepted silently today.
 - **Single-writer** caps write throughput; fine for a personal board, unproven at scale.
 - **500s leak raw error strings** to clients (`writeErr` default branch) — minor info exposure.
 - **No request size/time limits** beyond a 1 MiB body cap and `ReadHeaderTimeout`.

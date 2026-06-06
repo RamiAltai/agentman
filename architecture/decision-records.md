@@ -84,6 +84,38 @@ without evidence.
 - Consequences: machines without Go can't install yet (prebuilt binaries explicitly deferred).
 - Evidence: `cmd/am/update.go`; `README.md` "Updating".
 
+### ADR-010: Minimal in-code schema-migration runner
+- Status: Active (foundation landed in Phase 0; first real migration pending Phase 2)
+- Context: `CREATE TABLE IF NOT EXISTS` cannot add columns to existing DBs (IADR-003); upcoming
+  archive (a new column) and DB import (a version-compatibility check) both need a version story.
+- Decision: A forward-only, idempotent runner in `store.go` — `readSchemaVersion` +
+  `runMigrations(db, currentSchemaVersion, schemaMigrations)` wired into `OpenStore` after
+  `schema.sql`. Each step applies its change **and** bumps `meta.schema_version` in one tx;
+  integer-ordered; no new dependency. `schemaMigrations` is **empty at v1** (foundation only).
+- Rationale: enables additive schema evolution + import version checks without a migration library.
+- Consequences: forward-only (no down-migrations); a DB at a **newer** version than the binary is
+  currently accepted silently (to be gated by the Phase 1 import check / a future `cur>target`
+  guard); an unparseable `schema_version` defaults to 1, so migration steps must stay idempotent.
+- Evidence: `cmd/am/store.go` (`runMigrations`/`readSchemaVersion`/`schemaMigrations`, `OpenStore`);
+  `cmd/am/migrate_test.go`.
+
+### ADR-011: Localhost HTTP guardrails (Host allowlist + write-CSRF + CSP), no auth
+- Status: Active
+- Context: localhost-no-auth remains the posture (ADR-002), but a malicious website can drive the
+  loopback API (CSRF) and DNS rebinding bypasses the same-origin assumption; upcoming
+  archive/import make those gaps destructive.
+- Decision: Middleware around `Handler()` — a **Host-header allowlist** (`127.0.0.1`/`localhost`/
+  `::1`, else 403; DNS-rebinding guard), a **write-CSRF guard** (block cross-origin browser writes
+  via `Sec-Fetch-Site`/`Origin`, exempting header-less non-browser clients so the CLI works), and
+  `X-Content-Type-Options: nosniff` + a dashboard-safe CSP (`style-src 'self' 'unsafe-inline'` for
+  the app's inline style attributes). Auth/TLS stay deferred.
+- Rationale: closes the realistic browser-driven attack surface without adding auth, preserving the
+  CLI, the same-origin dashboard, and SSE.
+- Consequences: cross-origin browser writes are blocked; CLI + dashboard unaffected. This is **not
+  authentication** — any local process can still call the API.
+- Evidence: `cmd/am/server.go` (`hostGuard`/`csrfGuard`/`securityHeaders`, `Handler`);
+  `cmd/am/server_test.go`.
+
 ## Inferred Decisions
 
 ### IADR-001: SSE chosen over WebSockets
@@ -100,13 +132,14 @@ without evidence.
 - Evidence: `cmd/am/web/app.js onEvent`/`renderBoard`.
 - Risk if Wrong: Medium — O(n) re-render limits very large boards; revisit before scaling.
 
-### IADR-003: No schema-migration framework
-- Confidence: High
-- Inferred Decision: Rely on `CREATE TABLE IF NOT EXISTS` only; `meta.schema_version` is written but
+### IADR-003: No schema-migration framework — RESOLVED (Phase 0)
+- Confidence: High (now confirmed/resolved by ADR-010)
+- Original inference: relied on `CREATE TABLE IF NOT EXISTS` only; `meta.schema_version` written but
   never read; no `ALTER`/migration runner.
-- Evidence: `cmd/am/store.go OpenStore`; `cmd/am/schema.sql`.
-- Risk if Wrong: **High** — altering a column on existing DBs silently won't apply; plan migrations
-  before any schema change beyond adding a new table.
+- Status: **Resolved.** Phase 0 added a forward-only runner (ADR-010) that reads/bumps
+  `meta.schema_version`. `schemaMigrations` is still empty (no column changes yet), so the residual
+  risk is only that the runner is exercised end-to-end starting in Phase 2.
+- Evidence: `cmd/am/store.go` (`runMigrations`), `cmd/am/migrate_test.go`.
 
 ### IADR-004: Native HTML5 drag-and-drop (no library, no touch)
 - Confidence: High

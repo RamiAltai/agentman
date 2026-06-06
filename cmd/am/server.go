@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 )
@@ -39,7 +41,70 @@ func (s *Server) Handler() http.Handler {
 
 	sub, _ := fs.Sub(webFS, "web")
 	mux.Handle("/", http.FileServer(http.FS(sub)))
-	return mux
+
+	// Loopback browser hardening. securityHeaders is outermost so its headers
+	// (and nosniff) also apply to the 403s emitted by hostGuard/csrfGuard.
+	// Order of checks: host first (cheapest reject), then CSRF, then the mux.
+	return securityHeaders(hostGuard(csrfGuard(mux)))
+}
+
+// ---------- security middleware ----------
+
+// hostGuard blocks DNS-rebinding by requiring a loopback Host header. The CLI and
+// the dashboard's EventSource/fetch both send 127.0.0.1:port or localhost:port,
+// so they pass; a rebound attacker host (e.g. evil.com) is rejected. Applies to
+// every method, including GET/SSE.
+func hostGuard(next http.Handler) http.Handler {
+	allowed := map[string]bool{"127.0.0.1": true, "localhost": true, "::1": true, "": true}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		if !allowed[host] {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden_host"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// csrfGuard blocks cross-origin browser writes while allowing the header-less CLI
+// and same-origin dashboard. It only inspects state-changing methods; GET/HEAD/
+// OPTIONS (incl. SSE) pass untouched. A request is rejected if Sec-Fetch-Site is
+// present and cross-origin, or if an Origin header's host differs from Host.
+func csrfGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+			if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": "cross_origin"})
+				return
+			}
+			if origin := r.Header.Get("Origin"); origin != "" {
+				if u, err := url.Parse(origin); err != nil || u.Host != r.Host {
+					writeJSON(w, http.StatusForbidden, map[string]string{"error": "cross_origin"})
+					return
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// securityHeaders sets nosniff and a CSP that still permits the dashboard's
+// external /app.js + /app.css, inline style attributes (set via el(...,{style:…})),
+// same-origin fetch/EventSource, and data: emoji/img. style-src 'unsafe-inline'
+// is required for the inline style attributes; dropping it breaks board styling.
+func securityHeaders(next http.Handler) http.Handler {
+	const csp = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; " +
+		"img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'"
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Content-Security-Policy", csp)
+		next.ServeHTTP(w, r)
+	})
 }
 
 // ---------- handlers ----------
