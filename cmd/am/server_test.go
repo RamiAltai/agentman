@@ -178,6 +178,110 @@ func TestListenAddrLoopback(t *testing.T) {
 	}
 }
 
+func TestArchiveUnarchiveEndpoints(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "archivedemo")
+
+	// Initially visible in default list
+	r := do(t, ts, http.MethodGet, "/api/projects", "", nil)
+	defer r.Body.Close()
+	var ps []Project
+	if err := json.NewDecoder(r.Body).Decode(&ps); err != nil {
+		t.Fatalf("decode projects: %v", err)
+	}
+	found := false
+	for _, p := range ps {
+		if p.Slug == "archivedemo" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("project should appear in default list before archive")
+	}
+
+	// Archive it
+	r2 := do(t, ts, http.MethodPost, "/api/projects/archivedemo/archive", "", nil)
+	defer r2.Body.Close()
+	if r2.StatusCode != http.StatusOK {
+		t.Fatalf("archive = %d, want 200", r2.StatusCode)
+	}
+	var archived Project
+	if err := json.NewDecoder(r2.Body).Decode(&archived); err != nil {
+		t.Fatalf("decode archived project: %v", err)
+	}
+	if archived.ArchivedAt == "" {
+		t.Error("archived_at should be set after archive")
+	}
+
+	// No longer visible in default list
+	r3 := do(t, ts, http.MethodGet, "/api/projects", "", nil)
+	defer r3.Body.Close()
+	var ps2 []Project
+	if err := json.NewDecoder(r3.Body).Decode(&ps2); err != nil {
+		t.Fatalf("decode projects: %v", err)
+	}
+	for _, p := range ps2 {
+		if p.Slug == "archivedemo" {
+			t.Fatal("archived project should not appear in default list")
+		}
+	}
+
+	// Visible with ?archived=true
+	r4 := do(t, ts, http.MethodGet, "/api/projects?archived=true", "", nil)
+	defer r4.Body.Close()
+	var ps3 []Project
+	if err := json.NewDecoder(r4.Body).Decode(&ps3); err != nil {
+		t.Fatalf("decode projects all: %v", err)
+	}
+	found = false
+	for _, p := range ps3 {
+		if p.Slug == "archivedemo" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("archived project should appear in ?archived=true list")
+	}
+
+	// Unarchive it
+	r5 := do(t, ts, http.MethodPost, "/api/projects/archivedemo/unarchive", "", nil)
+	defer r5.Body.Close()
+	if r5.StatusCode != http.StatusOK {
+		t.Fatalf("unarchive = %d, want 200", r5.StatusCode)
+	}
+	var unarchived Project
+	if err := json.NewDecoder(r5.Body).Decode(&unarchived); err != nil {
+		t.Fatalf("decode unarchived project: %v", err)
+	}
+	if unarchived.ArchivedAt != "" {
+		t.Error("archived_at should be empty after unarchive")
+	}
+
+	// Visible again in default list
+	r6 := do(t, ts, http.MethodGet, "/api/projects", "", nil)
+	defer r6.Body.Close()
+	var ps4 []Project
+	if err := json.NewDecoder(r6.Body).Decode(&ps4); err != nil {
+		t.Fatalf("decode projects: %v", err)
+	}
+	found = false
+	for _, p := range ps4 {
+		if p.Slug == "archivedemo" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("unarchived project should appear in default list again")
+	}
+
+	// 404 on missing project
+	r7 := do(t, ts, http.MethodPost, "/api/projects/nosuchproject/archive", "", nil)
+	defer r7.Body.Close()
+	if r7.StatusCode != http.StatusNotFound {
+		t.Fatalf("archive missing project = %d, want 404", r7.StatusCode)
+	}
+}
+
 // ---------- helpers ----------
 
 func mustCreateProject(t *testing.T, ts *httptest.Server, slug string) {

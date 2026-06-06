@@ -56,7 +56,7 @@ func TestExportImportRoundtrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store2.Close()
-	projs, err := store2.ListProjects()
+	projs, err := store2.ListProjects(false)
 	if err != nil {
 		t.Fatal(err)
 	}

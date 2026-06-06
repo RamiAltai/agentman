@@ -32,11 +32,12 @@ var validStatus = map[string]bool{"todo": true, "doing": true, "blocked": true, 
 // ---------- types ----------
 
 type Project struct {
-	ID        int64          `json:"id"`
-	Slug      string         `json:"slug"`
-	Name      string         `json:"name"`
-	CreatedAt string         `json:"created_at"`
-	Counts    map[string]int `json:"counts,omitempty"`
+	ID         int64          `json:"id"`
+	Slug       string         `json:"slug"`
+	Name       string         `json:"name"`
+	CreatedAt  string         `json:"created_at"`
+	ArchivedAt string         `json:"archived_at,omitempty"`
+	Counts     map[string]int `json:"counts,omitempty"`
 }
 
 type Task struct {
@@ -110,7 +111,7 @@ func OpenStore(path string) (*Store, error) {
 // currentSchemaVersion is the version OpenStore migrates to. schema.sql seeds a
 // fresh DB at version 1; runMigrations applies any steps with version > the DB's
 // recorded version to reach this target.
-const currentSchemaVersion = 1
+const currentSchemaVersion = 2
 
 // migration is one forward-only, idempotent step. apply runs inside the same tx
 // that bumps meta.schema_version, so a step + its version bump commit atomically.
@@ -123,7 +124,12 @@ type migration struct {
 // Phase 0 (no column changes yet); later phases append steps like
 // {version: 2, apply: func(tx *sql.Tx) error { ... }}. Versions must be strictly
 // increasing and start above 1 (the seed version).
-var schemaMigrations = []migration{}
+var schemaMigrations = []migration{
+	{version: 2, apply: func(tx *sql.Tx) error {
+		_, err := tx.Exec("ALTER TABLE projects ADD COLUMN archived_at TEXT")
+		return err
+	}},
+}
 
 // readSchemaVersion returns the DB's recorded schema version, defaulting to 1 if
 // the meta row is missing or unparseable (a fresh DB is implicitly at version 1).
@@ -217,15 +223,18 @@ func (s *Store) resolveTaskID(ref string) (int64, error) {
 
 // ---------- projects ----------
 
-func (s *Store) ListProjects() ([]Project, error) {
-	rows, err := s.db.Query(`
-		SELECT p.id, p.slug, p.name, p.created_at,
-		  COALESCE(SUM(t.status='todo'),0),
-		  COALESCE(SUM(t.status='doing'),0),
-		  COALESCE(SUM(t.status='blocked'),0),
-		  COALESCE(SUM(t.status='done'),0)
-		FROM projects p LEFT JOIN tasks t ON t.project_id = p.id
-		GROUP BY p.id ORDER BY p.id`)
+func (s *Store) ListProjects(includeArchived bool) ([]Project, error) {
+	q := `SELECT p.id, p.slug, p.name, p.created_at, COALESCE(p.archived_at,''),
+	          COALESCE(SUM(t.status='todo'),0),
+	          COALESCE(SUM(t.status='doing'),0),
+	          COALESCE(SUM(t.status='blocked'),0),
+	          COALESCE(SUM(t.status='done'),0)
+	      FROM projects p LEFT JOIN tasks t ON t.project_id = p.id`
+	if !includeArchived {
+		q += " WHERE p.archived_at IS NULL"
+	}
+	q += " GROUP BY p.id ORDER BY p.id"
+	rows, err := s.db.Query(q)
 	if err != nil {
 		return nil, err
 	}
@@ -234,13 +243,84 @@ func (s *Store) ListProjects() ([]Project, error) {
 	for rows.Next() {
 		var p Project
 		var todo, doing, blocked, done int
-		if err := rows.Scan(&p.ID, &p.Slug, &p.Name, &p.CreatedAt, &todo, &doing, &blocked, &done); err != nil {
+		if err := rows.Scan(&p.ID, &p.Slug, &p.Name, &p.CreatedAt, &p.ArchivedAt,
+			&todo, &doing, &blocked, &done); err != nil {
 			return nil, err
 		}
 		p.Counts = map[string]int{"todo": todo, "doing": doing, "blocked": blocked, "done": done}
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// ArchiveProject soft-archives a project (sets archived_at). Idempotent.
+func (s *Store) ArchiveProject(slug, actor string) (*Project, *Event, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+
+	var p Project
+	var archivedAt string
+	err = tx.QueryRow("SELECT id, slug, name, created_at, COALESCE(archived_at,'') FROM projects WHERE slug=?", slug).
+		Scan(&p.ID, &p.Slug, &p.Name, &p.CreatedAt, &archivedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if archivedAt != "" {
+		// Already archived — idempotent success, no event
+		p.ArchivedAt = archivedAt
+		return &p, nil, tx.Commit()
+	}
+	if _, err := tx.Exec(
+		"UPDATE projects SET archived_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?", p.ID); err != nil {
+		return nil, nil, err
+	}
+	ev, err := insertEvent(tx, p.ID, 0, actorOr(actor), "project.archived", map[string]any{"slug": slug})
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := tx.QueryRow("SELECT COALESCE(archived_at,'') FROM projects WHERE id=?", p.ID).Scan(&p.ArchivedAt); err != nil {
+		return nil, nil, err
+	}
+	return &p, ev, tx.Commit()
+}
+
+// UnarchiveProject restores a project (clears archived_at). Idempotent.
+func (s *Store) UnarchiveProject(slug, actor string) (*Project, *Event, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+
+	var p Project
+	var archivedAt string
+	err = tx.QueryRow("SELECT id, slug, name, created_at, COALESCE(archived_at,'') FROM projects WHERE slug=?", slug).
+		Scan(&p.ID, &p.Slug, &p.Name, &p.CreatedAt, &archivedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if archivedAt == "" {
+		// Not archived — idempotent success, no event
+		return &p, nil, tx.Commit()
+	}
+	if _, err := tx.Exec("UPDATE projects SET archived_at=NULL WHERE id=?", p.ID); err != nil {
+		return nil, nil, err
+	}
+	ev, err := insertEvent(tx, p.ID, 0, actorOr(actor), "project.unarchived", map[string]any{"slug": slug})
+	if err != nil {
+		return nil, nil, err
+	}
+	p.ArchivedAt = "" // explicitly clear; was scanned into a local var, not p.ArchivedAt
+	return &p, ev, tx.Commit()
 }
 
 func (s *Store) CreateProject(slug, name string) (*Project, *Event, error) {

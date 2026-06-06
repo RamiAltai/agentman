@@ -125,6 +125,84 @@ func TestClaimRaceExactlyOneWinner(t *testing.T) {
 	}
 }
 
+func TestArchiveUnarchiveProject(t *testing.T) {
+	st := openTestStore(t)
+	// Create a project
+	_, _, err := st.CreateProject("testproj", "Test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Default list excludes nothing (not archived yet)
+	ps, err := st.ListProjects(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ps) != 1 {
+		t.Fatalf("want 1 project, got %d", len(ps))
+	}
+
+	// Archive it
+	p, ev, err := st.ArchiveProject("testproj", "tester")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.ArchivedAt == "" {
+		t.Error("ArchivedAt should be set after archive")
+	}
+	if ev == nil {
+		t.Error("expected event on first archive")
+	}
+
+	// Default list now excludes it
+	ps, err = st.ListProjects(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ps) != 0 {
+		t.Fatalf("archived project should be hidden in default list, got %d", len(ps))
+	}
+
+	// All list includes it
+	ps, err = st.ListProjects(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ps) != 1 {
+		t.Fatalf("archived project should appear with includeArchived=true, got %d", len(ps))
+	}
+
+	// Idempotent re-archive (no event)
+	_, ev2, err := st.ArchiveProject("testproj", "tester")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev2 != nil {
+		t.Error("expected no event on idempotent re-archive")
+	}
+
+	// Unarchive
+	p2, ev3, err := st.UnarchiveProject("testproj", "tester")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p2.ArchivedAt != "" {
+		t.Error("ArchivedAt should be empty after unarchive")
+	}
+	if ev3 == nil {
+		t.Error("expected event on unarchive")
+	}
+
+	// Default list includes it again
+	ps, err = st.ListProjects(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ps) != 1 {
+		t.Fatalf("want 1 project after unarchive, got %d", len(ps))
+	}
+}
+
 func TestEventsCursorStrictlyIncreasing(t *testing.T) {
 	st := openTestStore(t)
 	if _, _, err := st.CreateProject("web", "Web"); err != nil {

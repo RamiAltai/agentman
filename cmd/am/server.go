@@ -30,6 +30,8 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/projects", s.handleListProjects)
 	mux.HandleFunc("POST /api/projects", s.handleCreateProject)
+	mux.HandleFunc("POST /api/projects/{slug}/archive", s.handleArchiveProject)
+	mux.HandleFunc("POST /api/projects/{slug}/unarchive", s.handleUnarchiveProject)
 	mux.HandleFunc("GET /api/tasks", s.handleListTasks)
 	mux.HandleFunc("POST /api/tasks", s.handleCreateTask)
 	mux.HandleFunc("GET /api/tasks/{id}", s.handleGetTask)
@@ -110,12 +112,39 @@ func securityHeaders(next http.Handler) http.Handler {
 // ---------- handlers ----------
 
 func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
-	ps, err := s.store.ListProjects()
+	includeArchived := r.URL.Query().Get("archived") == "true"
+	ps, err := s.store.ListProjects(includeArchived)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, ps)
+}
+
+func (s *Server) handleArchiveProject(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	p, ev, err := s.store.ArchiveProject(slug, actorOf(r))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if ev != nil {
+		s.hub.Broadcast(ev)
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+func (s *Server) handleUnarchiveProject(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	p, ev, err := s.store.UnarchiveProject(slug, actorOf(r))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if ev != nil {
+		s.hub.Broadcast(ev)
+	}
+	writeJSON(w, http.StatusOK, p)
 }
 
 func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {

@@ -242,7 +242,11 @@ func cmdDrop(c *Client, a Args) {
 }
 
 func cmdProjects(c *Client, a Args) {
-	data := c.doOrFail("GET", "/api/projects", nil)
+	path := "/api/projects"
+	if a.has("all") {
+		path += "?archived=true"
+	}
+	data := c.doOrFail("GET", path, nil)
 	var ps []Project
 	json.Unmarshal(data, &ps)
 	if a.has("json") {
@@ -250,24 +254,43 @@ func cmdProjects(c *Client, a Args) {
 		return
 	}
 	for _, p := range ps {
-		fmt.Printf("%-10s %-20s todo:%d doing:%d blocked:%d done:%d\n",
-			p.Slug, trunc(p.Name, 20), p.Counts["todo"], p.Counts["doing"], p.Counts["blocked"], p.Counts["done"])
+		archived := ""
+		if p.ArchivedAt != "" {
+			archived = " (archived)"
+		}
+		fmt.Printf("%-10s %-20s todo:%d doing:%d blocked:%d done:%d%s\n",
+			p.Slug, trunc(p.Name, 20), p.Counts["todo"], p.Counts["doing"], p.Counts["blocked"], p.Counts["done"], archived)
 	}
 }
 
 func cmdProject(c *Client, a Args) {
-	if a.at(0) != "new" || a.at(1) == "" {
-		fail(1, "usage: am project new <slug> [name]")
+	switch a.at(0) {
+	case "new":
+		if a.at(1) == "" {
+			fail(1, "usage: am project new <slug> [name]")
+		}
+		slug := a.at(1)
+		name := slug
+		if a.at(2) != "" {
+			name = a.at(2)
+		}
+		data := c.doOrFail("POST", "/api/projects", map[string]any{"slug": slug, "name": name})
+		var p Project
+		json.Unmarshal(data, &p)
+		fmt.Println(p.Slug)
+	case "archive":
+		if a.at(1) == "" {
+			fail(1, "usage: am project archive <slug>")
+		}
+		c.doOrFail("POST", "/api/projects/"+a.at(1)+"/archive", nil)
+	case "unarchive":
+		if a.at(1) == "" {
+			fail(1, "usage: am project unarchive <slug>")
+		}
+		c.doOrFail("POST", "/api/projects/"+a.at(1)+"/unarchive", nil)
+	default:
+		fail(1, "usage: am project <new|archive|unarchive> ...")
 	}
-	slug := a.at(1)
-	name := slug
-	if a.at(2) != "" {
-		name = a.at(2)
-	}
-	data := c.doOrFail("POST", "/api/projects", map[string]any{"slug": slug, "name": name})
-	var p Project
-	json.Unmarshal(data, &p)
-	fmt.Println(p.Slug)
 }
 
 // ---------- formatting helpers ----------

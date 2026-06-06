@@ -154,8 +154,10 @@ func usage() {
   am note <id> "text"                         add a comment
   am edit <id> [--title T] [--body B] [--priority N]
   am drop <id>                                release back to todo
-  am projects                                 list projects with counts
+  am projects [--all]                    list projects (--all includes archived)
   am project new <slug> [name]                create a project
+  am project archive <slug>              soft-archive a project (hides it)
+  am project unarchive <slug>            restore an archived project
   am version                                  print version
   am update [version]                         reinstall the latest (or a given) version
   am db export [path] [--db PATH]          export a DB snapshot (prints path)

@@ -439,7 +439,11 @@ function onEvent(ev) {
   if (fe) fe.remove();
   $("feedList").prepend(feedItem(ev));
   trimFeed();
-  if (ev.kind === "project.created") loadProjects().catch(() => {});
+  if (ev.kind === "project.created" || ev.kind === "project.unarchived") loadProjects().catch(() => {});
+  if (ev.kind === "project.archived") {
+    if (current && (ev.data || {}).slug === current) selectProject("");
+    else loadProjects().catch(() => {});
+  }
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => loadBoard().catch(() => {}), 250); // debounced reconcile
   if (openTaskId && ev.task_id === openTaskId) refreshModal();
@@ -484,6 +488,8 @@ function evText(ev) {
     case "task.patched": span.append(who, " edited ", ref); break;
     case "comment.added": span.append(who, " commented on ", ref); break;
     case "project.created": span.append(who, " created project ", el("b", {}, d.slug || "")); break;
+    case "project.archived": span.append(who, " archived project ", el("b", {}, d.slug || "")); break;
+    case "project.unarchived": span.append(who, " unarchived project ", el("b", {}, d.slug || "")); break;
     default: span.append(who, " " + ev.kind + " ", ref);
   }
   return span;
@@ -501,6 +507,8 @@ function describeText(ev) {
     case "task.patched": return `${who} edited ${t}`;
     case "comment.added": return `${who} commented on ${t}`;
     case "project.created": return `${who} created project ${d.slug || ""}`;
+    case "project.archived": return `${who} archived project ${d.slug || ""}`;
+    case "project.unarchived": return `${who} unarchived project ${d.slug || ""}`;
     default: return `${who} ${ev.kind} ${t}`;
   }
 }
