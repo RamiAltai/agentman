@@ -37,6 +37,9 @@ func main() {
 	case "version", "--version", "-v":
 		cmdVersion()
 		return
+	case "update", "upgrade":
+		cmdUpdate(a)
+		return
 	}
 
 	c := NewClient()
@@ -100,6 +103,8 @@ func runServe(argv []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	checkForUpdate() // non-blocking; logs once if a newer version is published
+
 	go func() {
 		log.Printf("agentman: dashboard on http://%s   (db: %s)", httpServer.Addr, dbPath)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -144,6 +149,7 @@ func usage() {
   am projects                                 list projects with counts
   am project new <slug> [name]                create a project
   am version                                  print version
+  am update [version]                         reinstall the latest (or a given) version
 
 Identity: run 'am init <tasktype>' once per session (or set AGENTMAN_AGENT).
 Env: AGENTMAN_URL (default http://127.0.0.1:8787), AGENTMAN_PROJECT (default project).
