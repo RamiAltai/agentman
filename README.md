@@ -25,6 +25,8 @@ you (browser) ◄──SSE────┘        sole writer · broadcasts every
   database server. Back up = copy one file.
 - **Multi-project & multi-agent.** Group tasks into projects; atomic task claims so two
   agents never grab the same ticket.
+- **Polished dashboard.** A responsive kanban board with drag-and-drop status changes, a
+  collapsible/resizable live activity feed, and keyboard shortcuts.
 
 ## Install
 
@@ -75,6 +77,19 @@ am status "$id" done       # todo | doing | blocked | done
 Everything you do on the dashboard flows through the same API the agents use, so human and
 agent actions both show up live.
 
+## Dashboard
+
+The embedded web UI (no build step, no npm) is a live kanban board:
+
+- **Columns** — Todo / In Progress / Blocked / Done, with per-project tabs and counts.
+- **Drag a card** between columns to change its status; click a card to open a wide,
+  **resizable** ticket with description, comments, and full history.
+- **Activity feed** you can **collapse** or **drag-resize** (it becomes an overlay drawer on
+  small screens); task `#refs` in the feed are clickable.
+- **Responsive** from desktop down to mobile — columns stack and the panel overlays.
+- **Keyboard:** `n` new task · `a` toggle the activity panel · `Enter`/`Space` open a focused
+  card · `[` / `]` move a focused card between statuses · `Esc` close a dialog.
+
 ## Using it from agents (Claude Code & others)
 
 Any agent that can run shell commands can use `am`. For **Claude Code**, the one-time setup
@@ -122,6 +137,7 @@ Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting 
 | `am projects` · `am project new <slug> [name]` | list / create projects |
 | `am init <tasktype>` · `am whoami` | identity |
 | `am serve [--port 8787] [--db PATH]` | run the dashboard + API |
+| `am version` · `am update [version]` | print version · reinstall the latest (or a given) version |
 
 `<id>` accepts a global id (`13`) or a project ref (`web-3`). `--status` accepts a comma
 list. Priority is `0` urgent … `3` low (default `2`). Add `--json` to any read to parse.
@@ -154,6 +170,25 @@ curl -s -H 'X-Agent: claude-1' -X POST 127.0.0.1:8787/api/tasks/13/claim
 | `AGENTMAN_AGENT` | identity override (else `am init` file) |
 | `AGENTMAN_PORT` / `--port` | server port (default `8787`) |
 | `AGENTMAN_DB` / `--db` | database path (default `~/.agentman/agentman.db`) |
+| `AGENTMAN_NO_UPDATE_CHECK` | set to `1` to disable the startup "update available" check |
+
+## Updating
+
+On any machine where `am` is installed:
+
+```sh
+am update            # reinstalls the latest release (runs `go install …@latest` for you)
+# or directly:  go install github.com/RamiAltai/agentman/cmd/am@latest
+```
+
+Then **restart any running `am serve`** — the dashboard is embedded in the binary, so a
+running server keeps serving the old UI until you restart it (hard-refresh the browser tab
+too). `am serve` also checks on startup and logs `update available — vX.Y.Z` when you're
+behind; disable that with `AGENTMAN_NO_UPDATE_CHECK=1`.
+
+> **Maintainers:** `…@latest` resolves to the highest **git tag**, so publish each release as
+> a semver tag — `git tag v0.3.0 && git push origin v0.3.0` — or `@latest` won't advance past
+> it.
 
 ## How it works
 
@@ -177,14 +212,15 @@ behind a reverse proxy with auth, or open an issue.
 ## Development
 
 ```sh
-go build -o am ./cmd/am      # build
-go vet ./...                 # lint
-am serve --db /tmp/dev.db    # run against a throwaway db
+go build -o am ./cmd/am                       # build
+go vet ./... && go test ./...                 # lint + tests
+am serve --db /tmp/dev.db                     # run against a throwaway db
+go build -ldflags "-X main.injectedVersion=v0.3.0" -o am ./cmd/am   # version-stamped build
 ```
 
 Layout: `cmd/am/` holds the single `main` package — `server.go` (API + SSE), `hub.go`
 (broadcast), `store.go` + `schema.sql` (SQLite), `client.go` + `cli.go` (CLI),
-`identity.go`, and `web/` (dashboard).
+`identity.go`, `version.go`, `update.go`, and `web/` (dashboard).
 
 Contributions welcome — open an issue or PR.
 

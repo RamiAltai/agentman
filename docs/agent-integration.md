@@ -135,3 +135,16 @@ WantedBy=default.target
 ```sh
 systemctl --user enable --now agentman
 ```
+
+### Updating
+
+Update the binary with `am update` (or `go install …@latest`), then restart the server so it
+serves the new embedded dashboard:
+
+```sh
+am update
+launchctl kickstart -k "gui/$(id -u)/com.agentman"   # macOS, if using the launchd unit above
+systemctl --user restart agentman                     # Linux, if using the systemd unit above
+```
+
+See the [README](../README.md#updating) for the full update flow.
