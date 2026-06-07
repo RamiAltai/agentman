@@ -183,7 +183,9 @@ Deliberately addressed in this codebase (see `decision-records.md` IADR / UX his
 - Modal: `role="dialog"`, `aria-modal`, dynamic `aria-label`, a **focus trap** (`trapFocus`) and
   **focus restore** to the trigger (`lastFocus`).
 - Cards are `role="button"`, `tabindex=0`, openable with Enter/Space; status moves via `[` / `]`.
-- Keyboard shortcuts (`onKey`): `n` new task, `a` toggle activity, `g` open graph overlay, `Esc` close.
+- Keyboard shortcuts (`onKey`): `n` new task, `a` toggle activity, `g` toggle graph overlay
+  (open/close), `Esc` close. The graph detail panel's "Open task" closes the overlay, then opens the
+  task modal on the board (so the modal isn't hidden behind the overlay).
 - `aria-pressed` on tabs, `aria-expanded` on the activity toggle, labels on all fields.
 - Drawer resize handle is a `role="separator"` with arrow-key support.
 

@@ -105,11 +105,12 @@ The embedded web UI (no build step, no npm) is a live kanban board:
   tag when they have unfinished prerequisites, or a **✓ Ready** tag when all prerequisites are
   done. Attempting to start or claim a blocked task is rejected with a 409 that names the open
   prerequisites; the dashboard surfaces this and reverts the change.
-- **Dependency graph:** the **"Graph"** button in the header (or press **`g`**) opens a
-  per-project full-screen graph of the task dependency DAG. Click a task to highlight its full
-  upstream prerequisite path and downstream subtree, and see a side panel with the task's status,
-  priority, assignee, a clickable **Prerequisites** list, a clickable **Unblocks** list, and an
-  **"Open task"** button. Nodes are colored by priority; edges show whether each prerequisite is
+- **Dependency graph:** the **"Graph"** button in the header (or press **`g`** to toggle it
+  open/closed; `Esc` also closes) opens a per-project full-screen graph of the task dependency DAG.
+  Click a task to highlight its full upstream prerequisite path and downstream subtree, and see a
+  side panel with the task's status, priority, assignee, a clickable **Prerequisites** list, a
+  clickable **Unblocks** list, and an **"Open task"** button (which closes the graph and opens that
+  task on the board). Nodes are colored by priority; edges show whether each prerequisite is
   cleared (green solid) or still blocking (amber dashed). Pan, zoom, and reset the view freely.
 - **Delete task / delete comment:** open a task modal to see a **Delete task** button (permanently
   removes the task and its comments); each comment has a **×** button to delete it individually.

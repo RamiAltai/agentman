@@ -942,7 +942,7 @@ function onKey(e) {
   const k = e.key.toLowerCase();
   if (k === "a") { e.preventDefault(); toggleFeed(); }
   else if (k === "n") { e.preventDefault(); openNew(); }
-  else if (k === "g") { e.preventDefault(); openGraphOverlay(); }
+  else if (k === "g") { e.preventDefault(); if (graphOpen) closeGraphOverlay(); else openGraphOverlay(); }
 }
 
 // ---------- init ----------
@@ -1547,7 +1547,9 @@ function renderGraphDetail(node, edges, nodesById) {
   }
   d.append(unblockSec);
 
-  const openBtn = el("button", { class: "gd-open-btn", onclick: () => openTask(node.id) }, "Open task");
+  // Leave the graph and open the full task: close the overlay first so the task
+  // modal isn't hidden behind it, then open the task on the board.
+  const openBtn = el("button", { class: "gd-open-btn", onclick: () => { closeGraphOverlay(); openTask(node.id); } }, "Open task");
   d.append(openBtn);
 }
 
