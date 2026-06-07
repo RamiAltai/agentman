@@ -9,7 +9,10 @@ fresh `[Unreleased]` section.
 
 ## [Unreleased]
 
-_Target: **v0.4.0** — not yet tagged._
+## [0.4.1] - 2026-06-07
+
+> Note: `v0.4.0` was accidentally tagged on a stale commit (and that tag was already cached by the
+> Go module proxy, which is immutable), so this release ships as **v0.4.1**. Do not use `v0.4.0`.
 
 ### Added
 

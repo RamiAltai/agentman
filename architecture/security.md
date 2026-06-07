@@ -60,8 +60,10 @@ a credential.
 ## Dependencies
 
 - One direct dependency: `modernc.org/sqlite` (pure Go, no cgo) plus its transitive deps (`go.mod`).
-- **No dependency scanning** (no `.github/`, no Dependabot, no `govulncheck` in CI). Supply-chain
-  risk is unmonitored. Run `govulncheck ./...` manually before releases (recommended).
+- **Dependency scanning**: `govulncheck ./...` runs in CI (`.github/workflows/ci.yml`) on every
+  push to `main` and every PR, failing the build on a *reachable* vulnerability. Residual: no
+  Dependabot/automated dependency-update PRs. (One known *unreachable*, Windows-only advisory today:
+  `GO-2026-5024` in the indirect `golang.org/x/sys@v0.42.0`; clears at `x/sys ≥ v0.44.0`.)
 
 ## Attack Surface
 
@@ -123,7 +125,7 @@ the server. Their security-relevant properties:
 3. No TLS (a token over plain HTTP would be sniffable).
 4. No rate limiting / brute-force protection.
 5. ~~500s expose internal error text~~ — **fixed (Phase D1)**; 500s return `{"error":"internal"}`; detail only in server-side logs.
-6. No dependency vulnerability scanning.
+6. ~~No dependency vulnerability scanning~~ — **added (Phase F)**; `govulncheck ./...` runs in CI. Residual: no Dependabot.
 7. Audit actor is spoofable (no identity verification).
 
 ## Secure Implementation Checklist

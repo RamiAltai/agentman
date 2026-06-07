@@ -28,8 +28,8 @@ broadcast → dashboard**. Confirmed via `cmd/am/main.go`, `cmd/am/server.go`, `
 | `cmd/am/identity.go` | Per-directory agent identity (`am init`/`am whoami`) | `resolveAgent`, `identityFile` |
 | `cmd/am/version.go` | Version reporting (`am version`) | `version()`, `injectedVersion` (ldflags) |
 | `cmd/am/update.go` | `am update` + startup update check | `cmdUpdate`, `checkForUpdate` |
-| `cmd/am/db.go` | `am db` export/import/prune (offline snapshot/restore/retention) | `cmdDB`, `exportDB`, `importDB`, `pruneEvents` |
-| `cmd/am/*_test.go` | Tests: `update_test`, `store_test`, `server_test`, `migrate_test`, `db_test` | claim race, HTTP guards, migrations, export/import |
+| `cmd/am/*_test.go` | Tests: `update/store/server/migrate/db/cli/sse/identity/web_test` | claim race, HTTP guards, migrations, deletes, CLI/exit codes, SSE replay, identity, XSS guard |
+| `.github/workflows/ci.yml` | CI: build/vet/gofmt/test(-race)/JS-check/govulncheck on push + PR | — |
 | `cmd/am/web/` | Embedded dashboard: `index.html`, `app.css`, `app.js` | Vanilla, no build step |
 | `.github/workflows/ci.yml` | GitHub Actions CI — build/vet/gofmt/test(-race)/JS-syntax/govulncheck | Runs on push to `main` and on PRs |
 | `docs/agent-integration.md` | How to wire agents (Claude Code) to the board | User docs |

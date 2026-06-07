@@ -45,7 +45,8 @@ touch.
 
 ## Known documentation gaps
 
-- No CI/CD exists, so there is no machine-enforced check that these docs stay accurate.
+- CI (`.github/workflows/ci.yml`) runs build/vet/gofmt/test(-race)/JS-check/govulncheck on push +
+  PR, but does **not** verify that these docs stay in sync with the code — that's still manual.
 - Test coverage is narrow (see `known-risks-and-gaps.md`), so docs describe *intended* behavior
   more than *test-verified* behavior in several places — flagged inline where relevant.
 - The frontend has no automated tests; its documented behavior is from source reading, not test evidence.

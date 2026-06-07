@@ -173,6 +173,7 @@ actor.
 GET    /api/projects                          GET    /api/tasks/{id}
 POST   /api/projects {slug,name}              PATCH  /api/tasks/{id} {status?,assignee?,title?,body?,priority?}
 DELETE /api/projects/{slug}                   POST   /api/tasks/{id}/claim
+POST   /api/projects/{slug}/archive           POST   /api/projects/{slug}/unarchive
 GET    /api/tasks?project=&status=&assignee=  POST   /api/tasks/{id}/comments {body}
 POST   /api/tasks {project,title,...}         DELETE /api/tasks/{id}/comments/{cid}
 DELETE /api/tasks/{id}                        GET    /api/events?since=|?tail=|?before=  (poll/page)
