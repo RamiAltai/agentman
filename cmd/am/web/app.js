@@ -719,6 +719,7 @@ function connect() {
 }
 
 function onEvent(ev) {
+  graphMaybeRefresh(ev);
   if (ev.id <= cursor) return; // dedupe replay overlap
   cursor = ev.id;
   const fe = $("feedList").querySelector(".feed-empty");
@@ -941,6 +942,7 @@ function onKey(e) {
   const k = e.key.toLowerCase();
   if (k === "a") { e.preventDefault(); toggleFeed(); }
   else if (k === "n") { e.preventDefault(); openNew(); }
+  else if (k === "g") { e.preventDefault(); openGraphOverlay(); }
 }
 
 // ---------- init ----------
@@ -955,3 +957,740 @@ initFeed();
   catch (e) { setStatus("error: " + e.message, "warn"); }
   connect();
 })();
+
+// ===================== dependency graph overlay =====================
+
+// svg() creates an SVG element (parallel to el() for HTML). Uses createElementNS
+// to produce real SVG; never uses innerHTML.
+function svg(tag, attrs) {
+  const ns = "http://www.w3.org/2000/svg";
+  const n = document.createElementNS(ns, tag);
+  if (attrs) {
+    for (const k in attrs) {
+      if (attrs[k] != null) n.setAttribute(k, String(attrs[k]));
+    }
+  }
+  return n;
+}
+
+// wrapTextLines splits text into lines of at most maxChars, up to maxLines lines.
+function wrapTextLines(text, maxChars, maxLines) {
+  if (!text) return [""];
+  const words = text.split(" ");
+  const lines = [];
+  let cur = "";
+  for (const word of words) {
+    if (lines.length >= maxLines) break;
+    if (!cur) { cur = word; continue; }
+    if (cur.length + 1 + word.length <= maxChars) { cur += " " + word; }
+    else { lines.push(cur); cur = word; }
+  }
+  if (cur && lines.length < maxLines) lines.push(cur);
+  if (!lines.length) lines.push("");
+  return lines;
+}
+
+// --- layout ---
+
+// computeGraphLayout: topological longest-path layering (Kahn's algorithm).
+// nodes: Task[], edges: GraphEdge[] {from, to}
+// Returns { nodes, edges, positions: Map<id, {x,y,w,h}>, width, height }
+function computeGraphLayout(nodes, edges) {
+  const nodeW = 176;
+  const nodeH = 60;
+  const colGap = 248;
+  const rowGap = 88;
+  const margin = 72;
+
+  const ids = nodes.map((n) => n.id);
+  const idSet = new Set(ids);
+  const validEdges = edges.filter((e) => idSet.has(e.from) && idSet.has(e.to));
+
+  // Partition: nodes in >=1 edge get the layered DAG; dep-free tasks go into a
+  // compact grid lane below, so isolated tasks don't pile into one tall column.
+  // (We still show ALL tasks — decision: graph all tasks.)
+  const connectedIds = new Set();
+  for (const e of validEdges) {
+    connectedIds.add(e.from);
+    connectedIds.add(e.to);
+  }
+  const connected = nodes.filter((n) => connectedIds.has(n.id));
+  const isolated = nodes
+    .filter((n) => !connectedIds.has(n.id))
+    .sort((a, b) => a.title.localeCompare(b.title));
+
+  const positions = new Map();
+
+  // ---- layered DAG (longest-path / Kahn's layering) over the connected nodes ----
+  let dagWidth = 0;
+  let dagHeight = 0;
+  if (connected.length) {
+    const cids = connected.map((n) => n.id);
+    const indegree = new Map(cids.map((id) => [id, 0]));
+    const adjacency = new Map(cids.map((id) => [id, []]));
+    for (const e of validEdges) {
+      indegree.set(e.to, (indegree.get(e.to) || 0) + 1);
+      adjacency.get(e.from).push(e.to);
+    }
+    const levels = new Map(cids.map((id) => [id, 0]));
+    const queue = cids.filter((id) => (indegree.get(id) || 0) === 0);
+    while (queue.length > 0) {
+      const cur = queue.shift();
+      for (const next of adjacency.get(cur) || []) {
+        levels.set(next, Math.max(levels.get(next) || 0, (levels.get(cur) || 0) + 1));
+        indegree.set(next, (indegree.get(next) || 0) - 1);
+        if ((indegree.get(next) || 0) === 0) queue.push(next);
+      }
+    }
+    const grouped = new Map();
+    for (const n of connected) {
+      const lv = levels.get(n.id) || 0;
+      if (!grouped.has(lv)) grouped.set(lv, []);
+      grouped.get(lv).push(n);
+    }
+    for (const list of grouped.values()) {
+      list.sort((a, b) => a.title.localeCompare(b.title));
+    }
+    const maxLevel = Math.max(0, ...Array.from(grouped.keys()));
+    const maxRows = Math.max(1, ...Array.from(grouped.values()).map((l) => l.length));
+    dagWidth = margin * 2 + nodeW + maxLevel * colGap;
+    dagHeight = margin * 2 + (maxRows - 1) * rowGap + nodeH;
+    for (const [lv, list] of grouped.entries()) {
+      const groupH = nodeH + (list.length - 1) * rowGap;
+      const startY = Math.max(margin, (dagHeight - groupH) / 2);
+      list.forEach((n, i) => {
+        positions.set(n.id, { x: margin + lv * colGap, y: startY + i * rowGap, w: nodeW, h: nodeH });
+      });
+    }
+  }
+
+  // ---- compact grid lane for isolated (dependency-free) tasks ----
+  let laneY = 0;
+  let gridWidth = 0;
+  let gridHeight = 0;
+  if (isolated.length) {
+    const gapX = 26;
+    const gapY = 24;
+    const perRow = Math.min(isolated.length, 6);
+    const top = connected.length ? dagHeight + 56 : margin;
+    laneY = connected.length ? dagHeight + 8 : 0; // divider position (0 = no divider)
+    gridWidth = margin * 2 + perRow * nodeW + (perRow - 1) * gapX;
+    isolated.forEach((n, i) => {
+      const row = Math.floor(i / perRow);
+      const col = i % perRow;
+      positions.set(n.id, {
+        x: margin + col * (nodeW + gapX),
+        y: top + row * (nodeH + gapY),
+        w: nodeW,
+        h: nodeH,
+      });
+    });
+    const rows = Math.ceil(isolated.length / perRow);
+    gridHeight = top + rows * nodeH + (rows - 1) * gapY + margin;
+  }
+
+  const width = Math.max(440, dagWidth, gridWidth);
+  const height = Math.max(440, isolated.length ? gridHeight : dagHeight);
+
+  return { nodes, edges: validEdges, positions, width, height, laneY };
+}
+
+// --- graph state ---
+
+let graphOpen = false;
+let graphSlug = "";         // slug currently displayed
+let graphData = null;       // {nodes:[], edges:[]}  (last fetched)
+let graphViewState = { x: 0, y: 0, width: 1000, height: 640 };
+let graphInitialView = { x: 0, y: 0, width: 1000, height: 640 };
+let graphSelectedId = null; // selected node id (number)
+let graphDragState = null;
+let graphRefreshTimer = null;
+let graphLastFocus = null;
+let graphPanZoomInstalled = false; // installed once per overlay open; guards listener leak
+
+// BFS upstream (ancestors) and downstream (descendants) from a node.
+function graphNeighbors(nodeId, edges) {
+  const upstream = new Set();
+  const downstream = new Set();
+  const upEdges = new Set();
+  const downEdges = new Set();
+
+  // upstream: walk edges backward (to→from)
+  let q = [nodeId];
+  while (q.length) {
+    const cur = q.shift();
+    for (const e of edges) {
+      if (e.to === cur && !upstream.has(e.from)) {
+        upstream.add(e.from);
+        upEdges.add(e);
+        q.push(e.from);
+      }
+    }
+  }
+  // downstream: walk edges forward (from→to)
+  q = [nodeId];
+  while (q.length) {
+    const cur = q.shift();
+    for (const e of edges) {
+      if (e.from === cur && !downstream.has(e.to)) {
+        downstream.add(e.to);
+        downEdges.add(e);
+        q.push(e.to);
+      }
+    }
+  }
+  return { upstream, downstream, upEdges, downEdges };
+}
+
+function openGraphOverlay() {
+  // Determine project to show.
+  const slug = selected.size === 1 ? [...selected][0] : (projects[0] ? projects[0].slug : "");
+  if (!slug) return;
+  graphLastFocus = document.activeElement;
+  graphSelectedId = null;
+  $("graphOverlay").classList.remove("hidden");
+  graphOpen = true;
+  graphPanZoomInstalled = false;
+  buildGraphProjectSelect(slug);
+  fetchAndRenderGraph(slug);
+  $("graphClose").focus();
+}
+
+function closeGraphOverlay() {
+  $("graphOverlay").classList.add("hidden");
+  graphOpen = false;
+  graphData = null;
+  graphSelectedId = null;
+  if (graphRefreshTimer) { clearTimeout(graphRefreshTimer); graphRefreshTimer = null; }
+  if (graphLastFocus && graphLastFocus.focus) try { graphLastFocus.focus(); } catch (e) { /* */ }
+}
+
+function buildGraphProjectSelect(activeSlug) {
+  const sel = $("graphProjectSel");
+  sel.replaceChildren();
+  for (const p of projects) {
+    const o = el("option", { value: p.slug }, p.name);
+    if (p.slug === activeSlug) o.setAttribute("selected", "selected");
+    sel.append(o);
+  }
+  sel.onchange = () => {
+    graphSelectedId = null;
+    fetchAndRenderGraph(sel.value);
+  };
+}
+
+async function fetchAndRenderGraph(slug) {
+  graphSlug = slug;
+  $("graphTitle").textContent = "Dependencies — " + slug;
+  // Update select to match slug.
+  const sel = $("graphProjectSel");
+  if (sel.value !== slug) sel.value = slug;
+
+  let data;
+  try {
+    data = await api("GET", "/api/projects/" + encodeURIComponent(slug) + "/graph");
+  } catch (e) {
+    showGraphEmpty("Error loading graph: " + e.message);
+    return;
+  }
+  graphData = data;
+  if (!data.nodes || !data.nodes.length) {
+    showGraphEmpty("No tasks in this project yet.");
+    return;
+  }
+  renderGraph();
+}
+
+function showGraphEmpty(msg) {
+  const svgEl = $("graphSvg");
+  svgEl.replaceChildren();
+  svgEl.setAttribute("viewBox", "0 0 600 200");
+  const t = svg("text", { x: "300", y: "100", "text-anchor": "middle", class: "graph-empty-text" });
+  t.textContent = msg;
+  svgEl.append(t);
+  $("graphDetail").replaceChildren(el("p", { class: "graph-detail-hint" }, msg));
+  buildGraphLegend();
+}
+
+function renderGraph() {
+  if (!graphData) return;
+
+  const { nodes, edges, positions, width, height, laneY } = computeGraphLayout(graphData.nodes, graphData.edges);
+  const nodesById = new Map(nodes.map((n) => [n.id, n]));
+
+  // Update the initial (reset-target) viewBox from layout dims.
+  graphInitialView = { x: 0, y: 0, width, height };
+  // Preserve the user's current pan/zoom on live refresh; only reset on first render.
+  if (!graphPanZoomInstalled) graphViewState = { ...graphInitialView };
+
+  const svgEl = $("graphSvg");
+  svgEl.replaceChildren();
+  svgEl.setAttribute("viewBox", viewBoxStr(graphViewState));
+
+  // Arrowhead markers (two: green for cleared, amber for blocking).
+  const defs = svg("defs");
+
+  function makeArrow(id, color) {
+    const m = svg("marker", {
+      id, viewBox: "0 0 10 10", refX: "9", refY: "5",
+      markerWidth: "6", markerHeight: "6", orient: "auto-start-reverse",
+    });
+    const p = svg("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: color });
+    m.append(p);
+    return m;
+  }
+  defs.append(makeArrow("gArrowCleared", "var(--st-done)"));
+  defs.append(makeArrow("gArrowBlocking", "var(--warn)"));
+  defs.append(makeArrow("gArrowUp", "var(--accent)"));
+  defs.append(makeArrow("gArrowDown", "var(--violet)"));
+  svgEl.append(defs);
+
+  // Pan surface (transparent background for drag/click).
+  const panSurface = svg("rect", {
+    x: "0", y: "0", width: String(width), height: String(height), class: "graph-pan-surface",
+  });
+  svgEl.append(panSurface);
+
+  // Divider + label between the dependency DAG and the dependency-free lane.
+  if (laneY > 0) {
+    const sep = svg("g", { class: "graph-lane-sep" });
+    sep.append(svg("line", {
+      x1: "24", y1: String(laneY), x2: String(width - 24), y2: String(laneY), class: "graph-lane-line",
+    }));
+    const lbl = svg("text", { x: "28", y: String(laneY + 22), class: "graph-lane-label" });
+    lbl.textContent = "No dependencies";
+    sep.append(lbl);
+    svgEl.append(sep);
+  }
+
+  const edgeGroup = svg("g", { class: "gedge-group" });
+  const nodeGroup = svg("g", { class: "gnode-group" });
+  svgEl.append(edgeGroup);
+  svgEl.append(nodeGroup);
+
+  // --- draw edges ---
+  const edgeEls = new Map();  // Map<GraphEdge, SVGElement>
+
+  for (const e of edges) {
+    const fp = positions.get(e.from);
+    const tp = positions.get(e.to);
+    if (!fp || !tp) continue;
+
+    const sx = fp.x + fp.w;
+    const sy = fp.y + fp.h / 2;
+    const tx = tp.x;
+    const ty = tp.y + tp.h / 2;
+    const delta = tx - sx;
+    const bend = Math.max(58, Math.abs(delta) * 0.42);
+    const d = delta >= 0
+      ? `M ${sx} ${sy} C ${sx + bend} ${sy}, ${tx - bend} ${ty}, ${tx} ${ty}`
+      : `M ${sx} ${sy} C ${sx + bend} ${sy}, ${tx - bend} ${ty - 80}, ${tx} ${ty}`;
+
+    const fromNode = nodesById.get(e.from);
+    const cleared = fromNode && fromNode.status === "done";
+    const marker = cleared ? "url(#gArrowCleared)" : "url(#gArrowBlocking)";
+    const edgeCls = "gedge " + (cleared ? "gedge-cleared" : "gedge-blocking");
+
+    const path = svg("path", { d, class: edgeCls, "marker-end": marker,
+      "data-from": String(e.from), "data-to": String(e.to) });
+    edgeGroup.append(path);
+    edgeEls.set(e, path);
+  }
+
+  // --- draw nodes ---
+  const nodeEls = new Map();  // Map<id, SVGElement>
+
+  for (const n of nodes) {
+    const pos = positions.get(n.id);
+    if (!pos) continue;
+
+    const prioColor = PRIO[n.priority] || PRIO[3];
+    const statusColor = ST[n.status] || "var(--faint)";
+    const isDone = n.status === "done";
+    const isBlocked = n.nopen > 0;
+    const isReady = n.nprereq > 0 && n.nopen === 0;
+
+    const g = svg("g", {
+      class: "gnode" + (isDone ? " gnode-done" : ""),
+      transform: `translate(${pos.x}, ${pos.y})`,
+      "data-id": String(n.id),
+      role: "button",
+      tabindex: "0",
+      "aria-label": n.project + "-" + n.ref + " " + n.title + " (" + n.status + ")",
+    });
+
+    const rect = svg("rect", {
+      x: "0", y: "0", width: String(pos.w), height: String(pos.h),
+      rx: "9", class: "gnode-rect",
+      stroke: prioColor,
+    });
+    g.append(rect);
+
+    // Status dot.
+    const dot = svg("circle", { cx: "14", cy: "16", r: "5", class: "gnode-dot", fill: statusColor });
+    g.append(dot);
+
+    // Ready/blocked indicator text.
+    if (isBlocked) {
+      const ind = svg("text", { x: String(pos.w - 10), y: "16", class: "gnode-ind gnode-ind-blocked",
+        "text-anchor": "end", "dominant-baseline": "middle" });
+      ind.textContent = "🔒";  // lock emoji
+      g.append(ind);
+    } else if (isReady) {
+      const ind = svg("text", { x: String(pos.w - 10), y: "16", class: "gnode-ind gnode-ind-ready",
+        "text-anchor": "end", "dominant-baseline": "middle" });
+      ind.textContent = "✓";
+      g.append(ind);
+    }
+
+    // Label: #ref + title wrapped.
+    const refLine = n.project + "-" + n.ref;
+    const refT = svg("text", { x: "26", y: "16", class: "gnode-ref", "dominant-baseline": "middle" });
+    refT.textContent = refLine;
+    g.append(refT);
+
+    const titleLines = wrapTextLines(n.title, 22, 2);
+    const titleGroup = svg("text", { x: "8", y: "36", class: "gnode-title" });
+    titleLines.forEach((line, i) => {
+      const span = svg("tspan", { x: "8", dy: i === 0 ? "0" : "14" });
+      span.textContent = line;
+      titleGroup.append(span);
+    });
+    g.append(titleGroup);
+
+    nodeGroup.append(g);
+    nodeEls.set(n.id, g);
+
+    g.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      if (graphSelectedId === n.id) {
+        graphSelectedId = null;
+      } else {
+        graphSelectedId = n.id;
+      }
+      applyGraphFocus(nodeEls, edgeEls, edges, nodesById);
+      if (graphSelectedId != null) renderGraphDetail(n, edges, nodesById);
+      else clearGraphDetail();
+    });
+    g.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        g.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      }
+    });
+  }
+
+  // Pan-surface click clears selection (panSurface is a new element each render; no leak).
+  panSurface.addEventListener("click", () => {
+    graphSelectedId = null;
+    rebuildFocusAfterDetailNav(); // uses current DOM, not stale closure
+    clearGraphDetail();
+  });
+  // svgEl is persistent — add this click-to-deselect listener only once (guarded by graphPanZoomInstalled).
+  if (!graphPanZoomInstalled) {
+    svgEl.addEventListener("click", (ev) => {
+      if (ev.target === svgEl) {
+        graphSelectedId = null;
+        rebuildFocusAfterDetailNav();
+        clearGraphDetail();
+      }
+    });
+  }
+
+  // Restore selection if the node still exists.
+  if (graphSelectedId != null && nodesById.has(graphSelectedId)) {
+    applyGraphFocus(nodeEls, edgeEls, edges, nodesById);
+    renderGraphDetail(nodesById.get(graphSelectedId), edges, nodesById);
+  } else {
+    graphSelectedId = null;
+    clearGraphDetail();
+  }
+
+  // Pan/zoom — install listeners only once per overlay open to avoid stacking them
+  // on every live refresh (svgEl is the same DOM node across re-renders).
+  if (!graphPanZoomInstalled) {
+    installGraphPanZoom(svgEl, panSurface);
+    graphPanZoomInstalled = true;
+  }
+  buildGraphLegend();
+}
+
+function viewBoxStr(vs) {
+  return `${vs.x} ${vs.y} ${vs.width} ${vs.height}`;
+}
+
+function applyGraphFocus(nodeEls, edgeEls, edges, nodesById) {
+  // Reset all.
+  nodeEls.forEach((el) => el.classList.remove("gnode-sel", "gnode-up", "gnode-down", "gnode-dim"));
+  edgeEls.forEach((el) => el.classList.remove("gedge-up", "gedge-down", "gedge-dim"));
+  // Reset marker refs on edges to their original markers.
+  edgeEls.forEach((pathEl, e) => {
+    const fromNode = nodesById.get(e.from);
+    const cleared = fromNode && fromNode.status === "done";
+    pathEl.setAttribute("marker-end", cleared ? "url(#gArrowCleared)" : "url(#gArrowBlocking)");
+  });
+
+  if (graphSelectedId == null) return;
+
+  const { upstream, downstream, upEdges, downEdges } = graphNeighbors(graphSelectedId, edges);
+
+  // Dim everything first.
+  nodeEls.forEach((el) => el.classList.add("gnode-dim"));
+  edgeEls.forEach((el) => el.classList.add("gedge-dim"));
+
+  // Selected node.
+  nodeEls.get(graphSelectedId)?.classList.remove("gnode-dim");
+  nodeEls.get(graphSelectedId)?.classList.add("gnode-sel");
+
+  // Upstream nodes + edges.
+  for (const id of upstream) {
+    nodeEls.get(id)?.classList.remove("gnode-dim");
+    nodeEls.get(id)?.classList.add("gnode-up");
+  }
+  for (const e of upEdges) {
+    const pathEl = edgeEls.get(e);
+    if (pathEl) {
+      pathEl.classList.remove("gedge-dim");
+      pathEl.classList.add("gedge-up");
+      pathEl.setAttribute("marker-end", "url(#gArrowUp)");
+    }
+  }
+
+  // Downstream nodes + edges.
+  for (const id of downstream) {
+    nodeEls.get(id)?.classList.remove("gnode-dim");
+    nodeEls.get(id)?.classList.add("gnode-down");
+  }
+  for (const e of downEdges) {
+    const pathEl = edgeEls.get(e);
+    if (pathEl) {
+      pathEl.classList.remove("gedge-dim");
+      pathEl.classList.add("gedge-down");
+      pathEl.setAttribute("marker-end", "url(#gArrowDown)");
+    }
+  }
+}
+
+function clearGraphDetail() {
+  const d = $("graphDetail");
+  d.replaceChildren(el("p", { class: "graph-detail-hint" }, "Click a node to inspect. Scroll to zoom, drag to pan."));
+}
+
+function renderGraphDetail(node, edges, nodesById) {
+  const d = $("graphDetail");
+  d.replaceChildren();
+
+  const prioColor = PRIO[node.priority] || PRIO[3];
+  const statusColor = ST[node.status] || "var(--faint)";
+
+  const head = el("div", { class: "gd-head" });
+  head.append(el("span", { class: "gd-ref" }, node.project + "-" + node.ref));
+  head.append(el("span", { class: "gd-title" }, node.title));
+  d.append(head);
+
+  const chips = el("div", { class: "gd-chips" });
+  chips.append(el("span", { class: "gd-chip", style: "background:" + statusColor + "22;color:" + statusColor }, node.status));
+  chips.append(el("span", { class: "gd-chip", style: "border-color:" + prioColor + ";color:" + prioColor },
+    PRIO_LABEL[node.priority] || ("P" + node.priority)));
+  if (node.assignee) chips.append(el("span", { class: "gd-chip gd-assignee" }, node.assignee));
+  d.append(chips);
+
+  const blockedLine = el("div", { class: "gd-blocked-line" });
+  if (node.nopen > 0) {
+    blockedLine.append(el("span", { class: "gd-blocked" }, "🔒 Blocked — " + node.nopen + " open prereq" + (node.nopen > 1 ? "s" : "")));
+  } else if (node.nprereq > 0) {
+    blockedLine.append(el("span", { class: "gd-ready" }, "✓ Ready"));
+  } else {
+    blockedLine.append(el("span", { class: "gd-free" }, "No prerequisites"));
+  }
+  d.append(blockedLine);
+
+  // Prerequisites (incoming edges from→this node).
+  const prereqs = edges.filter((e) => e.to === node.id).map((e) => nodesById.get(e.from)).filter(Boolean);
+  const prereqSec = el("div", { class: "gd-section" });
+  prereqSec.append(el("div", { class: "gd-section-label" }, "Prerequisites (" + prereqs.length + ")"));
+  if (!prereqs.length) {
+    prereqSec.append(el("div", { class: "gd-none" }, "None"));
+  } else {
+    for (const p of prereqs) {
+      const row = el("div", { class: "gd-dep-row", role: "link", tabindex: "0",
+        onclick: () => { graphSelectedId = p.id; renderGraphDetail(p, edges, nodesById); rebuildFocusAfterDetailNav(); },
+        onkeydown: (ev) => { if (ev.key === "Enter") { graphSelectedId = p.id; renderGraphDetail(p, edges, nodesById); rebuildFocusAfterDetailNav(); } },
+      });
+      const dot = el("span", { class: "gd-dep-dot", style: "background:" + (ST[p.status] || "var(--faint)") });
+      row.append(dot, el("span", { class: "gd-dep-ref" }, p.project + "-" + p.ref),
+        el("span", { class: "gd-dep-title" }, p.title),
+        el("span", { class: "gd-dep-status" }, p.status === "done" ? "✓" : p.status));
+      prereqSec.append(row);
+    }
+  }
+  d.append(prereqSec);
+
+  // Unblocks (outgoing edges this→to).
+  const unblocks = edges.filter((e) => e.from === node.id).map((e) => nodesById.get(e.to)).filter(Boolean);
+  const unblockSec = el("div", { class: "gd-section" });
+  unblockSec.append(el("div", { class: "gd-section-label" }, "Unblocks (" + unblocks.length + ")"));
+  if (!unblocks.length) {
+    unblockSec.append(el("div", { class: "gd-none" }, "None"));
+  } else {
+    for (const u of unblocks) {
+      const row = el("div", { class: "gd-dep-row", role: "link", tabindex: "0",
+        onclick: () => { graphSelectedId = u.id; renderGraphDetail(u, edges, nodesById); rebuildFocusAfterDetailNav(); },
+        onkeydown: (ev) => { if (ev.key === "Enter") { graphSelectedId = u.id; renderGraphDetail(u, edges, nodesById); rebuildFocusAfterDetailNav(); } },
+      });
+      const dot = el("span", { class: "gd-dep-dot", style: "background:" + (ST[u.status] || "var(--faint)") });
+      row.append(dot, el("span", { class: "gd-dep-ref" }, u.project + "-" + u.ref),
+        el("span", { class: "gd-dep-title" }, u.title),
+        el("span", { class: "gd-dep-status" }, u.status === "done" ? "✓" : u.status));
+      unblockSec.append(row);
+    }
+  }
+  d.append(unblockSec);
+
+  const openBtn = el("button", { class: "gd-open-btn", onclick: () => openTask(node.id) }, "Open task");
+  d.append(openBtn);
+}
+
+function rebuildFocusAfterDetailNav() {
+  if (!graphData) return;
+  const { nodes, edges } = graphData;
+  const nodesById = new Map(nodes.map((n) => [n.id, n]));
+  // Re-collect SVG elements by data-id.
+  const svgEl = $("graphSvg");
+  const nodeEls = new Map();
+  svgEl.querySelectorAll(".gnode[data-id]").forEach((el) => nodeEls.set(Number(el.dataset.id), el));
+  const edgeEls = new Map();
+  // For edges we need the original edge objects — iterate all path elements.
+  svgEl.querySelectorAll(".gedge").forEach((pathEl) => {
+    const from = Number(pathEl.getAttribute("data-from"));
+    const to = Number(pathEl.getAttribute("data-to"));
+    // Find matching edge.
+    const e = edges.find((x) => x.from === from && x.to === to);
+    if (e) edgeEls.set(e, pathEl);
+  });
+  applyGraphFocus(nodeEls, edgeEls, edges, nodesById);
+}
+
+function installGraphPanZoom(svgEl, panSurface) {
+  const setViewBox = () => svgEl.setAttribute("viewBox", viewBoxStr(graphViewState));
+
+  svgEl.addEventListener("wheel", (ev) => {
+    ev.preventDefault();
+    const rect = svgEl.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const px = (ev.clientX - rect.left) / rect.width;
+    const py = (ev.clientY - rect.top) / rect.height;
+    const anchorX = graphViewState.x + px * graphViewState.width;
+    const anchorY = graphViewState.y + py * graphViewState.height;
+    const factor = ev.deltaY < 0 ? 0.9 : 1.1;
+    const nextW = Math.min(Math.max(260, graphViewState.width * factor), 6000);
+    const nextH = Math.min(Math.max(180, graphViewState.height * factor), 4000);
+    graphViewState.x = anchorX - px * nextW;
+    graphViewState.y = anchorY - py * nextH;
+    graphViewState.width = nextW;
+    graphViewState.height = nextH;
+    setViewBox();
+  }, { passive: false });
+
+  svgEl.addEventListener("mousedown", (ev) => {
+    if (!(ev.target === svgEl || ev.target === panSurface || ev.target.classList?.contains("graph-pan-surface"))) return;
+    graphDragState = { startX: ev.clientX, startY: ev.clientY, viewX: graphViewState.x, viewY: graphViewState.y };
+  });
+  svgEl.addEventListener("mousemove", (ev) => {
+    if (!graphDragState) return;
+    const rect = svgEl.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const dx = ((ev.clientX - graphDragState.startX) * graphViewState.width) / rect.width;
+    const dy = ((ev.clientY - graphDragState.startY) * graphViewState.height) / rect.height;
+    graphViewState.x = graphDragState.viewX - dx;
+    graphViewState.y = graphDragState.viewY - dy;
+    setViewBox();
+  });
+  svgEl.addEventListener("mouseup", () => { graphDragState = null; });
+  svgEl.addEventListener("mouseleave", () => { graphDragState = null; });
+}
+
+function buildGraphLegend() {
+  const leg = $("graphLegend");
+  leg.replaceChildren();
+
+  const items = [
+    { color: PRIO[0], label: "Urgent" },
+    { color: PRIO[1], label: "High" },
+    { color: PRIO[2], label: "Normal" },
+    { color: PRIO[3], label: "Low" },
+    { color: "var(--st-done)", label: "Cleared edge", isLine: true },
+    { color: "var(--warn)", label: "Blocking edge", isLine: true, dashed: true },
+    { color: "var(--st-done)", label: "Done task", isDot: true },
+    { color: "var(--warn)", label: "Blocked task", isDot: true },
+  ];
+
+  for (const item of items) {
+    const row = el("div", { class: "graph-legend-row" });
+    if (item.isDot) {
+      row.append(el("span", { class: "graph-legend-dot", style: "background:" + item.color }));
+    } else if (item.isLine) {
+      const line = el("span", { class: "graph-legend-line" + (item.dashed ? " dashed" : ""), style: "background:" + item.color });
+      row.append(line);
+    } else {
+      row.append(el("span", { class: "graph-legend-swatch", style: "border-color:" + item.color }));
+    }
+    row.append(el("span", { class: "graph-legend-label" }, item.label));
+    leg.append(row);
+  }
+}
+
+// graphMaybeRefresh is called from onEvent (below) when the graph overlay is open.
+const GRAPH_REFRESH_KINDS = new Set([
+  "task.dep_added", "task.dep_removed", "task.status", "task.created", "task.deleted",
+  "task.assign", "task.patched",
+]);
+
+function graphMaybeRefresh(ev) {
+  if (!graphOpen || !graphSlug || !graphData) return;
+  if (!GRAPH_REFRESH_KINDS.has(ev.kind)) return;
+  // Skip if the event clearly belongs to a different project.
+  if (ev.task_id) {
+    const node = graphData.nodes.find((n) => n.id === ev.task_id);
+    if (node && node.project !== graphSlug) return;
+  }
+  if (graphRefreshTimer) clearTimeout(graphRefreshTimer);
+  graphRefreshTimer = setTimeout(async () => {
+    if (!graphOpen) return;
+    const prevSel = graphSelectedId;
+    await fetchAndRenderGraph(graphSlug);
+    // Restore selection if the node still exists after refresh.
+    if (prevSel != null && graphData && graphData.nodes.find((n) => n.id === prevSel)) {
+      graphSelectedId = prevSel;
+      rebuildFocusAfterDetailNav();
+      const n = graphData.nodes.find((x) => x.id === prevSel);
+      if (n) {
+        const nodesById = new Map(graphData.nodes.map((x) => [x.id, x]));
+        renderGraphDetail(n, graphData.edges, nodesById);
+      }
+    }
+  }, 350);
+}
+
+// Focus trap for graph overlay.
+function graphTrapFocus(ev) {
+  if (ev.key !== "Tab" || $("graphOverlay").classList.contains("hidden")) return;
+  const f = $("graphOverlay").querySelectorAll('a[href],button,select,textarea,input,[tabindex]:not([tabindex="-1"])');
+  const list = Array.from(f).filter((x) => !x.disabled && x.offsetParent !== null);
+  if (!list.length) return;
+  const first = list[0], last = list[list.length - 1];
+  if (ev.shiftKey && document.activeElement === first) { ev.preventDefault(); last.focus(); }
+  else if (!ev.shiftKey && document.activeElement === last) { ev.preventDefault(); first.focus(); }
+}
+
+// Wire up graph overlay controls.
+$("graphBtn").onclick = openGraphOverlay;
+$("graphClose").onclick = closeGraphOverlay;
+$("graphReset").onclick = () => {
+  graphViewState = { ...graphInitialView };
+  $("graphSvg").setAttribute("viewBox", viewBoxStr(graphViewState));
+};
+$("graphOverlay").addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape") { ev.stopPropagation(); closeGraphOverlay(); }
+  graphTrapFocus(ev);
+});

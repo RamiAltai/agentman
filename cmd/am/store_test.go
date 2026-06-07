@@ -1100,3 +1100,86 @@ func TestTaskDepsTableExistsOnReopenedDB(t *testing.T) {
 
 // Suppress unused import warning for fmt (used in TestAddDepCycleRejected).
 var _ = fmt.Sprintf
+
+// ===================== ProjectGraph tests =====================
+
+func TestProjectGraph(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("gproj", "Graph Project"); err != nil {
+		t.Fatal(err)
+	}
+	// Second project — its tasks must not appear in gproj's graph.
+	if _, _, err := st.CreateProject("other", "Other"); err != nil {
+		t.Fatal(err)
+	}
+
+	ta, _, err := st.CreateTask(CreateTaskInput{Project: "gproj", Title: "Task A"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tb, _, err := st.CreateTask(CreateTaskInput{Project: "gproj", Title: "Task B"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc, _, err := st.CreateTask(CreateTaskInput{Project: "gproj", Title: "Task C"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Task in other project — must not leak into gproj graph.
+	tOther, _, err := st.CreateTask(CreateTaskInput{Project: "other", Title: "Other Task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = tOther
+
+	// Chain: B depends on A; C depends on B.
+	if _, err := st.AddDep(tb.ID, ta.ID, "alice"); err != nil {
+		t.Fatalf("AddDep(B->A): %v", err)
+	}
+	if _, err := st.AddDep(tc.ID, tb.ID, "alice"); err != nil {
+		t.Fatalf("AddDep(C->B): %v", err)
+	}
+
+	data, err := st.ProjectGraph("gproj")
+	if err != nil {
+		t.Fatalf("ProjectGraph: %v", err)
+	}
+
+	// Node count must match the project's task count.
+	if len(data.Nodes) != 3 {
+		t.Fatalf("ProjectGraph nodes = %d, want 3", len(data.Nodes))
+	}
+	// All nodes must belong to gproj.
+	for _, n := range data.Nodes {
+		if n.Project != "gproj" {
+			t.Errorf("ProjectGraph returned node from project %q, want gproj", n.Project)
+		}
+	}
+
+	// Edge count.
+	if len(data.Edges) != 2 {
+		t.Fatalf("ProjectGraph edges = %d, want 2", len(data.Edges))
+	}
+
+	// Verify direction: From = prereq, To = dependent.
+	edgeMap := map[int64]int64{}
+	for _, e := range data.Edges {
+		edgeMap[e.From] = e.To
+	}
+	// B depends on A → edge From=A.ID, To=B.ID
+	if edgeMap[ta.ID] != tb.ID {
+		t.Errorf("expected edge A->B (from=%d, to=%d), got to=%d", ta.ID, tb.ID, edgeMap[ta.ID])
+	}
+	// C depends on B → edge From=B.ID, To=C.ID
+	if edgeMap[tb.ID] != tc.ID {
+		t.Errorf("expected edge B->C (from=%d, to=%d), got to=%d", tb.ID, tc.ID, edgeMap[tb.ID])
+	}
+}
+
+func TestProjectGraphMissingProject(t *testing.T) {
+	st := openTestStore(t)
+	_, err := st.ProjectGraph("nonexistent")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ProjectGraph missing slug: got %v, want ErrNotFound", err)
+	}
+}

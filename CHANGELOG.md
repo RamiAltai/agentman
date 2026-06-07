@@ -11,6 +11,39 @@ fresh `[Unreleased]` section.
 
 ### Added
 
+- **Dependency-graph overlay** — a per-project interactive visualization of the task dependency DAG.
+  - **Entry:** the **"Graph"** button in the dashboard header + the **`g`** keyboard shortcut (not
+    while typing). Opens a full-screen overlay (`#graphOverlay`) reusing the modal focus-trap and
+    `Esc`-to-close; a project `<select>` defaults to the selected project; **"Reset view"** + ✕
+    close the overlay.
+  - **Rendering:** pure vanilla SVG, no library, no npm. A new `svg(tag, attrs)` helper
+    (`document.createElementNS`) is parallel to the existing `el()` helper and uses `.textContent`
+    for all text — XSS-safe (`TestDashboardNoXSSSinks` passes). Edges are cubic Bézier curves
+    with `<marker>` arrowheads.
+  - **Layout:** topological longest-path / Kahn's algorithm — prerequisites left, dependents
+    right. Dependency-free tasks are placed in a compact grid **"No dependencies" lane** below
+    the DAG (so isolated tasks don't pile into one tall column). All tasks in the project appear.
+  - **Encoding:** nodes colored by task **priority** (`PRIO` palette) with a status dot and
+    Ready/🔒 Blocked indicators. Edges: `done` prerequisite → **green solid** ("cleared"); open
+    prerequisite → **amber dashed** ("blocking"). A **bottom-left legend** explains both axes.
+  - **Interaction:** click a task → **transitive highlight** — its full upstream prereq path and
+    downstream subtree light up in distinct accents; everything else dims. Click the empty canvas
+    to clear. The **right detail panel** (built with `el()`) shows title, status/priority/assignee,
+    Ready/Blocked, a clickable **Prerequisites** list and **Unblocks** list, and an **"Open task"**
+    button → the existing detail modal.
+  - **Pan/zoom:** drag to pan, scroll to zoom, `viewBox` manipulation — no library. **"Reset view"**
+    restores the initial viewport.
+  - **Live:** while open, debounced re-fetch on SSE events affecting the project
+    (`task.dep_added/removed`, `task.status`, `task.created/deleted`, `task.assign`,
+    `task.patched`), preserving pan/zoom and selection.
+  - **Backend:** `GET /api/projects/{slug}/graph` → `{nodes: []Task, edges: []GraphEdge{from,to}}`
+    — all tasks as nodes, edges oriented prereq→dependent. Read-only: no writes, no events emitted.
+    404 on a missing project. New store method `ProjectGraph`; new types `GraphEdge`,
+    `ProjectGraphData`.
+  - **Tests:** +4 backend (`TestProjectGraph`, `TestProjectGraphMissingProject` in `store_test.go`;
+    `TestProjectGraphEndpoint`, `TestProjectGraphEndpoint404` in `server_test.go`) → **95 tests**
+    total. Overlay JS is untested behaviorally (no JS runner — ADR-018); XSS-sink guard covers it.
+
 - **Task dependencies (Phase H)** — tasks can now have prerequisites (other tasks that must be
   `done` first). Many-to-many, same-project only.
   - **CLI:** `am dep add <id> <prereq…>` / `am dep rm <id> <prereq>` — add/remove prerequisite

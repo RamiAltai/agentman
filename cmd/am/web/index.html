@@ -14,6 +14,7 @@
     <span class="brand">agent<span class="brand-accent">man</span></span>
     <nav id="tabs" class="tabs" aria-label="Projects"></nav>
     <div class="actions">
+      <button id="graphBtn" class="iconbtn" title="Dependency graph (g)" aria-label="Open dependency graph">Graph</button>
       <button id="newBtn" class="btn-primary" title="New task (n)">+ Task</button>
       <span id="status" class="status" role="status" aria-live="polite">
         <span class="pulse" aria-hidden="true"></span><span class="status-text">connecting…</span>
@@ -43,6 +44,22 @@
 
   <div id="modal" class="hidden" role="dialog" aria-modal="true" aria-label="Task details">
     <div class="sheet" id="sheet" tabindex="-1"></div>
+  </div>
+
+  <div id="graphOverlay" class="graph-overlay hidden" role="dialog" aria-modal="true" aria-label="Dependency graph">
+    <div class="graph-shell">
+      <div class="graph-header">
+        <span class="graph-title" id="graphTitle">Dependencies</span>
+        <select id="graphProjectSel" class="graph-proj-sel" aria-label="Project"></select>
+        <button id="graphReset" class="iconbtn ghost" title="Reset view">Reset view</button>
+        <button id="graphClose" class="iconbtn ghost graph-close" aria-label="Close graph" title="Close">✕</button>
+      </div>
+      <div class="graph-body">
+        <svg id="graphSvg" class="graph-svg" aria-label="Dependency graph canvas"></svg>
+        <div id="graphDetail" class="graph-detail" aria-live="polite"></div>
+      </div>
+      <div id="graphLegend" class="graph-legend"></div>
+    </div>
   </div>
 
   <script src="app.js"></script>

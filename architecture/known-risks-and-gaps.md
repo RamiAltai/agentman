@@ -66,7 +66,15 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   should use `am ls --ready` to find actionable work rather than `--status todo`.
 - **Dependency UI is untested at the behavioral level** — the prereq chips, add-prereq dropdown,
   and blocks list in the task modal are vanilla JS covered only by the `TestDashboardNoXSSSinks`
-  source-level guard. See Testing Gaps above.
+  source-level guard. See Testing Gaps below.
+- **Dependency-graph overlay is untested at the behavioral level** (same gap, by design). The
+  overlay JS (layout, pan/zoom, transitive highlight, detail panel, live refresh) is covered only
+  by the `TestDashboardNoXSSSinks` source-level XSS guard. No JS test runner (ADR-018). See
+  Testing Gaps below.
+- **Graph layout is a simplified layered algorithm** (Low). `computeGraphLayout` uses topological
+  longest-path / Kahn's layering with no crossing-minimization. For modest project sizes this is
+  clean and fast; for large, dense DAGs edge crossings can accumulate. Mitigated by pan/zoom and
+  the separate isolated-task grid lane. Acceptable for a personal board's scale.
 
 ## Security Risks
 
@@ -88,7 +96,7 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 ## Testing Gaps
 
-- Coverage now spans store/server/migrate/db/cli/sse/identity/web tests (9 files, 91 tests,
+- Coverage now spans store/server/migrate/db/cli/sse/identity/web tests (9 files, 95 tests,
   `-race`-clean): the **atomic claim** (race, `-race`-clean), events cursor, store CRUD/validation,
   validation→status mapping, the Host/CSRF/CSP guards, project archive/unarchive (store round-trip
   + idempotency and the HTTP endpoints incl. 404), the v2 migration (adds `archived_at` +
@@ -117,17 +125,21 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
     `web/app.js` + `web/index.html` via `webFS` and asserts no `.innerHTML`/`.outerHTML`/
     `.insertAdjacentHTML`/`document.write`/`eval(` appear — a source-level lock on the
     `el()`/`textContent` convention.
-  The +24 dependency tests added in this phase cover: cycle/self/cross-project rejection,
+  The +24 dependency tests added in that phase cover: cycle/self/cross-project rejection,
   idempotent add/remove, cascade on task delete, `NPrereqs`/`NOpenPrereqs` counts, `Ready`/`Blocked`
   list filters, hard-block on `ClaimTask` and `PatchTask` (409 `blocked`), HTTP add/remove dep
   endpoints, `?ready=`/`?blocked=` query params, and a fresh-DB table-existence check.
+  The +4 graph tests cover: `TestProjectGraph` (store: correct nodes + edges shape),
+  `TestProjectGraphMissingProject` (store: `ErrNotFound`), `TestProjectGraphEndpoint` (HTTP 200
+  with correct shape), `TestProjectGraphEndpoint404` (HTTP 404 for missing project).
   **Still untested:** behavioral dashboard JS — the "Manage projects" modal, the delete confirm
   flows (task/comment/project), the feed pagination button, the dependency section UI (prereq chips,
-  add-prereq dropdown, blocks list), and other client-side logic — because the project deliberately
+  add-prereq dropdown, blocks list), the **graph overlay** (layout, pan/zoom, transitive highlight,
+  detail panel, live refresh), and other client-side logic — because the project deliberately
   adopts **no JS test runner** (preserves the no-npm/single-binary ethos; ADR-018). The
-  `web_test.go` sink guard mitigates XSS regressions at the source level; the dependency UI is
-  additional un-runner-tested JS covered by that same guard.
-  → `backend.md`, `frontend.md`, `decision-records.md` ADR-018.
+  `web_test.go` sink guard mitigates XSS regressions at the source level; the dependency UI and
+  the graph overlay are additional un-runner-tested JS covered by that same guard.
+  → `backend.md`, `frontend.md`, `decision-records.md` ADR-018, ADR-021.
 
 ## Documentation Gaps
 
@@ -145,7 +157,7 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 - ~~`gofmt -l` is non-empty~~ — **fixed in Phase 0** (`cmd/am/update_test.go`, `cmd/am/version.go`
   formatted; `gofmt -l cmd/am` is now empty).
-- `store.go` (~1000 lines) and `app.js` (~854 lines) are the largest files and mix several
+- `store.go` (~1292 lines) and `app.js` (~1696 lines) are the largest files and mix several
   responsibilities; fine now, watch for growth.
 - No linter beyond `gofmt`/`go vet`; no pre-commit hooks. CI now enforces `gofmt`/`go vet`/
   `go test -race`/`govulncheck` on every push and PR, so format/vet/test drift is caught

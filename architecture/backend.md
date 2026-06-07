@@ -31,6 +31,7 @@ GET   /api/stream                   handleStream            text/event-stream (S
 DELETE /api/tasks/{id}              handleDeleteTask        hard-delete task + comments + dep edges (cascade); 200 {"status":"deleted"}
 DELETE /api/tasks/{id}/comments/{cid} handleDeleteComment  hard-delete one comment; 200 {"status":"deleted"}
 DELETE /api/projects/{slug}         handleDeleteProject     hard-delete project + tasks + comments (cascade); 200 {"status":"deleted"}
+GET   /api/projects/{slug}/graph    handleProjectGraph      {nodes:[]Task, edges:[]GraphEdge{from,to}}; 404 on missing project; read-only (no events)
 /                                   http.FileServer(embed)  serves cmd/am/web/
 ```
 
@@ -66,7 +67,7 @@ logic). Each mutating method returns `(result, *Event, error)`; the handler broa
 Key methods: `CreateProject`, `ListProjects(includeArchived bool)`, `ArchiveProject`,
 `UnarchiveProject`, `DeleteProject`, `ListTasks`, `GetTask`, `CreateTask`, `PatchTask`,
 `ClaimTask`, `AddComment`, `DeleteComment`, `ListEvents`, `RecentEvents`, `ListEventsBefore`,
-`DeleteTask`, `AddDep`, `RemoveDep`. `ArchiveProject`/`UnarchiveProject` are transactional and
+`DeleteTask`, `AddDep`, `RemoveDep`, `ProjectGraph`. `ArchiveProject`/`UnarchiveProject` are transactional and
 idempotent (no event when already in the target state).
 `CreateTask` checks the target project's `archived_at` before the insert and returns
 `ErrProjectArchived` if archived — creation into an archived project is rejected.
@@ -81,7 +82,10 @@ for backward pagination.
 `AddDep(taskID, dependsOnID, actor)` validates same-project membership, rejects self-deps, and
 runs a recursive CTE (`wouldCycle`) to reject transitive cycles before inserting into `task_deps`.
 Duplicate edges are idempotent (returns `nil, nil`). `RemoveDep` is also idempotent (no-op if the
-edge does not exist). `ListTasks` now accepts `TaskFilter.Ready` (todo tasks with zero open
+edge does not exist). `ProjectGraph(slug)` is **read-only** (no events, no writes): it calls
+`ListTasks(TaskFilter{Project: slug})` for nodes and queries `task_deps JOIN tasks` for edges,
+returning `{nodes: []Task, edges: []GraphEdge{From, To}}` with edges oriented prereq→dependent.
+Returns `ErrNotFound` for a missing project. `ListTasks` now accepts `TaskFilter.Ready` (todo tasks with zero open
 prereqs) and `TaskFilter.Blocked` (tasks with ≥1 open prereq); it also selects `NPrereqs` and
 `NOpenPrereqs` counts for every row via subqueries. `GetTask` additionally populates `DependsOn`
 and `Blocks` slices (full `DepRef` objects).
@@ -183,18 +187,20 @@ per request after completion: `METHOD PATH STATUS LATENCY ACTOR` (actor = `X-Age
 
 ## Testing
 
-There are nine test files (run `go test -race ./cmd/am/`; 91 tests, all green):
+There are nine test files (run `go test -race ./cmd/am/`; 95 tests, all green):
 - `cmd/am/update_test.go` — version-comparison logic.
 - `cmd/am/store_test.go` — atomic-claim race (concurrent, `-race`-clean), events-cursor monotonicity,
   store CRUD + validation (`ErrValidation`), project archive/unarchive round-trip + idempotency,
-  and hard-delete cascade/not-found (`TestDeleteTaskCascadesComments`, `TestDeleteTaskNotFound`,
-  `TestDeleteCommentRemovesOnlyComment`, `TestDeleteProjectCascades`).
+  hard-delete cascade/not-found (`TestDeleteTaskCascadesComments`, `TestDeleteTaskNotFound`,
+  `TestDeleteCommentRemovesOnlyComment`, `TestDeleteProjectCascades`), and graph store:
+  `TestProjectGraph` (nodes + edges shape), `TestProjectGraphMissingProject` (ErrNotFound).
 - `cmd/am/server_test.go` — validation→status mapping (400/404/409), `hostGuard`, `csrfGuard`,
   `securityHeaders`, `listenAddr` loopback regression, archive/unarchive endpoints + 404,
   hard-delete HTTP endpoints (`TestDeleteTaskEndpoint`, `TestDeleteProjectEndpoint`,
-  `TestDeleteCommentEndpoint`), and Phase D: `TestWriteErrHidesInternalDetail` (500 returns
-  generic body, not raw error), `TestRequestLoggerPassesThrough`, `TestRequestLoggerPreservesFlusher`
-  (via `net/http/httptest`).
+  `TestDeleteCommentEndpoint`), Phase D: `TestWriteErrHidesInternalDetail` (500 returns generic
+  body, not raw error), `TestRequestLoggerPassesThrough`, `TestRequestLoggerPreservesFlusher`, and
+  graph endpoint: `TestProjectGraphEndpoint` (200 with correct nodes + edges),
+  `TestProjectGraphEndpoint404` (missing project → 404) (via `net/http/httptest`).
 - `cmd/am/migrate_test.go` — migration runner (apply/skip/idempotent/rollback), incl. the v2 step
   that adds `projects.archived_at`.
 - `cmd/am/db_test.go` — `db export`/`import` roundtrip + file perms (0o600), backup creation + perms,
@@ -224,7 +230,9 @@ The +24 dependency tests are spread across existing files: `store_test.go` (cycl
 rejection, idempotent add/remove, cascade on task delete, `NPrereqs`/`NOpenPrereqs` counts,
 `Ready`/`Blocked` list filters, hard-block on `ClaimTask` and `PatchTask`, fresh-DB table existence);
 `server_test.go` (HTTP add/remove dep endpoints, `?ready=`/`?blocked=` query params, 409 blocked
-response for claim and patch).
+response for claim and patch). The +4 graph tests (`TestProjectGraph`, `TestProjectGraphMissingProject`
+in `store_test.go`; `TestProjectGraphEndpoint`, `TestProjectGraphEndpoint404` in `server_test.go`)
+bring the total to **95 tests**.
 
 SSE streaming/reconnect, CLI verbs, exit-code mapping, and identity are now covered. The
 dashboard has a source-level XSS-sink guard but **no behavioral JS tests** — the project

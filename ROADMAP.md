@@ -119,6 +119,27 @@ Archiving currently hides a project's **tab** (`ListProjects`) and its **board t
       unreachable) documented in `known-risks-and-gaps.md` and `decision-records.md` ADR-019.
       → `architecture/known-risks-and-gaps.md`, ADR-019.
 
+## Phase I — Dependency-graph overlay (shipped, beyond original roadmap)
+
+This feature was built on top of Phase H and has shipped.
+
+- [x] **I1 · Interactive dependency-graph overlay** — _L_ — **shipped (Phase I)**
+  - **"Graph"** button in the header + `g` keyboard shortcut → full-screen SVG overlay.
+  - Layered DAG layout (topological longest-path / Kahn's), isolated-task grid lane below.
+  - Pure vanilla SVG via new `svg()` helper (`createElementNS`) — no library, no npm.
+  - Nodes colored by priority (`PRIO` palette); edges colored by prereq-satisfied state
+    (green solid = cleared, amber dashed = blocking); bottom-left legend.
+  - Click a node → transitive highlight (upstream + downstream); right detail panel with
+    clickable prereq/unblocks lists and **"Open task"** button.
+  - Pan (drag) + zoom (wheel) + Reset view.
+  - Live refresh: debounced re-fetch on SSE events for the project; preserves pan/zoom and
+    selection.
+  - Backend: `GET /api/projects/{slug}/graph` (read-only, no events; 404 on missing project);
+    `ProjectGraph` store method; `GraphEdge` / `ProjectGraphData` types.
+  - +4 backend tests (`TestProjectGraph`, `TestProjectGraphMissingProject`,
+    `TestProjectGraphEndpoint`, `TestProjectGraphEndpoint404`); total now 95.
+  → ADR-021, `frontend.md`, `backend.md`, `CHANGELOG.md`.
+
 ## Phase H — Task dependencies (shipped, beyond original roadmap)
 
 This feature was requested after the original roadmap was written and has shipped.
@@ -153,6 +174,6 @@ and only matter if the network bind ever widens. (`architecture/security.md`)
 
 ### Suggested order
 
-Phases A, C, D, E, F, and H are **complete**. Remaining open work:
+Phases A, C, D, E, F, H, and I are **complete**. Remaining open work:
 
 **B1 → B2** (commit pending fixes + tag v0.4.0). **G** stays parked unless the access model changes.

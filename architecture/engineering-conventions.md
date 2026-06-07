@@ -80,7 +80,7 @@ convention is loose, it's called out.
 
 - `go test -race ./cmd/am/` (or `go test ./...`); table-driven tests (see `cmd/am/update_test.go`).
   Coverage spans pure logic, the store, HTTP, migrations, offline DB tooling, CLI verbs + exit codes,
-  SSE streaming/reconnect, identity, and the dashboard XSS-sink guard — 9 test files, 91 tests.
+  SSE streaming/reconnect, identity, and the dashboard XSS-sink guard — 9 test files, 95 tests.
 - **`osExit` testability var** — `cli.go` declares `var osExit = os.Exit`; `fail()` calls `osExit`
   rather than `os.Exit` directly. Tests in `cli_test.go` replace it via `captureExit(t, fn)`,
   which substitutes a panic-based stub so exit codes can be asserted without terminating the process.
@@ -109,9 +109,19 @@ matching `architecture/` doc. (`gofmt -l cmd/am` is currently empty — no outst
 CI (`.github/workflows/ci.yml`) enforces the same checks — build, vet, gofmt, test(-race),
 JS syntax (`node --check`), and `govulncheck` — on every push to `main` and on every PR.
 
+## SVG Convention
+
+SVG elements in `web/app.js` are created with the `svg(tag, attrs)` helper
+(`document.createElementNS(SVG_NS, tag)`), parallel to `el()` for HTML. All text is set via
+`.textContent`, never by attribute concatenation or `innerHTML`. This keeps the XSS-safe DOM
+convention consistent across HTML and SVG. **Never** use `innerHTML` to construct SVG either —
+the `TestDashboardNoXSSSinks` guard will catch it. When adding new SVG-based UI, use `svg()` for
+SVG elements and `el()` for any HTML wrapper elements (e.g., the detail panel next to the canvas).
+
 ## Anti-Patterns
 
-- ❌ `innerHTML` / `insertAdjacentHTML` in `web/` — always use `el()` / `textContent` (XSS).
+- ❌ `innerHTML` / `insertAdjacentHTML` in `web/` — always use `el()` / `textContent` for HTML
+  and `svg()` / `textContent` for SVG (XSS).
 - ❌ SQL built by string concatenation with user input.
 - ❌ Broadcasting an SSE event before the DB transaction commits.
 - ❌ A second DB writer / opening the SQLite file from the CLI (breaks the single-writer model).

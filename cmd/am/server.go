@@ -45,6 +45,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/tasks/{id}", s.handleDeleteTask)
 	mux.HandleFunc("DELETE /api/tasks/{id}/comments/{cid}", s.handleDeleteComment)
 	mux.HandleFunc("DELETE /api/projects/{slug}", s.handleDeleteProject)
+	mux.HandleFunc("GET /api/projects/{slug}/graph", s.handleProjectGraph)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.HandleFunc("GET /api/stream", s.handleStream)
 
@@ -435,6 +436,16 @@ func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
 	}
 	s.hub.Broadcast(ev)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+func (s *Server) handleProjectGraph(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	data, err := s.store.ProjectGraph(slug)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, data)
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {

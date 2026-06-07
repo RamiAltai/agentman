@@ -78,6 +78,8 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   `DELETE /api/tasks/{id}/comments/{cid}`,
   `POST /api/tasks/{id}/deps` (add prerequisite edge),
   `DELETE /api/tasks/{id}/deps/{depId}` (remove prerequisite edge),
+  `GET /api/projects/{slug}/graph` (read-only DAG: all tasks as nodes + dep edges; 404 on missing
+  project; no events emitted),
   `GET /api/events` (`?since=` ascending / `?tail=` newest-first / `?before=` backward cursor),
   `GET /api/stream`, and `/` → `http.FileServer` over `go:embed web`.
   All three DELETE routes return `200 {"status":"deleted"}`; `ErrNotFound` → 404.
@@ -117,6 +119,10 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   The task modal has a **Dependencies** section: "Depends on" chips with a ✕ remove button, an
   "Add prerequisite…" dropdown of same-project tasks, and a read-only "Blocks" list. A hard-block
   409 surfaces the blocking prereq ids and reverts the UI.
+  A **"Graph"** button in the header (and the `g` keyboard shortcut) opens a full-screen
+  **dependency-graph overlay**: a layered SVG DAG of all tasks in a project, with pan/zoom,
+  transitive-path highlighting on click, a right detail panel, a legend, and live refresh from SSE
+  (via `GET /api/projects/{slug}/graph`; `svg()` helper + `createElementNS`; no library).
 
 ## External Dependencies
 

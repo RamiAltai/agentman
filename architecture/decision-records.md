@@ -384,6 +384,74 @@ without evidence.
   `cmd/am/cli.go` (`cmdDep`, `--ready`/`--blocked` flags, `taskLine` `[blk:N]`/`[ready]`);
   `cmd/am/web/app.js` (deps section, card tags, hard-block UX); 24 new tests.
 
+### ADR-021: Dependency-graph overlay — vanilla SVG, no graph library (Phase I)
+- Status: Active
+- Context: The task-dependency DAG (Phase H / ADR-020) ships as CLI + API; the human dashboard
+  needs a visual companion so humans can see the whole graph at a glance, trace chains, and spot
+  bottlenecks without reading raw CLI output. The no-npm/single-binary/no-build-step invariant
+  (ADR-001, ADR-007) rules out any npm graph library (d3, Cytoscape, Elk.js, etc.).
+- Decision:
+  1. **Vanilla SVG via a `svg()` helper (`createElementNS`), no library, no npm.** A new `svg(tag,
+     attrs)` function parallels the existing `el(tag, props, ...kids)` HTML helper: it calls
+     `document.createElementNS(SVG_NS, tag)`, sets attributes, and is the sole SVG construction
+     primitive in `app.js`. The technique was ported from a reference DFD renderer. All text is set
+     via `.textContent` (never `innerHTML`) — XSS-safe, guarded by `TestDashboardNoXSSSinks`.
+  2. **Layered DAG layout using topological longest-path / Kahn's algorithm.** Prerequisites
+     are placed to the left, dependents to the right, each layer placed at depth = max(predecessor
+     depths) + 1. Dependency-free (isolated) tasks are collected into a compact grid **"No
+     dependencies" lane** below the DAG so they don't pile into one tall column; all tasks are
+     still shown. No crossing-minimization — a deliberate simplification acceptable for personal-
+     board scale; pan/zoom and the isolated lane mitigate readability for denser graphs.
+  3. **Entry:** a **"Graph"** button in the header `.actions` + the **`g`** keyboard shortcut
+     (suppressed while a text input has focus). Opens `#graphOverlay` — a full-screen overlay
+     reusing the existing modal focus-trap + `Esc`-to-close. Overlay has: a project `<select>`
+     (defaults to the selected project), a **"Reset view"** button, a close ✕, the SVG canvas
+     (`#graphSvg`), a **right detail panel** (`#graphDetail`), and a **bottom-left legend**
+     (`#graphLegend`).
+  4. **Node/edge encoding.** Nodes are colored by task **priority** (`PRIO` palette); each node
+     shows a status dot and a Ready/🔒 Blocked indicator. Edges are colored by prereq-satisfied
+     state: a `done` prerequisite → **green solid** ("cleared"); an open prerequisite → **amber
+     dashed** ("blocking"). A legend explains both axes.
+  5. **Transitive-path highlight.** Clicking a node runs a BFS both backward (upstream ancestors
+     — "what leads to it") and forward (downstream subtree — "what it unblocks"), applying
+     distinct CSS accent classes while dimming all other nodes/edges. Clicking the empty canvas
+     clears the selection.
+  6. **Right detail panel.** Built with `el()` (never `innerHTML`): task title, status/priority/
+     assignee, Ready/Blocked state, a clickable **Prerequisites** list, a clickable **Unblocks**
+     list (both navigate the graph selection), and an **"Open task"** button that invokes the
+     existing `openTask()` detail modal.
+  7. **Pan (drag) + zoom (wheel) + Reset view.** Implemented via `viewBox` manipulation on the SVG
+     element. A "Reset view" button restores `graphInitialView`.
+  8. **Live refresh.** `graphMaybeRefresh` is called from `onEvent` for project-affecting events
+     (`task.dep_added/removed`, `task.status`, `task.created/deleted`, `task.assign`,
+     `task.patched`). It debounces re-fetches via `graphRefreshTimer` and restores
+     `graphViewState` + `graphSelectedId` after the re-render.
+  9. **Backend: read-only `GET /api/projects/{slug}/graph`** — `handleProjectGraph` →
+     `store.ProjectGraph(slug)`. Reuses `ListTasks(TaskFilter{Project: slug})` for nodes and a
+     `task_deps JOIN tasks` query for edges oriented prereq→dependent
+     (`{from: depends_on_id, to: task_id}`). Returns `{nodes: []Task, edges: []GraphEdge}`.
+     No writes, no events emitted. 404 on a missing project. New types: `GraphEdge`, `ProjectGraphData`.
+  10. **Tests:** +4 backend (`TestProjectGraph`, `TestProjectGraphMissingProject` in
+      `store_test.go`; `TestProjectGraphEndpoint`, `TestProjectGraphEndpoint404` in `server_test.go`).
+      Total: **95 tests**. The overlay JS is untested behaviorally (no JS runner — ADR-018);
+      the `TestDashboardNoXSSSinks` source-level guard covers XSS safety.
+- Rationale: preserves the no-npm/single-binary invariant (ADR-001/ADR-007); `createElementNS` is
+  standard browser API that requires no build step; the `svg()` helper keeps the XSS-safe
+  `textContent` discipline consistent throughout the codebase. Layered longest-path is the
+  canonical DAG visualization algorithm; crossing-minimization adds complexity disproportionate to
+  a personal board. The isolated-task lane prevents the layout from becoming unusable when most
+  tasks have no deps.
+- Consequences: no graph library dependency; SVG is built imperatively (verbose but transparent);
+  the layout algorithm is simplified (no Sugiyama-style crossing minimization — denser graphs may
+  have edge crossings); behavioral JS is not automatically tested (ADR-018 deliberate gap).
+- Evidence: `cmd/am/web/app.js` (`svg()`, `computeGraphLayout`, `renderGraph`, `renderGraphDetail`,
+  `graphMaybeRefresh`, `openGraphOverlay`/`closeGraphOverlay`, graph state variables);
+  `cmd/am/web/index.html` (`#graphOverlay`, `#graphSvg`, `#graphDetail`, `#graphLegend`,
+  `#graphBtn`, `#graphReset`, `#graphProjectSel`); `cmd/am/web/app.css` (`.graph-*`, `.gnode-*`,
+  `.gedge-*`, `.gd-*`); `cmd/am/server.go` (`handleProjectGraph`); `cmd/am/store.go`
+  (`ProjectGraph`, `GraphEdge`, `ProjectGraphData`); `cmd/am/store_test.go` + `cmd/am/server_test.go`
+  (4 new graph tests).
+
 ## Inferred Decisions
 
 ### IADR-001: SSE chosen over WebSockets

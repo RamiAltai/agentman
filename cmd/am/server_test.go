@@ -642,6 +642,57 @@ func TestClaimBlockedEndpoint(t *testing.T) {
 	}
 }
 
+// ===================== graph endpoint tests =====================
+
+func TestProjectGraphEndpoint(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "gep")
+	id1 := mustCreateTask(t, ts, "gep", "Node 1")
+	id2 := mustCreateTask(t, ts, "gep", "Node 2")
+
+	// Add dependency: task 2 depends on task 1.
+	r := do(t, ts, http.MethodPost, "/api/tasks/"+id2+"/deps",
+		`{"depends_on":`+id1+`}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("add dep = %d, want 200", r.StatusCode)
+	}
+
+	// GET /api/projects/gep/graph → 200 with correct shape.
+	rg := do(t, ts, http.MethodGet, "/api/projects/gep/graph", "", nil)
+	defer rg.Body.Close()
+	if rg.StatusCode != http.StatusOK {
+		t.Fatalf("GET graph = %d, want 200", rg.StatusCode)
+	}
+	var data ProjectGraphData
+	if err := json.NewDecoder(rg.Body).Decode(&data); err != nil {
+		t.Fatalf("decode graph: %v", err)
+	}
+	if len(data.Nodes) != 2 {
+		t.Fatalf("graph nodes = %d, want 2", len(data.Nodes))
+	}
+	if len(data.Edges) != 1 {
+		t.Fatalf("graph edges = %d, want 1", len(data.Edges))
+	}
+	// Edge direction: From = prereq (id1), To = dependent (id2).
+	id1n, _ := strconv.ParseInt(id1, 10, 64)
+	id2n, _ := strconv.ParseInt(id2, 10, 64)
+	if data.Edges[0].From != id1n || data.Edges[0].To != id2n {
+		t.Errorf("edge = {from:%d, to:%d}, want {from:%d, to:%d}",
+			data.Edges[0].From, data.Edges[0].To, id1n, id2n)
+	}
+}
+
+func TestProjectGraphEndpoint404(t *testing.T) {
+	ts := newTestServer(t)
+	r := do(t, ts, http.MethodGet, "/api/projects/doesnotexist/graph", "", nil)
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusNotFound {
+		t.Fatalf("GET graph missing project = %d, want 404", r.StatusCode)
+	}
+}
+
 // ---------- helpers ----------
 
 func mustCreateProject(t *testing.T, ts *httptest.Server, slug string) {

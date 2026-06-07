@@ -1164,6 +1164,61 @@ func (s *Store) RecentEvents(project string, limit int) ([]Event, int64, error) 
 	return out, max, rows.Err()
 }
 
+// ---------- project graph ----------
+
+// GraphEdge is one directed edge in the project dependency graph.
+// From is the prerequisite task id; To is the dependent task id.
+// (direction = "unblocks": From must complete before To can start)
+type GraphEdge struct {
+	From int64 `json:"from"`
+	To   int64 `json:"to"`
+}
+
+// ProjectGraphData is the payload returned by GET /api/projects/{slug}/graph.
+type ProjectGraphData struct {
+	Nodes []Task      `json:"nodes"`
+	Edges []GraphEdge `json:"edges"`
+}
+
+// ProjectGraph returns all tasks (nodes) and dependency edges for the project
+// identified by slug. Edges are oriented prereq → dependent (the "unblocks"
+// direction). Returns ErrNotFound when the slug does not exist.
+func (s *Store) ProjectGraph(slug string) (*ProjectGraphData, error) {
+	pid, err := s.projectID(slug)
+	if err != nil {
+		return nil, err // ErrNotFound propagated
+	}
+
+	nodes, err := s.ListTasks(TaskFilter{Project: slug})
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := s.db.Query(
+		`SELECT d.depends_on_id, d.task_id
+		       FROM task_deps d
+		       JOIN tasks t ON t.id = d.task_id
+		       WHERE t.project_id = ?`, pid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	edges := []GraphEdge{}
+	for rows.Next() {
+		var e GraphEdge
+		if err := rows.Scan(&e.From, &e.To); err != nil {
+			return nil, err
+		}
+		edges = append(edges, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return &ProjectGraphData{Nodes: nodes, Edges: edges}, nil
+}
+
 // ---------- helpers ----------
 
 // queryer is satisfied by both *sql.DB and *sql.Tx.
