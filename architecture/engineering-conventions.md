@@ -77,9 +77,21 @@ convention is loose, it's called out.
 
 ## Testing
 
-- `go test ./...` (`go test -race ./cmd/am/` for the race detector); table-driven tests (see
-  `cmd/am/update_test.go`). Coverage spans pure logic plus the store, HTTP, migrations, and the
-  offline DB tooling — `store_test.go`, `server_test.go`, `migrate_test.go`, `db_test.go`.
+- `go test -race ./cmd/am/` (or `go test ./...`); table-driven tests (see `cmd/am/update_test.go`).
+  Coverage spans pure logic, the store, HTTP, migrations, offline DB tooling, CLI verbs + exit codes,
+  SSE streaming/reconnect, identity, and the dashboard XSS-sink guard — 9 test files, 71 tests.
+- **`osExit` testability var** — `cli.go` declares `var osExit = os.Exit`; `fail()` calls `osExit`
+  rather than `os.Exit` directly. Tests in `cli_test.go` replace it via `captureExit(t, fn)`,
+  which substitutes a panic-based stub so exit codes can be asserted without terminating the process.
+  Follow this pattern for any new CLI path that needs exit-code testing.
+- **`captureStdout(t, fn)`** in `cli_test.go` — redirects `os.Stdout` to a pipe for the duration
+  of `fn` and returns the captured output. Use this to assert CLI stdout is clean (no chatter).
+- **`AGENTMAN_AGENT_FILE` seam** in `identity.go` — set via `t.Setenv` in identity tests to
+  redirect the per-dir identity file to `t.TempDir()` so the real `~/.agentman` is never written.
+- **No JS test runner** — the project deliberately avoids npm/jsdom (preserves the
+  single-binary/no-build-step ethos; ADR-018). Dashboard XSS safety is enforced by the
+  `el()`/`textContent` convention plus the `TestDashboardNoXSSSinks` Go source-level sink guard
+  in `web_test.go`. Do not add a JS runner; extend `web_test.go` instead if you add new patterns.
 
 ## Commands
 

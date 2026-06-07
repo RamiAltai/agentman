@@ -278,6 +278,31 @@ without evidence.
   (`TestWriteErrHidesInternalDetail`, `TestRequestLoggerPassesThrough`,
   `TestRequestLoggerPreservesFlusher`).
 
+### ADR-018: No JS test runner — XSS safety enforced by convention + Go source guard (Phase E4)
+- Status: Active
+- Context: The dashboard has no automated tests. Options considered: (a) adopt a JS runner such as
+  node + jsdom or Playwright; (b) document the deliberate choice not to and enforce what matters
+  most via existing tooling.
+- Decision: **No JS test runner.** Adding npm/jsdom/Playwright would introduce a build step and an
+  npm dependency, violating the single-binary / no-build-step / no-npm project invariant (ADR-001,
+  ADR-007). Instead, dashboard XSS safety is enforced by two layers:
+  1. **Convention:** all DOM construction uses `el()` / `textContent` (never `innerHTML` or related
+     sinks), as codified in the Anti-Patterns section of `engineering-conventions.md` and in the
+     comment block at the top of `web_test.go`.
+  2. **Go source-level sink guard:** `TestDashboardNoXSSSinks` in `cmd/am/web_test.go` reads the
+     embedded `web/app.js` + `web/index.html` via the `webFS` embed.FS at `go test` time and asserts
+     that `.innerHTML`/`.outerHTML`/`.insertAdjacentHTML`/`document.write`/`eval(` do not appear.
+     A future accidental sink assignment fails `go test` before it ships.
+- Rationale: the XSS-safe DOM convention is the highest-value thing to enforce automatically;
+  doing so at the Go level costs nothing extra (same `go test` run, no new dependencies). Behavioral
+  JS logic (modal flows, delete confirms, feed pagination) remains manually verified — acceptable for
+  a personal board where the risk surface is localhost-only.
+- Consequences: behavioral dashboard JS is not automatically tested (documented gap in
+  `known-risks-and-gaps.md` and `frontend.md`). The sink guard is the chosen mitigation for the
+  most dangerous class of dashboard regression (XSS). Contributors must not add a JS runner.
+- Evidence: `cmd/am/web_test.go` (`TestDashboardNoXSSSinks`); `cmd/am/server.go`
+  (`//go:embed web`, `webFS`); `cmd/am/web/app.js` (`el()` helper, no `.innerHTML` usage).
+
 ## Inferred Decisions
 
 ### IADR-001: SSE chosen over WebSockets
@@ -315,7 +340,9 @@ without evidence.
 
 These are **undecided/undocumented** in the repo (decide + record before building):
 - **Authentication / remote-access model** — discussed but not chosen or written down.
-- **Testing strategy & coverage targets** — only `update_test.go` exists; no policy.
+- **Testing strategy & coverage targets** — Phase E closed the major gaps (CLI, SSE, identity,
+  dashboard XSS guard; ADR-018); behavioral dashboard JS is a documented deliberate gap. No
+  formal coverage target policy exists.
 - **Schema migration approach** — resolved + exercised; see IADR-003 / ADR-010 / ADR-013.
 - **Delete / archival semantics** — archive resolved as a reversible soft-delete (ADR-013); hard
   delete resolved (ADR-015, Phase C1); `events` retention resolved (ADR-016, Phase C2: offline prune

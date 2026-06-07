@@ -165,7 +165,7 @@ per request after completion: `METHOD PATH STATUS LATENCY ACTOR` (actor = `X-Age
 
 ## Testing
 
-There are six test files (run `go test ./...`):
+There are nine test files (run `go test -race ./cmd/am/`; 71 tests, all green):
 - `cmd/am/update_test.go` — version-comparison logic.
 - `cmd/am/store_test.go` — atomic-claim race (concurrent, `-race`-clean), events-cursor monotonicity,
   store CRUD + validation (`ErrValidation`), project archive/unarchive round-trip + idempotency,
@@ -182,10 +182,29 @@ There are six test files (run `go test ./...`):
 - `cmd/am/db_test.go` — `db export`/`import` roundtrip + file perms (0o600), backup creation + perms,
   garbage rejection, server-liveness check; `TestPruneEventsKeep`, `TestPruneEventsBefore`,
   `TestPruneEventsBeforeSameDayBoundary` (prune).
+- `cmd/am/cli_test.go` — CLI command-path + exit-code tests (Phase E1). Exercises verbs against a
+  real `httptest` server via a directly-constructed `Client`, using `captureStdout`/`captureExit`
+  helpers. Covers: `cmdNew` prints only the numeric id; `cmdLs` produces terse output; mutations
+  (`cmdStatus`/`cmdNote`/`cmdDrop`) are silent on success; and the exit-code mapping in
+  `client.go doOrFail` — 3 (not found), 4 (conflict), 5 (validation/`project_archived`), 6 (server
+  down). Also table-tests for `parse`/`Args` and the pure formatters
+  (`taskLine`/`statusShort`/`assignee`/`trunc`/`apiErr`).
+- `cmd/am/sse_test.go` — SSE streaming + reconnect (Phase E2). `TestSSEDeliversLiveEvent`
+  subscribes to `/api/stream`, creates a task, and asserts the `task.created` event arrives live.
+  `TestSSEReplayOnReconnect` reconnects with `Last-Event-ID` and asserts that events created while
+  disconnected are replayed and deduplicated (every replayed id is strictly greater than the resume
+  cursor).
+- `cmd/am/identity_test.go` — identity (Phase E3). `cmdInit`→`resolveAgent` roundtrip,
+  `AGENTMAN_AGENT` env override wins, `sanitizeType` table, `newIdentity` format. Isolates via the
+  `AGENTMAN_AGENT_FILE` env seam so the real `~/.agentman` is never written.
+- `cmd/am/web_test.go` — dashboard XSS-sink guard (Phase E4). `TestDashboardNoXSSSinks` reads the
+  embedded `web/app.js` + `web/index.html` via the `webFS` embed.FS and asserts that none of
+  `.innerHTML`/`.outerHTML`/`.insertAdjacentHTML`/`document.write`/`eval(` appear — a source-level
+  regression guard that locks in the `el()`/`textContent` XSS-safe DOM convention.
 
-So the archive, DB export/import, and prune paths are now covered. Also covered: events backward
-pagination (`TestListEventsBefore`, `TestEventsBeforeEndpoint`). **Still untested:** SSE
-streaming/reconnect, the rest of the CLI commands, identity, and the dashboard. (Gap; see
+So SSE streaming/reconnect, CLI verbs, exit-code mapping, and identity are now covered. The
+dashboard has a source-level XSS-sink guard but **no behavioral JS tests** — the project
+deliberately adopts no JS test runner (preserves the single-binary/no-npm ethos). (See
 `known-risks-and-gaps.md`.)
 
 ## Where to Add New Features

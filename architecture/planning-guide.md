@@ -77,11 +77,18 @@ Flag the change if it touches any of these invariants:
 ## Testing Checklist
 
 - [ ] Unit tests for new pure logic (table-driven, like `update_test.go`).
-- [ ] If you touch the claim, status, or validation paths, add a behavioral test (these are
-  high-value paths now covered by `TestClaimRaceExactlyOneWinner` (`store_test.go`),
-  `TestLostClaim409` (`server_test.go`), and the validation tests in `store_test.go` — extend
-  these rather than leaving new behavior uncovered).
-- [ ] `go vet ./...` and `go test ./...` pass; `gofmt -l cmd/am` empty.
+- [ ] If you touch the claim, status, or validation paths, add a behavioral test. High-value paths
+  are now covered by `TestClaimRaceExactlyOneWinner` (`store_test.go`), `TestLostClaim409`
+  (`server_test.go`), and the validation tests in `store_test.go` — extend these rather than
+  leaving new behavior uncovered.
+- [ ] If you add a new CLI command or exit-code path, test it via `captureExit`/`captureStdout`
+  against a `newTestServer(t)` — see `cli_test.go` for the pattern.
+- [ ] If you add new identity logic, use the `AGENTMAN_AGENT_FILE` env seam — see
+  `identity_test.go`.
+- [ ] Do **not** add a JS test runner. If you add DOM construction code, verify it uses `el()`/
+  `textContent` only, and add the new sink pattern to `TestDashboardNoXSSSinks` in `web_test.go`
+  if needed (ADR-018).
+- [ ] `go vet ./...` and `go test -race ./...` pass; `gofmt -l cmd/am` empty.
 
 ## Approval Gates
 

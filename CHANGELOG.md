@@ -13,6 +13,28 @@ _Target: **v0.4.0** — not yet tagged._
 
 ### Added
 
+- **Expanded automated test coverage (Phase E)** — 9 test files, 71 tests, all green under
+  `-race`. Four new test files close the previously-untested layers:
+  - **`cli_test.go` (E1)** — CLI verb output (`cmdNew`/`cmdLs`/`cmdStatus`/`cmdNote`/`cmdDrop`)
+    and the `doOrFail` exit-code mapping (3 not found · 4 conflict · 5 validation · 6 server
+    down); plus table tests for the `parse`/`Args` helpers and the pure formatters
+    (`taskLine`/`statusShort`/`assignee`/`trunc`/`apiErr`). Uses `captureStdout`/`captureExit`
+    helpers against a real `httptest` server.
+  - **`sse_test.go` (E2)** — `TestSSEDeliversLiveEvent` (live mutation arrives over SSE) and
+    `TestSSEReplayOnReconnect` (reconnect with `Last-Event-ID` replays missed events; every
+    replayed id is strictly greater than the resume cursor).
+  - **`identity_test.go` (E3)** — `cmdInit`→`resolveAgent` roundtrip, `AGENTMAN_AGENT` env
+    override, `sanitizeType` table, `newIdentity` format. Isolated via the `AGENTMAN_AGENT_FILE`
+    env seam (never writes to `~/.agentman`).
+  - **`web_test.go` (E4)** — `TestDashboardNoXSSSinks`: source-level XSS-sink guard that reads
+    the embedded `web/app.js` + `web/index.html` via `webFS` and asserts none of `.innerHTML`/
+    `.outerHTML`/`.insertAdjacentHTML`/`document.write`/`eval(` appear. Locks in the `el()`/
+    `textContent` convention at `go test` time. No JS runner added (ADR-018).
+  - **Testability seam:** `var osExit = os.Exit` in `cli.go`; `fail()` now calls `osExit` so
+    tests can intercept exit codes without killing the process. No production behavior change.
+  (`cmd/am/cli_test.go`, `cmd/am/sse_test.go`, `cmd/am/identity_test.go`, `cmd/am/web_test.go`,
+  `cmd/am/cli.go`)
+
 - **Opt-in request logging (Phase D2)** — `am serve --log` or `AGENTMAN_LOG=1` installs a
   `requestLogger` middleware that logs one line per request after completion:
   `METHOD PATH STATUS LATENCY ACTOR` (actor = `X-Agent`, default `"human"`) to stderr via the

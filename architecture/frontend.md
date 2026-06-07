@@ -125,8 +125,19 @@ Deliberately addressed in this codebase (see `decision-records.md` IADR / UX his
 
 ## Testing
 
-**None.** No JS test runner, no Playwright/Cypress, no snapshot tests. All frontend behavior in
-these docs is from source reading and manual verification, not automated tests. (Gap.)
+**No JS test runner** — by deliberate decision (Phase E4 / ADR-018). Adding npm/jsdom would break
+the no-npm/single-binary/no-build-step ethos that is a core project invariant.
+
+**XSS-sink guard (Go level):** `cmd/am/web_test.go` `TestDashboardNoXSSSinks` reads the embedded
+`web/app.js` + `web/index.html` via the `webFS` embed.FS at Go test time and asserts that none of
+`.innerHTML`/`.outerHTML`/`.insertAdjacentHTML`/`document.write`/`eval(` appear. This locks in the
+`el()`/`textContent` convention at `go test` time — an accidental sink assignment will fail the
+build before it ships.
+
+**Remaining gap:** behavioral dashboard JS — the "Manage projects" modal, the delete confirm flows
+(task/comment/project), the feed pagination button, multi-select filter logic, and SSE
+reconciliation paths — is not automatically tested. All frontend behavior in these docs is from
+source reading and manual verification. (Gap; see `known-risks-and-gaps.md`.)
 
 ## Where to Add New Features
 
@@ -141,7 +152,9 @@ these docs is from source reading and manual verification, not automated tests. 
 - **Native HTML5 drag-and-drop doesn't fire on touch** → mobile relies on the status dropdown /
   `[ ]` keys (documented fallback in code comments).
 - **Full board re-render per event batch** (debounced) — fine at small scale, O(n) at large scale.
-- Single 854-line `app.js`, no module split, no minification, no tests → refactors are unguarded.
-  The new delete confirm flows (task/comment/project) and feed pagination are additional untested JS.
+- Single 854-line `app.js`, no module split, no minification. Behavioral JS logic is not
+  automatically tested (deliberate no-JS-runner decision); XSS-sink safety is enforced by the
+  `TestDashboardNoXSSSinks` Go guard. The delete confirm flows and feed pagination are still
+  untested at the behavioral level.
 - `localStorage` access is wrapped (`lsGet`/`lsSet`) so a sandboxed/Private-mode browser won't
   break the app — keep that pattern if you add persistence.

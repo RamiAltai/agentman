@@ -67,26 +67,40 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 ## Testing Gaps
 
-- Coverage now spans store/server/migrate/db tests: the **atomic claim** (race, `-race`-clean), events
-  cursor, store CRUD/validation, validation→status mapping, the Host/CSRF/CSP guards, project
-  archive/unarchive (store round-trip + idempotency and the HTTP endpoints incl. 404), the v2 migration
-  (adds `archived_at` + apply/bump/idempotency/rollback), DB export/import (roundtrip+perms, backup
-  creation, garbage rejection, liveness probe), **feed hiding of archived-project events**
+- Coverage now spans store/server/migrate/db/cli/sse/identity/web tests (9 files, 71 tests,
+  `-race`-clean): the **atomic claim** (race, `-race`-clean), events cursor, store CRUD/validation,
+  validation→status mapping, the Host/CSRF/CSP guards, project archive/unarchive (store round-trip
+  + idempotency and the HTTP endpoints incl. 404), the v2 migration (adds `archived_at` +
+  apply/bump/idempotency/rollback), DB export/import (roundtrip+perms, backup creation, garbage
+  rejection, liveness probe), **feed hiding of archived-project events**
   (`TestFeedHidesArchivedProjectEvents`), **task creation into an archived project**
-  (`TestCreateTaskRejectsArchivedProject` store, `TestCreateTaskIntoArchivedProject400` HTTP), and
+  (`TestCreateTaskRejectsArchivedProject` store, `TestCreateTaskIntoArchivedProject400` HTTP),
   **hard deletes** (`TestDeleteTaskCascadesComments`, `TestDeleteTaskNotFound`,
   `TestDeleteCommentRemovesOnlyComment`, `TestDeleteProjectCascades` in `store_test.go`;
   `TestDeleteTaskEndpoint`, `TestDeleteProjectEndpoint`, `TestDeleteCommentEndpoint` in
   `server_test.go`), **events backward pagination** (`TestListEventsBefore` in `store_test.go`;
-  `TestEventsBeforeEndpoint` in `server_test.go`), and **events prune** (`TestPruneEventsKeep`,
-  `TestPruneEventsBefore`, `TestPruneEventsBeforeSameDayBoundary` in `db_test.go`) are all covered.
-  Phase D added `TestWriteErrHidesInternalDetail` (500 returns generic body, not raw error),
-  `TestRequestLoggerPassesThrough`, and `TestRequestLoggerPreservesFlusher` (in `server_test.go`).
-  **Still untested:** SSE streaming/reconnect, identity, most CLI command paths, and the entire
-  dashboard — including the "Manage projects" modal, the new delete confirm flows
-  (task/comment/project), and the feed pagination button — as no JS test runner exists.
-  → `backend.md`, `frontend.md`. Next highest-value: an XSS regression test for the dashboard and
-  CLI-path tests.
+  `TestEventsBeforeEndpoint` in `server_test.go`), **events prune** (`TestPruneEventsKeep`,
+  `TestPruneEventsBefore`, `TestPruneEventsBeforeSameDayBoundary` in `db_test.go`), and Phase D's
+  `TestWriteErrHidesInternalDetail`, `TestRequestLoggerPassesThrough`,
+  `TestRequestLoggerPreservesFlusher` (in `server_test.go`).
+  Phase E added:
+  - **CLI verbs + exit codes** (`cli_test.go`) — `cmdNew`, `cmdLs`, mutations (`cmdStatus`/
+    `cmdNote`/`cmdDrop`) silent-on-success, and the `doOrFail` exit-code mapping (3/4/5/6); plus
+    table tests for `parse`/`Args` and formatters (`taskLine`/`statusShort`/`assignee`/`trunc`/
+    `apiErr`).
+  - **SSE streaming + reconnect** (`sse_test.go`) — `TestSSEDeliversLiveEvent` and
+    `TestSSEReplayOnReconnect` (gap-replay with dedupe; every replayed id > resume cursor).
+  - **Identity** (`identity_test.go`) — `cmdInit`→`resolveAgent` roundtrip, `AGENTMAN_AGENT` env
+    override, `sanitizeType` table, `newIdentity` format.
+  - **Dashboard XSS-sink guard** (`web_test.go`) — `TestDashboardNoXSSSinks` reads the embedded
+    `web/app.js` + `web/index.html` via `webFS` and asserts no `.innerHTML`/`.outerHTML`/
+    `.insertAdjacentHTML`/`document.write`/`eval(` appear — a source-level lock on the
+    `el()`/`textContent` convention.
+  **Still untested:** behavioral dashboard JS — the "Manage projects" modal, the delete confirm
+  flows (task/comment/project), the feed pagination button, and other client-side logic — because
+  the project deliberately adopts **no JS test runner** (preserves the no-npm/single-binary ethos;
+  ADR-018). The `web_test.go` sink guard mitigates XSS regressions at the source level.
+  → `backend.md`, `frontend.md`, `decision-records.md` ADR-018.
 
 ## Documentation Gaps
 

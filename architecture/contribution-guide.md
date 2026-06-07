@@ -36,11 +36,12 @@ via `//go:embed`, so a running/old binary serves stale assets. Hard-refresh the 
 ## Running Tests
 
 ```sh
-go test ./...            # or: go test ./cmd/am/
+go test -race ./cmd/am/                     # run all tests with the race detector (71 tests)
+go test ./...                               # equivalent short form
 go test -run TestUpdateAvailable -v ./cmd/am/
 ```
 
-Tests live next to the code in `cmd/am/`:
+Tests live next to the code in `cmd/am/` (9 test files):
 
 - `update_test.go` — version-comparison logic.
 - `store_test.go` — CRUD + validation, the atomic claim race (exactly one winner), archive/unarchive
@@ -48,15 +49,58 @@ Tests live next to the code in `cmd/am/`:
   (`TestFeedHidesArchivedProjectEvents`), and task creation rejected into an archived project
   (`TestCreateTaskRejectsArchivedProject`).
 - `server_test.go` — HTTP status mapping (404 / 400 / lost-claim 409), the Host/CSRF guards and
-  security headers, the archive/unarchive endpoints, and HTTP 400 on task creation into an archived
-  project (`TestCreateTaskIntoArchivedProject400`).
+  security headers, the archive/unarchive endpoints, HTTP 400 on task creation into an archived
+  project (`TestCreateTaskIntoArchivedProject400`), `TestWriteErrHidesInternalDetail` (500 returns
+  generic body), `TestRequestLoggerPassesThrough`, `TestRequestLoggerPreservesFlusher`.
 - `migrate_test.go` — the forward-only migration runner (apply + version bump, skip ≤ current,
   idempotency, rollback) and the v2 `archived_at` column.
 - `db_test.go` — `am db` export/import (roundtrip + perms, backup creation, garbage rejection,
-  server-liveness probe).
+  server-liveness probe), and prune (`TestPruneEventsKeep`, `TestPruneEventsBefore`,
+  `TestPruneEventsBeforeSameDayBoundary`).
+- `cli_test.go` — CLI command-path + exit-code tests (Phase E1). Constructs a `Client` directly
+  against an `httptest` server. `captureStdout` captures os.Stdout via a pipe; `captureExit` stubs
+  the `osExit` var (see "Test Seams" below) to intercept exit codes as panics. Covers: `cmdNew`
+  prints only the numeric id; `cmdLs` terse output; mutations (`cmdStatus`/`cmdNote`/`cmdDrop`)
+  silent on success; exit-code mapping 3/4/5/6; and pure formatter/parse table tests.
+- `sse_test.go` — SSE streaming + reconnect (Phase E2). `TestSSEDeliversLiveEvent` opens
+  `/api/stream`, creates a task, and asserts the `task.created` event arrives live.
+  `TestSSEReplayOnReconnect` reconnects with `Last-Event-ID` and verifies gap-replay with
+  dedupe (every replayed id strictly greater than the resume cursor).
+- `identity_test.go` — identity (Phase E3). `cmdInit`→`resolveAgent` roundtrip, `AGENTMAN_AGENT`
+  env override wins, `sanitizeType` table, `newIdentity` format. Uses the `AGENTMAN_AGENT_FILE` env
+  seam so the real `~/.agentman` is never written.
+- `web_test.go` — dashboard XSS-sink guard (Phase E4). `TestDashboardNoXSSSinks` reads the embedded
+  `web/app.js` + `web/index.html` via the `webFS` embed.FS and asserts none of `.innerHTML`/
+  `.outerHTML`/`.insertAdjacentHTML`/`document.write`/`eval(` appear.
 
-The UI, SSE stream, and CLI dispatch are still **untested** — see `known-risks-and-gaps.md`. New
-behavioral tests are welcome.
+Behavioral dashboard JS (the modal flows, delete confirms, feed pagination) remains untested —
+see `known-risks-and-gaps.md`. New behavioral tests are welcome.
+
+### Test Seams
+
+Three seams exist specifically to make the CLI and identity layers testable without process-level
+side effects. Use them when adding tests for CLI commands or identity:
+
+| Seam | File | How to use in tests |
+|---|---|---|
+| `var osExit = os.Exit` | `cli.go` | Replace with a panic via `captureExit(t, fn)` in `cli_test.go` to intercept exit codes without killing the process. |
+| `captureStdout(t, fn)` | `cli_test.go` | Redirects `os.Stdout` to a pipe for the duration of `fn`; returns captured output. Safe with `t.Setenv`. |
+| `AGENTMAN_AGENT_FILE` env | `identity.go` | Set in tests (`t.Setenv`) to redirect the identity file to `t.TempDir()`, so the real `~/.agentman` is never written. |
+
+To build a `Client` against an `httptest` server without needing a real network:
+
+```go
+ts := newTestServer(t)                            // spins up a temp server + temp DB
+c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+cmdNew(c, parse([]string{"title", "-p", "proj"}))
+```
+
+### JS test runner
+
+The project deliberately adopts **no JS test runner** (no npm, no jsdom — preserves the
+single-binary/no-build-step ethos; see `decision-records.md` ADR-018). Dashboard XSS safety is
+enforced by the `el()`/`textContent` convention plus the `TestDashboardNoXSSSinks` Go source-level
+sink guard in `web_test.go`. Behavioral dashboard JS logic is not automatically tested.
 
 ## Inspecting Logs / Behavior
 
@@ -121,6 +165,12 @@ behavioral tests are welcome.
   `server_test.go` for status-mapping and guard examples.
 - For schema changes, follow `migrate_test.go`: assert the runner applies the step and bumps
   `meta.schema_version`, and that a fresh DB lands on `currentSchemaVersion`.
+- For CLI command paths, construct a `Client` directly against a `newTestServer(t)` and use
+  `captureStdout`/`captureExit` — see `cli_test.go` for the pattern.
+- For identity, set `AGENTMAN_AGENT_FILE` via `t.Setenv` to redirect the file to `t.TempDir()` —
+  see `identity_test.go`.
+- Do **not** add a JS test runner. Dashboard XSS safety is enforced by `TestDashboardNoXSSSinks` in
+  `web_test.go`; extend that test if you add new sink-like patterns.
 
 ## Common Mistakes
 

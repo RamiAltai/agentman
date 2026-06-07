@@ -9,6 +9,10 @@ import (
 	"strings"
 )
 
+// osExit is the process-exit function. Tests replace it with a panic-based
+// stub so that fail() can be tested without killing the test binary.
+var osExit = os.Exit
+
 // Boolean (valueless) flags; everything else with a leading dash consumes the
 // next token as its value. Aliases are canonicalised in canonFlag.
 var boolFlags = map[string]bool{"json": true, "mine": true, "all": true, "comments": true, "yes": true, "log": true}
@@ -400,5 +404,5 @@ func printJSON(v any) {
 
 func fail(code int, format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
-	os.Exit(code)
+	osExit(code)
 }

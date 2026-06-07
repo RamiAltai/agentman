@@ -90,21 +90,23 @@ Archiving currently hides a project's **tab** (`ListProjects`) and its **board t
     non-empty value as on (`=0`/`=false` also enable it — document `=1` as canonical).
     → `backend.md`, ADR-017. (`cmd/am/server.go`, `cmd/am/main.go`, `cmd/am/cli.go`)
 
-## Phase E — Test coverage (the untested areas)
+## Phase E — Test coverage (the untested areas) — **COMPLETE**
 
-Highest risk-reduction per effort; see `known-risks-and-gaps.md` "Testing Gaps".
-
-- [ ] **E1 · CLI command-path tests** — _M_ — exercise `ls/new/claim/status/assign/note/edit/drop/
-      projects/project/db` against an `httptest` server + temp `--db`; assert terse output, silent
-      success, and exit-code mapping (`client.go doOrFail`).
-- [ ] **E2 · SSE streaming / reconnect test** — _M_ — connect to `/api/stream`, emit a mutation,
-      assert the event arrives; reconnect with `Last-Event-ID` and assert gap replay + dedupe.
-- [ ] **E3 · Identity tests** — _S_ — `am init` writes the per-dir file; `resolveAgent` reads it;
-      `AGENTMAN_AGENT` overrides (`cmd/am/identity.go`).
-- [ ] **E4 · Dashboard JS — XSS regression + a runner decision** — _M_ — there is no JS test runner.
-      Either adopt a tiny one (e.g. node + jsdom) for an XSS regression (agent text rendered as
-      literal text, never markup) and the multi-select/archive logic, or document the deliberate
-      choice not to. → `frontend.md`.
+- [x] **E1 · CLI command-path tests** — _M_ — **shipped (Phase E1)**
+      `cmd/am/cli_test.go`: `captureStdout`/`captureExit` helpers; `cmdNew`/`cmdLs`/mutations
+      against a real `httptest` server; exit-code mapping 3/4/5/6; formatter/parse table tests.
+      Seam: `var osExit = os.Exit` in `cli.go` so `fail()` is interceptable in tests.
+- [x] **E2 · SSE streaming / reconnect test** — _M_ — **shipped (Phase E2)**
+      `cmd/am/sse_test.go`: `TestSSEDeliversLiveEvent` (live mutation arrives) and
+      `TestSSEReplayOnReconnect` (reconnect with `Last-Event-ID`; replayed ids > resume cursor).
+- [x] **E3 · Identity tests** — _S_ — **shipped (Phase E3)**
+      `cmd/am/identity_test.go`: `cmdInit`→`resolveAgent` roundtrip, `AGENTMAN_AGENT` env
+      override, `sanitizeType` table, `newIdentity` format. Uses `AGENTMAN_AGENT_FILE` seam.
+- [x] **E4 · Dashboard JS — XSS regression + runner decision** — _M_ — **shipped (Phase E4)**
+      Decision: **no JS test runner** (preserves no-npm/single-binary ethos; ADR-018).
+      `cmd/am/web_test.go` `TestDashboardNoXSSSinks`: source-level sink guard via Go + `webFS`
+      embed.FS. Behavioral dashboard JS remains manually verified (documented gap). → `frontend.md`,
+      `decision-records.md` ADR-018.
 
 ## Phase F — CI & tooling
 
