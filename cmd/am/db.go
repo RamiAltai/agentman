@@ -14,6 +14,36 @@ import (
 	"time"
 )
 
+// pruneEvents deletes old events rows from dbPath. Exactly one of before or keep
+// must be supplied (before as a YYYY-MM-DD string, keep as a positive count).
+// Returns the number of rows deleted. VACUUM is run afterwards on a best-effort
+// basis — a VACUUM error does NOT fail the prune.
+func pruneEvents(dbPath, before string, keep int) (int64, error) {
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"+
+		"&_pragma=foreign_keys(1)&_pragma=synchronous(1)", dbPath)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return 0, err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	var res sql.Result
+	if before != "" {
+		res, err = db.Exec("DELETE FROM events WHERE created_at < ?", before)
+	} else {
+		// Delete all rows NOT in the newest keep rows.
+		res, err = db.Exec("DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT ?)", keep)
+	}
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	// VACUUM to reclaim disk space; best-effort — don't fail if it errors.
+	db.Exec("VACUUM")
+	return n, nil
+}
+
 // cmdDB dispatches the "am db" subcommand.
 func cmdDB(a Args) {
 	sub := a.at(0)
@@ -46,8 +76,55 @@ func cmdDB(a Args) {
 		if err := importDB(srcPath, dbPath, backupDir, assumeYes); err != nil {
 			fail(1, "am db import: %v", err)
 		}
+	case "prune":
+		beforeDate := a.flag("before")
+		keepStr := a.flag("keep")
+		dbPath := a.flag("db")
+		if dbPath == "" {
+			dbPath = defaultDBPath()
+		}
+		assumeYes := a.has("yes")
+
+		// Require exactly one of --before / --keep.
+		if (beforeDate == "") == (keepStr == "") {
+			fail(1, "am db prune: provide exactly one of --before <YYYY-MM-DD> or --keep <N>")
+		}
+		var keepN int
+		if keepStr != "" {
+			v, err := strconv.Atoi(keepStr)
+			if err != nil || v < 0 {
+				fail(1, "am db prune: --keep must be a non-negative integer")
+			}
+			keepN = v
+		}
+
+		// Refuse while a server is running.
+		if isServerRunning(envOr("AGENTMAN_URL", "http://127.0.0.1:8787")) {
+			fail(1, "am db prune: stop `am serve` before pruning")
+		}
+
+		// Confirm unless --yes.
+		if !assumeYes {
+			if beforeDate != "" {
+				fmt.Fprintf(os.Stderr, "This will delete events before %s from %s. Continue? [y/N] ", beforeDate, dbPath)
+			} else {
+				fmt.Fprintf(os.Stderr, "This will delete all but the newest %d events from %s. Continue? [y/N] ", keepN, dbPath)
+			}
+			scanner := bufio.NewScanner(os.Stdin)
+			scanner.Scan()
+			line := strings.TrimSpace(strings.ToLower(scanner.Text()))
+			if line != "y" && line != "yes" {
+				fail(1, "aborted")
+			}
+		}
+
+		n, err := pruneEvents(dbPath, beforeDate, keepN)
+		if err != nil {
+			fail(1, "am db prune: %v", err)
+		}
+		fmt.Fprintf(os.Stderr, "pruned %d events\n", n)
 	default:
-		fail(1, "usage: am db <export|import> ...")
+		fail(1, "usage: am db <export|import|prune> ...")
 	}
 }
 

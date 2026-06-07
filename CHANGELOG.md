@@ -13,6 +13,26 @@ _Target: **v0.4.0** — not yet tagged._
 
 ### Added
 
+- **Events pagination + retention (Phase C2)** — completes Phase C:
+  - **`GET /api/events?before=<id>`** — backward cursor: returns events with `id < before`,
+    newest-first (default 40, cap 200). Applies the same archived-project filter as `?since=`/`?tail=`
+    when no `?project=` is given; an explicit `?project=<slug>` returns that project's events.
+    Store method: `ListEventsBefore(before, project, limit)` (`cmd/am/store.go`).
+  - **Dashboard "Load older activity"** button at the bottom of the activity feed fetches
+    `?before=<oldest-loaded-id>` and appends results. Placed outside `#feedList` so `trimFeed`
+    can't remove it. `feedPaginated` disables the feed cap once the user has paged (trade-off: the
+    in-browser feed can grow unbounded until the next reload). An end-marker replaces the button
+    when all history is loaded. All DOM via `el()` (no `innerHTML`).
+    (`cmd/am/web/app.js`, `cmd/am/web/app.css`)
+  - **`am db prune (--before <YYYY-MM-DD> | --keep <N>) [--db PATH] [--yes]`** — offline events
+    retention (CLI-only, no HTTP route). Refuses while a server is running (same guard as
+    `am db import`). Deletes rows from the **`events` table only** (not tasks/comments/projects),
+    then runs `VACUUM` (best-effort) to reclaim disk space. Prints `pruned N events` to stderr;
+    stdout stays clean. `--before <date>`: same-day events are kept (date-only string sorts before
+    same-day ISO timestamps). `--keep N`: keeps the newest N events by id. (`cmd/am/db.go`)
+  - Tests: `TestListEventsBefore` (store), `TestEventsBeforeEndpoint` (HTTP); `TestPruneEventsKeep`,
+    `TestPruneEventsBefore`, `TestPruneEventsBeforeSameDayBoundary` (prune). 43 tests pass total.
+
 - **Hard delete (Phase C1)** — permanent removal for tasks, comments, and projects:
   - CLI: `am rm <id>` hard-deletes a task and all its comments (silent success; exit 3 if not found).
     `am project rm <slug> --yes` hard-deletes a project **and all its tasks/comments** (cascade);

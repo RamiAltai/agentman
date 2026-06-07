@@ -21,14 +21,14 @@ broadcast → dashboard**. Confirmed via `cmd/am/main.go`, `cmd/am/server.go`, `
 | `cmd/am/server.go` | HTTP handlers, routing, SSE endpoint, `go:embed web` | `Server`, `Handler()`, `handle*` |
 | `cmd/am/hub.go` | SSE subscriber hub (broadcast/fan-out) | `Hub`, `subscriber` |
 | `cmd/am/store.go` | All SQLite access; types; atomic claim; events | `Store` + domain structs |
-| `cmd/am/db.go` | `am db export`/`import` (offline snapshot/restore) | `cmdDB`, `exportDB`, `importDB` |
+| `cmd/am/db.go` | `am db export`/`import`/`prune` (offline snapshot/restore/retention) | `cmdDB`, `exportDB`, `importDB`, `pruneEvents` |
 | `cmd/am/schema.sql` | DB schema (embedded) | `meta/projects/tasks/comments/events` |
 | `cmd/am/client.go` | CLI HTTP client; HTTP-status → exit-code mapping | `Client`, `doOrFail` |
 | `cmd/am/cli.go` | CLI verb parsing + terse/JSON formatters | `cmd*`, `parse`, `fail` |
 | `cmd/am/identity.go` | Per-directory agent identity (`am init`/`am whoami`) | `resolveAgent`, `identityFile` |
 | `cmd/am/version.go` | Version reporting (`am version`) | `version()`, `injectedVersion` (ldflags) |
 | `cmd/am/update.go` | `am update` + startup update check | `cmdUpdate`, `checkForUpdate` |
-| `cmd/am/db.go` | `am db` export/import (offline snapshot/restore) | `cmdDB`, `exportDB`, `importDB` |
+| `cmd/am/db.go` | `am db` export/import/prune (offline snapshot/restore/retention) | `cmdDB`, `exportDB`, `importDB`, `pruneEvents` |
 | `cmd/am/*_test.go` | Tests: `update_test`, `store_test`, `server_test`, `migrate_test`, `db_test` | claim race, HTTP guards, migrations, export/import |
 | `cmd/am/web/` | Embedded dashboard: `index.html`, `app.css`, `app.js` | Vanilla, no build step |
 | `docs/agent-integration.md` | How to wire agents (Claude Code) to the board | User docs |
@@ -41,7 +41,8 @@ Unknown/absent: no `internal/`, `pkg/`, `.github/`, `Makefile`, `Dockerfile`, or
 
 - **Process entry:** `cmd/am/main.go` `func main()`. It reads `os.Args[1]` and dispatches.
   Local-only verbs (`init`, `whoami`, `version`, `update`, `db`) run without a server — `db`
-  dispatches before the `Client` is built, operating directly on the SQLite file; everything else
+  dispatches before the `Client` is built, operating directly on the SQLite file (`export`,
+  `import`, and `prune` all refuse while a server is running); everything else
   constructs a `Client` (`NewClient()`); `serve` calls `runServe()`.
 - **Server entry:** `runServe()` opens the store, builds `Server` (`NewServer`), and runs
   `http.Server{Addr: "127.0.0.1:"+port}`.
@@ -67,7 +68,8 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   `GET/POST /api/tasks`, `GET/PATCH /api/tasks/{id}`,
   `DELETE /api/tasks/{id}` (hard-delete + cascade to comments),
   `POST /api/tasks/{id}/claim`, `POST /api/tasks/{id}/comments`,
-  `DELETE /api/tasks/{id}/comments/{cid}`, `GET /api/events`,
+  `DELETE /api/tasks/{id}/comments/{cid}`,
+  `GET /api/events` (`?since=` ascending / `?tail=` newest-first / `?before=` backward cursor),
   `GET /api/stream`, and `/` → `http.FileServer` over `go:embed web`.
   All three DELETE routes return `200 {"status":"deleted"}`; `ErrNotFound` → 404.
   (Uses Go 1.22+ method+pattern ServeMux, e.g. `"GET /api/tasks/{id}"`.)
@@ -79,9 +81,10 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   event in the same tx before the DELETE, then commits; cascade via FK).
 - **CLI** — `cmd/am/cli.go` + `cmd/am/client.go`: verb parsing, terse output, exit-code mapping.
   Includes `project archive`/`project unarchive <slug>` and `projects --all` (lists archived,
-  marked `(archived)`); `db export`/`db import` are handled offline in `cmd/am/db.go`.
+  marked `(archived)`); `db export`/`db import`/`db prune` are handled offline in `cmd/am/db.go`.
   Hard-delete verbs: `am rm <id>` (silent success, exit 3 if not found); `am project rm <slug> --yes`
-  (requires `--yes`; cascade-deletes project + all tasks/comments).
+  (requires `--yes`; cascade-deletes project + all tasks/comments). `am db prune (--before <date> |
+  --keep <N>) [--yes]` — offline events-only retention.
 - **Dashboard** — `cmd/am/web/app.js`: vanilla SPA; SSE consumer; board/modal/feed rendering.
   Includes a `⋯` "Manage projects" button in the tab bar that opens a modal (`openManageProjects`/
   `renderManageList`) listing all projects (active + archived via `GET /api/projects?archived=true`),

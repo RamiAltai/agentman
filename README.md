@@ -156,6 +156,7 @@ Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting 
 | `am serve [--port 8787] [--db PATH]` | run the dashboard + API |
 | `am db export [path] [--db PATH]` | write a consistent DB snapshot (prints the path) |
 | `am db import <path> [--db PATH] [--yes]` | restore a snapshot (stop `am serve` first; backs up current DB) |
+| `am db prune (--before <YYYY-MM-DD> \| --keep <N>) [--db PATH] [--yes]` | trim old events from the DB (offline; events only; stop `am serve` first) |
 | `am version` · `am update [version]` | print version · reinstall the latest (or a given) version |
 
 `<id>` accepts a global id (`13`) or a project ref (`web-3`). `--status` accepts a comma
@@ -173,7 +174,7 @@ POST   /api/projects {slug,name}              PATCH  /api/tasks/{id} {status?,as
 DELETE /api/projects/{slug}                   POST   /api/tasks/{id}/claim
 GET    /api/tasks?project=&status=&assignee=  POST   /api/tasks/{id}/comments {body}
 POST   /api/tasks {project,title,...}         DELETE /api/tasks/{id}/comments/{cid}
-DELETE /api/tasks/{id}                        GET    /api/events?since=  (poll)
+DELETE /api/tasks/{id}                        GET    /api/events?since=|?tail=|?before=  (poll/page)
                                               GET    /api/stream  (SSE)
 ```
 
@@ -206,6 +207,18 @@ am db import /backups/board.db   # restore — stop `am serve` first; backs up t
 
 `am db import` validates the snapshot, refuses to run while a server is up, and backs up your
 existing DB before swapping it in. Both commands operate directly on the SQLite file.
+
+To trim the event log on a long-running instance, use `am db prune` (stop `am serve` first):
+
+```sh
+am db prune --before 2026-01-01   # delete events older than 2026-01-01 (same-day events kept)
+am db prune --keep 10000          # keep only the newest 10 000 events
+am db prune --keep 10000 --yes    # skip the confirmation prompt
+```
+
+`am db prune` deletes **events only** (not tasks, comments, or projects), then runs `VACUUM` to
+reclaim disk space. It prints `pruned N events` to stderr. The dashboard's activity feed also has a
+**"Load older activity"** button at the bottom of the feed to page back through history on demand.
 
 ## Updating
 

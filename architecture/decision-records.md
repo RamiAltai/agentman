@@ -216,6 +216,40 @@ without evidence.
   (`cmdRm`, `project rm`); `cmd/am/main.go` (`rm` dispatch); `cmd/am/web/app.js` (delete buttons,
   `onEvent` for `*.deleted`); `cmd/am/store_test.go` + `cmd/am/server_test.go` (7 new tests).
 
+### ADR-016: Events retention via offline prune + backward cursor pagination (Phase C2)
+- Status: Active
+- Context: The `events` table is append-only (ADR-004); long-running instances grow without bound.
+  Phase C1 added hard deletes for tasks/comments/projects but explicitly left event retention for C2.
+  The dashboard "Load older activity" need drove a `?before=` cursor alongside the existing `?since=`
+  and `?tail=` query modes.
+- Decision:
+  1. **`?before=` backward cursor** on `GET /api/events` — `ListEventsBefore(before, project, limit)`
+     returns events with `id < before`, newest-first (default limit 40, cap 200), applying the same
+     archived-project filter as `ListEvents`/`RecentEvents`. The `handleEvents` handler dispatches to
+     it when a `before=` param is present; returns `{"events":[...]}`.
+  2. **`am db prune (--before <YYYY-MM-DD> | --keep <N>) [--yes]`** — CLI-only offline maintenance,
+     dispatched in `main.go` before the HTTP client is built (same as `am db import`). Refuses while
+     a server is running (probes `AGENTMAN_URL`). Deletes rows from the **`events` table only** (not
+     comments/tasks/projects), then runs `VACUUM` best-effort. Prints `pruned N events` to stderr;
+     stdout stays clean. `--before`: date-only string sorts before same-day ISO timestamps, so same-day
+     events are kept. `--keep N`: keeps the newest N by id. Confirms unless `--yes`.
+  3. **Dashboard "Load older activity"** button placed **outside** `#feedList` (so `trimFeed` can't
+     remove it); `feedPaginated` disables `trimFeed` once the user has paged. End-marker replaces the
+     button when exhausted. All DOM via `el()`.
+- Rationale: cursor pagination avoids a server-side scan on every feed load and lets the dashboard
+  lazily extend history on demand. Offline-only prune keeps retention out of the loopback attack
+  surface (ADR-011) and avoids fighting the single-writer connection (ADR-003). Events-only scope
+  is intentional — tasks/comments already have hard-delete; event rows are denormalized (ADR-004),
+  so pruning them doesn't break referential integrity.
+- Residuals: prune is manual (no scheduled compaction); the `isServerRunning` guard checks
+  `AGENTMAN_URL` and is bypassable on non-default ports (same residual as `am db import`);
+  `feedPaginated` disabling `trimFeed` can grow the in-browser feed unbounded until reload.
+- Evidence: `cmd/am/store.go` (`ListEventsBefore`); `cmd/am/server.go` (`handleEvents` `?before=`
+  branch); `cmd/am/db.go` (`pruneEvents`, `cmdDB` prune case); `cmd/am/web/app.js`
+  (`feedOldest`, `feedPaginated`, `loadOlderActivity`, `loadOlderBtn`);
+  `cmd/am/store_test.go` (`TestListEventsBefore`); `cmd/am/server_test.go` (`TestEventsBeforeEndpoint`);
+  `cmd/am/db_test.go` (`TestPruneEventsKeep`, `TestPruneEventsBefore`, `TestPruneEventsBeforeSameDayBoundary`).
+
 ## Inferred Decisions
 
 ### IADR-001: SSE chosen over WebSockets
@@ -256,7 +290,8 @@ These are **undecided/undocumented** in the repo (decide + record before buildin
 - **Testing strategy & coverage targets** — only `update_test.go` exists; no policy.
 - **Schema migration approach** — resolved + exercised; see IADR-003 / ADR-010 / ADR-013.
 - **Delete / archival semantics** — archive resolved as a reversible soft-delete (ADR-013); hard
-  delete resolved (ADR-015, Phase C1); `events`/`comments` retention still undecided (C2 pending).
+  delete resolved (ADR-015, Phase C1); `events` retention resolved (ADR-016, Phase C2: offline prune
+  + `?before=` cursor pagination); `comments` retention remains undecided (no bulk prune).
 - **CI/CD & release automation** — no `.github/`; releases are manual `git tag` + push.
 - **Versioning / CHANGELOG policy** — tags exist (`v0.1.0`–`v0.3.0`); `CHANGELOG.md` (Keep a
   Changelog format) and `ROADMAP.md` now exist in the repo root. Release automation and a stated

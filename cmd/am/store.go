@@ -838,6 +838,48 @@ func (s *Store) ListEvents(since int64, project string, limit int) ([]Event, int
 	return out, last, rows.Err()
 }
 
+// ListEventsBefore returns events with id < before, newest-first, up to limit.
+// It mirrors the archived-project filter used by ListEvents and RecentEvents.
+// Default limit 40, cap 200.
+func (s *Store) ListEventsBefore(before int64, project string, limit int) ([]Event, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 40
+	}
+	var args []any
+	q := `SELECT events.id,COALESCE(events.project_id,0),COALESCE(events.task_id,0),events.actor,events.kind,events.data,events.created_at
+	      FROM events LEFT JOIN projects p ON p.id = events.project_id
+	      WHERE events.id<?`
+	args = append(args, before)
+	if project != "" {
+		pid, err := s.projectID(project)
+		if err != nil {
+			return nil, err
+		}
+		q += " AND events.project_id=?"
+		args = append(args, pid)
+	} else {
+		q += " AND (events.project_id IS NULL OR p.archived_at IS NULL)"
+	}
+	q += " ORDER BY events.id DESC LIMIT ?"
+	args = append(args, limit)
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Event{}
+	for rows.Next() {
+		var e Event
+		var data string
+		if err := rows.Scan(&e.ID, &e.ProjectID, &e.TaskID, &e.Actor, &e.Kind, &data, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		e.Data = json.RawMessage(data)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) MaxEventID() (int64, error) {
 	var id int64
 	err := s.db.QueryRow("SELECT COALESCE(MAX(id),0) FROM events").Scan(&id)

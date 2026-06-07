@@ -6,6 +6,104 @@ import (
 	"testing"
 )
 
+func TestListEventsBefore(t *testing.T) {
+	st := openTestStore(t)
+
+	// Create two projects, one active and one to be archived.
+	if _, _, err := st.CreateProject("active", "Active"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateProject("archproj", "Archived"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create several tasks in "active" to generate events.
+	var ids []int64
+	for _, title := range []string{"t1", "t2", "t3", "t4"} {
+		tk, _, err := st.CreateTask(CreateTaskInput{Project: "active", Title: title})
+		if err != nil {
+			t.Fatalf("CreateTask %s: %v", title, err)
+		}
+		ids = append(ids, tk.ID)
+	}
+
+	// Create a task in archproj.
+	archTask, _, err := st.CreateTask(CreateTaskInput{Project: "archproj", Title: "arch-t1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = archTask
+
+	// Collect all event IDs in ascending order.
+	allEvs, _, err := st.ListEvents(0, "", 500)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if len(allEvs) < 5 {
+		t.Fatalf("want >=5 events, got %d", len(allEvs))
+	}
+
+	// before= the last event id: should return all but the last, newest-first.
+	lastID := allEvs[len(allEvs)-1].ID
+	got, err := st.ListEventsBefore(lastID, "", 100)
+	if err != nil {
+		t.Fatalf("ListEventsBefore: %v", err)
+	}
+	if len(got) != len(allEvs)-1 {
+		t.Fatalf("ListEventsBefore(%d) len=%d, want %d", lastID, len(got), len(allEvs)-1)
+	}
+	// Must be strictly descending.
+	for i := 1; i < len(got); i++ {
+		if got[i].ID >= got[i-1].ID {
+			t.Fatalf("ids not descending: %d then %d", got[i-1].ID, got[i].ID)
+		}
+	}
+	// All returned ids must be < lastID.
+	for _, e := range got {
+		if e.ID >= lastID {
+			t.Fatalf("returned event id %d >= before %d", e.ID, lastID)
+		}
+	}
+
+	// Archive archproj — its events must be excluded from unfiltered before-query.
+	archPID, _ := st.projectID("archproj")
+	if _, _, err := st.ArchiveProject("archproj", "tester"); err != nil {
+		t.Fatal(err)
+	}
+	gotAfterArchive, err := st.ListEventsBefore(lastID+1, "", 100)
+	if err != nil {
+		t.Fatalf("ListEventsBefore after archive: %v", err)
+	}
+	for _, e := range gotAfterArchive {
+		if e.ProjectID == archPID {
+			t.Errorf("ListEventsBefore(unfiltered) returned event from archived project_id=%d kind=%s", archPID, e.Kind)
+		}
+	}
+
+	// Explicit project="archproj" should still return that project's events even archived.
+	archEvs, err := st.ListEventsBefore(lastID+1, "archproj", 100)
+	if err != nil {
+		t.Fatalf("ListEventsBefore(archproj): %v", err)
+	}
+	if len(archEvs) == 0 {
+		t.Error("ListEventsBefore(archproj) returned no events; want archived project's events")
+	}
+	for _, e := range archEvs {
+		if e.ProjectID != archPID {
+			t.Errorf("ListEventsBefore(archproj) returned unexpected project_id=%d", e.ProjectID)
+		}
+	}
+
+	// Limit is respected.
+	limited, err := st.ListEventsBefore(lastID+1, "", 2)
+	if err != nil {
+		t.Fatalf("ListEventsBefore limited: %v", err)
+	}
+	if len(limited) > 2 {
+		t.Fatalf("expected <=2 events with limit=2, got %d", len(limited))
+	}
+}
+
 func TestCreateProjectAndTaskHappyPath(t *testing.T) {
 	st := openTestStore(t)
 	if _, _, err := st.CreateProject("web", "Web"); err != nil {

@@ -164,8 +164,9 @@ func usage() {
   am project rm <slug> --yes             hard-delete a project + ALL its tasks/comments
   am version                                  print version
   am update [version]                         reinstall the latest (or a given) version
-  am db export [path] [--db PATH]          export a DB snapshot (prints path)
-  am db import <path> [--db PATH] [--yes]  import a snapshot (stop serve first)
+  am db export [path] [--db PATH]                            export a DB snapshot (prints path)
+  am db import <path> [--db PATH] [--yes]                    import a snapshot (stop serve first)
+  am db prune [--db PATH] (--before YYYY-MM-DD | --keep N) [--yes]  delete old events rows
 
 Identity: run 'am init <tasktype>' once per session (or set AGENTMAN_AGENT).
 Env: AGENTMAN_URL (default http://127.0.0.1:8787), AGENTMAN_PROJECT (default project).

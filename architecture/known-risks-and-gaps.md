@@ -31,8 +31,20 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
     `LEFT JOIN projects … p.archived_at IS NULL`, and a deleted project has no row (JOIN yields NULL,
     treated as "not archived"). The `project.deleted` event and the deleted project's earlier history
     remain visible in the feed (good for an audit trail; see `data-model.md`).
-  - **`events`/`comments` growth is still unbounded** — C2 (events pagination + retention/prune) is
-    pending. The dashboard caps render but not DB storage.
+  - **`events` growth is now partially bounded** — **Phase C2 shipped**: backward cursor pagination
+    (`GET /api/events?before=<id>`, `ListEventsBefore`; dashboard "Load older activity" button) and
+    offline retention (`am db prune (--before <YYYY-MM-DD> | --keep <N>)`, events-only, refuses while
+    a server is running). Residuals (Low):
+    - `am db prune` is **manual and offline** — no automated compaction; a long-running instance
+      still grows until an operator runs it.
+    - The `isServerRunning` offline guard checks `AGENTMAN_URL` (default `http://127.0.0.1:8787`). A
+      server running on a non-default port with `AGENTMAN_URL` unset/mismatched would **not** be
+      detected, so `am db import` and `am db prune` could run against a live DB. The documented
+      instruction is "stop `am serve` first"; the guard is bypassable on non-default ports.
+    - The dashboard's paginated feed (`feedPaginated = true`) **disables `trimFeed`** — a
+      long-running tab that has clicked "Load older" can grow the feed unbounded until the next reload.
+  - **`comments` growth is still unbounded** — comments are only removed individually via the
+    hard-delete endpoint (no bulk prune). The dashboard caps render but not DB storage.
   Residual (Low) from earlier: the live SSE broadcast (`hub.Broadcast`) is not archive-filtered —
   an event on a project archived after the SSE connection was opened can flash transiently in the
   feed until the next `ListEvents` reload filters it out. → `data-model.md`.
@@ -65,9 +77,12 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   **hard deletes** (`TestDeleteTaskCascadesComments`, `TestDeleteTaskNotFound`,
   `TestDeleteCommentRemovesOnlyComment`, `TestDeleteProjectCascades` in `store_test.go`;
   `TestDeleteTaskEndpoint`, `TestDeleteProjectEndpoint`, `TestDeleteCommentEndpoint` in
-  `server_test.go`) are all covered. **Still untested:** SSE streaming/reconnect, identity, most CLI
-  command paths, and the entire dashboard — including the "Manage projects" modal and the new delete
-  confirm flows (task/comment/project) — as no JS test runner exists.
+  `server_test.go`), **events backward pagination** (`TestListEventsBefore` in `store_test.go`;
+  `TestEventsBeforeEndpoint` in `server_test.go`), and **events prune** (`TestPruneEventsKeep`,
+  `TestPruneEventsBefore`, `TestPruneEventsBeforeSameDayBoundary` in `db_test.go`) are all covered.
+  **Still untested:** SSE streaming/reconnect, identity, most CLI command paths, and the entire
+  dashboard — including the "Manage projects" modal, the new delete confirm flows
+  (task/comment/project), and the feed pagination button — as no JS test runner exists.
   → `backend.md`, `frontend.md`. Next highest-value: an XSS regression test for the dashboard and
   CLI-path tests.
 
@@ -85,7 +100,7 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 - ~~`gofmt -l` is non-empty~~ — **fixed in Phase 0** (`cmd/am/update_test.go`, `cmd/am/version.go`
   formatted; `gofmt -l cmd/am` is now empty).
-- `store.go` (~850 lines) and `app.js` (~615 lines) are the largest files and mix several
+- `store.go` (~1000 lines) and `app.js` (~854 lines) are the largest files and mix several
   responsibilities; fine now, watch for growth.
 - No linter beyond `gofmt`/`go vet`; no pre-commit hooks.
 
@@ -94,9 +109,11 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 - Single SQLite file + single writer + full-board re-render → designed for a personal board, not a
   large team or thousands of tasks. No pagination on most reads (list capped only by `limit`/`tail`
   params and a client-side "Done" cap of 50).
-- `events` table is append-only with no retention — long-running instances grow indefinitely.
-- Backup/restore now exists via `am db export` / `am db import` (CLI-only, `VACUUM INTO` snapshot);
-  import still refuses while a server is running, so it requires stopping `am serve` first.
+- `events` table is append-only; offline pruning via `am db prune` is now available but is
+  **manual** — long-running instances still grow unless an operator prunes periodically.
+- `comments` table has no bulk prune; individual comments are deleted via the hard-delete endpoint.
+- Backup/restore now exists via `am db export` / `am db import` / `am db prune` (all CLI-only);
+  `import` and `prune` refuse while a server is running, so they require stopping `am serve` first.
 
 ## Unknowns
 

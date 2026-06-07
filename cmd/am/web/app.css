@@ -215,6 +215,13 @@ body.resizing { cursor: col-resize; user-select: none; }
 .ev-text .ref:hover { text-decoration: underline; }
 .ev-time { color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .feed-empty { color: var(--faint); text-align: center; padding: 28px 16px; font-size: 13px; }
+.feed-load-older {
+  display: block; width: calc(100% - 24px); margin: 4px 12px 8px;
+  background: var(--card-bg); border: 1px solid var(--line); color: var(--muted);
+  border-radius: 8px; padding: 7px 12px; font-size: 12px; text-align: center;
+}
+.feed-load-older:hover:not(:disabled) { color: var(--fg); border-color: var(--line-strong); }
+.feed-start-marker { color: var(--faint); text-align: center; font-size: 11px; padding: 6px 12px 10px; }
 
 /* collapsed on desktop = panel slides to zero width */
 @media (min-width: 721px) {

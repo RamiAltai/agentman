@@ -85,7 +85,7 @@ project → tasks → comments. **Events are never deleted** (append-only).
   broadcasts after commit. Cascade is via existing schema FKs (`projects → tasks → comments`
   and `tasks → comments` are `ON DELETE CASCADE`; DSN has `foreign_keys(1)`), so deleting a project
   removes all its tasks and comments, and deleting a task removes all its comments.
-  **`events` rows are never deleted** — `events.project_id` / `events.task_id` are denormalized,
+  **`events` rows are not deleted by hard-delete operations** — `events.project_id` / `events.task_id` are denormalized,
   nullable, and not foreign keys (confirmed: `schema.sql` defines no FK on `events`), so the
   audit log, including the new `*.deleted` event, survives the hard delete.
   **Nuance — deleted-project events reappear in the feed:** the unfiltered activity feed uses
@@ -100,8 +100,11 @@ project → tasks → comments. **Events are never deleted** (append-only).
   CLI: `am rm <id>` (silent success; exit 3 if not found); `am project rm <slug> --yes` (requires
   `--yes` or it errors with a hint; cascade-deletes the project and all its tasks/comments).
   Missing target → `ErrNotFound` → HTTP 404.
-- **Growth:** `events` and `comments` grow unbounded (C2 pending); the dashboard caps the "Done"
-  column render at 50 and the feed at ~200 nodes (`web/app.js`), but the DB retains everything.
+- **Growth:** `events` can now be **paged** (`GET /api/events?before=<id>` — backward cursor via
+  `ListEventsBefore`) and **pruned** offline with `am db prune (--before <YYYY-MM-DD> | --keep <N>)`
+  (events-only, no HTTP route, refuses while a server is running). `comments` are still only removed
+  individually via the hard-delete endpoint (Phase C1). The dashboard caps the "Done" column render at
+  50 and the feed at ~200 nodes (`web/app.js`), but the DB retains everything until explicitly pruned.
 
 ## Migrations
 
@@ -128,6 +131,12 @@ Backup/restore:
   required tables, `schema_version <= currentSchemaVersion`), **refuses while a server is running**,
   backs up the current DB (`0o600`) into the DB's directory, then atomically replaces it
   (`cmd/am/db.go importDB`).
+- **`am db prune (--before <YYYY-MM-DD> | --keep <N>) [--db PATH] [--yes]`** — offline maintenance
+  (refuses while a server is running, like `am db import`); deletes rows from the **`events` table
+  only** (NOT comments/tasks/projects), then runs `VACUUM` (best-effort) to reclaim disk space.
+  Prints `pruned N events` to stderr; stdout stays clean. `--before <date>`: deletes events strictly
+  before that calendar day (same-day events are kept — a date-only string sorts before same-day ISO
+  timestamps). `--keep N`: keeps the newest N events by id, deletes the rest. Confirms unless `--yes`.
 
 ## Diagram
 
@@ -176,7 +185,8 @@ erDiagram
 
 ## Unknowns
 
-- **Retention/archival policy** for `events`/`comments` — none defined (C2 pending, Unknown).
+- **Retention policy for `comments`** — none defined; comments are only removed individually via
+  hard-delete. For `events`: offline pruning is available via `am db prune` (see Backup/restore).
 - **Per-project `ref` is not gap-free after deletes** — `MAX(ref)+1` reuses the number if the
   highest-numbered task in a project is deleted and a new task is created. Accepted for a personal
   board (no counter/migration added, Phase C1 decision).

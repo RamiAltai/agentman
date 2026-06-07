@@ -13,6 +13,11 @@ let selected = new Set();    // selected project slugs; empty = "All"
 let tasks = new Map();       // id -> task (terse)
 let cursor = 0;              // highest event id seen (SSE since=)
 let es = null, backoff = 1000, refreshTimer = null, openTaskId = null, lastFocus = null, dragId = null;
+let feedOldest = 0;          // lowest event id currently in #feedList (0 = none loaded)
+let feedPaginated = false;   // true once the user has clicked "Load older"; trimFeed is then skipped
+                             // to avoid fighting pagination (raising the cap is the other option,
+                             // but skipping trimming is simpler since the user explicitly asked for more)
+let loadOlderBtn = null;     // reference to the "Load older" button element
 
 const $ = (id) => document.getElementById(id);
 
@@ -80,9 +85,24 @@ async function loadFeed() {
   const res = await api("GET", "/api/events" + qstr({ tail: 50 }));
   const list = $("feedList");
   list.replaceChildren();
-  if (!res.events.length) list.append(el("li", { class: "feed-empty" }, "No activity yet"));
-  else for (const ev of res.events) list.append(feedItem(ev)); // newest-first
+  feedPaginated = false; // reset pagination state on full reload
+  if (!res.events.length) {
+    list.append(el("li", { class: "feed-empty" }, "No activity yet"));
+    feedOldest = 0;
+  } else {
+    for (const ev of res.events) list.append(feedItem(ev)); // newest-first
+    // Track the oldest (minimum) event id currently shown.
+    feedOldest = res.events.reduce((min, ev) => ev.id < min ? ev.id : min, res.events[0].id);
+  }
   cursor = Math.max(cursor, res.last_id || 0);
+
+  // Rebuild the "Load older" button outside #feedList so trimFeed can't remove it.
+  const feed = $("feed");
+  if (loadOlderBtn) { loadOlderBtn.remove(); loadOlderBtn = null; }
+  if (feedOldest > 0) {
+    loadOlderBtn = el("button", { class: "feed-load-older", onclick: loadOlderActivity }, "Load older activity");
+    feed.append(loadOlderBtn);
+  }
 }
 
 function renderTabs() {
@@ -655,8 +675,39 @@ function feedItem(ev) {
 }
 
 function trimFeed() {
+  // Once the user has paginated, skip trimming so older entries they loaded are
+  // preserved. Without this, each live event would pop the oldest paginated row.
+  if (feedPaginated) return;
   const l = $("feedList");
   while (l.children.length > 200) l.removeChild(l.lastChild);
+}
+
+async function loadOlderActivity() {
+  if (!feedOldest || !loadOlderBtn) return;
+  loadOlderBtn.disabled = true;
+  const limit = 50;
+  try {
+    const params = { before: String(feedOldest), limit: String(limit) };
+    if (selected.size === 1) params.project = [...selected][0];
+    const qs = new URLSearchParams(params);
+    const res = await api("GET", "/api/events?" + qs.toString());
+    const evs = res.events || [];
+    const list = $("feedList");
+    for (const ev of evs) list.append(feedItem(ev)); // already newest-first, append to bottom
+    if (evs.length > 0) {
+      feedOldest = evs.reduce((min, ev) => ev.id < min ? ev.id : min, evs[0].id);
+      feedPaginated = true;
+    }
+    if (evs.length < limit) {
+      // No more older events — replace button with an end-marker.
+      loadOlderBtn.replaceWith(el("div", { class: "feed-start-marker" }, "— start of activity —"));
+      loadOlderBtn = null;
+    } else {
+      loadOlderBtn.disabled = false;
+    }
+  } catch (e) {
+    loadOlderBtn.disabled = false;
+  }
 }
 
 function evKind(ev) {

@@ -447,6 +447,81 @@ func TestDeleteCommentEndpoint(t *testing.T) {
 	}
 }
 
+func TestEventsBeforeEndpoint(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "evproj")
+
+	// Create tasks to generate events.
+	for _, title := range []string{"a", "b", "c"} {
+		mustCreateTask(t, ts, "evproj", title)
+	}
+
+	// Fetch all events via ?tail= to get their IDs.
+	r := do(t, ts, http.MethodGet, "/api/events?tail=50", "", nil)
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("GET events tail = %d, want 200", r.StatusCode)
+	}
+	var tailResp struct {
+		Events []struct {
+			ID int64 `json:"id"`
+		} `json:"events"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&tailResp); err != nil {
+		t.Fatalf("decode tail response: %v", err)
+	}
+	if len(tailResp.Events) < 2 {
+		t.Fatalf("expected >=2 events from tail, got %d", len(tailResp.Events))
+	}
+	// tailResp.Events is newest-first; the last entry is the oldest.
+	oldestID := tailResp.Events[len(tailResp.Events)-1].ID
+	newestID := tailResp.Events[0].ID
+
+	// ?before=<newestID> should return events with id < newestID, newest-first.
+	r2 := do(t, ts, http.MethodGet, "/api/events?before="+strconv.FormatInt(newestID, 10), "", nil)
+	defer r2.Body.Close()
+	if r2.StatusCode != http.StatusOK {
+		t.Fatalf("GET events before = %d, want 200", r2.StatusCode)
+	}
+	var beforeResp struct {
+		Events []struct {
+			ID int64 `json:"id"`
+		} `json:"events"`
+	}
+	if err := json.NewDecoder(r2.Body).Decode(&beforeResp); err != nil {
+		t.Fatalf("decode before response: %v", err)
+	}
+	for _, e := range beforeResp.Events {
+		if e.ID >= newestID {
+			t.Errorf("?before=%d returned event id %d >= cutoff", newestID, e.ID)
+		}
+	}
+	// Results must be newest-first (descending).
+	for i := 1; i < len(beforeResp.Events); i++ {
+		if beforeResp.Events[i].ID >= beforeResp.Events[i-1].ID {
+			t.Fatalf("events not descending: %d then %d", beforeResp.Events[i-1].ID, beforeResp.Events[i].ID)
+		}
+	}
+
+	// ?before=<oldestID> should return nothing (no events older than the first).
+	r3 := do(t, ts, http.MethodGet, "/api/events?before="+strconv.FormatInt(oldestID, 10), "", nil)
+	defer r3.Body.Close()
+	if r3.StatusCode != http.StatusOK {
+		t.Fatalf("GET events before oldest = %d, want 200", r3.StatusCode)
+	}
+	var emptyResp struct {
+		Events []struct {
+			ID int64 `json:"id"`
+		} `json:"events"`
+	}
+	if err := json.NewDecoder(r3.Body).Decode(&emptyResp); err != nil {
+		t.Fatalf("decode empty before response: %v", err)
+	}
+	if len(emptyResp.Events) != 0 {
+		t.Fatalf("expected 0 events before oldest id, got %d", len(emptyResp.Events))
+	}
+}
+
 // ---------- helpers ----------
 
 func mustCreateProject(t *testing.T, ts *httptest.Server, slug string) {

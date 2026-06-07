@@ -63,12 +63,17 @@ Archiving currently hides a project's **tab** (`ListProjects`) and its **board t
     `am project rm <slug> --yes`; dashboard inline two-step confirms; 3 new event kinds
     (`task.deleted`, `comment.deleted`, `project.deleted`); 7 new tests. `ref` reuse accepted
     (no counter). → ADR-015, `data-model.md`, `CHANGELOG.md`.
-- [ ] **C2 · Bound `events` / `comments` growth** — _M_ — (remaining half of Phase C)
-  - Why: both grow unbounded (no retention/pagination); long-running instances bloat. The dashboard
-    only caps render, not storage.
-  - Do: choose one — (a) a retention/compaction job or `am db prune --before <date>`; and/or
-    (b) `?before=`/cursor pagination on `GET /api/events`. → `data-model.md` (Retention is an open
-    Unknown today).
+- [x] **C2 · Bound `events` growth (pagination + retention)** — _M_ — **shipped (Phase C2)**
+  - `GET /api/events?before=<id>` backward cursor (`ListEventsBefore`; default 40, cap 200; same
+    archived-project filter as `?since=`/`?tail=`). Dashboard "Load older activity" button
+    (`feedOldest`/`feedPaginated`/`loadOlderActivity`; outside `#feedList`; end-marker when
+    exhausted; `trimFeed` skipped after first paginate).
+  - `am db prune (--before <YYYY-MM-DD> | --keep <N>) [--yes]` — offline, events-only, refuses
+    while server is running, VACUUM after, prints `pruned N events` to stderr.
+  - Tests: `TestListEventsBefore`, `TestEventsBeforeEndpoint`, `TestPruneEventsKeep`,
+    `TestPruneEventsBefore`, `TestPruneEventsBeforeSameDayBoundary`. → ADR-016, `data-model.md`.
+  - **Phase C is now COMPLETE.** Residuals: prune is manual/offline; `isServerRunning` guard is
+    bypassable on non-default ports (applies to `import` + `prune`); `comments` growth still unbounded.
 
 ## Phase D — Error handling & observability
 

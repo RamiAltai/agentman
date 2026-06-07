@@ -7,7 +7,7 @@ convention is loose, it's called out.
 
 - **One flat `main` package** in `cmd/am/`; modules are separated **by file, not by Go package**:
   `server.go` (HTTP), `hub.go` (SSE), `store.go` (data + domain), `client.go`/`cli.go` (CLI),
-  `db.go` (offline DB export/import), `identity.go`, `version.go`, `update.go`. The web UI is in `cmd/am/web/`.
+  `db.go` (offline DB export/import/prune), `identity.go`, `version.go`, `update.go`. The web UI is in `cmd/am/web/`.
 - Keep that split: HTTP handling in `server.go`, all SQL in `store.go`, CLI presentation in `cli.go`.
   Do **not** put SQL in handlers or HTTP in the store.
 - There is no `internal/`/`pkg/`; because it's one package, every symbol is mutually visible —

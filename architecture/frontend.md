@@ -1,7 +1,7 @@
 # Frontend Architecture
 
 There **is** a frontend: a small single-page dashboard in `cmd/am/web/`
-(`index.html` 50 lines, `app.css` 366 lines, `app.js` 803 lines), embedded into the binary via
+(`index.html` 50 lines, `app.css` 373 lines, `app.js` 854 lines), embedded into the binary via
 `//go:embed web` (`cmd/am/server.go`) and served at `/`. It is the human-facing view; agents do
 not use it.
 
@@ -36,7 +36,14 @@ All built imperatively in `app.js` (no component framework):
 - **Activity feed** — `feedItem`, `evText`, `evKind`: color-coded events with clickable `#refs`.
   Event kinds include the project lifecycle: `project.created`, `project.archived`,
   `project.unarchived` (render via `evText`/`describeText`; `evKind` colors them as generic "other"),
-  and the new delete kinds: `task.deleted`, `comment.deleted`, `project.deleted`.
+  and the new delete kinds: `task.deleted`, `comment.deleted`, `project.deleted`. The feed supports
+  **backward pagination** via a "Load older activity" button appended **outside** `#feedList` (so
+  `trimFeed` can't remove it); clicking it fetches `GET /api/events?before=<oldest-loaded-id>` and
+  appends the results. `feedOldest` tracks the lowest event id currently in the feed; `feedPaginated`
+  is set to `true` on the first paginated fetch, which causes `trimFeed` to skip its cap so the user's
+  loaded history is not silently discarded. Trade-off: a long-running tab that paginates can grow
+  the feed unbounded until the next page reload. When `?before=` returns no events, the button is
+  replaced by a `"— start of activity —"` end-marker. All DOM via `el()` (no `innerHTML`).
 - **Detail modal** — `renderModal`, plus `openNew` (new task) and `openNewProject`: one reused
   `#sheet` element; auto-growing title `<textarea>`; status/assignee/priority controls; comments;
   history. The modal includes a **Delete task** button (inline two-step confirm — see below) and
@@ -55,11 +62,12 @@ All built imperatively in `app.js` (no component framework):
 
 Module-level mutable variables in `app.js` (no store/framework):
 `projects` (array), `selected` (`Set<slug>` of active project filters, empty=all), `tasks`
-(`Map<id,task>`), `cursor`
-(highest seen `events.id` for SSE `since=`), `es` (EventSource), `openTaskId`, `dragId`,
-`lastFocus`. Reconciliation is **snapshot-based**: on each SSE event the feed updates immediately
-and a **debounced (250 ms) full `loadBoard()`** re-fetches and re-renders (`onEvent`). Simple and
-correct over clever diffing.
+(`Map<id,task>`), `cursor` (highest seen `events.id` for SSE `since=`), `es` (EventSource),
+`openTaskId`, `dragId`, `lastFocus`, `feedOldest` (lowest event id currently in `#feedList`; `0`
+if none loaded), `feedPaginated` (`true` once the user has paginated; disables `trimFeed` cap),
+`loadOlderBtn` (reference to the "Load older" button outside `#feedList`). Reconciliation is
+**snapshot-based**: on each SSE event the feed updates immediately and a **debounced (250 ms) full
+`loadBoard()`** re-fetches and re-renders (`onEvent`). Simple and correct over clever diffing.
 
 ## API Integration
 
@@ -101,7 +109,8 @@ inline `.ferr` error text. Slug auto-derives from project name (`slugify`).
   column, "No comments yet" / "No activity yet".
 - **Connection state** — `setStatus()` shows `live` (green pulse) / `reconnecting…` / `connecting…`.
 - **Loading** — minimal; localhost fetches are instant. No spinners.
-- **Done column** capped at 50 rendered cards (`+N more`); feed capped at ~200 nodes (`trimFeed`).
+- **Done column** capped at 50 rendered cards (`+N more`); feed capped at ~200 nodes (`trimFeed`) —
+  cap is skipped once the user has paginated (`feedPaginated = true`) to preserve loaded history.
 
 ## Accessibility
 
@@ -132,7 +141,7 @@ these docs is from source reading and manual verification, not automated tests. 
 - **Native HTML5 drag-and-drop doesn't fire on touch** → mobile relies on the status dropdown /
   `[ ]` keys (documented fallback in code comments).
 - **Full board re-render per event batch** (debounced) — fine at small scale, O(n) at large scale.
-- Single 803-line `app.js`, no module split, no minification, no tests → refactors are unguarded.
-  The new delete confirm flows (task/comment/project) are additional untested JS.
+- Single 854-line `app.js`, no module split, no minification, no tests → refactors are unguarded.
+  The new delete confirm flows (task/comment/project) and feed pagination are additional untested JS.
 - `localStorage` access is wrapped (`lsGet`/`lsSet`) so a sandboxed/Private-mode browser won't
   break the app — keep that pattern if you add persistence.

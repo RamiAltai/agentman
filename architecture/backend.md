@@ -24,7 +24,7 @@ GET   /api/tasks/{id}               handleGetTask           (task + comments + r
 PATCH /api/tasks/{id}               handlePatchTask         {status?,assignee?,title?,body?,priority?}
 POST  /api/tasks/{id}/claim         handleClaim             (atomic; X-Agent = claimant)
 POST  /api/tasks/{id}/comments      handleComment           {body}
-GET   /api/events                   handleEvents            ?since=  | ?tail=  | ?project=  (no project ⇒ hides archived-project events)
+GET   /api/events                   handleEvents            ?since=  | ?tail=  | ?before=  | ?project=  (no project ⇒ hides archived-project events)
 GET   /api/stream                   handleStream            text/event-stream (SSE)
 DELETE /api/tasks/{id}              handleDeleteTask        hard-delete task + comments (cascade); 200 {"status":"deleted"}
 DELETE /api/tasks/{id}/comments/{cid} handleDeleteComment  hard-delete one comment; 200 {"status":"deleted"}
@@ -35,9 +35,9 @@ DELETE /api/projects/{slug}         handleDeleteProject     hard-delete project 
 `{id}` accepts a global id (`13`) or a project ref (`web-3`), resolved by `store.resolveTaskID`.
 Responses are JSON via `writeJSON`; errors via `writeErr`.
 
-`am db export`/`am db import` have **no HTTP route** — they are a CLI-only local-file operation.
-The `db` command is dispatched in `cmd/am/main.go` *before* the HTTP client is built (`cmdDB`,
-ahead of `NewClient()`), so it works directly on the SQLite file (`cmd/am/db.go`).
+`am db export`/`am db import`/`am db prune` have **no HTTP route** — they are CLI-only local-file
+operations. The `db` command is dispatched in `cmd/am/main.go` *before* the HTTP client is built
+(`cmdDB`, ahead of `NewClient()`), so it works directly on the SQLite file (`cmd/am/db.go`).
 
 ## Request Flow
 
@@ -54,14 +54,18 @@ Lives in `cmd/am/store.go` (there is no separate "service" layer — the store *
 logic). Each mutating method returns `(result, *Event, error)`; the handler broadcasts the event.
 Key methods: `CreateProject`, `ListProjects(includeArchived bool)`, `ArchiveProject`,
 `UnarchiveProject`, `DeleteProject`, `ListTasks`, `GetTask`, `CreateTask`, `PatchTask`,
-`ClaimTask`, `AddComment`, `DeleteComment`, `ListEvents`, `RecentEvents`, `DeleteTask`. `ArchiveProject`/`UnarchiveProject` are
+`ClaimTask`, `AddComment`, `DeleteComment`, `ListEvents`, `RecentEvents`, `ListEventsBefore`,
+`DeleteTask`. `ArchiveProject`/`UnarchiveProject` are
 transactional and idempotent (no event when already in the target state).
 `CreateTask` checks the target project's `archived_at` before the insert and returns
 `ErrProjectArchived` if archived — creation into an archived project is rejected.
 `ListEvents`/`RecentEvents` use `LEFT JOIN projects p ON p.id = events.project_id` and,
 when no explicit `project=` filter is supplied, exclude events whose project is archived via
 `(events.project_id IS NULL OR p.archived_at IS NULL)` — mirroring `ListTasks`. An explicit
-`?project=<slug>` filter still returns that project's events.
+`?project=<slug>` filter still returns that project's events. `ListEventsBefore(before, project,
+limit)` applies the same archived-project filter and returns events with `id < before`,
+newest-first (default limit 40, cap 200) — used by the `?before=` cursor branch in `handleEvents`
+for backward pagination.
 
 **Atomic claim** (`ClaimTask`) is the most important invariant — a single conditional statement:
 
@@ -157,9 +161,11 @@ There are six test files (run `go test ./...`):
 - `cmd/am/migrate_test.go` — migration runner (apply/skip/idempotent/rollback), incl. the v2 step
   that adds `projects.archived_at`.
 - `cmd/am/db_test.go` — `db export`/`import` roundtrip + file perms (0o600), backup creation + perms,
-  garbage rejection, server-liveness check.
+  garbage rejection, server-liveness check; `TestPruneEventsKeep`, `TestPruneEventsBefore`,
+  `TestPruneEventsBeforeSameDayBoundary` (prune).
 
-So the archive and DB export/import paths are now covered. **Still untested:** SSE
+So the archive, DB export/import, and prune paths are now covered. Also covered: events backward
+pagination (`TestListEventsBefore`, `TestEventsBeforeEndpoint`). **Still untested:** SSE
 streaming/reconnect, the rest of the CLI commands, identity, and the dashboard. (Gap; see
 `known-risks-and-gaps.md`.)
 

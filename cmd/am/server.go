@@ -345,6 +345,15 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"events": evs, "last_id": max})
 		return
 	}
+	if b := q.Get("before"); b != "" { // newest-first, paging older events
+		evs, err := s.store.ListEventsBefore(atoi64Default(b, 0), q.Get("project"), atoiDefault(q.Get("limit"), 40))
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"events": evs})
+		return
+	}
 	since := atoi64Default(q.Get("since"), 0)
 	evs, last, err := s.store.ListEvents(since, q.Get("project"), atoiDefault(q.Get("limit"), 0))
 	if err != nil {

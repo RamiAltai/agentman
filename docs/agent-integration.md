@@ -155,6 +155,17 @@ Default export path is a timestamped file in the current directory. `import` val
 candidate, **refuses while a server is running**, prompts unless `--yes`, and backs up the
 existing DB into the DB's directory first. Stop `am serve` before importing.
 
+To trim old events on a long-running instance (stop `am serve` first):
+
+```sh
+am db prune --before 2026-01-01   # delete events strictly before that date (same-day kept)
+am db prune --keep 10000          # keep only the newest 10 000 events
+am db prune --keep 10000 --yes    # skip the confirmation prompt
+```
+
+Events are the only table affected; tasks, comments, and projects are untouched. A `VACUUM`
+runs afterwards to reclaim disk space (`pruned N events` printed to stderr).
+
 ### Updating
 
 Update the binary with `am update` (or `go install …@latest`), then restart the server so it
