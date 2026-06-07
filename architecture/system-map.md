@@ -75,6 +75,12 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   Includes `project archive`/`project unarchive <slug>` and `projects --all` (lists archived,
   marked `(archived)`); `db export`/`db import` are handled offline in `cmd/am/db.go`.
 - **Dashboard** — `cmd/am/web/app.js`: vanilla SPA; SSE consumer; board/modal/feed rendering.
+  Includes a `⋯` "Manage projects" button in the tab bar that opens a modal (`openManageProjects`/
+  `renderManageList`) listing all projects (active + archived via `GET /api/projects?archived=true`),
+  with Archive/Unarchive buttons that call the existing `POST /api/projects/{slug}/archive|unarchive`
+  routes. The activity feed hides archived projects' events (no `project=` filter → `ListEvents`/
+  `RecentEvents` exclude events whose project has a non-NULL `archived_at`). Task creation into an
+  archived project is rejected at the store layer (`CreateTask` → `ErrProjectArchived` → HTTP 400).
 
 ## External Dependencies
 

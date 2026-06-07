@@ -20,9 +20,14 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 ## Product Risks
 
-- **No hard delete; unbounded history** (Medium). Reversible project soft-archive now exists
-  (`archive`/`unarchive`, `projects.archived_at`); but there is still no API to delete a task or
-  comment and no hard delete of anything, and `events`/`comments` still grow unbounded. → `data-model.md`.
+- **No hard delete; unbounded history** (Medium). Reversible project soft-archive is now enforced
+  consistently across all read surfaces (tab list, board tasks, activity feed via `ListEvents`/
+  `RecentEvents`) and write-blocked on task creation (`ErrProjectArchived`); the dashboard exposes
+  archive/unarchive controls (the "Manage projects" modal). No API to delete a task or comment and
+  no hard delete of anything; `events`/`comments` still grow unbounded. Residual (Low): the live SSE
+  broadcast (`hub.Broadcast`) is not archive-filtered — an event on a project that was archived after
+  the SSE connection was opened can flash transiently in the feed until the next `ListEvents` reload
+  filters it out. → `data-model.md`.
 - **Identity collisions in one directory** (Low). Two agents in the same working dir share the
   per-dir identity unless one sets `AGENTMAN_AGENT`. → ADR-008.
 - **Update bootstrap** (Low). A machine must do one manual `go install …@latest` to get a binary
@@ -45,9 +50,13 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 - Coverage now spans store/server/migrate/db tests: the **atomic claim** (race, `-race`-clean), events
   cursor, store CRUD/validation, validation→status mapping, the Host/CSRF/CSP guards, project
   archive/unarchive (store round-trip + idempotency and the HTTP endpoints incl. 404), the v2 migration
-  (adds `archived_at` + apply/bump/idempotency/rollback), and DB export/import (roundtrip+perms, backup
-  creation, garbage rejection, liveness probe) are all covered. **Still untested:** SSE
-  streaming/reconnect, identity, most CLI command paths, and the entire dashboard (no JS test runner).
+  (adds `archived_at` + apply/bump/idempotency/rollback), DB export/import (roundtrip+perms, backup
+  creation, garbage rejection, liveness probe), **feed hiding of archived-project events**
+  (`TestFeedHidesArchivedProjectEvents`), and **task creation into an archived project**
+  (`TestCreateTaskRejectsArchivedProject` store, `TestCreateTaskIntoArchivedProject400` HTTP) are all
+  covered. **Still untested:** SSE streaming/reconnect, identity, most CLI command paths, and the
+  entire dashboard — including the new "Manage projects" modal (`openManageProjects`,
+  `renderManageList`) — as no JS test runner exists.
   → `backend.md`, `frontend.md`. Next highest-value: an XSS regression test for the dashboard and
   CLI-path tests.
 

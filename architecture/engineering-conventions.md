@@ -18,7 +18,7 @@ convention is loose, it's called out.
 - HTTP handlers: `handleX` (e.g. `handleClaim`). Routes registered in `Server.Handler()`.
 - Store methods: exported PascalCase domain verbs (`CreateTask`, `ClaimTask`, `ListEvents`).
 - CLI verb implementations: `cmdX` (`cmdClaim`, `cmdNew`); dispatched in `main.go`.
-- Sentinel errors: `ErrNotFound`, `ErrConflict`, `ErrValidation`; typed `*ConflictError`.
+- Sentinel errors: `ErrNotFound`, `ErrConflict`, `ErrValidation`, `ErrProjectArchived` (→ HTTP 400 `project_archived`); typed `*ConflictError`.
 - Event kinds: dotted `noun.verb` strings — `task.created`, `task.claimed`, `task.status`,
   `task.assign`, `task.patched`, `comment.added`, `project.created`, `project.archived`,
   `project.unarchived`.

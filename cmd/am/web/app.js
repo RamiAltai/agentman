@@ -91,6 +91,7 @@ function renderTabs() {
   nav.replaceChildren(tab("", "All", allOpen));
   for (const p of projects) nav.append(tab(p.slug, p.name, openCount(p.counts)));
   nav.append(el("button", { class: "tab add", onclick: openNewProject, title: "New project", "aria-label": "New project" }, "＋"));
+  nav.append(el("button", { class: "tab add", onclick: openManageProjects, title: "Manage projects", "aria-label": "Manage projects" }, "⋯"));
 }
 
 function openCount(c) { c = c || {}; return (c.todo || 0) + (c.doing || 0) + (c.blocked || 0); }
@@ -425,6 +426,83 @@ function openNewProject() {
   s.append(name, el("div", { class: "mrow" }, label("Slug", slug)), err, save);
   openModal();
   name.focus();
+}
+
+// ---------- manage projects modal ----------
+
+async function openManageProjects() {
+  const s = $("sheet");
+  s.replaceChildren();
+  s.append(el("button", { class: "x", onclick: closeModal, "aria-label": "Close" }, "✕"));
+  s.append(el("div", { class: "mhead" }, "Manage projects"));
+  const err = el("div", { class: "ferr" });
+  s.append(err);
+
+  const list = el("ul", { class: "proj-list", "aria-label": "Projects" });
+  s.append(list);
+
+  openModal();
+  s.focus();
+
+  await renderManageList(list, err);
+}
+
+async function renderManageList(list, err) {
+  list.replaceChildren();
+  let all;
+  try {
+    all = await api("GET", "/api/projects?archived=true");
+  } catch (e) {
+    err.textContent = e.message;
+    return;
+  }
+  if (!all.length) {
+    list.append(el("li", { class: "feed-empty" }, "No projects yet"));
+    return;
+  }
+  for (const p of all) {
+    const isArchived = !!p.archived_at;
+    const openTasks = openCount(p.counts);
+
+    const row = el("li", { class: "proj-row" + (isArchived ? " archived" : "") });
+
+    const nameSpan = el("span", { class: "proj-row-name" }, p.name);
+    const slugSpan = el("span", { class: "proj-row-slug" }, p.slug);
+    const countSpan = el("span", { class: "proj-row-count" }, openTasks + " open");
+
+    const archBtn = el("button", {
+      class: "btn-archive" + (isArchived ? " unarchive" : ""),
+      onclick: async () => {
+        archBtn.disabled = true;
+        try {
+          if (isArchived) {
+            await api("POST", "/api/projects/" + p.slug + "/unarchive");
+          } else {
+            await api("POST", "/api/projects/" + p.slug + "/archive");
+            // If this project was selected, remove it from selection.
+            if (selected.has(p.slug)) {
+              selected.delete(p.slug);
+              loadBoard().catch(() => {});
+              loadFeed().catch(() => {});
+              connect();
+            }
+          }
+          // Refresh tab bar.
+          await loadProjects();
+          // Refresh the manage list in place.
+          await renderManageList(list, err);
+        } catch (e) {
+          err.textContent = e.message;
+          archBtn.disabled = false;
+        }
+      },
+    }, isArchived ? "Unarchive" : "Archive");
+
+    if (isArchived) row.append(nameSpan, slugSpan, el("span", { class: "badge-archived" }, "Archived"), countSpan, archBtn);
+    else row.append(nameSpan, slugSpan, countSpan, archBtn);
+
+    list.append(row);
+  }
 }
 
 // ---------- live stream ----------

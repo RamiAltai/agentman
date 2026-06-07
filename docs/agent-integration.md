@@ -46,7 +46,8 @@ Then use `am` normally (`am whoami` shows it).
     am show <id> -c            # full detail + comments
     am note <id> "progress"    # leave a short comment as you work
     am status <id> done        # todo | doing | blocked | done
-    am new "title" -p <proj>   # create a task (prints its id)
+    am new "title" -p <proj>   # create a task (prints its id); exits non-zero with
+                               #   `project_archived` if the target project is archived
     am projects --all          # list projects, incl. archived (marked "(archived)")
     am project archive <slug>  # hide a project (exit 3 if not found)
     am project unarchive <slug>

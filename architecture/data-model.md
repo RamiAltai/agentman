@@ -66,9 +66,17 @@ project → tasks → comments. **Events are never deleted** (append-only).
 - **Archive (soft, projects only):** a project can be **soft-archived** — `ArchiveProject` sets
   `projects.archived_at` (and `UnarchiveProject` clears it). This is **reversible** and hides the
   project from default lists; it is **not** a hard delete (the row and its tasks/comments stay).
-  An archived project's **tasks are also hidden** from the unfiltered task list/board
-  (`ListTasks` adds `p.archived_at IS NULL` when no project is named); an explicit
-  `?project=<slug>` still returns that archived project's tasks for direct inspection.
+  Archiving is now enforced across three surfaces:
+  - **Tasks** — `ListTasks` adds `p.archived_at IS NULL` (LEFT JOIN on projects) when no project
+    filter is given; an explicit `?project=<slug>` still returns that archived project's tasks.
+  - **Activity feed** — `ListEvents` and `RecentEvents` similarly LEFT JOIN projects and exclude
+    events whose project is archived (`p.archived_at IS NULL`) when no `project=` filter is
+    present; an explicit `?project=<slug>` still returns that project's events. The SSE replay
+    path (`handleStream` → `ListEvents`) inherits this filter automatically.
+  - **Task creation** — `CreateTask` checks the target project's `archived_at` before the insert
+    transaction; if the project is archived it returns the sentinel `ErrProjectArchived`, mapped
+    to HTTP 400 `{"error":"project_archived"}` by `writeErr`. The CLI prints `project_archived`
+    to stderr and exits non-zero.
 - **Delete:** **No hard-delete endpoint or store method exists** for projects/tasks/comments today —
   the cascade rules are defined but unused via the API (Confirmed: no `DELETE` route in
   `server.go`). Hard removal only happens by editing the DB file directly.

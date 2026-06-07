@@ -279,6 +279,29 @@ select:hover, .field:hover { border-color: var(--line-strong); }
 .save:hover { filter: brightness(1.08); }
 .ferr { color: var(--warn); font-size: 13px; margin-top: 10px; min-height: 18px; }
 
+/* ===================== manage-projects list ===================== */
+.proj-list { list-style: none; margin: 16px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.proj-row {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--card-bg); border: 1px solid var(--line);
+  border-radius: 9px; padding: 10px 13px;
+}
+.proj-row.archived { opacity: .65; }
+.proj-row-name { font-weight: 600; font-size: 14px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proj-row-slug { color: var(--faint); font-size: 11px; font-family: ui-monospace, monospace; flex: none; }
+.proj-row-count { color: var(--muted); font-size: 12px; flex: none; }
+.badge-archived {
+  font-size: 10px; font-weight: 700; letter-spacing: .4px; text-transform: uppercase;
+  background: var(--line); color: var(--faint); border-radius: 5px; padding: 2px 7px; flex: none;
+}
+.btn-archive {
+  background: var(--card-bg); border: 1px solid var(--line); color: var(--muted);
+  border-radius: 7px; padding: 5px 10px; font-size: 12px; white-space: nowrap; flex: none;
+}
+.btn-archive:hover { color: var(--fg); border-color: var(--line-strong); }
+.btn-archive.unarchive { color: var(--accent); border-color: var(--accent); background: var(--accent-weak); }
+.btn-archive.unarchive:hover { filter: brightness(1.1); }
+
 /* ===================== responsive ===================== */
 @media (max-width: 720px) {
   header { gap: 8px; padding: 0 10px; }

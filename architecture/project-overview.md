@@ -59,7 +59,12 @@ Evidence:
   `am db import` restores a validated candidate (integrity/FK checks, refuses while a server is
   running, backs up the existing DB first). Evidence: `cmd/am/db.go`.
 - **Project archive/hide**: reversible soft-archive (`archived_at`) that hides a project from
-  default views; `am project archive`/`unarchive`. Evidence: `cmd/am/store.go`, `cmd/am/cli.go`.
+  default views across all surfaces — tab bar (`ListProjects`), board (`ListTasks`), and activity
+  feed (`ListEvents`/`RecentEvents`). Writing into an archived project is blocked: `CreateTask`
+  returns `ErrProjectArchived` → HTTP 400 `{"error":"project_archived"}`. Archive/unarchive is
+  accessible from the CLI (`am project archive`/`unarchive`) and from a "Manage projects" modal in
+  the dashboard tab bar (`openManageProjects`). Evidence: `cmd/am/store.go`, `cmd/am/cli.go`,
+  `cmd/am/server.go`, `cmd/am/web/app.js`.
 - **Self-update**: `am update` + startup "update available" check (`cmd/am/update.go`).
 
 ## Domain Concepts
@@ -90,5 +95,6 @@ Inferred (Confidence: Medium–High) from `README.md` "Security" and the localho
 
 - **Intended scale.** No stated target for concurrent agents / task volume. The single-writer
   SQLite design (`SetMaxOpenConns(1)`) implies modest scale, but this is not documented.
-- **Roadmap.** Auth, remote access, labels/due-dates, and prebuilt binaries are discussed as
-  "later" in conversation but **not** captured in repo docs — treat as unconfirmed.
+- **Roadmap.** Near-term gap-closing work is now tracked in `ROADMAP.md` (repo root). Longer-term
+  ideas (auth, remote access, labels/due-dates, prebuilt binaries) remain discussion-only — treat
+  those as unconfirmed.

@@ -282,6 +282,34 @@ func TestArchiveUnarchiveEndpoints(t *testing.T) {
 	}
 }
 
+func TestCreateTaskIntoArchivedProject400(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "archproj")
+
+	// Archive the project.
+	r := do(t, ts, http.MethodPost, "/api/projects/archproj/archive", "", nil)
+	r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("archive = %d, want 200", r.StatusCode)
+	}
+
+	// Attempt to create a task into the archived project — must get 400.
+	resp := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"archproj","title":"blocked task"}`,
+		map[string]string{"Content-Type": "application/json"})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("POST /api/tasks into archived project = %d, want 400", resp.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	if body["error"] != "project_archived" {
+		t.Fatalf("error body = %q, want project_archived", body["error"])
+	}
+}
+
 // ---------- helpers ----------
 
 func mustCreateProject(t *testing.T, ts *httptest.Server, slug string) {

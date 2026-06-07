@@ -44,9 +44,12 @@ Tests live next to the code in `cmd/am/`:
 
 - `update_test.go` — version-comparison logic.
 - `store_test.go` — CRUD + validation, the atomic claim race (exactly one winner), archive/unarchive
-  round-trip + idempotency, and the strictly-increasing events cursor.
+  round-trip + idempotency, the strictly-increasing events cursor, feed hiding archived-project events
+  (`TestFeedHidesArchivedProjectEvents`), and task creation rejected into an archived project
+  (`TestCreateTaskRejectsArchivedProject`).
 - `server_test.go` — HTTP status mapping (404 / 400 / lost-claim 409), the Host/CSRF guards and
-  security headers, and the archive/unarchive endpoints.
+  security headers, the archive/unarchive endpoints, and HTTP 400 on task creation into an archived
+  project (`TestCreateTaskIntoArchivedProject400`).
 - `migrate_test.go` — the forward-only migration runner (apply + version bump, skip ≤ current,
   idempotency, rollback) and the v2 `archived_at` column.
 - `db_test.go` — `am db` export/import (roundtrip + perms, backup creation, garbage rejection,

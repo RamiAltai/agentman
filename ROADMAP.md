@@ -15,7 +15,7 @@ When you finish an item, check it off here and add a `CHANGELOG.md` entry.
 Archiving currently hides a project's **tab** (`ListProjects`) and its **board tasks**
 (`ListTasks`, fixed) but is not enforced anywhere else. Close the remaining seams.
 
-- [ ] **A1 · Hide archived projects' events from the feed** — _S_
+- [x] **A1 · Hide archived projects' events from the feed** — _S_
   - Why: in the "All" view the activity drawer keeps streaming an archived project's events even
     though its board/tab are gone (inconsistent with "hide archived").
   - Do: in `ListEvents` and `RecentEvents` (`cmd/am/store.go`), exclude events whose `project_id`
@@ -24,14 +24,14 @@ Archiving currently hides a project's **tab** (`ListProjects`) and its **board t
     `?project=<slug>` unfiltered.
   - Accept: archiving a project drops its lines from the unfiltered feed; `?project=<archived>`
     still returns them; SSE reconcile shows the same. Add a store test.
-- [ ] **A2 · Guard task creation into an archived project** — _S_
+- [x] **A2 · Guard task creation into an archived project** — _S_
   - Why: `am new -p <archived>` / `POST /api/tasks` silently creates a ticket that is then
     immediately hidden (`CreateTask` looks up the slug with no archived check).
   - Do: in `CreateTask` (`cmd/am/store.go`), reject with `ErrValidation` (or a dedicated error
     mapped to 409/400) when the target project is archived; surface a clear CLI message.
   - Accept: creating into an archived project fails with a clear error + non-zero exit; creating
     into an active project is unaffected. Add a store test + an HTTP mapping test.
-- [ ] **A3 · Dashboard archive / unarchive control** — _M–L_
+- [x] **A3 · Dashboard archive / unarchive control** — _M–L_
   - Why: archiving is CLI/API-only; the human's decluttering action isn't available on the human's
     dashboard (you can create a project with ＋ but not archive one, nor restore it).
   - Do: add an archive affordance per project (e.g. a small ⋯ menu on the active project tab, or a

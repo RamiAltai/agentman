@@ -1,7 +1,7 @@
 # Frontend Architecture
 
 There **is** a frontend: a small single-page dashboard in `cmd/am/web/`
-(`index.html` 50 lines, `app.css` 304 lines, `app.js` 616 lines), embedded into the binary via
+(`index.html` 50 lines, `app.css` 331 lines, `app.js` 694 lines), embedded into the binary via
 `//go:embed web` (`cmd/am/server.go`) and served at `/`. It is the human-facing view; agents do
 not use it.
 
@@ -22,7 +22,14 @@ implicit single document.
 
 All built imperatively in `app.js` (no component framework):
 - **Header / tabs** — `renderTabs`, `tab()`: project tabs with open-count badges + an "All" tab + a
-  "＋" new-project button.
+  "＋" new-project button + a "⋯" **Manage projects** button (after the ＋). Clicking "⋯" calls
+  `openManageProjects`, which opens the reused `#sheet` modal (same focus-trap / Esc-to-close
+  infrastructure as the task modal). Inside, `renderManageList` fetches all projects including
+  archived ones via `GET /api/projects?archived=true` and builds a list with `el()` (no
+  `innerHTML`): active projects show an **Archive** button; archived projects show an **Archived**
+  badge and an **Unarchive** button. Both buttons call `POST /api/projects/{slug}/archive|unarchive`
+  via `api()`, then refresh the list. If the just-archived project was selected, the tab bar and
+  board reload automatically.
 - **Board** — `renderBoard`, `card(t)`: four status columns (`COLS`), priority via card left-border
   + chip, avatar initials, project tag (shown when `selected.size !== 1`, i.e. only when the board
   isn't already scoped to a single project), comment count.
@@ -62,6 +69,12 @@ correct over clever diffing.
 `--line`, text `--fg`/`--muted`/`--faint`, `--accent`, status colors (`--st-todo/doing/blocked/
 done`), radii, `--feed-w`, `--header-h`. Dark theme only (`color-scheme: dark`). Thin custom
 scrollbars. Status and priority each have a consistent color language across board, cards, and feed.
+
+The board uses `justify-content: safe center` on `#board` so columns are centered on wide/ultrawide
+screens. The `safe` keyword falls back to `flex-start` when columns overflow their container, so
+horizontal scrolling on narrow screens never clips the leftmost column. New CSS classes support the
+Manage-projects modal: `.proj-list`, `.proj-row`, `.badge-archived`, `.btn-archive` (and
+`.btn-archive.unarchive`).
 
 ## Forms
 
@@ -106,6 +119,6 @@ these docs is from source reading and manual verification, not automated tests. 
 - **Native HTML5 drag-and-drop doesn't fire on touch** → mobile relies on the status dropdown /
   `[ ]` keys (documented fallback in code comments).
 - **Full board re-render per event batch** (debounced) — fine at small scale, O(n) at large scale.
-- Single 616-line `app.js`, no module split, no minification, no tests → refactors are unguarded.
+- Single 694-line `app.js`, no module split, no minification, no tests → refactors are unguarded.
 - `localStorage` access is wrapped (`lsGet`/`lsSet`) so a sandboxed/Private-mode browser won't
   break the app — keep that pattern if you add persistence.

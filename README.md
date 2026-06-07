@@ -90,6 +90,12 @@ The embedded web UI (no build step, no npm) is a live kanban board:
 - **Responsive** from desktop down to mobile — columns stack and the panel overlays.
 - **Keyboard:** `n` new task · `a` toggle the activity panel · `Enter`/`Space` open a focused
   card · `[` / `]` move a focused card between statuses · `Esc` close a dialog.
+- **Manage projects:** the `⋯` button in the tab bar opens a modal listing all projects.
+  Active projects show an **Archive** button; archived ones show an **Unarchive** button.
+  Archiving a project hides it from the board tabs, the task list, and the activity feed.
+  Creating a new task into an archived project is blocked (API returns `400 project_archived`;
+  the CLI exits non-zero). Previously CLI-only, archive/unarchive is now also available from
+  the dashboard.
 
 ## Using it from agents (Claude Code & others)
 

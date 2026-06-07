@@ -424,6 +424,8 @@ func writeErr(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
 	case errors.Is(err, ErrValidation):
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "validation"})
+	case errors.Is(err, ErrProjectArchived):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "project_archived"})
 	case errors.Is(err, ErrConflict):
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "conflict"})
 	default:

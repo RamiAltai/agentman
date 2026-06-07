@@ -220,4 +220,6 @@ These are **undecided/undocumented** in the repo (decide + record before buildin
 - **Delete / archival semantics** — archive resolved as a reversible soft-delete (ADR-013); hard
   delete and `events`/`comments` retention remain undecided.
 - **CI/CD & release automation** — no `.github/`; releases are manual `git tag` + push.
-- **Versioning / CHANGELOG policy** — tags exist (`v0.1.0`–`v0.3.0`) but no CHANGELOG or stated scheme.
+- **Versioning / CHANGELOG policy** — tags exist (`v0.1.0`–`v0.3.0`); `CHANGELOG.md` (Keep a
+  Changelog format) and `ROADMAP.md` now exist in the repo root. Release automation and a stated
+  versioning policy remain undocumented.

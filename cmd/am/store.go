@@ -17,9 +17,10 @@ var schemaSQL string
 
 // Sentinel errors mapped to HTTP status / CLI exit codes by callers.
 var (
-	ErrNotFound   = errors.New("not_found")
-	ErrConflict   = errors.New("conflict")
-	ErrValidation = errors.New("validation")
+	ErrNotFound        = errors.New("not_found")
+	ErrConflict        = errors.New("conflict")
+	ErrValidation      = errors.New("validation")
+	ErrProjectArchived = errors.New("project_archived")
 )
 
 // ConflictError carries the current owner of a task that lost a claim race.
@@ -498,6 +499,13 @@ func (s *Store) CreateTask(in CreateTaskInput) (*Task, *Event, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	var archivedAt sql.NullString
+	if err := s.db.QueryRow("SELECT archived_at FROM projects WHERE id=?", pid).Scan(&archivedAt); err != nil {
+		return nil, nil, err
+	}
+	if archivedAt.Valid && archivedAt.String != "" {
+		return nil, nil, ErrProjectArchived
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, nil, err
@@ -702,18 +710,21 @@ func (s *Store) ListEvents(since int64, project string, limit int) ([]Event, int
 		limit = 200
 	}
 	var args []any
-	q := `SELECT id,COALESCE(project_id,0),COALESCE(task_id,0),actor,kind,data,created_at
-	      FROM events WHERE id>?`
+	q := `SELECT events.id,COALESCE(events.project_id,0),COALESCE(events.task_id,0),events.actor,events.kind,events.data,events.created_at
+	      FROM events LEFT JOIN projects p ON p.id = events.project_id
+	      WHERE events.id>?`
 	args = append(args, since)
 	if project != "" {
 		pid, err := s.projectID(project)
 		if err != nil {
 			return nil, since, err
 		}
-		q += " AND project_id=?"
+		q += " AND events.project_id=?"
 		args = append(args, pid)
+	} else {
+		q += " AND (events.project_id IS NULL OR p.archived_at IS NULL)"
 	}
-	q += " ORDER BY id ASC LIMIT ?"
+	q += " ORDER BY events.id ASC LIMIT ?"
 	args = append(args, limit)
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
@@ -748,16 +759,19 @@ func (s *Store) RecentEvents(project string, limit int) ([]Event, int64, error) 
 		limit = 40
 	}
 	var args []any
-	q := `SELECT id,COALESCE(project_id,0),COALESCE(task_id,0),actor,kind,data,created_at FROM events`
+	q := `SELECT events.id,COALESCE(events.project_id,0),COALESCE(events.task_id,0),events.actor,events.kind,events.data,events.created_at
+	      FROM events LEFT JOIN projects p ON p.id = events.project_id`
 	if project != "" {
 		pid, err := s.projectID(project)
 		if err != nil {
 			return nil, 0, err
 		}
-		q += " WHERE project_id=?"
+		q += " WHERE events.project_id=?"
 		args = append(args, pid)
+	} else {
+		q += " WHERE (events.project_id IS NULL OR p.archived_at IS NULL)"
 	}
-	q += " ORDER BY id DESC LIMIT ?"
+	q += " ORDER BY events.id DESC LIMIT ?"
 	args = append(args, limit)
 	rows, err := s.db.Query(q, args...)
 	if err != nil {

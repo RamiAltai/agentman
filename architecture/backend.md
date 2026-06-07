@@ -24,7 +24,7 @@ GET   /api/tasks/{id}               handleGetTask           (task + comments + r
 PATCH /api/tasks/{id}               handlePatchTask         {status?,assignee?,title?,body?,priority?}
 POST  /api/tasks/{id}/claim         handleClaim             (atomic; X-Agent = claimant)
 POST  /api/tasks/{id}/comments      handleComment           {body}
-GET   /api/events                   handleEvents            ?since=  | ?tail=  (poll / feed bootstrap)
+GET   /api/events                   handleEvents            ?since=  | ?tail=  | ?project=  (no project ⇒ hides archived-project events)
 GET   /api/stream                   handleStream            text/event-stream (SSE)
 /                                   http.FileServer(embed)  serves cmd/am/web/
 ```
@@ -53,6 +53,12 @@ Key methods: `CreateProject`, `ListProjects(includeArchived bool)`, `ArchiveProj
 `UnarchiveProject`, `ListTasks`, `GetTask`, `CreateTask`, `PatchTask`, `ClaimTask`,
 `AddComment`, `ListEvents`, `RecentEvents`. `ArchiveProject`/`UnarchiveProject` are
 transactional and idempotent (no event when already in the target state).
+`CreateTask` checks the target project's `archived_at` before the insert and returns
+`ErrProjectArchived` if archived — creation into an archived project is rejected.
+`ListEvents`/`RecentEvents` use `LEFT JOIN projects p ON p.id = events.project_id` and,
+when no explicit `project=` filter is supplied, exclude events whose project is archived via
+`(events.project_id IS NULL OR p.archived_at IS NULL)` — mirroring `ListTasks`. An explicit
+`?project=<slug>` filter still returns that project's events.
 
 **Atomic claim** (`ClaimTask`) is the most important invariant — a single conditional statement:
 
@@ -99,6 +105,8 @@ trusted). No per-resource authorization. See `security.md` (ADR-002/ADR-011 in `
 - Priority coerced via `toInt`. Unknown PATCH keys are ignored (only known fields applied in
   `PatchTask`).
 - Handlers map `ErrValidation` → HTTP 400.
+- Creating a task into an archived project is rejected: `CreateTask` returns `ErrProjectArchived`
+  → HTTP 400 `{"error":"project_archived"}`.
 
 ## Background Jobs
 
@@ -117,11 +125,13 @@ No job queue. Long-lived goroutines only:
 
 ## Error Handling
 
-Sentinel errors in `store.go`: `ErrNotFound`, `ErrConflict`, `ErrValidation`, and a typed
-`*ConflictError{Assignee}`. `writeErr` (`server.go`) maps them: 404 / 409 / 400, with
-`ConflictError` → `409 {"error":"already_claimed","assignee":…}`; anything else → 500 with the raw
+Sentinel errors in `store.go`: `ErrNotFound`, `ErrConflict`, `ErrValidation`, `ErrProjectArchived`,
+and a typed `*ConflictError{Assignee}`. `writeErr` (`server.go`) maps them: 404 / 409 / 400, with
+`ConflictError` → `409 {"error":"already_claimed","assignee":…}`,
+`ErrProjectArchived` → `400 {"error":"project_archived"}`,
+`ErrValidation` → `400`; anything else → 500 with the raw
 message. The CLI re-maps HTTP status to **exit codes** in `client.go doOrFail`
-(`3` not found · `4` conflict · `5` validation · `6` server down · `1` other).
+(`3` not found · `4` conflict · `5` validation/project_archived · `6` server down · `1` other).
 
 ## Observability
 

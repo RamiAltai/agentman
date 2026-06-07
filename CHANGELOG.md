@@ -24,8 +24,28 @@ _Target: **v0.4.0** — not yet tagged._
   `projects.archived_at`), which exercises the Phase-0 forward-only migration runner end-to-end.
 - **Multi-select project filter** on the dashboard — click several project tabs to view their
   boards together; the **All** tab clears the selection.
+- **Dashboard archive / unarchive control** — a "⋯ Manage projects" button in the tab bar opens a
+  modal listing all projects (active and archived). Active projects have an **Archive** button;
+  archived projects show an "Archived" badge and an **Unarchive** button. Archive/unarchive calls
+  the existing API endpoints; on success the tab bar refreshes in place and, if the just-archived
+  project was selected, the board and feed reload automatically. All DOM is built via the existing
+  `el()` helper (no `innerHTML`); the modal focus trap and Esc-to-close are preserved.
+  (`cmd/am/web/app.js`, `cmd/am/web/app.css`)
 
 ### Fixed
+
+- **Archived projects' events appeared in the activity feed.** `ListEvents` and `RecentEvents`
+  had no archived filter, so the "All"-view feed kept streaming events from archived projects.
+  Both functions now LEFT JOIN `projects` and exclude events whose `project_id` belongs to an
+  archived project when no explicit `project=` filter is given. An explicit `?project=<slug>`
+  still returns all of that project's events for direct inspection. Regression test:
+  `TestFeedHidesArchivedProjectEvents`. (`cmd/am/store.go`, `cmd/am/store_test.go`)
+- **`am new -p <archived>` silently created a hidden ticket.** `CreateTask` looked up the project
+  slug with no archived check, so tasks created into archived projects were immediately invisible
+  everywhere. `CreateTask` now rejects with a new `ErrProjectArchived` sentinel (mapped to
+  `400 {"error":"project_archived"}` by the HTTP layer). Regression tests:
+  `TestCreateTaskRejectsArchivedProject` (store) and `TestCreateTaskIntoArchivedProject400` (HTTP).
+  (`cmd/am/store.go`, `cmd/am/server.go`, `cmd/am/store_test.go`, `cmd/am/server_test.go`)
 
 - **Archived projects' tasks were still shown on the board.** Archiving hid a project's tab and
   column header (`ListProjects` filters archived) but `ListTasks` had no archived filter, so the

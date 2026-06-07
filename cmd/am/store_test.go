@@ -262,6 +262,117 @@ func TestListTasksHidesArchivedProjectTasks(t *testing.T) {
 	}
 }
 
+func TestFeedHidesArchivedProjectEvents(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("alpha", "Alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateProject("beta", "Beta"); err != nil {
+		t.Fatal(err)
+	}
+	// Create tasks — generates task.created events for each project.
+	if _, _, err := st.CreateTask(CreateTaskInput{Project: "alpha", Title: "alpha task"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateTask(CreateTaskInput{Project: "beta", Title: "beta task"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Resolve alpha's project id for assertion checks.
+	alphaPID, err := st.projectID("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Archive alpha.
+	if _, _, err := st.ArchiveProject("alpha", "tester"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unfiltered RecentEvents must NOT include any event whose project_id is alpha's.
+	recent, _, err := st.RecentEvents("", 50)
+	if err != nil {
+		t.Fatalf("RecentEvents: %v", err)
+	}
+	for _, e := range recent {
+		if e.ProjectID == alphaPID {
+			t.Errorf("RecentEvents(\"\") returned event with archived project_id %d (kind=%s)", alphaPID, e.Kind)
+		}
+	}
+
+	// Unfiltered ListEvents must NOT include alpha's events.
+	all, _, err := st.ListEvents(0, "", 200)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	for _, e := range all {
+		if e.ProjectID == alphaPID {
+			t.Errorf("ListEvents(0,\"\") returned event with archived project_id %d (kind=%s)", alphaPID, e.Kind)
+		}
+	}
+
+	// Explicit project=alpha MUST still return alpha's events.
+	alphaEvs, _, err := st.RecentEvents("alpha", 50)
+	if err != nil {
+		t.Fatalf("RecentEvents(alpha): %v", err)
+	}
+	if len(alphaEvs) == 0 {
+		t.Error("RecentEvents(\"alpha\") returned no events for archived project; want alpha's events")
+	}
+	for _, e := range alphaEvs {
+		if e.ProjectID != alphaPID {
+			t.Errorf("RecentEvents(\"alpha\") returned event with unexpected project_id %d", e.ProjectID)
+		}
+	}
+
+	// Unarchive alpha — its events must reappear in the unfiltered feed.
+	if _, _, err := st.UnarchiveProject("alpha", "tester"); err != nil {
+		t.Fatal(err)
+	}
+	recentAfter, _, err := st.RecentEvents("", 50)
+	if err != nil {
+		t.Fatalf("RecentEvents after unarchive: %v", err)
+	}
+	found := false
+	for _, e := range recentAfter {
+		if e.ProjectID == alphaPID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("RecentEvents(\"\") after unarchive should contain alpha's events again")
+	}
+}
+
+func TestCreateTaskRejectsArchivedProject(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("active", "Active"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateProject("archived", "Archived"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.ArchiveProject("archived", "tester"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Creating into an archived project must return ErrProjectArchived.
+	_, _, err := st.CreateTask(CreateTaskInput{Project: "archived", Title: "should fail"})
+	if !errors.Is(err, ErrProjectArchived) {
+		t.Fatalf("CreateTask into archived project: got %v, want ErrProjectArchived", err)
+	}
+
+	// Creating into an active project must still succeed.
+	task, ev, err := st.CreateTask(CreateTaskInput{Project: "active", Title: "should work"})
+	if err != nil {
+		t.Fatalf("CreateTask into active project: %v", err)
+	}
+	if task == nil || ev == nil {
+		t.Fatal("CreateTask into active project returned nil task or event")
+	}
+}
+
 func TestEventsCursorStrictlyIncreasing(t *testing.T) {
 	st := openTestStore(t)
 	if _, _, err := st.CreateProject("web", "Web"); err != nil {
