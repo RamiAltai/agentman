@@ -342,9 +342,34 @@ function renderModal(t) {
   const cl = el("div", { class: "comments" });
   if (!t.comments || !t.comments.length) cl.append(el("div", { class: "feed-empty" }, "No comments yet"));
   for (const cm of t.comments || []) {
-    cl.append(el("div", { class: "cm" },
-      el("div", { class: "cm-head" }, el("b", {}, cm.author), el("span", { class: "t" }, fmtTime(cm.created_at))),
-      el("div", { class: "cbody" }, cm.body)));
+    const cmDiv = el("div", { class: "cm" });
+    const cmHead = el("div", { class: "cm-head" },
+      el("b", {}, cm.author),
+      el("span", { class: "t" }, fmtTime(cm.created_at)));
+    // Inline two-step delete for each comment.
+    const delCm = el("button", { class: "btn-del-cm", "aria-label": "Delete comment" }, "×");
+    let cmConfirming = false;
+    delCm.onclick = async () => {
+      if (!cmConfirming) {
+        cmConfirming = true;
+        delCm.textContent = "Confirm delete?";
+        delCm.classList.add("confirming");
+        setTimeout(() => { if (cmConfirming) { cmConfirming = false; delCm.textContent = "×"; delCm.classList.remove("confirming"); } }, 4000);
+        return;
+      }
+      delCm.disabled = true;
+      try {
+        await api("DELETE", "/api/tasks/" + t.id + "/comments/" + cm.id);
+      } catch (e) {
+        delCm.disabled = false;
+        cmConfirming = false;
+        delCm.textContent = "×";
+        delCm.classList.remove("confirming");
+      }
+    };
+    cmHead.append(delCm);
+    cmDiv.append(cmHead, el("div", { class: "cbody" }, cm.body));
+    cl.append(cmDiv);
   }
   s.append(cl);
 
@@ -362,6 +387,39 @@ function renderModal(t) {
   const hl = el("ul", { class: "hist" });
   for (const ev of t.events || []) hl.append(el("li", {}, el("span", { class: "t" }, fmtTime(ev.created_at)), el("span", {}, describeText(ev))));
   s.append(hl);
+
+  // Inline two-step delete for the task itself.
+  const delBtn = el("button", { class: "btn-danger-task" }, "Delete task");
+  let delConfirming = false;
+  delBtn.onclick = async () => {
+    if (!delConfirming) {
+      delConfirming = true;
+      delBtn.textContent = "Confirm delete?";
+      delBtn.classList.add("confirming");
+      const cancelEl = el("button", { class: "btn-cancel-del" }, "Cancel");
+      cancelEl.onclick = () => {
+        delConfirming = false;
+        delBtn.textContent = "Delete task";
+        delBtn.classList.remove("confirming");
+        cancelEl.remove();
+      };
+      delBtn.after(cancelEl);
+      return;
+    }
+    delBtn.disabled = true;
+    try {
+      await api("DELETE", "/api/tasks/" + t.id);
+      closeModal();
+    } catch (e) {
+      delBtn.disabled = false;
+      delConfirming = false;
+      delBtn.textContent = "Delete task";
+      delBtn.classList.remove("confirming");
+      const sibling = delBtn.nextSibling;
+      if (sibling && sibling.classList && sibling.classList.contains("btn-cancel-del")) sibling.remove();
+    }
+  };
+  s.append(el("div", { class: "del-task-row" }, delBtn));
 }
 
 function openNew() {
@@ -498,8 +556,34 @@ async function renderManageList(list, err) {
       },
     }, isArchived ? "Unarchive" : "Archive");
 
-    if (isArchived) row.append(nameSpan, slugSpan, el("span", { class: "badge-archived" }, "Archived"), countSpan, archBtn);
-    else row.append(nameSpan, slugSpan, countSpan, archBtn);
+    // Inline two-step delete button for the project.
+    const rmBtn = el("button", { class: "btn-danger-proj" }, "Delete");
+    let rmConfirming = false;
+    rmBtn.onclick = async () => {
+      if (!rmConfirming) {
+        rmConfirming = true;
+        rmBtn.textContent = "Confirm delete?";
+        rmBtn.classList.add("confirming");
+        setTimeout(() => { if (rmConfirming) { rmConfirming = false; rmBtn.textContent = "Delete"; rmBtn.classList.remove("confirming"); } }, 5000);
+        return;
+      }
+      rmBtn.disabled = true;
+      try {
+        await api("DELETE", "/api/projects/" + p.slug);
+        if (selected.has(p.slug)) { selected.delete(p.slug); loadBoard().catch(() => {}); loadFeed().catch(() => {}); connect(); }
+        await loadProjects();
+        await renderManageList(list, err);
+      } catch (e) {
+        err.textContent = e.message;
+        rmBtn.disabled = false;
+        rmConfirming = false;
+        rmBtn.textContent = "Delete";
+        rmBtn.classList.remove("confirming");
+      }
+    };
+
+    if (isArchived) row.append(nameSpan, slugSpan, el("span", { class: "badge-archived" }, "Archived"), countSpan, archBtn, rmBtn);
+    else row.append(nameSpan, slugSpan, countSpan, archBtn, rmBtn);
 
     list.append(row);
   }
@@ -539,9 +623,28 @@ function onEvent(ev) {
     }
     loadProjects().catch(() => {});
   }
+  if (ev.kind === "task.deleted") {
+    tasks.delete(ev.task_id);
+    renderBoard();
+    if (openTaskId === ev.task_id) closeModal();
+    loadProjects().catch(() => {});
+  }
+  if (ev.kind === "comment.deleted") {
+    if (openTaskId === ev.task_id) refreshModal();
+  }
+  if (ev.kind === "project.deleted") {
+    const deletedSlug = (ev.data || {}).slug;
+    if (selected.has(deletedSlug)) {
+      selected.delete(deletedSlug);
+      renderTabs();
+      connect();
+    }
+    loadProjects().catch(() => {});
+    loadBoard().catch(() => {});
+  }
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => loadBoard().catch(() => {}), 250); // debounced reconcile
-  if (openTaskId && ev.task_id === openTaskId) refreshModal();
+  if (openTaskId && ev.task_id === openTaskId && ev.kind !== "task.deleted" && ev.kind !== "comment.deleted") refreshModal();
 }
 
 function feedItem(ev) {
@@ -585,6 +688,9 @@ function evText(ev) {
     case "project.created": span.append(who, " created project ", el("b", {}, d.slug || "")); break;
     case "project.archived": span.append(who, " archived project ", el("b", {}, d.slug || "")); break;
     case "project.unarchived": span.append(who, " unarchived project ", el("b", {}, d.slug || "")); break;
+    case "task.deleted": span.append(who, " deleted ", ref || document.createTextNode("#" + ev.task_id)); break;
+    case "comment.deleted": span.append(who, " deleted a comment on ", ref || document.createTextNode("#" + ev.task_id)); break;
+    case "project.deleted": span.append(who, " deleted project ", el("b", {}, d.slug || "")); break;
     default: span.append(who, " " + ev.kind + " ", ref);
   }
   return span;
@@ -604,6 +710,9 @@ function describeText(ev) {
     case "project.created": return `${who} created project ${d.slug || ""}`;
     case "project.archived": return `${who} archived project ${d.slug || ""}`;
     case "project.unarchived": return `${who} unarchived project ${d.slug || ""}`;
+    case "task.deleted": return `${who} deleted task`;
+    case "comment.deleted": return `${who} deleted a comment on ${t}`;
+    case "project.deleted": return `${who} deleted project ${d.slug || ""}`;
     default: return `${who} ${ev.kind} ${t}`;
   }
 }

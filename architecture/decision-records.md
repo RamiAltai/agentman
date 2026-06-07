@@ -178,6 +178,44 @@ without evidence.
 - Evidence: `cmd/am/web/app.js` (`selected` Set, `toggleProject`, `qstr` `selected.size === 1`,
   `renderBoard` `selected.has(t.project)`, `tab()`/`card()`).
 
+### ADR-015: Hard-delete endpoints with FK cascade and retained audit log (Phase C1)
+- Status: Active
+- Context: No API existed to delete tasks, comments, or projects — removal was only possible by
+  editing the SQLite file directly. Archive (ADR-013) is reversible and projects-only; a distinct
+  "permanently remove" path was needed. The existing `ON DELETE CASCADE` FKs
+  (`projects → tasks → comments`, `tasks → comments`) and the `foreign_keys(1)` DSN pragma meant
+  cascade was already wired but unused via the API.
+- Decision:
+  1. **Hard delete (irreversible)** — not a second soft-delete. Archive already covers "hide";
+     the new surface is permanent removal.
+  2. **Cascade via existing FKs** — no new SQL; deleting a project removes all its tasks and
+     comments; deleting a task removes all its comments.
+  3. **Events retained as audit log** — `events.project_id` / `events.task_id` are denormalized
+     nullable non-FKs (`schema.sql` defines no FK on `events`), so event rows survive hard deletes.
+     Each delete method inserts a `*.deleted` event in the same transaction before the `DELETE`, then
+     commits. The handler broadcasts after commit (consistent with all other mutations).
+  4. **`ref` reuse accepted** — the global `tasks.id` autoincrement never reuses (wire refs are
+     stable), but a per-project human `ref` (e.g. `web-3`) can be reused if the highest-numbered
+     task is deleted and a new task is created. No counter/migration was added — acceptable for a
+     personal board.
+  5. **`am project rm <slug> --yes` requires `--yes`** — without the flag the CLI errors with a
+     hint and a non-zero exit (destructive cascade; guard against accidents). `am rm <id>` is silent
+     on success (agent-friendly), exits 3 if not found.
+- New event kinds: `task.deleted`, `comment.deleted`, `project.deleted` (total now 12).
+- Routes: `DELETE /api/tasks/{id}`, `DELETE /api/tasks/{id}/comments/{cid}`,
+  `DELETE /api/projects/{slug}` — all return `200 {"status":"deleted"}`; `ErrNotFound` → 404.
+  The existing `csrfGuard` already gates DELETE methods.
+- Dashboard: inline two-step delete confirms for tasks (in modal), comments (per-row ×), and
+  projects (in Manage-projects modal). No native `confirm()`/`prompt()` — blocked in webviews.
+  All DOM via `el()`.
+- Known behavior: a deleted project's historical events reappear in the unfiltered activity feed
+  because the archived-event filter (`p.archived_at IS NULL`) passes a NULL (no row) as "not
+  archived". Acceptable as an audit trail; documented in `data-model.md`.
+- Evidence: `cmd/am/store.go` (`DeleteTask`/`DeleteComment`/`DeleteProject`); `cmd/am/server.go`
+  (`handleDeleteTask`/`handleDeleteComment`/`handleDeleteProject`, route table); `cmd/am/cli.go`
+  (`cmdRm`, `project rm`); `cmd/am/main.go` (`rm` dispatch); `cmd/am/web/app.js` (delete buttons,
+  `onEvent` for `*.deleted`); `cmd/am/store_test.go` + `cmd/am/server_test.go` (7 new tests).
+
 ## Inferred Decisions
 
 ### IADR-001: SSE chosen over WebSockets
@@ -218,7 +256,7 @@ These are **undecided/undocumented** in the repo (decide + record before buildin
 - **Testing strategy & coverage targets** — only `update_test.go` exists; no policy.
 - **Schema migration approach** — resolved + exercised; see IADR-003 / ADR-010 / ADR-013.
 - **Delete / archival semantics** — archive resolved as a reversible soft-delete (ADR-013); hard
-  delete and `events`/`comments` retention remain undecided.
+  delete resolved (ADR-015, Phase C1); `events`/`comments` retention still undecided (C2 pending).
 - **CI/CD & release automation** — no `.github/`; releases are manual `git tag` + push.
 - **Versioning / CHANGELOG policy** — tags exist (`v0.1.0`–`v0.3.0`); `CHANGELOG.md` (Keep a
   Changelog format) and `ROADMAP.md` now exist in the repo root. Release automation and a stated

@@ -310,6 +310,143 @@ func TestCreateTaskIntoArchivedProject400(t *testing.T) {
 	}
 }
 
+func TestDeleteTaskEndpoint(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "delproj")
+	id := mustCreateTask(t, ts, "delproj", "Delete me")
+
+	// First DELETE → 200.
+	r := do(t, ts, http.MethodDelete, "/api/tasks/"+id, "", nil)
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE task = %d, want 200", r.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		t.Fatalf("decode delete response: %v", err)
+	}
+	if body["status"] != "deleted" {
+		t.Fatalf("delete body status = %q, want deleted", body["status"])
+	}
+
+	// GET after delete → 404.
+	r2 := do(t, ts, http.MethodGet, "/api/tasks/"+id, "", nil)
+	defer r2.Body.Close()
+	if r2.StatusCode != http.StatusNotFound {
+		t.Fatalf("GET deleted task = %d, want 404", r2.StatusCode)
+	}
+
+	// Second DELETE → 404.
+	r3 := do(t, ts, http.MethodDelete, "/api/tasks/"+id, "", nil)
+	defer r3.Body.Close()
+	if r3.StatusCode != http.StatusNotFound {
+		t.Fatalf("re-DELETE task = %d, want 404", r3.StatusCode)
+	}
+}
+
+func TestDeleteProjectEndpoint(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "toberemoved")
+	_ = mustCreateTask(t, ts, "toberemoved", "task inside")
+
+	// DELETE project → 200.
+	r := do(t, ts, http.MethodDelete, "/api/projects/toberemoved", "", nil)
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE project = %d, want 200", r.StatusCode)
+	}
+
+	// Project no longer in list.
+	r2 := do(t, ts, http.MethodGet, "/api/projects?archived=true", "", nil)
+	defer r2.Body.Close()
+	var ps []Project
+	if err := json.NewDecoder(r2.Body).Decode(&ps); err != nil {
+		t.Fatalf("decode projects: %v", err)
+	}
+	for _, p := range ps {
+		if p.Slug == "toberemoved" {
+			t.Fatal("deleted project still in list")
+		}
+	}
+
+	// DELETE again → 404.
+	r3 := do(t, ts, http.MethodDelete, "/api/projects/toberemoved", "", nil)
+	defer r3.Body.Close()
+	if r3.StatusCode != http.StatusNotFound {
+		t.Fatalf("re-DELETE project = %d, want 404", r3.StatusCode)
+	}
+}
+
+func TestDeleteCommentEndpoint(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "cmproj")
+	id := mustCreateTask(t, ts, "cmproj", "Has comments")
+	otherID := mustCreateTask(t, ts, "cmproj", "Other task")
+
+	// Add a comment to the first task, capture its id.
+	r := do(t, ts, http.MethodPost, "/api/tasks/"+id+"/comments",
+		`{"body":"to be deleted"}`,
+		map[string]string{"Content-Type": "application/json"})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusCreated {
+		t.Fatalf("create comment = %d, want 201", r.StatusCode)
+	}
+	var cm Comment
+	if err := json.NewDecoder(r.Body).Decode(&cm); err != nil {
+		t.Fatalf("decode comment: %v", err)
+	}
+	cid := strconv.FormatInt(cm.ID, 10)
+
+	// Wrong task id: the comment exists but does not belong to otherID → 404.
+	rw := do(t, ts, http.MethodDelete, "/api/tasks/"+otherID+"/comments/"+cid, "", nil)
+	defer rw.Body.Close()
+	if rw.StatusCode != http.StatusNotFound {
+		t.Fatalf("DELETE comment under wrong task = %d, want 404", rw.StatusCode)
+	}
+
+	// Non-existent comment id on the correct task → 404.
+	rn := do(t, ts, http.MethodDelete, "/api/tasks/"+id+"/comments/999999", "", nil)
+	defer rn.Body.Close()
+	if rn.StatusCode != http.StatusNotFound {
+		t.Fatalf("DELETE non-existent comment = %d, want 404", rn.StatusCode)
+	}
+
+	// Valid delete → 200 {"status":"deleted"}.
+	rd := do(t, ts, http.MethodDelete, "/api/tasks/"+id+"/comments/"+cid, "", nil)
+	defer rd.Body.Close()
+	if rd.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE comment = %d, want 200", rd.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(rd.Body).Decode(&body); err != nil {
+		t.Fatalf("decode delete response: %v", err)
+	}
+	if body["status"] != "deleted" {
+		t.Fatalf("delete body status = %q, want deleted", body["status"])
+	}
+
+	// Task still exists; its comment is gone.
+	rg := do(t, ts, http.MethodGet, "/api/tasks/"+id, "", nil)
+	defer rg.Body.Close()
+	if rg.StatusCode != http.StatusOK {
+		t.Fatalf("GET task after comment delete = %d, want 200", rg.StatusCode)
+	}
+	var task Task
+	if err := json.NewDecoder(rg.Body).Decode(&task); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	if len(task.Comments) != 0 {
+		t.Fatalf("task still has %d comments, want 0", len(task.Comments))
+	}
+
+	// Re-delete the now-missing comment → 404.
+	rr := do(t, ts, http.MethodDelete, "/api/tasks/"+id+"/comments/"+cid, "", nil)
+	defer rr.Body.Close()
+	if rr.StatusCode != http.StatusNotFound {
+		t.Fatalf("re-DELETE comment = %d, want 404", rr.StatusCode)
+	}
+}
+
 // ---------- helpers ----------
 
 func mustCreateProject(t *testing.T, ts *httptest.Server, slug string) {

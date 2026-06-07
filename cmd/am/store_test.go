@@ -373,6 +373,173 @@ func TestCreateTaskRejectsArchivedProject(t *testing.T) {
 	}
 }
 
+func TestDeleteTaskCascadesComments(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "to delete"})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	c, _, err := st.AddComment(task.ID, "alice", "a comment")
+	if err != nil {
+		t.Fatalf("AddComment: %v", err)
+	}
+	_ = c
+
+	ev, err := st.DeleteTask(task.ID, "alice")
+	if err != nil {
+		t.Fatalf("DeleteTask: %v", err)
+	}
+	if ev == nil || ev.Kind != "task.deleted" {
+		t.Fatalf("DeleteTask event = %v, want kind task.deleted", ev)
+	}
+
+	// Task must be gone.
+	if _, err := st.GetTask(task.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetTask after delete = %v, want ErrNotFound", err)
+	}
+
+	// Comment must also be gone (cascade).
+	var count int
+	st.db.QueryRow("SELECT COUNT(*) FROM comments WHERE task_id=?", task.ID).Scan(&count)
+	if count != 0 {
+		t.Fatalf("comments after task delete = %d, want 0", count)
+	}
+
+	// task.deleted event must exist.
+	evs, _, err := st.ListEvents(0, "web", 200)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	found := false
+	for _, e := range evs {
+		if e.Kind == "task.deleted" && e.TaskID == task.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("task.deleted event not found in event log")
+	}
+}
+
+func TestDeleteTaskNotFound(t *testing.T) {
+	st := openTestStore(t)
+	_, err := st.DeleteTask(99999, "alice")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("DeleteTask non-existent = %v, want ErrNotFound", err)
+	}
+}
+
+func TestDeleteCommentRemovesOnlyComment(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "task with comments"})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	c1, _, err := st.AddComment(task.ID, "alice", "first")
+	if err != nil {
+		t.Fatalf("AddComment 1: %v", err)
+	}
+	c2, _, err := st.AddComment(task.ID, "bob", "second")
+	if err != nil {
+		t.Fatalf("AddComment 2: %v", err)
+	}
+
+	ev, err := st.DeleteComment(task.ID, c1.ID, "alice")
+	if err != nil {
+		t.Fatalf("DeleteComment: %v", err)
+	}
+	if ev == nil || ev.Kind != "comment.deleted" {
+		t.Fatalf("DeleteComment event = %v, want kind comment.deleted", ev)
+	}
+
+	// First comment gone, second still present.
+	var count int
+	st.db.QueryRow("SELECT COUNT(*) FROM comments WHERE id=?", c1.ID).Scan(&count)
+	if count != 0 {
+		t.Fatalf("comment c1 still exists after delete")
+	}
+	st.db.QueryRow("SELECT COUNT(*) FROM comments WHERE id=?", c2.ID).Scan(&count)
+	if count != 1 {
+		t.Fatalf("comment c2 should still exist, count=%d", count)
+	}
+
+	// Task itself is still present.
+	if _, err := st.GetTask(task.ID); err != nil {
+		t.Fatalf("task should still exist: %v", err)
+	}
+
+	// Wrong task id → ErrNotFound.
+	_, err = st.DeleteComment(task.ID+999, c2.ID, "bob")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("DeleteComment wrong taskID = %v, want ErrNotFound", err)
+	}
+}
+
+func TestDeleteProjectCascades(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("alpha", "Alpha"); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	task, _, err := st.CreateTask(CreateTaskInput{Project: "alpha", Title: "child task"})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if _, _, err := st.AddComment(task.ID, "alice", "note"); err != nil {
+		t.Fatalf("AddComment: %v", err)
+	}
+
+	ev, err := st.DeleteProject("alpha", "alice")
+	if err != nil {
+		t.Fatalf("DeleteProject: %v", err)
+	}
+	if ev == nil || ev.Kind != "project.deleted" {
+		t.Fatalf("DeleteProject event = %v, want kind project.deleted", ev)
+	}
+
+	// Project gone.
+	ps, err := st.ListProjects(true)
+	if err != nil {
+		t.Fatalf("ListProjects: %v", err)
+	}
+	for _, p := range ps {
+		if p.Slug == "alpha" {
+			t.Fatal("project alpha still in list after DeleteProject")
+		}
+	}
+
+	// Task gone (cascade).
+	if _, err := st.GetTask(task.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("task after project delete = %v, want ErrNotFound", err)
+	}
+
+	// Comments gone (cascade).
+	var count int
+	st.db.QueryRow("SELECT COUNT(*) FROM comments WHERE task_id=?", task.ID).Scan(&count)
+	if count != 0 {
+		t.Fatalf("comments after project delete = %d, want 0", count)
+	}
+
+	// project.deleted event persists in event log (events are NOT deleted).
+	// Use direct DB query since ListEvents filters by archived projects.
+	var evCount int
+	st.db.QueryRow("SELECT COUNT(*) FROM events WHERE kind='project.deleted'").Scan(&evCount)
+	if evCount == 0 {
+		t.Error("project.deleted event not found in event log")
+	}
+
+	// ErrNotFound on re-delete.
+	_, err = st.DeleteProject("alpha", "alice")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("DeleteProject re-delete = %v, want ErrNotFound", err)
+	}
+}
+
 func TestEventsCursorStrictlyIncreasing(t *testing.T) {
 	st := openTestStore(t)
 	if _, _, err := st.CreateProject("web", "Web"); err != nil {

@@ -51,6 +51,8 @@ Then use `am` normally (`am whoami` shows it).
     am projects --all          # list projects, incl. archived (marked "(archived)")
     am project archive <slug>  # hide a project (exit 3 if not found)
     am project unarchive <slug>
+    am rm <id>                 # hard-delete a task — permanent (exit 3 if not found)
+    am project rm <slug> --yes # hard-delete a project + ALL its tasks/comments — permanent
 
 Choose the project with `-p <slug>` (or set AGENTMAN_PROJECT). Output is terse text — add
 `--json` to parse. Silence = success. Exit codes: 0 ok · 3 not found · 4 already claimed ·

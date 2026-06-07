@@ -13,6 +13,28 @@ _Target: **v0.4.0** — not yet tagged._
 
 ### Added
 
+- **Hard delete (Phase C1)** — permanent removal for tasks, comments, and projects:
+  - CLI: `am rm <id>` hard-deletes a task and all its comments (silent success; exit 3 if not found).
+    `am project rm <slug> --yes` hard-deletes a project **and all its tasks/comments** (cascade);
+    `--yes` is required or the command errors with a hint.
+  - API: `DELETE /api/tasks/{id}`, `DELETE /api/tasks/{id}/comments/{cid}`,
+    `DELETE /api/projects/{slug}` — all return `200 {"status":"deleted"}`; missing target → 404.
+    Cascade is via existing FK constraints (`projects → tasks → comments`).
+  - Dashboard: inline two-step delete confirms (no native `confirm()`/`prompt()`) in the task modal
+    (**Delete task**), per-comment (**×**), and the Manage-projects modal (**Delete project**,
+    distinct from Archive). All DOM via `el()`.
+  - Three new event kinds: `task.deleted`, `comment.deleted`, `project.deleted` (total now 12).
+    `onEvent` handles each: `task.deleted` removes the card and closes the open modal; `comment.deleted`
+    refreshes the open modal; `project.deleted` drops the project from selection and reloads.
+    Events are **never** deleted — the audit log (including `*.deleted` events) survives hard deletes.
+  - Store: `DeleteTask`, `DeleteComment`, `DeleteProject` — each inserts its `*.deleted` event in
+    the same tx before the `DELETE`, then commits; broadcast happens after commit.
+  - Tests: `TestDeleteTaskCascadesComments`, `TestDeleteTaskNotFound`,
+    `TestDeleteCommentRemovesOnlyComment`, `TestDeleteProjectCascades` (store);
+    `TestDeleteTaskEndpoint`, `TestDeleteProjectEndpoint`, `TestDeleteCommentEndpoint` (HTTP).
+    (`cmd/am/store.go`, `cmd/am/server.go`, `cmd/am/cli.go`, `cmd/am/main.go`, `cmd/am/web/app.js`,
+    `cmd/am/web/app.css`)
+
 - **DB export / import** — `am db export [path] [--db PATH]` writes a consistent `VACUUM INTO`
   snapshot (chmod `0o600`, prints the path); `am db import <path> [--db PATH] [--yes]` validates
   the candidate (integrity + foreign-key checks, required tables, schema version), **refuses to

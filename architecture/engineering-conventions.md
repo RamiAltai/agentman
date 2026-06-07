@@ -20,8 +20,8 @@ convention is loose, it's called out.
 - CLI verb implementations: `cmdX` (`cmdClaim`, `cmdNew`); dispatched in `main.go`.
 - Sentinel errors: `ErrNotFound`, `ErrConflict`, `ErrValidation`, `ErrProjectArchived` (→ HTTP 400 `project_archived`); typed `*ConflictError`.
 - Event kinds: dotted `noun.verb` strings — `task.created`, `task.claimed`, `task.status`,
-  `task.assign`, `task.patched`, `comment.added`, `project.created`, `project.archived`,
-  `project.unarchived`.
+  `task.assign`, `task.patched`, `task.deleted`, `comment.added`, `comment.deleted`,
+  `project.created`, `project.archived`, `project.unarchived`, `project.deleted` (12 total).
 - Env vars: `AGENTMAN_*` (`AGENTMAN_URL/PROJECT/AGENT/AGENT_FILE/DB/PORT/NO_UPDATE_CHECK`).
 
 ## API Conventions

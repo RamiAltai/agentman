@@ -65,6 +65,8 @@ func main() {
 		cmdEdit(c, a)
 	case "drop":
 		cmdDrop(c, a)
+	case "rm":
+		cmdRm(c, a)
 	case "projects":
 		cmdProjects(c, a)
 	case "project":
@@ -154,10 +156,12 @@ func usage() {
   am note <id> "text"                         add a comment
   am edit <id> [--title T] [--body B] [--priority N]
   am drop <id>                                release back to todo
+  am rm <id>                                  hard-delete a task (permanent)
   am projects [--all]                    list projects (--all includes archived)
   am project new <slug> [name]                create a project
   am project archive <slug>              soft-archive a project (hides it)
   am project unarchive <slug>            restore an archived project
+  am project rm <slug> --yes             hard-delete a project + ALL its tasks/comments
   am version                                  print version
   am update [version]                         reinstall the latest (or a given) version
   am db export [path] [--db PATH]          export a DB snapshot (prints path)

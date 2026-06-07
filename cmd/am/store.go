@@ -671,6 +671,98 @@ func (s *Store) ClaimTask(id int64, agent string) (*Task, *Event, error) {
 	return t, ev, tx.Commit()
 }
 
+// DeleteTask hard-deletes a task (and its comments via FK cascade) and records
+// a task.deleted event in the same transaction. Returns ErrNotFound if the task
+// does not exist.
+func (s *Store) DeleteTask(id int64, actor string) (*Event, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	t, err := s.getTaskTx(tx, id)
+	if err != nil {
+		return nil, err
+	}
+	ev, err := insertEvent(tx, t.ProjectID, id, actorOr(actor), "task.deleted",
+		map[string]any{"title": t.Title})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec("DELETE FROM tasks WHERE id=?", id); err != nil {
+		return nil, err
+	}
+	return ev, tx.Commit()
+}
+
+// DeleteComment hard-deletes a single comment that belongs to taskID. Bumps
+// the task's updated_at and records a comment.deleted event. Returns ErrNotFound
+// if the comment does not exist or does not belong to taskID.
+func (s *Store) DeleteComment(taskID, commentID int64, actor string) (*Event, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// Verify the comment exists and belongs to this task.
+	var dummy int64
+	err = tx.QueryRow("SELECT id FROM comments WHERE id=? AND task_id=?", commentID, taskID).Scan(&dummy)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Need the task's project_id for the event.
+	t, err := s.getTaskTx(tx, taskID)
+	if err != nil {
+		return nil, err
+	}
+
+	ev, err := insertEvent(tx, t.ProjectID, taskID, actorOr(actor), "comment.deleted",
+		map[string]any{"comment_id": commentID})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec("DELETE FROM comments WHERE id=?", commentID); err != nil {
+		return nil, err
+	}
+	tx.Exec("UPDATE tasks SET updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?", taskID)
+	return ev, tx.Commit()
+}
+
+// DeleteProject hard-deletes a project (and its tasks+comments via FK cascade)
+// and records a project.deleted event. Returns ErrNotFound if the slug does not exist.
+func (s *Store) DeleteProject(slug, actor string) (*Event, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var projectID int64
+	err = tx.QueryRow("SELECT id FROM projects WHERE slug=?", slug).Scan(&projectID)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	ev, err := insertEvent(tx, projectID, 0, actorOr(actor), "project.deleted",
+		map[string]any{"slug": slug})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec("DELETE FROM projects WHERE id=?", projectID); err != nil {
+		return nil, err
+	}
+	return ev, tx.Commit()
+}
+
 func (s *Store) AddComment(id int64, author, body string) (*Comment, *Event, error) {
 	if strings.TrimSpace(body) == "" {
 		return nil, nil, ErrValidation

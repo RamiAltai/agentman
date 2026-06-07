@@ -63,24 +63,37 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
 - **HTTP API + routing** — `cmd/am/server.go` `Handler()`:
   `GET/POST /api/projects` (`GET …?archived=true` includes archived),
   `POST /api/projects/{slug}/archive`, `POST /api/projects/{slug}/unarchive`,
+  `DELETE /api/projects/{slug}` (hard-delete + cascade),
   `GET/POST /api/tasks`, `GET/PATCH /api/tasks/{id}`,
-  `POST /api/tasks/{id}/claim`, `POST /api/tasks/{id}/comments`, `GET /api/events`,
+  `DELETE /api/tasks/{id}` (hard-delete + cascade to comments),
+  `POST /api/tasks/{id}/claim`, `POST /api/tasks/{id}/comments`,
+  `DELETE /api/tasks/{id}/comments/{cid}`, `GET /api/events`,
   `GET /api/stream`, and `/` → `http.FileServer` over `go:embed web`.
+  All three DELETE routes return `200 {"status":"deleted"}`; `ErrNotFound` → 404.
   (Uses Go 1.22+ method+pattern ServeMux, e.g. `"GET /api/tasks/{id}"`.)
 - **SSE hub** — `cmd/am/hub.go`: best-effort fan-out; buffered per-subscriber channels; a
   `project.created` event reaches all subscribers regardless of filter.
 - **Data layer** — `cmd/am/store.go`: opens SQLite with `SetMaxOpenConns(1)` (single writer),
   WAL via DSN pragmas; all queries parameterized; atomic claim; event insertion helper.
+  Hard-delete methods: `DeleteTask`, `DeleteComment`, `DeleteProject` (each inserts `*.deleted`
+  event in the same tx before the DELETE, then commits; cascade via FK).
 - **CLI** — `cmd/am/cli.go` + `cmd/am/client.go`: verb parsing, terse output, exit-code mapping.
   Includes `project archive`/`project unarchive <slug>` and `projects --all` (lists archived,
   marked `(archived)`); `db export`/`db import` are handled offline in `cmd/am/db.go`.
+  Hard-delete verbs: `am rm <id>` (silent success, exit 3 if not found); `am project rm <slug> --yes`
+  (requires `--yes`; cascade-deletes project + all tasks/comments).
 - **Dashboard** — `cmd/am/web/app.js`: vanilla SPA; SSE consumer; board/modal/feed rendering.
   Includes a `⋯` "Manage projects" button in the tab bar that opens a modal (`openManageProjects`/
   `renderManageList`) listing all projects (active + archived via `GET /api/projects?archived=true`),
-  with Archive/Unarchive buttons that call the existing `POST /api/projects/{slug}/archive|unarchive`
-  routes. The activity feed hides archived projects' events (no `project=` filter → `ListEvents`/
-  `RecentEvents` exclude events whose project has a non-NULL `archived_at`). Task creation into an
-  archived project is rejected at the store layer (`CreateTask` → `ErrProjectArchived` → HTTP 400).
+  with Archive/Unarchive buttons and a **Delete project** button (inline two-step confirm, calls
+  `DELETE /api/projects/{slug}`). The task modal has a **Delete task** button (inline two-step);
+  each comment has a **× delete** button (inline two-step; `DELETE /api/tasks/{id}/comments/{cid}`).
+  All confirms use the `el()` helper, no native `confirm()`/`prompt()`. `onEvent` handles
+  `task.deleted` (remove card + close modal), `comment.deleted` (refresh modal), and
+  `project.deleted` (drop from selection + reload). The activity feed hides archived projects'
+  events (no `project=` filter → `ListEvents`/`RecentEvents` exclude events whose project has a
+  non-NULL `archived_at`). Task creation into an archived project is rejected at the store layer
+  (`CreateTask` → `ErrProjectArchived` → HTTP 400).
 
 ## External Dependencies
 

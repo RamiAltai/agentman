@@ -30,7 +30,8 @@ are ISO-8601 UTC **TEXT** (`strftime('%Y-%m-%dT%H:%M:%fZ','now')`), so they sort
   (`UnarchiveProject`). Soft-archive is reversible; default project lists hide archived rows.
 - **`events.id`** — monotonic; doubles as the `?since=` cursor and the SSE `Last-Event-ID`.
 - **`events.kind`** — one of `task.created | task.claimed | task.status | task.assign |
-  task.patched | comment.added | project.created | project.archived | project.unarchived`.
+  task.patched | task.deleted | comment.added | comment.deleted | project.created |
+  project.archived | project.unarchived | project.deleted` (12 total).
 - **`events.data`** — compact JSON delta, e.g. `{"status":["todo","doing"]}`.
 
 ### Indexes
@@ -77,11 +78,30 @@ project → tasks → comments. **Events are never deleted** (append-only).
     transaction; if the project is archived it returns the sentinel `ErrProjectArchived`, mapped
     to HTTP 400 `{"error":"project_archived"}` by `writeErr`. The CLI prints `project_archived`
     to stderr and exits non-zero.
-- **Delete:** **No hard-delete endpoint or store method exists** for projects/tasks/comments today —
-  the cascade rules are defined but unused via the API (Confirmed: no `DELETE` route in
-  `server.go`). Hard removal only happens by editing the DB file directly.
-- **Growth:** `events` and `comments` grow unbounded; the dashboard caps the "Done" column render
-  at 50 and the feed at ~200 nodes (`web/app.js`), but the DB retains everything.
+- **Delete (hard, irreversible):** `DELETE /api/tasks/{id}`, `DELETE /api/tasks/{id}/comments/{cid}`,
+  and `DELETE /api/projects/{slug}` — backed by `store.DeleteTask`, `store.DeleteComment`, and
+  `store.DeleteProject` respectively — permanently remove rows. Each method inserts the matching
+  `*.deleted` event in the **same transaction** before the `DELETE`, then commits; the handler
+  broadcasts after commit. Cascade is via existing schema FKs (`projects → tasks → comments`
+  and `tasks → comments` are `ON DELETE CASCADE`; DSN has `foreign_keys(1)`), so deleting a project
+  removes all its tasks and comments, and deleting a task removes all its comments.
+  **`events` rows are never deleted** — `events.project_id` / `events.task_id` are denormalized,
+  nullable, and not foreign keys (confirmed: `schema.sql` defines no FK on `events`), so the
+  audit log, including the new `*.deleted` event, survives the hard delete.
+  **Nuance — deleted-project events reappear in the feed:** the unfiltered activity feed uses
+  `LEFT JOIN projects p ON p.id = events.project_id … (events.project_id IS NULL OR p.archived_at IS NULL)`.
+  A deleted project has no row, so the JOIN yields NULL, which the `archived_at IS NULL` check
+  passes — making the deleted project's earlier event history visible in the feed (acceptable as an
+  audit trail; this differs from a *soft-archived* project whose events are hidden while the row exists).
+  **`ref` reuse:** the global `tasks.id` autoincrement never reuses (wire references stay stable),
+  but a per-project human `ref` (e.g. `web-3`) can be reused if the highest-numbered task in a
+  project is deleted and a new task is then created (no counter/migration was added — acceptable
+  for a personal board).
+  CLI: `am rm <id>` (silent success; exit 3 if not found); `am project rm <slug> --yes` (requires
+  `--yes` or it errors with a hint; cascade-deletes the project and all its tasks/comments).
+  Missing target → `ErrNotFound` → HTTP 404.
+- **Growth:** `events` and `comments` grow unbounded (C2 pending); the dashboard caps the "Done"
+  column render at 50 and the feed at ~200 nodes (`web/app.js`), but the DB retains everything.
 
 ## Migrations
 
@@ -156,6 +176,7 @@ erDiagram
 
 ## Unknowns
 
-- **Retention/archival policy** for `events`/`comments` — none defined (Unknown).
-- Whether per-project `ref` is expected to stay gap-free after deletes — moot today (no deletes),
-  but `MAX(ref)+1` would reuse numbers if deletes were added (Inference, Confidence: Medium).
+- **Retention/archival policy** for `events`/`comments` — none defined (C2 pending, Unknown).
+- **Per-project `ref` is not gap-free after deletes** — `MAX(ref)+1` reuses the number if the
+  highest-numbered task in a project is deleted and a new task is created. Accepted for a personal
+  board (no counter/migration added, Phase C1 decision).

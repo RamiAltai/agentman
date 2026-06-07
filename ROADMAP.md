@@ -57,16 +57,13 @@ Archiving currently hides a project's **tab** (`ListProjects`) and its **board t
 
 ## Phase C — Data lifecycle (medium)
 
-- [ ] **C1 · Hard-delete endpoints** — _M_
-  - Why: no API to delete a task/comment/project; removal only by editing the DB file. (Archive is
-    soft/reversible and projects-only.)
-  - Do: add `DELETE /api/tasks/{id}`, `…/comments/{cid}`, `…/projects/{slug}` with store methods in
-    one tx + an `events` row, broadcast after commit; CLI verbs (`am rm`/`am drop --hard`?). Decide
-    **`ref` reuse semantics** (per-project `MAX(ref)+1` would reuse numbers after deletes) and
-    cascade behavior (project→tasks→comments already `ON DELETE CASCADE`). → `data-model.md`,
-    `decision-records.md` (new ADR).
-  - Accept: documented delete semantics; tests for cascade + `ref` behavior.
-- [ ] **C2 · Bound `events` / `comments` growth** — _M_
+- [x] **C1 · Hard-delete endpoints** — _M_ — **shipped (Phase C1)**
+  - `DELETE /api/tasks/{id}`, `DELETE /api/tasks/{id}/comments/{cid}`, `DELETE /api/projects/{slug}`;
+    store methods `DeleteTask`/`DeleteComment`/`DeleteProject`; CLI `am rm <id>` and
+    `am project rm <slug> --yes`; dashboard inline two-step confirms; 3 new event kinds
+    (`task.deleted`, `comment.deleted`, `project.deleted`); 7 new tests. `ref` reuse accepted
+    (no counter). → ADR-015, `data-model.md`, `CHANGELOG.md`.
+- [ ] **C2 · Bound `events` / `comments` growth** — _M_ — (remaining half of Phase C)
   - Why: both grow unbounded (no retention/pagination); long-running instances bloat. The dashboard
     only caps render, not storage.
   - Do: choose one — (a) a retention/compaction job or `am db prune --before <date>`; and/or

@@ -1,7 +1,7 @@
 # Frontend Architecture
 
 There **is** a frontend: a small single-page dashboard in `cmd/am/web/`
-(`index.html` 50 lines, `app.css` 331 lines, `app.js` 694 lines), embedded into the binary via
+(`index.html` 50 lines, `app.css` 366 lines, `app.js` 803 lines), embedded into the binary via
 `//go:embed web` (`cmd/am/server.go`) and served at `/`. It is the human-facing view; agents do
 not use it.
 
@@ -35,11 +35,21 @@ All built imperatively in `app.js` (no component framework):
   isn't already scoped to a single project), comment count.
 - **Activity feed** — `feedItem`, `evText`, `evKind`: color-coded events with clickable `#refs`.
   Event kinds include the project lifecycle: `project.created`, `project.archived`,
-  `project.unarchived` (the last two render via `evText`/`describeText`; `evKind` colors them as
-  generic "other").
+  `project.unarchived` (render via `evText`/`describeText`; `evKind` colors them as generic "other"),
+  and the new delete kinds: `task.deleted`, `comment.deleted`, `project.deleted`.
 - **Detail modal** — `renderModal`, plus `openNew` (new task) and `openNewProject`: one reused
   `#sheet` element; auto-growing title `<textarea>`; status/assignee/priority controls; comments;
-  history.
+  history. The modal includes a **Delete task** button (inline two-step confirm — see below) and
+  each comment has a **× delete** button (also two-step).
+- **Delete affordances** — three inline two-step confirms (no native `confirm()`/`prompt()` — they
+  are blocked in webviews; all DOM built via `el()`, no `innerHTML`):
+  1. **Delete task** (`btn-danger-task`) in the task modal — on first click shows "Confirm delete?";
+     a 4-second timeout resets it; second click calls `DELETE /api/tasks/{id}`.
+  2. **Per-comment ×** (`btn-del-cm`) on each comment row — same two-step flow; calls
+     `DELETE /api/tasks/{id}/comments/{cid}`.
+  3. **Delete project** (`btn-danger-proj`) in the Manage-projects modal — distinct from the Archive
+     button; two-step with a 5-second timeout; calls `DELETE /api/projects/{slug}`.
+  All three are irreversible hard deletes (cascade for projects/tasks).
 
 ## State Management
 
@@ -60,7 +70,10 @@ correct over clever diffing.
   or 2+ selected it streams/loads everything and `renderBoard()` filters client-side
   (`selected.has(t.project)`). `onmessage` → `onEvent`; `onerror` → close + reconnect with
   exponential backoff (1s→10s) and a "reconnecting…" status. `loadFeed()` bootstraps from
-  `/api/events?tail=50` (same `qstr` rule).
+  `/api/events?tail=50` (same `qstr` rule). `onEvent` handles the three delete kinds:
+  `task.deleted` removes the card from `tasks` map and closes the modal if it was open;
+  `comment.deleted` refreshes the open modal; `project.deleted` drops the slug from `selected` and
+  reloads the board/feed.
 - Same-origin only; no CORS, no auth token (the API is unauthenticated).
 
 ## Styling and Design System
@@ -119,6 +132,7 @@ these docs is from source reading and manual verification, not automated tests. 
 - **Native HTML5 drag-and-drop doesn't fire on touch** → mobile relies on the status dropdown /
   `[ ]` keys (documented fallback in code comments).
 - **Full board re-render per event batch** (debounced) — fine at small scale, O(n) at large scale.
-- Single 694-line `app.js`, no module split, no minification, no tests → refactors are unguarded.
+- Single 803-line `app.js`, no module split, no minification, no tests → refactors are unguarded.
+  The new delete confirm flows (task/comment/project) are additional untested JS.
 - `localStorage` access is wrapped (`lsGet`/`lsSet`) so a sandboxed/Private-mode browser won't
   break the app — keep that pattern if you add persistence.

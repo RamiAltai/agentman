@@ -38,6 +38,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/tasks/{id}", s.handlePatchTask)
 	mux.HandleFunc("POST /api/tasks/{id}/claim", s.handleClaim)
 	mux.HandleFunc("POST /api/tasks/{id}/comments", s.handleComment)
+	mux.HandleFunc("DELETE /api/tasks/{id}", s.handleDeleteTask)
+	mux.HandleFunc("DELETE /api/tasks/{id}/comments/{cid}", s.handleDeleteComment)
+	mux.HandleFunc("DELETE /api/projects/{slug}", s.handleDeleteProject)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.HandleFunc("GET /api/stream", s.handleStream)
 
@@ -283,6 +286,52 @@ func (s *Server) handleComment(w http.ResponseWriter, r *http.Request) {
 	}
 	s.hub.Broadcast(ev)
 	writeJSON(w, http.StatusCreated, c)
+}
+
+func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
+	id, err := s.store.resolveTaskID(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	ev, err := s.store.DeleteTask(id, actorOf(r))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	s.hub.Broadcast(ev)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+func (s *Server) handleDeleteComment(w http.ResponseWriter, r *http.Request) {
+	taskID, err := s.store.resolveTaskID(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	cid, err := strconv.ParseInt(r.PathValue("cid"), 10, 64)
+	if err != nil {
+		writeErr(w, ErrNotFound)
+		return
+	}
+	ev, err := s.store.DeleteComment(taskID, cid, actorOf(r))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	s.hub.Broadcast(ev)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	ev, err := s.store.DeleteProject(slug, actorOf(r))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	s.hub.Broadcast(ev)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {

@@ -26,6 +26,9 @@ POST  /api/tasks/{id}/claim         handleClaim             (atomic; X-Agent = c
 POST  /api/tasks/{id}/comments      handleComment           {body}
 GET   /api/events                   handleEvents            ?since=  | ?tail=  | ?project=  (no project ⇒ hides archived-project events)
 GET   /api/stream                   handleStream            text/event-stream (SSE)
+DELETE /api/tasks/{id}              handleDeleteTask        hard-delete task + comments (cascade); 200 {"status":"deleted"}
+DELETE /api/tasks/{id}/comments/{cid} handleDeleteComment  hard-delete one comment; 200 {"status":"deleted"}
+DELETE /api/projects/{slug}         handleDeleteProject     hard-delete project + tasks + comments (cascade); 200 {"status":"deleted"}
 /                                   http.FileServer(embed)  serves cmd/am/web/
 ```
 
@@ -50,8 +53,8 @@ reads, or SSE.
 Lives in `cmd/am/store.go` (there is no separate "service" layer — the store *is* the domain
 logic). Each mutating method returns `(result, *Event, error)`; the handler broadcasts the event.
 Key methods: `CreateProject`, `ListProjects(includeArchived bool)`, `ArchiveProject`,
-`UnarchiveProject`, `ListTasks`, `GetTask`, `CreateTask`, `PatchTask`, `ClaimTask`,
-`AddComment`, `ListEvents`, `RecentEvents`. `ArchiveProject`/`UnarchiveProject` are
+`UnarchiveProject`, `DeleteProject`, `ListTasks`, `GetTask`, `CreateTask`, `PatchTask`,
+`ClaimTask`, `AddComment`, `DeleteComment`, `ListEvents`, `RecentEvents`, `DeleteTask`. `ArchiveProject`/`UnarchiveProject` are
 transactional and idempotent (no event when already in the target state).
 `CreateTask` checks the target project's `archived_at` before the insert and returns
 `ErrProjectArchived` if archived — creation into an archived project is rejected.
@@ -130,7 +133,8 @@ and a typed `*ConflictError{Assignee}`. `writeErr` (`server.go`) maps them: 404 
 `ConflictError` → `409 {"error":"already_claimed","assignee":…}`,
 `ErrProjectArchived` → `400 {"error":"project_archived"}`,
 `ErrValidation` → `400`; anything else → 500 with the raw
-message. The CLI re-maps HTTP status to **exit codes** in `client.go doOrFail`
+message. Delete handlers (`handleDeleteTask`, `handleDeleteComment`, `handleDeleteProject`) return
+`404` via `writeErr` when the target is missing (`ErrNotFound`). The CLI re-maps HTTP status to **exit codes** in `client.go doOrFail`
 (`3` not found · `4` conflict · `5` validation/project_archived · `6` server down · `1` other).
 
 ## Observability
@@ -143,10 +147,13 @@ fatal listen error. **No structured logging, request logging, metrics, or tracin
 There are six test files (run `go test ./...`):
 - `cmd/am/update_test.go` — version-comparison logic.
 - `cmd/am/store_test.go` — atomic-claim race (concurrent, `-race`-clean), events-cursor monotonicity,
-  store CRUD + validation (`ErrValidation`), and project archive/unarchive round-trip + idempotency.
+  store CRUD + validation (`ErrValidation`), project archive/unarchive round-trip + idempotency,
+  and hard-delete cascade/not-found (`TestDeleteTaskCascadesComments`, `TestDeleteTaskNotFound`,
+  `TestDeleteCommentRemovesOnlyComment`, `TestDeleteProjectCascades`).
 - `cmd/am/server_test.go` — validation→status mapping (400/404/409), `hostGuard`, `csrfGuard`,
-  `securityHeaders`, `listenAddr` loopback regression, archive/unarchive endpoints + 404
-  (via `net/http/httptest`).
+  `securityHeaders`, `listenAddr` loopback regression, archive/unarchive endpoints + 404,
+  and hard-delete HTTP endpoints (`TestDeleteTaskEndpoint`, `TestDeleteProjectEndpoint`,
+  `TestDeleteCommentEndpoint`) (via `net/http/httptest`).
 - `cmd/am/migrate_test.go` — migration runner (apply/skip/idempotent/rollback), incl. the v2 step
   that adds `projects.archived_at`.
 - `cmd/am/db_test.go` — `db export`/`import` roundtrip + file perms (0o600), backup creation + perms,
@@ -163,8 +170,9 @@ streaming/reconnect, the rest of the CLI commands, identity, and the dashboard. 
 - **New task field:** add the column in `schema.sql`, the struct field in `store.go`, thread it
   through `CreateTask`/`PatchTask`/`getTaskTx`, the API, and the dashboard (`web/`).
 - **New event kind:** emit via `insertEvent(...)` and handle it in `web/app.js` `evText`/`describeText`.
-  Current kinds: `task.created`, `task.claimed`, `task.status`, `task.assign`, `task.patched`,
-  `comment.added`, `project.created`, `project.archived`, `project.unarchived`.
+  Current kinds (12 total): `task.created`, `task.claimed`, `task.status`, `task.assign`,
+  `task.patched`, `task.deleted`, `comment.added`, `comment.deleted`, `project.created`,
+  `project.archived`, `project.unarchived`, `project.deleted`.
 
 ## Risks and Gaps
 

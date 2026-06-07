@@ -241,6 +241,12 @@ func cmdDrop(c *Client, a Args) {
 	c.doOrFail("PATCH", "/api/tasks/"+id, map[string]any{"assignee": "", "status": "todo"})
 }
 
+// cmdRm hard-deletes a task. Silent success (scriptable for agents).
+func cmdRm(c *Client, a Args) {
+	id := needID(a, "rm")
+	c.doOrFail("DELETE", "/api/tasks/"+id, nil)
+}
+
 func cmdProjects(c *Client, a Args) {
 	path := "/api/projects"
 	if a.has("all") {
@@ -288,8 +294,17 @@ func cmdProject(c *Client, a Args) {
 			fail(1, "usage: am project unarchive <slug>")
 		}
 		c.doOrFail("POST", "/api/projects/"+a.at(1)+"/unarchive", nil)
+	case "rm":
+		slug := a.at(1)
+		if slug == "" {
+			fail(1, "usage: am project rm <slug> --yes")
+		}
+		if !a.has("yes") {
+			fail(1, "am project rm <slug> --yes  (deletes the project and ALL its tasks/comments)")
+		}
+		c.doOrFail("DELETE", "/api/projects/"+slug, nil)
 	default:
-		fail(1, "usage: am project <new|archive|unarchive> ...")
+		fail(1, "usage: am project <new|archive|unarchive|rm> ...")
 	}
 }
 

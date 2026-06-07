@@ -65,6 +65,14 @@ Evidence:
   accessible from the CLI (`am project archive`/`unarchive`) and from a "Manage projects" modal in
   the dashboard tab bar (`openManageProjects`). Evidence: `cmd/am/store.go`, `cmd/am/cli.go`,
   `cmd/am/server.go`, `cmd/am/web/app.js`.
+- **Hard delete (tasks, comments, projects)**: permanent removal via `DELETE /api/tasks/{id}`,
+  `DELETE /api/tasks/{id}/comments/{cid}`, and `DELETE /api/projects/{slug}` (cascade via FK:
+  project → tasks → comments). CLI: `am rm <id>` (silent, exit 3 if not found);
+  `am project rm <slug> --yes` (requires `--yes`; cascade). The dashboard exposes inline two-step
+  delete confirms in the task modal, per-comment, and the Manage-projects modal. Events are never
+  deleted — the audit log (including the `*.deleted` events) survives. Evidence: `cmd/am/store.go`
+  (`DeleteTask`/`DeleteComment`/`DeleteProject`), `cmd/am/server.go`, `cmd/am/cli.go`,
+  `cmd/am/web/app.js`.
 - **Self-update**: `am update` + startup "update available" check (`cmd/am/update.go`).
 
 ## Domain Concepts

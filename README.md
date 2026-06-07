@@ -92,10 +92,15 @@ The embedded web UI (no build step, no npm) is a live kanban board:
   card · `[` / `]` move a focused card between statuses · `Esc` close a dialog.
 - **Manage projects:** the `⋯` button in the tab bar opens a modal listing all projects.
   Active projects show an **Archive** button; archived ones show an **Unarchive** button.
+  The modal also has a **Delete** button per project — permanently deletes the project and
+  **all its tasks and comments** (irreversible; two-step confirm required).
   Archiving a project hides it from the board tabs, the task list, and the activity feed.
   Creating a new task into an archived project is blocked (API returns `400 project_archived`;
   the CLI exits non-zero). Previously CLI-only, archive/unarchive is now also available from
   the dashboard.
+- **Delete task / delete comment:** open a task modal to see a **Delete task** button (permanently
+  removes the task and its comments); each comment has a **×** button to delete it individually.
+  Both use an inline two-step confirm (no browser dialog).
 
 ## Using it from agents (Claude Code & others)
 
@@ -143,8 +148,10 @@ Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting 
 | `am note <id> "text"` | add a comment (alias: `comment`) |
 | `am edit <id> [--title T] [--body B] [--priority N]` | edit fields |
 | `am drop <id>` | release: unassign + → todo |
+| `am rm <id>` | hard-delete a task (permanent; cascades its comments); exit 3 if not found |
 | `am projects [--all]` · `am project new <slug> [name]` | list (`--all` includes archived) / create projects |
 | `am project archive <slug>` · `am project unarchive <slug>` | soft-archive (hide) / restore a project |
+| `am project rm <slug> --yes` | hard-delete a project **and ALL its tasks/comments** (permanent; `--yes` required) |
 | `am init <tasktype>` · `am whoami` | identity |
 | `am serve [--port 8787] [--db PATH]` | run the dashboard + API |
 | `am db export [path] [--db PATH]` | write a consistent DB snapshot (prints the path) |
@@ -161,11 +168,13 @@ The CLI is a thin client over this (also what the dashboard uses). `X-Agent` hea
 actor.
 
 ```
-GET   /api/projects                          GET   /api/tasks/{id}
-POST  /api/projects {slug,name}              PATCH /api/tasks/{id} {status?,assignee?,title?,body?,priority?}
-GET   /api/tasks?project=&status=&assignee=  POST  /api/tasks/{id}/claim
-POST  /api/tasks {project,title,...}         POST  /api/tasks/{id}/comments {body}
-GET   /api/events?since=  (poll)             GET   /api/stream  (SSE)
+GET    /api/projects                          GET    /api/tasks/{id}
+POST   /api/projects {slug,name}              PATCH  /api/tasks/{id} {status?,assignee?,title?,body?,priority?}
+DELETE /api/projects/{slug}                   POST   /api/tasks/{id}/claim
+GET    /api/tasks?project=&status=&assignee=  POST   /api/tasks/{id}/comments {body}
+POST   /api/tasks {project,title,...}         DELETE /api/tasks/{id}/comments/{cid}
+DELETE /api/tasks/{id}                        GET    /api/events?since=  (poll)
+                                              GET    /api/stream  (SSE)
 ```
 
 ```sh

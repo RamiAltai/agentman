@@ -302,6 +302,41 @@ select:hover, .field:hover { border-color: var(--line-strong); }
 .btn-archive.unarchive { color: var(--accent); border-color: var(--accent); background: var(--accent-weak); }
 .btn-archive.unarchive:hover { filter: brightness(1.1); }
 
+/* ===================== delete / danger controls ===================== */
+
+/* Per-comment delete (×) button */
+.btn-del-cm {
+  margin-left: auto; background: transparent; border: none; color: var(--faint);
+  font-size: 13px; padding: 0 4px; border-radius: 5px; line-height: 1;
+  opacity: 0; transition: opacity .1s, color .1s;
+}
+.cm:hover .btn-del-cm, .btn-del-cm:focus-visible { opacity: 1; }
+.btn-del-cm:hover, .btn-del-cm.confirming { color: var(--danger); opacity: 1; }
+
+/* Delete task button row at the bottom of the task modal */
+.del-task-row { margin-top: 22px; border-top: 1px solid var(--line); padding-top: 14px; display: flex; gap: 9px; align-items: center; }
+.btn-danger-task {
+  background: transparent; border: 1px solid var(--line); color: var(--faint);
+  border-radius: 8px; padding: 6px 13px; font-size: 12px;
+  transition: color .12s, border-color .12s, background .12s;
+}
+.btn-danger-task:hover { color: var(--danger); border-color: var(--danger); }
+.btn-danger-task.confirming { color: var(--danger); border-color: var(--danger); background: rgba(244, 117, 107, .1); font-weight: 600; }
+.btn-cancel-del {
+  background: transparent; border: 1px solid var(--line); color: var(--muted);
+  border-radius: 8px; padding: 6px 11px; font-size: 12px;
+}
+.btn-cancel-del:hover { border-color: var(--line-strong); color: var(--fg); }
+
+/* Per-project delete button in the manage-projects list */
+.btn-danger-proj {
+  background: transparent; border: 1px solid var(--line); color: var(--faint);
+  border-radius: 7px; padding: 5px 10px; font-size: 12px; white-space: nowrap; flex: none;
+  transition: color .12s, border-color .12s, background .12s;
+}
+.btn-danger-proj:hover { color: var(--danger); border-color: var(--danger); }
+.btn-danger-proj.confirming { color: var(--danger); border-color: var(--danger); background: rgba(244, 117, 107, .1); font-weight: 600; }
+
 /* ===================== responsive ===================== */
 @media (max-width: 720px) {
   header { gap: 8px; padding: 0 10px; }
