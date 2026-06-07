@@ -51,7 +51,15 @@ async function api(method, path, body) {
   const r = await fetch(path, opt);
   const txt = await r.text();
   const data = txt ? JSON.parse(txt) : null;
-  if (!r.ok) throw new Error((data && data.error) || ("HTTP " + r.status));
+  if (!r.ok) {
+    let msg = (data && data.error) || ("HTTP " + r.status);
+    // Surface the blocking prerequisites instead of a bare "blocked".
+    if (data && data.error === "blocked" && Array.isArray(data.open_prereqs) && data.open_prereqs.length)
+      msg = "blocked by " + data.open_prereqs.map((n) => "#" + n).join(" ") + " (prereq not done)";
+    const err = new Error(msg);
+    err.data = data;
+    throw err;
+  }
   return data;
 }
 
@@ -218,6 +226,8 @@ function card(t) {
   foot.append(who);
   if (selected.size !== 1) foot.append(el("span", { class: "ptag" }, t.project));
   if (t.nc > 0) foot.append(el("span", { class: "cc" }, "💬 " + t.nc));
+  if (t.nopen > 0) foot.append(el("span", { class: "tag-blocked" }, "🔒 " + t.nopen));
+  else if (t.nprereq > 0) foot.append(el("span", { class: "tag-ready" }, "✓ Ready"));
   c.append(foot);
   return c;
 }
@@ -315,7 +325,11 @@ async function refreshModal() {
   try { const t = await api("GET", "/api/tasks/" + openTaskId); if (openTaskId === t.id) { renderModal(t); growTitle(); } } catch (e) { /* ignore */ }
 }
 
-function patch(id, body) { return api("PATCH", "/api/tasks/" + id, body).catch((e) => alert(e.message)); }
+function patch(id, body) {
+  // On failure (e.g. a hard-block 409), re-render the modal from server truth so
+  // the status <select> / fields revert to the real state instead of the rejected value.
+  return api("PATCH", "/api/tasks/" + id, body).catch((e) => { alert(e.message); refreshModal(); });
+}
 
 function label(text, node) { return el("label", { class: "lbl" }, el("span", {}, text), node); }
 
@@ -357,6 +371,86 @@ function renderModal(t) {
   body.value = t.body || "";
   body.onchange = () => patch(t.id, { body: body.value });
   s.append(el("label", { class: "lbl" }, el("span", {}, "Description"), body));
+
+  // ---- Dependencies section ----
+  s.append(el("h3", {}, "Dependencies"));
+  const depsSection = el("div", { class: "deps-section" });
+
+  // "Depends on" chips
+  const depsPrereqDiv = el("div", { class: "deps-prereq" });
+  const prereqs = t.depends_on || [];
+  if (prereqs.length) {
+    prereqs.forEach((dep) => {
+      const chip = el("div", { class: "dep-chip" + (dep.status !== "done" ? " dep-open" : " dep-done") });
+      chip.append(el("span", { class: "dep-dot", style: "background:" + (dep.status === "done" ? "var(--st-done)" : dep.status === "doing" ? "var(--st-doing)" : dep.status === "blocked" ? "var(--st-blocked)" : "var(--st-todo)") }));
+      chip.append(el("span", { class: "dep-ref", role: "link", tabindex: "0", onclick: (e) => { e.stopPropagation(); openTask(dep.id); } }, dep.project + "-" + dep.ref));
+      chip.append(el("span", { class: "dep-title" }, dep.title));
+      chip.append(el("span", { class: "dep-status" }, dep.status));
+      const rmBtn = el("button", { class: "dep-rm", "aria-label": "Remove prerequisite", title: "Remove" }, "✕");
+      rmBtn.onclick = async () => {
+        rmBtn.disabled = true;
+        try {
+          await api("DELETE", "/api/tasks/" + t.id + "/deps/" + dep.id);
+        } catch (e) {
+          rmBtn.disabled = false;
+          alert(e.message);
+        }
+      };
+      chip.append(rmBtn);
+      depsPrereqDiv.append(chip);
+    });
+  } else {
+    depsPrereqDiv.append(el("span", { class: "deps-empty" }, "None"));
+  }
+
+  // Add prerequisite control
+  const addDepErr = el("div", { class: "ferr" });
+  const depSel = el("select", { "aria-label": "Add prerequisite" });
+  depSel.append(el("option", { value: "" }, "Add prerequisite…"));
+  // Fetch same-project candidates lazily (do it async, populate when ready)
+  (async () => {
+    try {
+      const candidates = await api("GET", "/api/tasks?project=" + encodeURIComponent(t.project) + "&limit=500");
+      const existingIds = new Set(prereqs.map((d) => d.id));
+      existingIds.add(t.id); // exclude self
+      for (const cand of candidates) {
+        if (existingIds.has(cand.id)) continue;
+        depSel.append(el("option", { value: String(cand.id) }, cand.project + "-" + cand.ref + " " + cand.title));
+      }
+    } catch (e) { /* ignore */ }
+  })();
+  depSel.onchange = async () => {
+    const val = depSel.value;
+    if (!val) return;
+    depSel.value = "";
+    addDepErr.textContent = "";
+    try {
+      await api("POST", "/api/tasks/" + t.id + "/deps", { depends_on: Number(val) });
+    } catch (e) {
+      addDepErr.textContent = e.message;
+    }
+  };
+  depsPrereqDiv.append(el("div", { class: "dep-add-row" }, depSel, addDepErr));
+  depsSection.append(el("div", { class: "deps-group" },
+    el("span", { class: "deps-label" }, "Depends on"),
+    depsPrereqDiv));
+
+  // "Blocks" list (read-only)
+  const blocks = t.blocks || [];
+  if (blocks.length) {
+    const blocksDiv = el("div", { class: "deps-blocks" });
+    blocks.forEach((dep) => {
+      const row = el("div", { class: "dep-block-row" });
+      row.append(
+        el("span", { class: "dep-ref", role: "link", tabindex: "0", onclick: (e) => { e.stopPropagation(); openTask(dep.id); } }, dep.project + "-" + dep.ref),
+        el("span", { class: "dep-title" }, dep.title),
+        el("span", { class: "dep-status" }, "(" + dep.status + ")")
+      );
+      blocksDiv.append(row);
+    });
+    depsSection.append(el("div", { class: "deps-group" }, el("span", { class: "deps-label" }, "Blocks"), blocksDiv));
+  }
+  s.append(depsSection);
 
   s.append(el("h3", {}, "Comments" + (t.comments && t.comments.length ? " (" + t.comments.length + ")" : "")));
   const cl = el("div", { class: "comments" });
@@ -662,9 +756,14 @@ function onEvent(ev) {
     loadProjects().catch(() => {});
     loadBoard().catch(() => {});
   }
+  if (ev.kind === "task.dep_added" || ev.kind === "task.dep_removed") {
+    // Refresh modal if it shows either the task or the prereq being linked/unlinked.
+    const depId = (ev.data || {}).depends_on;
+    if (openTaskId === ev.task_id || openTaskId === depId) refreshModal();
+  }
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => loadBoard().catch(() => {}), 250); // debounced reconcile
-  if (openTaskId && ev.task_id === openTaskId && ev.kind !== "task.deleted" && ev.kind !== "comment.deleted") refreshModal();
+  if (openTaskId && ev.task_id === openTaskId && ev.kind !== "task.deleted" && ev.kind !== "comment.deleted" && ev.kind !== "task.dep_added" && ev.kind !== "task.dep_removed") refreshModal();
 }
 
 function feedItem(ev) {
@@ -742,6 +841,8 @@ function evText(ev) {
     case "task.deleted": span.append(who, " deleted ", ref || document.createTextNode("#" + ev.task_id)); break;
     case "comment.deleted": span.append(who, " deleted a comment on ", ref || document.createTextNode("#" + ev.task_id)); break;
     case "project.deleted": span.append(who, " deleted project ", el("b", {}, d.slug || "")); break;
+    case "task.dep_added": span.append(who, " linked ", ref, " → depends on #", String(d.depends_on || "")); break;
+    case "task.dep_removed": span.append(who, " unlinked ", ref, " dep #", String(d.depends_on || "")); break;
     default: span.append(who, " " + ev.kind + " ", ref);
   }
   return span;
@@ -764,6 +865,8 @@ function describeText(ev) {
     case "task.deleted": return `${who} deleted task`;
     case "comment.deleted": return `${who} deleted a comment on ${t}`;
     case "project.deleted": return `${who} deleted project ${d.slug || ""}`;
+    case "task.dep_added": return `${who} linked ${t} depends on #${d.depends_on || ""}`;
+    case "task.dep_removed": return `${who} unlinked ${t} dep #${d.depends_on || ""}`;
     default: return `${who} ${ev.kind} ${t}`;
   }
 }

@@ -40,6 +40,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/tasks/{id}", s.handlePatchTask)
 	mux.HandleFunc("POST /api/tasks/{id}/claim", s.handleClaim)
 	mux.HandleFunc("POST /api/tasks/{id}/comments", s.handleComment)
+	mux.HandleFunc("POST /api/tasks/{id}/deps", s.handleAddDep)
+	mux.HandleFunc("DELETE /api/tasks/{id}/deps/{depId}", s.handleRemoveDep)
 	mux.HandleFunc("DELETE /api/tasks/{id}", s.handleDeleteTask)
 	mux.HandleFunc("DELETE /api/tasks/{id}/comments/{cid}", s.handleDeleteComment)
 	mux.HandleFunc("DELETE /api/projects/{slug}", s.handleDeleteProject)
@@ -209,6 +211,8 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		Status:   q.Get("status"),
 		Assignee: q.Get("assignee"),
 		Limit:    atoiDefault(q.Get("limit"), 0),
+		Ready:    q.Get("ready") == "true",
+		Blocked:  q.Get("blocked") == "true",
 	}
 	ts, err := s.store.ListTasks(f)
 	if err != nil {
@@ -216,6 +220,68 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, ts)
+}
+
+func (s *Server) handleAddDep(w http.ResponseWriter, r *http.Request) {
+	taskID, err := s.store.resolveTaskID(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	var in struct {
+		DependsOn any `json:"depends_on"` // accept string ref or number
+	}
+	if err := decode(r, &in); err != nil || in.DependsOn == nil {
+		writeErr(w, ErrValidation)
+		return
+	}
+	// Resolve depends_on — may be a numeric id or a string ref like "web-3".
+	var depIDStr string
+	switch v := in.DependsOn.(type) {
+	case float64:
+		depIDStr = strconv.FormatInt(int64(v), 10)
+	case string:
+		depIDStr = v
+	default:
+		writeErr(w, ErrValidation)
+		return
+	}
+	depID, err := s.store.resolveTaskID(depIDStr)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	ev, err := s.store.AddDep(taskID, depID, actorOf(r))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if ev != nil {
+		s.hub.Broadcast(ev)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleRemoveDep(w http.ResponseWriter, r *http.Request) {
+	taskID, err := s.store.resolveTaskID(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	depID, err := s.store.resolveTaskID(r.PathValue("depId"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	ev, err := s.store.RemoveDep(taskID, depID, actorOf(r))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if ev != nil {
+		s.hub.Broadcast(ev)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
@@ -512,6 +578,11 @@ func writeErr(w http.ResponseWriter, err error) {
 	var ce *ConflictError
 	if errors.As(err, &ce) {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "already_claimed", "assignee": ce.Assignee})
+		return
+	}
+	var be *BlockedError
+	if errors.As(err, &be) {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "blocked", "open_prereqs": be.OpenPrereqs})
 		return
 	}
 	switch {

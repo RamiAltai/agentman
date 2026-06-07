@@ -9,6 +9,38 @@ fresh `[Unreleased]` section.
 
 ## [Unreleased]
 
+### Added
+
+- **Task dependencies (Phase H)** — tasks can now have prerequisites (other tasks that must be
+  `done` first). Many-to-many, same-project only.
+  - **CLI:** `am dep add <id> <prereq…>` / `am dep rm <id> <prereq>` — add/remove prerequisite
+    edges. `am ls --ready` lists todo tasks with no open prereqs (the safe pick-up list for agents).
+    `am ls --blocked` lists tasks with ≥1 open prereq. `am ls` rows show a `[blk:N]` or `[ready]`
+    marker. `am show <id>` prints `depends on:` / `blocks:` lines when present.
+  - **API:** `POST /api/tasks/{id}/deps {depends_on:<id-or-ref>}` — add edge (same project; rejects
+    self-deps, cross-project, cycles). `DELETE /api/tasks/{id}/deps/{depId}` — remove edge.
+    `GET /api/tasks?ready=true` / `?blocked=true` — server-side prereq filters.
+    `GET /api/tasks/{id}` now returns `depends_on:[…]` and `blocks:[…]`.
+  - **Hard-block:** claiming or PATCHing a task to `doing`/`done` while it has open prerequisites
+    fails with `409 {"error":"blocked","open_prereqs":[…]}`. CLI maps this to exit 4 and prints
+    e.g. `claim: #3 blocked — prereqs not done (#1 #2)`. Edit, comment, assign, and
+    status→`todo`/`blocked` are unaffected.
+  - **Cycle prevention:** self-deps and transitive cycles are rejected by a recursive CTE
+    (`wouldCycle`) — validation error / HTTP 400.
+  - **Dashboard:** task modal has a **Dependencies** section — "Depends on" chips (status dot +
+    ref link + title + status + ✕ remove), an **"Add prerequisite…"** dropdown of same-project
+    tasks (excludes self + existing edges), and a read-only **Blocks** list. Board cards show a
+    **🔒 Blocked** tag (`nopen > 0`) or **✓ Ready** tag (`nprereq > 0 && nopen == 0`). Hard-block
+    409s surface the blocking prereq ids and revert the card/modal.
+  - **Storage:** new join table `task_deps(task_id, depends_on_id)` — composite PK, `ON DELETE
+    CASCADE` on both FKs (deleting a task removes its edges in both directions), reverse index
+    `idx_task_deps_prereq`. Propagated to existing DBs via `CREATE TABLE IF NOT EXISTS` in
+    `schema.sql` — no migration-runner step, no version bump.
+  - **Event kinds:** 2 new — `task.dep_added`, `task.dep_removed` (total now 14).
+  - **Tests:** +24 (now 91 total) — cycle/self/cross-project rejection, idempotent add/remove,
+    cascade, counts, filters, hard-block (claim + patch), HTTP endpoints, 409 blocked, fresh-DB
+    table existence.
+
 ## [0.4.2] - 2026-06-07
 
 ### Changed

@@ -22,7 +22,7 @@ broadcast → dashboard**. Confirmed via `cmd/am/main.go`, `cmd/am/server.go`, `
 | `cmd/am/hub.go` | SSE subscriber hub (broadcast/fan-out) | `Hub`, `subscriber` |
 | `cmd/am/store.go` | All SQLite access; types; atomic claim; events | `Store` + domain structs |
 | `cmd/am/db.go` | `am db export`/`import`/`prune` (offline snapshot/restore/retention) | `cmdDB`, `exportDB`, `importDB`, `pruneEvents` |
-| `cmd/am/schema.sql` | DB schema (embedded) | `meta/projects/tasks/comments/events` |
+| `cmd/am/schema.sql` | DB schema (embedded) | `meta/projects/tasks/task_deps/comments/events` |
 | `cmd/am/client.go` | CLI HTTP client; HTTP-status → exit-code mapping | `Client`, `doOrFail` |
 | `cmd/am/cli.go` | CLI verb parsing + terse/JSON formatters | `cmd*`, `parse`, `fail` |
 | `cmd/am/identity.go` | Per-directory agent identity (`am init`/`am whoami`) | `resolveAgent`, `identityFile` |
@@ -71,10 +71,13 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   Routes: `GET/POST /api/projects` (`GET …?archived=true` includes archived),
   `POST /api/projects/{slug}/archive`, `POST /api/projects/{slug}/unarchive`,
   `DELETE /api/projects/{slug}` (hard-delete + cascade),
-  `GET/POST /api/tasks`, `GET/PATCH /api/tasks/{id}`,
-  `DELETE /api/tasks/{id}` (hard-delete + cascade to comments),
+  `GET/POST /api/tasks` (`?ready=true` / `?blocked=true` filter by prereq state),
+  `GET/PATCH /api/tasks/{id}` (GET returns `depends_on`/`blocks`),
+  `DELETE /api/tasks/{id}` (hard-delete + cascade to comments + dep edges),
   `POST /api/tasks/{id}/claim`, `POST /api/tasks/{id}/comments`,
   `DELETE /api/tasks/{id}/comments/{cid}`,
+  `POST /api/tasks/{id}/deps` (add prerequisite edge),
+  `DELETE /api/tasks/{id}/deps/{depId}` (remove prerequisite edge),
   `GET /api/events` (`?since=` ascending / `?tail=` newest-first / `?before=` backward cursor),
   `GET /api/stream`, and `/` → `http.FileServer` over `go:embed web`.
   All three DELETE routes return `200 {"status":"deleted"}`; `ErrNotFound` → 404.
@@ -91,6 +94,12 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   Hard-delete verbs: `am rm <id>` (silent success, exit 3 if not found); `am project rm <slug> --yes`
   (requires `--yes`; cascade-deletes project + all tasks/comments). `am db prune (--before <date> |
   --keep <N>) [--yes]` — offline events-only retention.
+  Dependency verbs: `am dep add <id> <prereq…>` (add one or more prerequisite edges),
+  `am dep rm <id> <prereq>` (remove an edge). `am ls --ready` lists todo tasks with no open
+  prereqs; `am ls --blocked` lists tasks with ≥1 open prereq. `am ls` rows show a `[blk:N]` marker
+  (N open prereqs) or `[ready]` (has prereqs, all done). `am show <id>` prints `depends on:` and
+  `blocks:` lines when present. Claiming a blocked task exits 4 with a message showing the open
+  prereq ids.
 - **Dashboard** — `cmd/am/web/app.js`: vanilla SPA; SSE consumer; board/modal/feed rendering.
   Includes a `⋯` "Manage projects" button in the tab bar that opens a modal (`openManageProjects`/
   `renderManageList`) listing all projects (active + archived via `GET /api/projects?archived=true`),
@@ -98,11 +107,16 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   `DELETE /api/projects/{slug}`). The task modal has a **Delete task** button (inline two-step);
   each comment has a **× delete** button (inline two-step; `DELETE /api/tasks/{id}/comments/{cid}`).
   All confirms use the `el()` helper, no native `confirm()`/`prompt()`. `onEvent` handles
-  `task.deleted` (remove card + close modal), `comment.deleted` (refresh modal), and
-  `project.deleted` (drop from selection + reload). The activity feed hides archived projects'
+  `task.deleted` (remove card + close modal), `comment.deleted` (refresh modal),
+  `project.deleted` (drop from selection + reload), and `task.dep_added`/`task.dep_removed`
+  (refresh the open modal for either side of the edge). The activity feed hides archived projects'
   events (no `project=` filter → `ListEvents`/`RecentEvents` exclude events whose project has a
   non-NULL `archived_at`). Task creation into an archived project is rejected at the store layer
   (`CreateTask` → `ErrProjectArchived` → HTTP 400).
+  Board cards show a **🔒 Blocked** tag (`nopen > 0`) or **✓ Ready** tag (`nprereq > 0 && nopen == 0`).
+  The task modal has a **Dependencies** section: "Depends on" chips with a ✕ remove button, an
+  "Add prerequisite…" dropdown of same-project tasks, and a read-only "Blocks" list. A hard-block
+  409 surfaces the blocking prereq ids and reverts the UI.
 
 ## External Dependencies
 

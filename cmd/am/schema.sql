@@ -33,6 +33,15 @@ CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status)
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee       ON tasks(assignee);
 CREATE INDEX IF NOT EXISTS idx_tasks_updated        ON tasks(updated_at);
 
+-- task_deps: prerequisite edges between tasks (many-to-many, same-project only).
+-- Both FKs cascade on delete so removing a task cleans up its edges automatically.
+CREATE TABLE IF NOT EXISTS task_deps (
+  task_id       INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,  -- dependent
+  depends_on_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,  -- prerequisite
+  PRIMARY KEY (task_id, depends_on_id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_deps_prereq ON task_deps(depends_on_id);
+
 -- comments: discussion thread on a task.
 CREATE TABLE IF NOT EXISTS comments (
   id         INTEGER PRIMARY KEY,
@@ -49,7 +58,7 @@ CREATE TABLE IF NOT EXISTS events (
   project_id INTEGER,
   task_id    INTEGER,
   actor      TEXT NOT NULL,
-  kind       TEXT NOT NULL,               -- task.created|claimed|status|assign|patched|comment.added|project.created|project.archived|project.unarchived
+  kind       TEXT NOT NULL,               -- task.created|claimed|status|assign|patched|deleted|dep_added|dep_removed|comment.added|comment.deleted|project.created|archived|unarchived|deleted
   data       TEXT NOT NULL DEFAULT '{}',  -- compact JSON delta, e.g. {"status":["todo","doing"]}
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );

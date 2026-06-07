@@ -15,7 +15,7 @@ var osExit = os.Exit
 
 // Boolean (valueless) flags; everything else with a leading dash consumes the
 // next token as its value. Aliases are canonicalised in canonFlag.
-var boolFlags = map[string]bool{"json": true, "mine": true, "all": true, "comments": true, "yes": true, "log": true}
+var boolFlags = map[string]bool{"json": true, "mine": true, "all": true, "comments": true, "yes": true, "log": true, "ready": true, "blocked": true}
 
 type Args struct {
 	pos   []string
@@ -104,6 +104,12 @@ func cmdLs(c *Client, a Args) {
 		}
 		qs.Set("assignee", me())
 	}
+	if a.has("ready") {
+		qs.Set("ready", "true")
+	}
+	if a.has("blocked") {
+		qs.Set("blocked", "true")
+	}
 	qs.Set("limit", "50")
 
 	data := c.doOrFail("GET", "/api/tasks?"+qs.Encode(), nil)
@@ -137,6 +143,20 @@ func cmdShow(c *Client, a Args) {
 		fmt.Println(t.Body)
 	}
 	fmt.Printf("created %s · %d comment%s\n", shortTime(t.CreatedAt), t.NComments, plural(t.NComments))
+	if len(t.DependsOn) > 0 {
+		parts := make([]string, len(t.DependsOn))
+		for i, d := range t.DependsOn {
+			parts[i] = fmt.Sprintf("%s-%d %s", d.Project, d.Ref, d.Status)
+		}
+		fmt.Println("depends on: " + strings.Join(parts, " · "))
+	}
+	if len(t.Blocks) > 0 {
+		parts := make([]string, len(t.Blocks))
+		for i, d := range t.Blocks {
+			parts[i] = fmt.Sprintf("%s-%d", d.Project, d.Ref)
+		}
+		fmt.Println("blocks: " + strings.Join(parts, " · "))
+	}
 	if a.has("comments") {
 		for _, cm := range t.Comments {
 			fmt.Printf("%s %s  %s\n", cm.Author, shortTime(cm.CreatedAt), cm.Body)
@@ -186,9 +206,19 @@ func cmdClaim(c *Client, a Args) {
 		fail(3, "claim: #%s not found", id)
 	case st == 409:
 		var e struct {
-			Assignee string `json:"assignee"`
+			Error       string  `json:"error"`
+			Assignee    string  `json:"assignee"`
+			OpenPrereqs []int64 `json:"open_prereqs"`
 		}
 		json.Unmarshal(data, &e)
+		if e.Error == "blocked" {
+			// Format the open prereq IDs for a clear error message.
+			parts := make([]string, len(e.OpenPrereqs))
+			for i, id := range e.OpenPrereqs {
+				parts[i] = fmt.Sprintf("#%d", id)
+			}
+			fail(4, "claim: #%s blocked — prereqs not done (%s)", id, strings.Join(parts, " "))
+		}
 		fail(4, "claim: #%s held by %s", id, e.Assignee)
 	default:
 		fail(1, "claim: %s", apiErr(data, "error"))
@@ -319,10 +349,42 @@ func taskLine(t Task, showProj bool) string {
 	if t.NComments > 0 {
 		line += fmt.Sprintf(" (%dc)", t.NComments)
 	}
+	if t.NOpenPrereqs > 0 {
+		line += fmt.Sprintf(" [blk:%d]", t.NOpenPrereqs)
+	} else if t.NPrereqs > 0 {
+		line += " [ready]"
+	}
 	if showProj {
 		line += " " + t.Project
 	}
 	return line
+}
+
+func cmdDep(c *Client, a Args) {
+	sub := a.at(0)
+	switch sub {
+	case "add":
+		id := a.at(1)
+		if id == "" {
+			fail(1, "usage: am dep add <id> <prereq> [prereq…]")
+		}
+		prereqs := a.pos[2:] // remaining positionals
+		if len(prereqs) == 0 {
+			fail(1, "usage: am dep add <id> <prereq> [prereq…]")
+		}
+		for _, prereq := range prereqs {
+			c.doOrFail("POST", "/api/tasks/"+id+"/deps", map[string]any{"depends_on": prereq})
+		}
+	case "rm":
+		id := a.at(1)
+		prereq := a.at(2)
+		if id == "" || prereq == "" {
+			fail(1, "usage: am dep rm <id> <prereq>")
+		}
+		c.doOrFail("DELETE", "/api/tasks/"+id+"/deps/"+prereq, nil)
+	default:
+		fail(1, "usage: am dep <add|rm> ...")
+	}
 }
 
 func statusShort(s string) string {

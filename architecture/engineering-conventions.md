@@ -18,10 +18,11 @@ convention is loose, it's called out.
 - HTTP handlers: `handleX` (e.g. `handleClaim`). Routes registered in `Server.Handler()`.
 - Store methods: exported PascalCase domain verbs (`CreateTask`, `ClaimTask`, `ListEvents`).
 - CLI verb implementations: `cmdX` (`cmdClaim`, `cmdNew`); dispatched in `main.go`.
-- Sentinel errors: `ErrNotFound`, `ErrConflict`, `ErrValidation`, `ErrProjectArchived` (→ HTTP 400 `project_archived`); typed `*ConflictError`.
+- Sentinel errors: `ErrNotFound`, `ErrConflict`, `ErrValidation`, `ErrProjectArchived` (→ HTTP 400 `project_archived`); typed `*ConflictError{Assignee}`; typed `*BlockedError{OpenPrereqs []int64}` (→ HTTP 409 `{"error":"blocked","open_prereqs":[…]}`).
 - Event kinds: dotted `noun.verb` strings — `task.created`, `task.claimed`, `task.status`,
-  `task.assign`, `task.patched`, `task.deleted`, `comment.added`, `comment.deleted`,
-  `project.created`, `project.archived`, `project.unarchived`, `project.deleted` (12 total).
+  `task.assign`, `task.patched`, `task.deleted`, `task.dep_added`, `task.dep_removed`,
+  `comment.added`, `comment.deleted`, `project.created`, `project.archived`, `project.unarchived`,
+  `project.deleted` (14 total).
 - Env vars: `AGENTMAN_*` (`AGENTMAN_URL/PROJECT/AGENT/AGENT_FILE/DB/PORT/NO_UPDATE_CHECK/LOG`).
 
 ## API Conventions
@@ -79,7 +80,7 @@ convention is loose, it's called out.
 
 - `go test -race ./cmd/am/` (or `go test ./...`); table-driven tests (see `cmd/am/update_test.go`).
   Coverage spans pure logic, the store, HTTP, migrations, offline DB tooling, CLI verbs + exit codes,
-  SSE streaming/reconnect, identity, and the dashboard XSS-sink guard — 9 test files, 71 tests.
+  SSE streaming/reconnect, identity, and the dashboard XSS-sink guard — 9 test files, 91 tests.
 - **`osExit` testability var** — `cli.go` declares `var osExit = os.Exit`; `fail()` calls `osExit`
   rather than `os.Exit` directly. Tests in `cli_test.go` replace it via `captureExit(t, fn)`,
   which substitutes a panic-based stub so exit codes can be asserted without terminating the process.
@@ -117,9 +118,12 @@ JS syntax (`node --check`), and `govulncheck` — on every push to `main` and on
 - ❌ Binding beyond `127.0.0.1` without adding authentication first.
 - ❌ Printing chatter to **stdout** in the CLI (breaks `id=$(am new …)` and token budgets).
 - ❌ Editing `cmd/am/web/*` and forgetting to rebuild — the running server serves stale embedded assets.
-- ❌ Adding a column to `schema.sql` and assuming existing DBs get it. A forward-only runner
-  exists (`store.go runMigrations`): for a column change, append a `{version, apply}` step to
+- ❌ Adding a **column** to an existing table in `schema.sql` and assuming existing DBs get it —
+  `ALTER TABLE` is needed. Use the forward-only runner: append a `{version, apply}` step to
   `schemaMigrations` and bump `currentSchemaVersion`; `schema.sql` still seeds fresh DBs.
+  Exception: adding a **new table** with `CREATE TABLE IF NOT EXISTS` propagates automatically on
+  every `OpenStore` without a runner step or version bump (see `task_deps` as the worked example).
+  Never use `CREATE TABLE IF NOT EXISTS` to add a column to an existing table.
 
 ## Unknowns
 

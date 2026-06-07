@@ -337,6 +337,53 @@ without evidence.
   Pre-commit hooks are still absent (local runs are manual). No CD/release automation added.
 - Evidence: `.github/workflows/ci.yml`; `known-risks-and-gaps.md` (Phase F notes).
 
+### ADR-020: Task dependency model — join table, same-project, hard-block on claim/doing/done, derived ready/blocked state (Phase H)
+- Status: Active
+- Context: Agents need to express sequencing — task B should not be started until task A is done.
+  The board had no prerequisite mechanism, so agents either polled manually or relied on out-of-band
+  coordination.
+- Decision:
+  1. **Join table (`task_deps`)** rather than a column. A many-to-many relationship between tasks
+     requires a join table; a column (e.g. `depends_on_id`) can only express one parent. The join
+     table has a composite PK `(task_id, depends_on_id)` and `ON DELETE CASCADE` FKs on both
+     columns (so deleting a task removes all its edges in both directions automatically). Propagated
+     to existing DBs via `CREATE TABLE IF NOT EXISTS` in `schema.sql` — no migration-runner step, no
+     version bump required (contrast with `ALTER TABLE projects ADD COLUMN archived_at`, which needed
+     the v2 runner step; a new table just needs to be in `schema.sql`).
+  2. **Same-project-only constraint.** A dependency may only link two tasks within the same project.
+     Cross-project deps add cascade, visibility, and query-complexity problems disproportionate to
+     the benefit for a personal board. Rejected at `AddDep` with `ErrValidation` → HTTP 400.
+  3. **Cycle prevention via recursive CTE (`wouldCycle`).** Self-deps and transitive cycles are
+     rejected. The CTE walks the existing `depends_on` graph forward from `dependsOnID` and checks
+     whether `taskID` is reachable, catching A→B→C→A before the insert.
+  4. **Hard-block on claim and on PATCH to `doing`/`done`.** A task with ≥1 open prerequisite
+     (status != `done`) cannot be claimed (`ClaimTask`) and cannot be PATCHed to status `doing` or
+     `done` (`PatchTask`). Other ops — edit, comment, assign, status→`todo`/`blocked` — are
+     **unaffected**: a task can be commented on and edited before its prereqs are done. The block
+     returns a typed `*BlockedError{OpenPrereqs []int64}` → `409 {"error":"blocked","open_prereqs":[…]}`.
+     CLI maps it to exit 4 and prints the open prereq ids.
+  5. **Ready/Blocked are derived, not stored statuses.** There is no `ready` value in
+     `tasks.status`. `NPrereqs`/`NOpenPrereqs` are computed via subqueries in `ListTasks` and
+     `GetTask`. `?ready=true` and `?blocked=true` are server-side filters; `[ready]`/`[blk:N]`
+     are CLI display markers. This avoids a status-sync problem (a prereq completing must not
+     require updating every dependent task) and keeps the status field a simple enumeration.
+  6. **Two new event kinds** — `task.dep_added`, `task.dep_removed` — following the existing
+     `noun.verb` convention. Total event kinds: 14.
+- Rationale: join table is the canonical relational model for many-to-many. Same-project constraint
+  keeps the query surface small and avoids cross-project cascade. Hard-blocking claim/doing/done
+  enforces ordering without requiring agent cooperation; soft fields (edit/comment) are left
+  unblocked to preserve ergonomics. Derived state avoids the consistency hazard of a stored
+  `ready` column.
+- Consequences: cross-project dependencies are unsupported; agents must coordinate cross-project
+  sequencing manually. A "blocked by deps" task can have status `todo` — agents should use
+  `am ls --ready` rather than `am ls --status todo` to find truly actionable work.
+- Evidence: `cmd/am/schema.sql` (`task_deps` table + index); `cmd/am/store.go` (`DepRef`,
+  `BlockedError`, `Task.NPrereqs`/`NOpenPrereqs`/`DependsOn`/`Blocks`, `TaskFilter.Ready`/
+  `Blocked`, `AddDep`, `RemoveDep`, `hasOpenPrereqs`, `wouldCycle`); `cmd/am/server.go`
+  (`handleAddDep`, `handleRemoveDep`, `?ready=`/`?blocked=` params, `BlockedError` → 409);
+  `cmd/am/cli.go` (`cmdDep`, `--ready`/`--blocked` flags, `taskLine` `[blk:N]`/`[ready]`);
+  `cmd/am/web/app.js` (deps section, card tags, hard-block UX); 24 new tests.
+
 ## Inferred Decisions
 
 ### IADR-001: SSE chosen over WebSockets

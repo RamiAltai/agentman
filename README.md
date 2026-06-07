@@ -99,6 +99,12 @@ The embedded web UI (no build step, no npm) is a live kanban board:
   Creating a new task into an archived project is blocked (API returns `400 project_archived`;
   the CLI exits non-zero). Previously CLI-only, archive/unarchive is now also available from
   the dashboard.
+- **Dependencies:** the task modal has a **Dependencies** section — prerequisite chips with status
+  dots and ✕ remove buttons, an **"Add prerequisite…"** dropdown of same-project tasks, and a
+  read-only **Blocks** list of tasks that depend on this one. Board cards show a **🔒 Blocked**
+  tag when they have unfinished prerequisites, or a **✓ Ready** tag when all prerequisites are
+  done. Attempting to start or claim a blocked task is rejected with a 409 that names the open
+  prerequisites; the dashboard surfaces this and reverts the change.
 - **Delete task / delete comment:** open a task modal to see a **Delete task** button (permanently
   removes the task and its comments); each comment has a **×** button to delete it individually.
   Both use an inline two-step confirm (no browser dialog).
@@ -111,9 +117,11 @@ The short version — drop this into your `~/.claude/CLAUDE.md` (or a project `C
 
 ```md
 ## Task board (am) — run `am init <tasktype>` once, then:
+am ls --ready         # todo tasks with no open prereqs (pick these up)
 am ls --status todo   # work to pick up        am ls --mine    # my tasks
-am claim <id>         # take it (exit 4 = already claimed)
-am show <id> -c       # detail + comments       am note <id> "msg"
+am claim <id>         # take it (exit 4 = already claimed or blocked by prereqs)
+am dep add <id> <prereq>   # add a prerequisite   am dep rm <id> <prereq>
+am show <id> -c       # detail + depends on/blocks + comments  am note <id> "msg"
 am status <id> done   # todo|doing|blocked|done  am new "title" -p <proj>
 am projects --all     # list projects (incl. archived)
 am project archive <slug>   # hide a project    am project unarchive <slug>
@@ -140,16 +148,18 @@ Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting 
 
 | Command | What it does |
 |---|---|
-| `am ls [--mine] [--status S] [-p P] [--all]` | list tasks (current project, hides done) |
-| `am show <id> [-c]` | task detail; comments with `-c` |
+| `am ls [--mine] [--status S] [-p P] [--all] [--ready] [--blocked]` | list tasks (hides done; `--ready` = todo with no open prereqs; `--blocked` = ≥1 open prereq) |
+| `am show <id> [-c]` | task detail + `depends on:` / `blocks:` lines; comments with `-c` |
 | `am new "title" [--body B] [-p P] [--priority N]` | create a task; prints the new id |
-| `am claim <id>` | atomic: assign me + → doing |
-| `am status <id> <todo\|doing\|blocked\|done>` | change status |
+| `am claim <id>` | atomic: assign me + → doing (exit 4 if already taken **or** has open prereqs) |
+| `am status <id> <todo\|doing\|blocked\|done>` | change status (blocked → 409 if doing/done and open prereqs) |
 | `am assign <id> <agent\|me\|->` | reassign (`-` = unassign) |
 | `am note <id> "text"` | add a comment (alias: `comment`) |
 | `am edit <id> [--title T] [--body B] [--priority N]` | edit fields |
 | `am drop <id>` | release: unassign + → todo |
-| `am rm <id>` | hard-delete a task (permanent; cascades its comments); exit 3 if not found |
+| `am rm <id>` | hard-delete a task (permanent; cascades its comments + dep edges); exit 3 if not found |
+| `am dep add <id> <prereq> [prereq…]` | add one or more prerequisites to a task (same project; rejects cycles) |
+| `am dep rm <id> <prereq>` | remove a prerequisite edge |
 | `am projects [--all]` · `am project new <slug> [name]` | list (`--all` includes archived) / create projects |
 | `am project archive <slug>` · `am project unarchive <slug>` | soft-archive (hide) / restore a project |
 | `am project rm <slug> --yes` | hard-delete a project **and ALL its tasks/comments** (permanent; `--yes` required) |
@@ -162,7 +172,7 @@ Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting 
 
 `<id>` accepts a global id (`13`) or a project ref (`web-3`). `--status` accepts a comma
 list. Priority is `0` urgent … `3` low (default `2`). Add `--json` to any read to parse.
-Exit codes: `0` ok · `3` not found · `4` already claimed · `5` invalid · `6` server down.
+Exit codes: `0` ok · `3` not found · `4` already claimed or blocked · `5` invalid · `6` server down.
 
 ## HTTP API
 
@@ -170,14 +180,15 @@ The CLI is a thin client over this (also what the dashboard uses). `X-Agent` hea
 actor.
 
 ```
-GET    /api/projects                          GET    /api/tasks/{id}
-POST   /api/projects {slug,name}              PATCH  /api/tasks/{id} {status?,assignee?,title?,body?,priority?}
-DELETE /api/projects/{slug}                   POST   /api/tasks/{id}/claim
-POST   /api/projects/{slug}/archive           POST   /api/projects/{slug}/unarchive
-GET    /api/tasks?project=&status=&assignee=  POST   /api/tasks/{id}/comments {body}
-POST   /api/tasks {project,title,...}         DELETE /api/tasks/{id}/comments/{cid}
-DELETE /api/tasks/{id}                        GET    /api/events?since=|?tail=|?before=  (poll/page)
-                                              GET    /api/stream  (SSE)
+GET    /api/projects                              GET    /api/tasks/{id}          (returns depends_on + blocks)
+POST   /api/projects {slug,name}                 PATCH  /api/tasks/{id} {status?,assignee?,title?,body?,priority?}
+DELETE /api/projects/{slug}                       POST   /api/tasks/{id}/claim    (409 if open prereqs)
+POST   /api/projects/{slug}/archive              POST   /api/projects/{slug}/unarchive
+GET    /api/tasks?project=&status=&assignee=     POST   /api/tasks/{id}/comments {body}
+       &ready=true|&blocked=true                 DELETE /api/tasks/{id}/comments/{cid}
+POST   /api/tasks {project,title,...}            POST   /api/tasks/{id}/deps {depends_on:<id-or-ref>}
+DELETE /api/tasks/{id}                           DELETE /api/tasks/{id}/deps/{depId}
+GET    /api/events?since=|?tail=|?before=        GET    /api/stream  (SSE)
 ```
 
 ```sh

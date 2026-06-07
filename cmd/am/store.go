@@ -28,6 +28,12 @@ type ConflictError struct{ Assignee string }
 
 func (e *ConflictError) Error() string { return "already_claimed" }
 
+// BlockedError is returned when an operation (claim/patch) is prevented because
+// the task has one or more incomplete prerequisites.
+type BlockedError struct{ OpenPrereqs []int64 }
+
+func (e *BlockedError) Error() string { return "blocked" }
+
 var validStatus = map[string]bool{"todo": true, "doing": true, "blocked": true, "done": true}
 
 // ---------- types ----------
@@ -41,21 +47,34 @@ type Project struct {
 	Counts     map[string]int `json:"counts,omitempty"`
 }
 
+// DepRef is a lightweight reference to a task used in dependency lists.
+type DepRef struct {
+	ID      int64  `json:"id"`
+	Ref     int64  `json:"ref"`
+	Project string `json:"project"`
+	Title   string `json:"title"`
+	Status  string `json:"status"`
+}
+
 type Task struct {
-	ID        int64     `json:"id"`
-	ProjectID int64     `json:"project_id"`
-	Project   string    `json:"project"` // slug
-	Ref       int64     `json:"ref"`
-	Title     string    `json:"title"`
-	Body      string    `json:"body,omitempty"`
-	Status    string    `json:"status"`
-	Assignee  string    `json:"assignee"`
-	Priority  int       `json:"priority"`
-	NComments int       `json:"nc"`
-	CreatedAt string    `json:"created_at"`
-	UpdatedAt string    `json:"updated_at"`
-	Comments  []Comment `json:"comments,omitempty"`
-	Events    []Event   `json:"events,omitempty"`
+	ID           int64     `json:"id"`
+	ProjectID    int64     `json:"project_id"`
+	Project      string    `json:"project"` // slug
+	Ref          int64     `json:"ref"`
+	Title        string    `json:"title"`
+	Body         string    `json:"body,omitempty"`
+	Status       string    `json:"status"`
+	Assignee     string    `json:"assignee"`
+	Priority     int       `json:"priority"`
+	NComments    int       `json:"nc"`
+	NPrereqs     int       `json:"nprereq,omitempty"`
+	NOpenPrereqs int       `json:"nopen,omitempty"`
+	CreatedAt    string    `json:"created_at"`
+	UpdatedAt    string    `json:"updated_at"`
+	Comments     []Comment `json:"comments,omitempty"`
+	Events       []Event   `json:"events,omitempty"`
+	DependsOn    []DepRef  `json:"depends_on,omitempty"`
+	Blocks       []DepRef  `json:"blocks,omitempty"`
 }
 
 type Comment struct {
@@ -81,6 +100,8 @@ type TaskFilter struct {
 	Status   string
 	Assignee string
 	Limit    int
+	Ready    bool // todo tasks with no open prereqs
+	Blocked  bool // tasks with ≥1 open prereq
 }
 
 // ---------- store ----------
@@ -396,9 +417,19 @@ func (s *Store) ListTasks(f TaskFilter) ([]Task, error) {
 		where = append(where, "t.assignee=?")
 		args = append(args, f.Assignee)
 	}
+	// open-prereq subquery reused for both Blocked and Ready filters.
+	const openPrereqExpr = `EXISTS (SELECT 1 FROM task_deps d JOIN tasks pt ON pt.id=d.depends_on_id WHERE d.task_id=t.id AND pt.status!='done')`
+	if f.Blocked {
+		where = append(where, openPrereqExpr)
+	}
+	if f.Ready {
+		where = append(where, "t.status='todo' AND NOT "+openPrereqExpr)
+	}
 	q := `SELECT t.id,t.ref,p.slug,t.title,t.status,COALESCE(t.assignee,''),t.priority,
 	         t.created_at,t.updated_at,
-	         (SELECT COUNT(*) FROM comments c WHERE c.task_id=t.id)
+	         (SELECT COUNT(*) FROM comments c WHERE c.task_id=t.id),
+	         COALESCE((SELECT COUNT(*) FROM task_deps d WHERE d.task_id=t.id),0),
+	         COALESCE((SELECT COUNT(*) FROM task_deps d JOIN tasks pt ON pt.id=d.depends_on_id WHERE d.task_id=t.id AND pt.status!='done'),0)
 	       FROM tasks t JOIN projects p ON p.id=t.project_id`
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
@@ -417,7 +448,7 @@ func (s *Store) ListTasks(f TaskFilter) ([]Task, error) {
 	for rows.Next() {
 		var t Task
 		if err := rows.Scan(&t.ID, &t.Ref, &t.Project, &t.Title, &t.Status, &t.Assignee,
-			&t.Priority, &t.CreatedAt, &t.UpdatedAt, &t.NComments); err != nil {
+			&t.Priority, &t.CreatedAt, &t.UpdatedAt, &t.NComments, &t.NPrereqs, &t.NOpenPrereqs); err != nil {
 			return nil, err
 		}
 		out = append(out, t)
@@ -444,7 +475,7 @@ func (s *Store) getTaskTx(q queryer, id int64) (*Task, error) {
 	return &t, nil
 }
 
-// GetTask returns a task with comments and recent events.
+// GetTask returns a task with comments, recent events, and dependency refs.
 func (s *Store) GetTask(id int64) (*Task, error) {
 	t, err := s.getTaskTx(s.db, id)
 	if err != nil {
@@ -479,6 +510,55 @@ func (s *Store) GetTask(id int64) (*Task, error) {
 		e.Data = json.RawMessage(data)
 		t.Events = append(t.Events, e)
 	}
+
+	// Populate DependsOn (prerequisites of this task).
+	drows, err := s.db.Query(`SELECT t.id,t.ref,p.slug,t.title,t.status
+	       FROM task_deps d JOIN tasks t ON t.id=d.depends_on_id JOIN projects p ON p.id=t.project_id
+	       WHERE d.task_id=? ORDER BY t.id`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer drows.Close()
+	t.DependsOn = []DepRef{}
+	for drows.Next() {
+		var dr DepRef
+		if err := drows.Scan(&dr.ID, &dr.Ref, &dr.Project, &dr.Title, &dr.Status); err != nil {
+			return nil, err
+		}
+		t.DependsOn = append(t.DependsOn, dr)
+	}
+	if err := drows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Populate Blocks (tasks that depend on this task).
+	brows, err := s.db.Query(`SELECT t.id,t.ref,p.slug,t.title,t.status
+	       FROM task_deps d JOIN tasks t ON t.id=d.task_id JOIN projects p ON p.id=t.project_id
+	       WHERE d.depends_on_id=? ORDER BY t.id`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer brows.Close()
+	t.Blocks = []DepRef{}
+	for brows.Next() {
+		var dr DepRef
+		if err := brows.Scan(&dr.ID, &dr.Ref, &dr.Project, &dr.Title, &dr.Status); err != nil {
+			return nil, err
+		}
+		t.Blocks = append(t.Blocks, dr)
+	}
+	if err := brows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Also populate the terse counts for the full task view.
+	if err := s.db.QueryRow(`SELECT
+	       COALESCE((SELECT COUNT(*) FROM task_deps d WHERE d.task_id=?),0),
+	       COALESCE((SELECT COUNT(*) FROM task_deps d JOIN tasks pt ON pt.id=d.depends_on_id WHERE d.task_id=? AND pt.status!='done'),0)`,
+		id, id).Scan(&t.NPrereqs, &t.NOpenPrereqs); err != nil {
+		return nil, err
+	}
+
 	return t, nil
 }
 
@@ -555,6 +635,16 @@ func (s *Store) PatchTask(id int64, patch map[string]any, actor string) (*Task, 
 			return nil, nil, ErrValidation
 		}
 		if st != cur.Status {
+			// Hard-block: cannot move to doing/done if open prereqs exist.
+			if st == "doing" || st == "done" {
+				openIDs, err := hasOpenPrereqs(tx, id)
+				if err != nil {
+					return nil, nil, err
+				}
+				if len(openIDs) > 0 {
+					return nil, nil, &BlockedError{OpenPrereqs: openIDs}
+				}
+			}
 			sets = append(sets, "status=?")
 			args = append(args, st)
 			delta["status"] = []any{cur.Status, st}
@@ -623,9 +713,42 @@ func (s *Store) PatchTask(id int64, patch map[string]any, actor string) (*Task, 
 	return t, ev, tx.Commit()
 }
 
+// hasOpenPrereqs returns the IDs of any prerequisite tasks that are not yet done.
+// It is called within an existing transaction via the queryer interface.
+func hasOpenPrereqs(q queryer, taskID int64) ([]int64, error) {
+	type txQuerier interface {
+		Query(query string, args ...any) (*sql.Rows, error)
+	}
+	// queryer only exposes QueryRow; we need Query here. Accept *sql.Tx or *sql.DB
+	// by type-asserting to the broader interface.
+	qr, ok := q.(txQuerier)
+	if !ok {
+		// Fail loud rather than silently skipping the hard-block check (which would
+		// let a blocked task be claimed/started). All current callers pass *sql.Tx/*sql.DB.
+		return nil, fmt.Errorf("hasOpenPrereqs: queryer %T does not support Query", q)
+	}
+	rows, err := qr.Query(`SELECT d.depends_on_id FROM task_deps d
+	       JOIN tasks pt ON pt.id=d.depends_on_id
+	       WHERE d.task_id=? AND pt.status!='done'`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // ClaimTask atomically assigns an unclaimed, non-done task to agent.
 // Returns (task, event, nil) on win; (task, nil, nil) if agent already owns it
 // (idempotent); (nil,nil,*ConflictError) if owned by someone else; ErrNotFound.
+// Returns *BlockedError if the task has open prerequisites.
 func (s *Store) ClaimTask(id int64, agent string) (*Task, *Event, error) {
 	if agent == "" {
 		return nil, nil, ErrValidation
@@ -635,6 +758,15 @@ func (s *Store) ClaimTask(id int64, agent string) (*Task, *Event, error) {
 		return nil, nil, err
 	}
 	defer tx.Rollback()
+
+	// Hard-block: check prerequisites before attempting the claim.
+	openIDs, err := hasOpenPrereqs(tx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(openIDs) > 0 {
+		return nil, nil, &BlockedError{OpenPrereqs: openIDs}
+	}
 
 	var newStatus string
 	var pid int64
@@ -761,6 +893,109 @@ func (s *Store) DeleteProject(slug, actor string) (*Event, error) {
 		return nil, err
 	}
 	return ev, tx.Commit()
+}
+
+// ---------- dependencies ----------
+
+// AddDep records a dependency edge: taskID depends on dependsOnID.
+// Rejects self-deps, cross-project deps, and cycles. Idempotent (duplicate → nil,nil).
+func (s *Store) AddDep(taskID, dependsOnID int64, actor string) (*Event, error) {
+	if taskID == dependsOnID {
+		return nil, fmt.Errorf("%w: a task cannot depend on itself", ErrValidation)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// Load both tasks to validate existence and same-project constraint.
+	task, err := s.getTaskTx(tx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	prereq, err := s.getTaskTx(tx, dependsOnID)
+	if err != nil {
+		return nil, err
+	}
+	if task.ProjectID != prereq.ProjectID {
+		return nil, fmt.Errorf("%w: dependencies must be within the same project", ErrValidation)
+	}
+
+	// Cycle check: adding taskID→dependsOnID creates a cycle iff taskID is
+	// reachable by walking depends_on edges forward from dependsOnID.
+	cycle, err := wouldCycle(tx, taskID, dependsOnID)
+	if err != nil {
+		return nil, err
+	}
+	if cycle {
+		return nil, fmt.Errorf("%w: would create a dependency cycle", ErrValidation)
+	}
+
+	res, err := tx.Exec("INSERT OR IGNORE INTO task_deps(task_id,depends_on_id) VALUES(?,?)", taskID, dependsOnID)
+	if err != nil {
+		return nil, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		// Edge already existed — idempotent success.
+		return nil, tx.Commit()
+	}
+	ev, err := insertEvent(tx, task.ProjectID, taskID, actorOr(actor), "task.dep_added",
+		map[string]any{"depends_on": dependsOnID})
+	if err != nil {
+		return nil, err
+	}
+	return ev, tx.Commit()
+}
+
+// RemoveDep removes a dependency edge. No-op if the edge does not exist.
+func (s *Store) RemoveDep(taskID, dependsOnID int64, actor string) (*Event, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	res, err := tx.Exec("DELETE FROM task_deps WHERE task_id=? AND depends_on_id=?", taskID, dependsOnID)
+	if err != nil {
+		return nil, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return nil, tx.Commit() // already gone — idempotent
+	}
+	// Need project_id for the event.
+	task, err := s.getTaskTx(tx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	ev, err := insertEvent(tx, task.ProjectID, taskID, actorOr(actor), "task.dep_removed",
+		map[string]any{"depends_on": dependsOnID})
+	if err != nil {
+		return nil, err
+	}
+	return ev, tx.Commit()
+}
+
+// wouldCycle reports whether adding an edge taskID→dependsOnID would introduce
+// a cycle. It does so by checking if taskID is reachable from dependsOnID via
+// existing depends_on edges (recursive BFS over task_deps).
+func wouldCycle(tx *sql.Tx, taskID, dependsOnID int64) (bool, error) {
+	// Use a recursive CTE to walk the graph from dependsOnID forward.
+	rows, err := tx.Query(`
+		WITH RECURSIVE reach(id) AS (
+		  SELECT ? AS id
+		  UNION
+		  SELECT d.depends_on_id FROM task_deps d JOIN reach r ON r.id=d.task_id
+		)
+		SELECT 1 FROM reach WHERE id=? LIMIT 1`, dependsOnID, taskID)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	found := rows.Next()
+	return found, rows.Err()
 }
 
 func (s *Store) AddComment(id int64, author, body string) (*Comment, *Event, error) {

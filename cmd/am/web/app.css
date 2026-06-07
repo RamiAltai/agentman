@@ -344,6 +344,48 @@ select:hover, .field:hover { border-color: var(--line-strong); }
 .btn-danger-proj:hover { color: var(--danger); border-color: var(--danger); }
 .btn-danger-proj.confirming { color: var(--danger); border-color: var(--danger); background: rgba(244, 117, 107, .1); font-weight: 600; }
 
+/* ===================== dependency tags (board cards) ===================== */
+.tag-blocked {
+  display: inline-flex; align-items: center; gap: 3px;
+  background: rgba(248, 183, 56, .15); color: var(--warn);
+  border: 1px solid rgba(248, 183, 56, .3); border-radius: 999px;
+  padding: 1px 7px; font-size: 11px; font-weight: 600;
+}
+.tag-ready {
+  display: inline-flex; align-items: center; gap: 3px;
+  background: rgba(53, 214, 164, .12); color: var(--ok);
+  border: 1px solid rgba(53, 214, 164, .3); border-radius: 999px;
+  padding: 1px 7px; font-size: 11px; font-weight: 600;
+}
+
+/* ===================== dependency section (task modal) ===================== */
+.deps-section { margin: 10px 0 14px; }
+.deps-group { margin-bottom: 10px; }
+.deps-label { font-size: 12px; color: var(--muted); font-weight: 600; display: block; margin-bottom: 6px; }
+.deps-prereq { display: flex; flex-wrap: wrap; gap: 6px; align-items: flex-start; }
+.deps-empty { font-size: 13px; color: var(--faint); }
+.dep-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  background: var(--card-bg); border: 1px solid var(--line);
+  border-radius: 8px; padding: 4px 8px; font-size: 12px;
+}
+.dep-chip.dep-open { border-color: rgba(248, 183, 56, .4); }
+.dep-chip.dep-done { opacity: .7; }
+.dep-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.dep-ref { color: var(--accent); cursor: pointer; font-weight: 600; }
+.dep-ref:hover { text-decoration: underline; }
+.dep-title { color: var(--fg); max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dep-status { color: var(--faint); font-size: 11px; }
+.dep-rm {
+  background: none; border: none; color: var(--faint); padding: 0 2px;
+  font-size: 13px; line-height: 1; cursor: pointer; margin-left: 2px;
+}
+.dep-rm:hover { color: var(--danger); }
+.dep-add-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.dep-add-row select { background: var(--card-bg); border: 1px solid var(--line); border-radius: 7px; color: var(--fg); padding: 4px 8px; font-size: 12px; }
+.deps-blocks { display: flex; flex-direction: column; gap: 4px; }
+.dep-block-row { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+
 /* ===================== responsive ===================== */
 @media (max-width: 720px) {
   header { gap: 8px; padding: 0 10px; }

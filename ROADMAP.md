@@ -119,6 +119,25 @@ Archiving currently hides a project's **tab** (`ListProjects`) and its **board t
       unreachable) documented in `known-risks-and-gaps.md` and `decision-records.md` ADR-019.
       → `architecture/known-risks-and-gaps.md`, ADR-019.
 
+## Phase H — Task dependencies (shipped, beyond original roadmap)
+
+This feature was requested after the original roadmap was written and has shipped.
+
+- [x] **H1 · Task prerequisite graph** — _L_ — **shipped (Phase H)**
+  - `task_deps` join table (many-to-many, same-project, `ON DELETE CASCADE` both directions,
+    propagated via `CREATE TABLE IF NOT EXISTS` — no migration step).
+  - CLI: `am dep add <id> <prereq…>`, `am dep rm <id> <prereq>`, `am ls --ready` / `--blocked`,
+    `[blk:N]` / `[ready]` markers in `am ls` output, `depends on:` / `blocks:` in `am show`.
+  - API: `POST /api/tasks/{id}/deps`, `DELETE /api/tasks/{id}/deps/{depId}`, `?ready=` / `?blocked=`
+    on `GET /api/tasks`, `depends_on` / `blocks` in `GET /api/tasks/{id}`.
+  - Hard-block: claiming or moving to `doing`/`done` with open prereqs → `409 {"error":"blocked",
+    "open_prereqs":[…]}` (exit 4 in CLI). Edit/comment/assign/`todo`/`blocked` unaffected.
+  - Cycle prevention: recursive CTE rejects self-deps and transitive cycles (→ 400).
+  - Dashboard: modal Dependencies section (prereq chips, add-prereq dropdown, Blocks list);
+    card **🔒 Blocked** / **✓ Ready** tags; hard-block 409 reverts the UI.
+  - 2 new event kinds (`task.dep_added`, `task.dep_removed`; total now 14); +24 tests (now 91).
+  → ADR-020, `data-model.md`, `backend.md`, `frontend.md`, `CHANGELOG.md`.
+
 ## Phase G — Security posture (deferred by design)
 
 agentman is loopback-only with no auth; the bind **is** the access control, hardened by the
@@ -134,6 +153,6 @@ and only matter if the network bind ever widens. (`architecture/security.md`)
 
 ### Suggested order
 
-Phases A, C, D, E, and F are **complete**. Remaining open work:
+Phases A, C, D, E, F, and H are **complete**. Remaining open work:
 
 **B1 → B2** (commit pending fixes + tag v0.4.0). **G** stays parked unless the access model changes.

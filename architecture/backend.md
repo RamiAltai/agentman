@@ -18,15 +18,17 @@ GET   /api/projects                 handleListProjects      ?archived=true inclu
 POST  /api/projects                 handleCreateProject     {slug,name}
 POST  /api/projects/{slug}/archive    handleArchiveProject
 POST  /api/projects/{slug}/unarchive  handleUnarchiveProject
-GET   /api/tasks                    handleListTasks         ?project=&status=&assignee=&limit=  (no project ⇒ hides archived-project tasks)
+GET   /api/tasks                    handleListTasks         ?project=&status=&assignee=&limit=&ready=true|&blocked=true  (no project ⇒ hides archived-project tasks)
 POST  /api/tasks                    handleCreateTask        {project,title,body?,priority?,assignee?}
-GET   /api/tasks/{id}               handleGetTask           (task + comments + recent events)
-PATCH /api/tasks/{id}               handlePatchTask         {status?,assignee?,title?,body?,priority?}
-POST  /api/tasks/{id}/claim         handleClaim             (atomic; X-Agent = claimant)
+GET   /api/tasks/{id}               handleGetTask           (task + comments + recent events + depends_on + blocks)
+PATCH /api/tasks/{id}               handlePatchTask         {status?,assignee?,title?,body?,priority?}  (hard-blocked if open prereqs + doing/done target)
+POST  /api/tasks/{id}/claim         handleClaim             (atomic; X-Agent = claimant; hard-blocked if open prereqs → 409 blocked)
 POST  /api/tasks/{id}/comments      handleComment           {body}
+POST  /api/tasks/{id}/deps          handleAddDep            {depends_on: <id-or-ref>}  add prerequisite edge
+DELETE /api/tasks/{id}/deps/{depId} handleRemoveDep         remove prerequisite edge
 GET   /api/events                   handleEvents            ?since=  | ?tail=  | ?before=  | ?project=  (no project ⇒ hides archived-project events)
 GET   /api/stream                   handleStream            text/event-stream (SSE)
-DELETE /api/tasks/{id}              handleDeleteTask        hard-delete task + comments (cascade); 200 {"status":"deleted"}
+DELETE /api/tasks/{id}              handleDeleteTask        hard-delete task + comments + dep edges (cascade); 200 {"status":"deleted"}
 DELETE /api/tasks/{id}/comments/{cid} handleDeleteComment  hard-delete one comment; 200 {"status":"deleted"}
 DELETE /api/projects/{slug}         handleDeleteProject     hard-delete project + tasks + comments (cascade); 200 {"status":"deleted"}
 /                                   http.FileServer(embed)  serves cmd/am/web/
@@ -64,8 +66,8 @@ logic). Each mutating method returns `(result, *Event, error)`; the handler broa
 Key methods: `CreateProject`, `ListProjects(includeArchived bool)`, `ArchiveProject`,
 `UnarchiveProject`, `DeleteProject`, `ListTasks`, `GetTask`, `CreateTask`, `PatchTask`,
 `ClaimTask`, `AddComment`, `DeleteComment`, `ListEvents`, `RecentEvents`, `ListEventsBefore`,
-`DeleteTask`. `ArchiveProject`/`UnarchiveProject` are
-transactional and idempotent (no event when already in the target state).
+`DeleteTask`, `AddDep`, `RemoveDep`. `ArchiveProject`/`UnarchiveProject` are transactional and
+idempotent (no event when already in the target state).
 `CreateTask` checks the target project's `archived_at` before the insert and returns
 `ErrProjectArchived` if archived — creation into an archived project is rejected.
 `ListEvents`/`RecentEvents` use `LEFT JOIN projects p ON p.id = events.project_id` and,
@@ -75,6 +77,19 @@ when no explicit `project=` filter is supplied, exclude events whose project is 
 limit)` applies the same archived-project filter and returns events with `id < before`,
 newest-first (default limit 40, cap 200) — used by the `?before=` cursor branch in `handleEvents`
 for backward pagination.
+
+`AddDep(taskID, dependsOnID, actor)` validates same-project membership, rejects self-deps, and
+runs a recursive CTE (`wouldCycle`) to reject transitive cycles before inserting into `task_deps`.
+Duplicate edges are idempotent (returns `nil, nil`). `RemoveDep` is also idempotent (no-op if the
+edge does not exist). `ListTasks` now accepts `TaskFilter.Ready` (todo tasks with zero open
+prereqs) and `TaskFilter.Blocked` (tasks with ≥1 open prereq); it also selects `NPrereqs` and
+`NOpenPrereqs` counts for every row via subqueries. `GetTask` additionally populates `DependsOn`
+and `Blocks` slices (full `DepRef` objects).
+
+`ClaimTask` and `PatchTask` call the helper `hasOpenPrereqs` before writing: if any prerequisite
+task is not `done`, they return a `*BlockedError{OpenPrereqs: []int64{…}}`. `ClaimTask` blocks
+unconditionally on open prereqs; `PatchTask` blocks only when the target status is `doing` or
+`done` (other ops — edit, comment, assign, status→todo/blocked — proceed normally).
 
 **Atomic claim** (`ClaimTask`) is the most important invariant — a single conditional statement:
 
@@ -142,15 +157,18 @@ No job queue. Long-lived goroutines only:
 ## Error Handling
 
 Sentinel errors in `store.go`: `ErrNotFound`, `ErrConflict`, `ErrValidation`, `ErrProjectArchived`,
-and a typed `*ConflictError{Assignee}`. `writeErr` (`server.go`) maps them: 404 / 409 / 400, with
+typed `*ConflictError{Assignee}`, and typed `*BlockedError{OpenPrereqs []int64}`. `writeErr`
+(`server.go`) maps them: 404 / 409 / 400, with
 `ConflictError` → `409 {"error":"already_claimed","assignee":…}`,
+`BlockedError` → `409 {"error":"blocked","open_prereqs":[…]}`,
 `ErrProjectArchived` → `400 {"error":"project_archived"}`,
 `ErrValidation` → `400`; anything else → **HTTP 500 with a generic `{"error":"internal"}` body**
 (the real error is logged server-side via `log.Printf("agentman: internal error: %v", err)` to
 stderr — it is never sent to the client). Delete handlers (`handleDeleteTask`,
 `handleDeleteComment`, `handleDeleteProject`) return `404` via `writeErr` when the target is
 missing (`ErrNotFound`). The CLI re-maps HTTP status to **exit codes** in `client.go doOrFail`
-(`3` not found · `4` conflict · `5` validation/project_archived · `6` server down · `1` other).
+(`3` not found · `4` conflict/blocked · `5` validation/project_archived · `6` server down · `1` other);
+a `blocked` 409 prints e.g. `claim: #3 blocked — prereqs not done (#1 #2)`.
 
 ## Observability
 
@@ -165,7 +183,7 @@ per request after completion: `METHOD PATH STATUS LATENCY ACTOR` (actor = `X-Age
 
 ## Testing
 
-There are nine test files (run `go test -race ./cmd/am/`; 71 tests, all green):
+There are nine test files (run `go test -race ./cmd/am/`; 91 tests, all green):
 - `cmd/am/update_test.go` — version-comparison logic.
 - `cmd/am/store_test.go` — atomic-claim race (concurrent, `-race`-clean), events-cursor monotonicity,
   store CRUD + validation (`ErrValidation`), project archive/unarchive round-trip + idempotency,
@@ -202,7 +220,13 @@ There are nine test files (run `go test -race ./cmd/am/`; 71 tests, all green):
   `.innerHTML`/`.outerHTML`/`.insertAdjacentHTML`/`document.write`/`eval(` appear — a source-level
   regression guard that locks in the `el()`/`textContent` XSS-safe DOM convention.
 
-So SSE streaming/reconnect, CLI verbs, exit-code mapping, and identity are now covered. The
+The +24 dependency tests are spread across existing files: `store_test.go` (cycle/self/cross-project
+rejection, idempotent add/remove, cascade on task delete, `NPrereqs`/`NOpenPrereqs` counts,
+`Ready`/`Blocked` list filters, hard-block on `ClaimTask` and `PatchTask`, fresh-DB table existence);
+`server_test.go` (HTTP add/remove dep endpoints, `?ready=`/`?blocked=` query params, 409 blocked
+response for claim and patch).
+
+SSE streaming/reconnect, CLI verbs, exit-code mapping, and identity are now covered. The
 dashboard has a source-level XSS-sink guard but **no behavioral JS tests** — the project
 deliberately adopts no JS test runner (preserves the single-binary/no-npm ethos). (See
 `known-risks-and-gaps.md`.)
@@ -214,9 +238,9 @@ deliberately adopts no JS test runner (preserves the single-binary/no-npm ethos)
 - **New task field:** add the column in `schema.sql`, the struct field in `store.go`, thread it
   through `CreateTask`/`PatchTask`/`getTaskTx`, the API, and the dashboard (`web/`).
 - **New event kind:** emit via `insertEvent(...)` and handle it in `web/app.js` `evText`/`describeText`.
-  Current kinds (12 total): `task.created`, `task.claimed`, `task.status`, `task.assign`,
-  `task.patched`, `task.deleted`, `comment.added`, `comment.deleted`, `project.created`,
-  `project.archived`, `project.unarchived`, `project.deleted`.
+  Current kinds (14 total): `task.created`, `task.claimed`, `task.status`, `task.assign`,
+  `task.patched`, `task.deleted`, `task.dep_added`, `task.dep_removed`, `comment.added`,
+  `comment.deleted`, `project.created`, `project.archived`, `project.unarchived`, `project.deleted`.
 
 ## Risks and Gaps
 

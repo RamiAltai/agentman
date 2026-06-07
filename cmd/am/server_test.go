@@ -526,6 +526,122 @@ func TestEventsBeforeEndpoint(t *testing.T) {
 	}
 }
 
+// ===================== dependency endpoint tests =====================
+
+func TestAddDepEndpoint(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "depproj")
+	id1 := mustCreateTask(t, ts, "depproj", "Prereq task")
+	id2 := mustCreateTask(t, ts, "depproj", "Dependent task")
+
+	// POST /api/tasks/<id2>/deps with {depends_on: <id1_num>}
+	r := do(t, ts, http.MethodPost, "/api/tasks/"+id2+"/deps",
+		`{"depends_on":`+id1+`}`,
+		map[string]string{"Content-Type": "application/json"})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("POST deps = %d, want 200", r.StatusCode)
+	}
+
+	// GET task2 should now show depends_on.
+	rg := do(t, ts, http.MethodGet, "/api/tasks/"+id2, "", nil)
+	defer rg.Body.Close()
+	var task Task
+	if err := json.NewDecoder(rg.Body).Decode(&task); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	if len(task.DependsOn) != 1 {
+		t.Fatalf("task.DependsOn = %v, want 1 entry", task.DependsOn)
+	}
+}
+
+func TestAddDepCycleEndpoint(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "cyc")
+	id1 := mustCreateTask(t, ts, "cyc", "T1")
+	id2 := mustCreateTask(t, ts, "cyc", "T2")
+
+	// id2 depends on id1
+	r1 := do(t, ts, http.MethodPost, "/api/tasks/"+id2+"/deps",
+		`{"depends_on":`+id1+`}`,
+		map[string]string{"Content-Type": "application/json"})
+	r1.Body.Close()
+	if r1.StatusCode != http.StatusOK {
+		t.Fatalf("first dep = %d, want 200", r1.StatusCode)
+	}
+
+	// id1 depends on id2 → cycle → 400
+	r2 := do(t, ts, http.MethodPost, "/api/tasks/"+id1+"/deps",
+		`{"depends_on":`+id2+`}`,
+		map[string]string{"Content-Type": "application/json"})
+	defer r2.Body.Close()
+	if r2.StatusCode != http.StatusBadRequest {
+		t.Fatalf("cycle dep = %d, want 400", r2.StatusCode)
+	}
+}
+
+func TestRemoveDepEndpoint(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "rmproj")
+	id1 := mustCreateTask(t, ts, "rmproj", "Prereq")
+	id2 := mustCreateTask(t, ts, "rmproj", "Dep task")
+
+	// Add the dep.
+	r := do(t, ts, http.MethodPost, "/api/tasks/"+id2+"/deps",
+		`{"depends_on":`+id1+`}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+
+	// Remove it.
+	rd := do(t, ts, http.MethodDelete, "/api/tasks/"+id2+"/deps/"+id1, "", nil)
+	defer rd.Body.Close()
+	if rd.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE dep = %d, want 200", rd.StatusCode)
+	}
+
+	// Verify it's gone.
+	rg := do(t, ts, http.MethodGet, "/api/tasks/"+id2, "", nil)
+	defer rg.Body.Close()
+	var task Task
+	if err := json.NewDecoder(rg.Body).Decode(&task); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	if len(task.DependsOn) != 0 {
+		t.Fatalf("DependsOn after remove = %v, want empty", task.DependsOn)
+	}
+}
+
+func TestClaimBlockedEndpoint(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "blkproj")
+	id1 := mustCreateTask(t, ts, "blkproj", "Prereq")
+	id2 := mustCreateTask(t, ts, "blkproj", "Blocked task")
+
+	// Add dep: id2 depends on id1.
+	r := do(t, ts, http.MethodPost, "/api/tasks/"+id2+"/deps",
+		`{"depends_on":`+id1+`}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+
+	// Attempt to claim id2 → 409 blocked.
+	rc := do(t, ts, http.MethodPost, "/api/tasks/"+id2+"/claim", "",
+		map[string]string{"X-Agent": "agent-x"})
+	defer rc.Body.Close()
+	if rc.StatusCode != http.StatusConflict {
+		t.Fatalf("claim blocked task = %d, want 409", rc.StatusCode)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(rc.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body["error"] != "blocked" {
+		t.Fatalf("error = %q, want blocked", body["error"])
+	}
+	if _, ok := body["open_prereqs"]; !ok {
+		t.Fatal("response missing open_prereqs field")
+	}
+}
+
 // ---------- helpers ----------
 
 func mustCreateProject(t *testing.T, ts *httptest.Server, slug string) {

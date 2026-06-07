@@ -47,11 +47,15 @@ Set your identity once at the start of a task:
     am init <tasktype>     # e.g. `am init bugfix` → bugfix_060626_4821 (remembered for this directory)
 Then use `am` normally (`am whoami` shows it).
 
+    am ls --ready              # todo tasks with no open prereqs — start here
     am ls --status todo        # unclaimed work to pick up      am ls --mine   # my tasks
-    am claim <id>              # take a task (exit 4 = already claimed by another agent)
-    am show <id> -c            # full detail + comments
+    am ls --blocked            # tasks blocked by unfinished prereqs (do not claim these)
+    am claim <id>              # take a task (exit 4 = already claimed OR prereqs not done)
+    am show <id> -c            # full detail + depends on/blocks + comments
     am note <id> "progress"    # leave a short comment as you work
     am status <id> done        # todo | doing | blocked | done
+    am dep add <id> <prereq>   # add a prerequisite (same project; rejects cycles)
+    am dep rm <id> <prereq>    # remove a prerequisite
     am new "title" -p <proj>   # create a task (prints its id); exits non-zero with
                                #   `project_archived` if the target project is archived
     am projects --all          # list projects, incl. archived (marked "(archived)")
@@ -61,8 +65,13 @@ Then use `am` normally (`am whoami` shows it).
     am project rm <slug> --yes # hard-delete a project + ALL its tasks/comments — permanent
 
 Choose the project with `-p <slug>` (or set AGENTMAN_PROJECT). Output is terse text — add
-`--json` to parse. Silence = success. Exit codes: 0 ok · 3 not found · 4 already claimed ·
-6 server down.
+`--json` to parse. Silence = success. Exit codes: 0 ok · 3 not found · 4 already claimed or
+blocked by prereqs · 6 server down.
+
+**Dependencies:** if a task has unfinished prerequisites, claiming it fails with exit 4 and a
+message like `claim: #5 blocked — prereqs not done (#2 #3)`. Use `am ls --ready` to find tasks
+that are safe to pick up. `am ls` rows show `[blk:N]` (N open prereqs) or `[ready]` (all prereqs
+done) markers.
 
 Typical flow: claim (or create then claim) a task before substantial work, post brief
 `am note` updates at milestones, and `am status <id> done` when finished — so the human can

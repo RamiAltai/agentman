@@ -1,7 +1,7 @@
 # Frontend Architecture
 
 There **is** a frontend: a small single-page dashboard in `cmd/am/web/`
-(`index.html` 50 lines, `app.css` 373 lines, `app.js` 854 lines), embedded into the binary via
+(`index.html` 50 lines, `app.css` 415 lines, `app.js` 957 lines), embedded into the binary via
 `//go:embed web` (`cmd/am/server.go`) and served at `/`. It is the human-facing view; agents do
 not use it.
 
@@ -32,7 +32,10 @@ All built imperatively in `app.js` (no component framework):
   board reload automatically.
 - **Board** — `renderBoard`, `card(t)`: four status columns (`COLS`), priority via card left-border
   + chip, avatar initials, project tag (shown when `selected.size !== 1`, i.e. only when the board
-  isn't already scoped to a single project), comment count.
+  isn't already scoped to a single project), comment count. Cards now also show a dependency tag in
+  the card footer: **🔒 Blocked** (`.tag-blocked`, shown when `t.nopen > 0`) or **✓ Ready**
+  (`.tag-ready`, shown when `t.nprereq > 0 && t.nopen === 0`). These are derived from server-side
+  counts (`nprereq`/`nopen` on the task object); there is no stored "ready" status field.
 - **Activity feed** — `feedItem`, `evText`, `evKind`: color-coded events with clickable `#refs`.
   Event kinds include the project lifecycle: `project.created`, `project.archived`,
   `project.unarchived` (render via `evText`/`describeText`; `evKind` colors them as generic "other"),
@@ -47,7 +50,21 @@ All built imperatively in `app.js` (no component framework):
 - **Detail modal** — `renderModal`, plus `openNew` (new task) and `openNewProject`: one reused
   `#sheet` element; auto-growing title `<textarea>`; status/assignee/priority controls; comments;
   history. The modal includes a **Delete task** button (inline two-step confirm — see below) and
-  each comment has a **× delete** button (also two-step).
+  each comment has a **× delete** button (also two-step). The modal also has a **Dependencies**
+  section (`depsSection`):
+  - **"Depends on"** — one chip per prerequisite showing a status dot, `project-ref` (clickable
+    link to open that task), title, status text, and a **✕ remove** button
+    (`DELETE /api/tasks/{id}/deps/{depId}`). Open prereqs get class `dep-open`; done ones get
+    `dep-done`. If none, shows "None".
+  - **"Add prerequisite…"** — a `<select>` dropdown lazily populated with same-project tasks
+    (excludes self and already-linked tasks). Selecting a candidate calls
+    `POST /api/tasks/{id}/deps {depends_on: id}` and refreshes the modal; an inline error element
+    shows the rejection message (e.g. "would create a dependency cycle").
+  - **"Blocks"** — a read-only list of tasks that depend on this one (`t.blocks`); each row shows
+    the ref link, title, and status.
+  Hard-block UX: if a claim or status-change to `doing`/`done` is rejected with a 409 `blocked`
+  response, the dashboard surfaces the blocking prereq ids (e.g. "blocked by #1 #2 (prereq not
+  done)") and reverts the card/modal to its previous state.
 - **Delete affordances** — three inline two-step confirms (no native `confirm()`/`prompt()` — they
   are blocked in webviews; all DOM built via `el()`, no `innerHTML`):
   1. **Delete task** (`btn-danger-task`) in the task modal — on first click shows "Confirm delete?";
@@ -81,7 +98,9 @@ if none loaded), `feedPaginated` (`true` once the user has paginated; disables `
   `/api/events?tail=50` (same `qstr` rule). `onEvent` handles the three delete kinds:
   `task.deleted` removes the card from `tasks` map and closes the modal if it was open;
   `comment.deleted` refreshes the open modal; `project.deleted` drops the slug from `selected` and
-  reloads the board/feed.
+  reloads the board/feed. For `task.dep_added` and `task.dep_removed`, `onEvent` refreshes the
+  open modal if either the task or the referenced prereq is currently open (so both sides of the
+  edge see the update), then triggers the debounced board reload.
 - Same-origin only; no CORS, no auth token (the API is unauthenticated).
 
 ## Styling and Design System
@@ -135,9 +154,11 @@ the no-npm/single-binary/no-build-step ethos that is a core project invariant.
 build before it ships.
 
 **Remaining gap:** behavioral dashboard JS — the "Manage projects" modal, the delete confirm flows
-(task/comment/project), the feed pagination button, multi-select filter logic, and SSE
-reconciliation paths — is not automatically tested. All frontend behavior in these docs is from
-source reading and manual verification. (Gap; see `known-risks-and-gaps.md`.)
+(task/comment/project), the feed pagination button, the dependency section (prereq chips, add-prereq
+dropdown, blocks list), multi-select filter logic, and SSE reconciliation paths — is not
+automatically tested. The new dependency UI is additional un-runner-tested JS; XSS safety is
+guarded by `TestDashboardNoXSSSinks`. All frontend behavior in these docs is from source reading
+and manual verification. (Gap; see `known-risks-and-gaps.md`.)
 
 ## Where to Add New Features
 
@@ -152,9 +173,9 @@ source reading and manual verification. (Gap; see `known-risks-and-gaps.md`.)
 - **Native HTML5 drag-and-drop doesn't fire on touch** → mobile relies on the status dropdown /
   `[ ]` keys (documented fallback in code comments).
 - **Full board re-render per event batch** (debounced) — fine at small scale, O(n) at large scale.
-- Single 854-line `app.js`, no module split, no minification. Behavioral JS logic is not
+- Single 957-line `app.js`, no module split, no minification. Behavioral JS logic is not
   automatically tested (deliberate no-JS-runner decision); XSS-sink safety is enforced by the
-  `TestDashboardNoXSSSinks` Go guard. The delete confirm flows and feed pagination are still
-  untested at the behavioral level.
+  `TestDashboardNoXSSSinks` Go guard. The delete confirm flows, feed pagination, and dependency
+  UI are still untested at the behavioral level.
 - `localStorage` access is wrapped (`lsGet`/`lsSet`) so a sandboxed/Private-mode browser won't
   break the app — keep that pattern if you add persistence.

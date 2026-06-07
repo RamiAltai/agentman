@@ -71,6 +71,8 @@ func main() {
 		cmdProjects(c, a)
 	case "project":
 		cmdProject(c, a)
+	case "dep":
+		cmdDep(c, a)
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -151,8 +153,8 @@ func usage() {
   am init <tasktype>                     set this session's identity (e.g. bugfix_050626_4821)
   am whoami                              print the current identity
 
-  am ls [--mine] [--status S] [-p P] [--all]   list tasks (hides done)
-  am show <id> [-c]                            task detail (+comments)
+  am ls [--mine] [--status S] [-p P] [--all] [--ready] [--blocked]   list tasks (hides done)
+  am show <id> [-c]                            task detail (+comments +deps)
   am new "title" [--body B] [-p P] [--priority N]   create, prints id
   am claim <id>                               assign me + ->doing (atomic)
   am status <id> <todo|doing|blocked|done>    change status
@@ -161,6 +163,8 @@ func usage() {
   am edit <id> [--title T] [--body B] [--priority N]
   am drop <id>                                release back to todo
   am rm <id>                                  hard-delete a task (permanent)
+  am dep add <id> <prereq> [prereq…]          add prerequisite(s) to a task
+  am dep rm <id> <prereq>                     remove a prerequisite
   am projects [--all]                    list projects (--all includes archived)
   am project new <slug> [name]                create a project
   am project archive <slug>              soft-archive a project (hides it)

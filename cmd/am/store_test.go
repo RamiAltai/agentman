@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"fmt"
+	"path/filepath"
 	"sync"
 	"testing"
 )
@@ -700,3 +702,401 @@ func TestEventsCursorStrictlyIncreasing(t *testing.T) {
 		t.Fatalf("RecentEvents not newest-first: %d then %d", recent[0].ID, recent[1].ID)
 	}
 }
+
+// ===================== dependency tests =====================
+
+func setupDepFixture(t *testing.T) (*Store, int64, int64, int64) {
+	t.Helper()
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+		t.Fatal(err)
+	}
+	t1, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Task 1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t2, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Task 2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t3, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Task 3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st, t1.ID, t2.ID, t3.ID
+}
+
+func TestAddDepHappyPath(t *testing.T) {
+	st, t1, t2, _ := setupDepFixture(t)
+
+	ev, err := st.AddDep(t2, t1, "alice") // t2 depends on t1
+	if err != nil {
+		t.Fatalf("AddDep: %v", err)
+	}
+	if ev == nil {
+		t.Fatal("AddDep: expected event, got nil")
+	}
+	if ev.Kind != "task.dep_added" {
+		t.Fatalf("AddDep event kind = %q, want task.dep_added", ev.Kind)
+	}
+
+	// GetTask should show the dependency.
+	task2, err := st.GetTask(t2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(task2.DependsOn) != 1 || task2.DependsOn[0].ID != t1 {
+		t.Fatalf("DependsOn = %+v, want [{ID:%d}]", task2.DependsOn, t1)
+	}
+
+	// GetTask on t1 should show it blocks t2.
+	task1, err := st.GetTask(t1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(task1.Blocks) != 1 || task1.Blocks[0].ID != t2 {
+		t.Fatalf("Blocks = %+v, want [{ID:%d}]", task1.Blocks, t2)
+	}
+}
+
+func TestAddDepSelfRejected(t *testing.T) {
+	st, t1, _, _ := setupDepFixture(t)
+	_, err := st.AddDep(t1, t1, "alice")
+	if !errors.Is(err, ErrValidation) {
+		t.Fatalf("self-dep err = %v, want ErrValidation", err)
+	}
+}
+
+func TestAddDepCrossProjectRejected(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("proj1", "P1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateProject("proj2", "P2"); err != nil {
+		t.Fatal(err)
+	}
+	ta, _, _ := st.CreateTask(CreateTaskInput{Project: "proj1", Title: "A"})
+	tb, _, _ := st.CreateTask(CreateTaskInput{Project: "proj2", Title: "B"})
+	_, err := st.AddDep(ta.ID, tb.ID, "alice")
+	if !errors.Is(err, ErrValidation) {
+		t.Fatalf("cross-project dep err = %v, want ErrValidation", err)
+	}
+}
+
+func TestAddDepCycleRejected(t *testing.T) {
+	st, t1, t2, t3 := setupDepFixture(t)
+	// t2 depends on t1
+	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
+		t.Fatalf("AddDep(t2->t1): %v", err)
+	}
+	// t3 depends on t2
+	if _, err := st.AddDep(t3, t2, "alice"); err != nil {
+		t.Fatalf("AddDep(t3->t2): %v", err)
+	}
+	// t1 depends on t3 would form a cycle: t1->t3->t2->t1
+	_, err := st.AddDep(t1, t3, "alice")
+	if !errors.Is(err, ErrValidation) {
+		t.Fatalf("cycle dep err = %v, want ErrValidation", err)
+	}
+}
+
+func TestAddDepDirectCycleRejected(t *testing.T) {
+	st, t1, t2, _ := setupDepFixture(t)
+	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
+		t.Fatalf("AddDep(t2->t1): %v", err)
+	}
+	// t1 depends on t2 would form a direct cycle
+	_, err := st.AddDep(t1, t2, "alice")
+	if !errors.Is(err, ErrValidation) {
+		t.Fatalf("direct cycle err = %v, want ErrValidation", err)
+	}
+}
+
+func TestAddDepIdempotent(t *testing.T) {
+	st, t1, t2, _ := setupDepFixture(t)
+	ev1, err := st.AddDep(t2, t1, "alice")
+	if err != nil {
+		t.Fatalf("first AddDep: %v", err)
+	}
+	if ev1 == nil {
+		t.Fatal("first AddDep: want event")
+	}
+	// Second add of the same edge must be a no-op (nil event).
+	ev2, err := st.AddDep(t2, t1, "alice")
+	if err != nil {
+		t.Fatalf("second AddDep: %v", err)
+	}
+	if ev2 != nil {
+		t.Fatal("second AddDep: want nil event (idempotent)")
+	}
+}
+
+func TestRemoveDep(t *testing.T) {
+	st, t1, t2, _ := setupDepFixture(t)
+	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
+		t.Fatalf("AddDep: %v", err)
+	}
+	ev, err := st.RemoveDep(t2, t1, "alice")
+	if err != nil {
+		t.Fatalf("RemoveDep: %v", err)
+	}
+	if ev == nil || ev.Kind != "task.dep_removed" {
+		t.Fatalf("RemoveDep event = %v, want task.dep_removed", ev)
+	}
+	// Edge should be gone.
+	task2, _ := st.GetTask(t2)
+	if len(task2.DependsOn) != 0 {
+		t.Fatalf("DependsOn after remove = %+v, want empty", task2.DependsOn)
+	}
+	// Idempotent remove — no error, nil event.
+	ev2, err := st.RemoveDep(t2, t1, "alice")
+	if err != nil {
+		t.Fatalf("second RemoveDep: %v", err)
+	}
+	if ev2 != nil {
+		t.Fatal("second RemoveDep: want nil event")
+	}
+}
+
+func TestGetTaskDependsOnAndBlocks(t *testing.T) {
+	st, t1, t2, t3 := setupDepFixture(t)
+	// t2 depends on t1; t3 depends on t1
+	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddDep(t3, t1, "alice"); err != nil {
+		t.Fatal(err)
+	}
+
+	task1, err := st.GetTask(t1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(task1.DependsOn) != 0 {
+		t.Fatalf("t1.DependsOn = %v, want empty", task1.DependsOn)
+	}
+	if len(task1.Blocks) != 2 {
+		t.Fatalf("t1.Blocks = %v, want 2 items", task1.Blocks)
+	}
+
+	task2, err := st.GetTask(t2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(task2.DependsOn) != 1 || task2.DependsOn[0].ID != t1 {
+		t.Fatalf("t2.DependsOn = %v, want [t1]", task2.DependsOn)
+	}
+}
+
+func TestDeleteTaskCascadesDeps(t *testing.T) {
+	st, t1, t2, _ := setupDepFixture(t)
+	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Delete t1 (the prereq). The edge must be removed via FK cascade.
+	if _, err := st.DeleteTask(t1, "alice"); err != nil {
+		t.Fatalf("DeleteTask: %v", err)
+	}
+	var count int
+	st.db.QueryRow("SELECT COUNT(*) FROM task_deps WHERE depends_on_id=?", t1).Scan(&count)
+	if count != 0 {
+		t.Fatalf("task_deps row survived deletion of prereq, count=%d", count)
+	}
+
+	// t2 should now have no deps.
+	task2, _ := st.GetTask(t2)
+	if len(task2.DependsOn) != 0 {
+		t.Fatalf("t2.DependsOn after prereq delete = %v, want empty", task2.DependsOn)
+	}
+}
+
+func TestListTasksDepCounts(t *testing.T) {
+	st, t1, t2, _ := setupDepFixture(t)
+	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks, err := st.ListTasks(TaskFilter{Project: "web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := map[int64]Task{}
+	for _, tk := range tasks {
+		m[tk.ID] = tk
+	}
+	if m[t1].NPrereqs != 0 || m[t1].NOpenPrereqs != 0 {
+		t.Fatalf("t1 counts = nprereq=%d nopen=%d, want 0,0", m[t1].NPrereqs, m[t1].NOpenPrereqs)
+	}
+	if m[t2].NPrereqs != 1 {
+		t.Fatalf("t2.NPrereqs = %d, want 1", m[t2].NPrereqs)
+	}
+	if m[t2].NOpenPrereqs != 1 {
+		t.Fatalf("t2.NOpenPrereqs = %d, want 1 (t1 is todo)", m[t2].NOpenPrereqs)
+	}
+
+	// Mark t1 done → t2's NOpenPrereqs should drop to 0.
+	if _, _, err := st.PatchTask(t1, map[string]any{"status": "done"}, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	tasks2, _ := st.ListTasks(TaskFilter{Project: "web"})
+	m2 := map[int64]Task{}
+	for _, tk := range tasks2 {
+		m2[tk.ID] = tk
+	}
+	if m2[t2].NOpenPrereqs != 0 {
+		t.Fatalf("t2.NOpenPrereqs after t1 done = %d, want 0", m2[t2].NOpenPrereqs)
+	}
+}
+
+func TestListTasksReadyFilter(t *testing.T) {
+	st, t1, t2, t3 := setupDepFixture(t)
+	// t2 depends on t1 (open prereq → not ready)
+	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	// t3 has no deps → ready
+
+	ready, err := st.ListTasks(TaskFilter{Project: "web", Ready: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := map[int64]bool{}
+	for _, tk := range ready {
+		ids[tk.ID] = true
+	}
+	// t1 and t3 have no open prereqs and are todo → ready
+	if !ids[t1] {
+		t.Error("t1 should appear in ready list (no deps)")
+	}
+	if !ids[t3] {
+		t.Error("t3 should appear in ready list (no deps)")
+	}
+	// t2 has open prereq → not ready
+	if ids[t2] {
+		t.Error("t2 should NOT appear in ready list (has open prereq)")
+	}
+}
+
+func TestListTasksBlockedFilter(t *testing.T) {
+	st, t1, t2, t3 := setupDepFixture(t)
+	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
+		t.Fatal(err)
+	}
+
+	blocked, err := st.ListTasks(TaskFilter{Project: "web", Blocked: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := map[int64]bool{}
+	for _, tk := range blocked {
+		ids[tk.ID] = true
+	}
+	if !ids[t2] {
+		t.Error("t2 should appear in blocked list (has open prereq)")
+	}
+	if ids[t1] || ids[t3] {
+		t.Error("t1/t3 should NOT appear in blocked list")
+	}
+}
+
+func TestClaimBlockedByOpenPrereq(t *testing.T) {
+	st, t1, t2, _ := setupDepFixture(t)
+	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Claim t2 while t1 is todo → must be blocked.
+	_, _, err := st.ClaimTask(t2, "agent-a")
+	var be *BlockedError
+	if !errors.As(err, &be) {
+		t.Fatalf("ClaimTask with open prereq: got %v, want *BlockedError", err)
+	}
+	if len(be.OpenPrereqs) == 0 {
+		t.Fatal("BlockedError.OpenPrereqs should be non-empty")
+	}
+}
+
+func TestClaimUnblockedAfterPrereqDone(t *testing.T) {
+	st, t1, t2, _ := setupDepFixture(t)
+	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	// Mark t1 done.
+	if _, _, err := st.PatchTask(t1, map[string]any{"status": "done"}, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	// Now claim t2 — should succeed.
+	task, ev, err := st.ClaimTask(t2, "agent-a")
+	if err != nil {
+		t.Fatalf("ClaimTask after prereq done: %v", err)
+	}
+	if task == nil || ev == nil {
+		t.Fatal("want task+event on successful claim")
+	}
+}
+
+func TestPatchTaskBlockedByOpenPrereq(t *testing.T) {
+	st, t1, t2, _ := setupDepFixture(t)
+	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Cannot patch t2 to doing while t1 is todo.
+	_, _, err := st.PatchTask(t2, map[string]any{"status": "doing"}, "alice")
+	var be *BlockedError
+	if !errors.As(err, &be) {
+		t.Fatalf("PatchTask(doing) with open prereq: got %v, want *BlockedError", err)
+	}
+
+	// Cannot patch t2 to done while t1 is todo.
+	_, _, err = st.PatchTask(t2, map[string]any{"status": "done"}, "alice")
+	if !errors.As(err, &be) {
+		t.Fatalf("PatchTask(done) with open prereq: got %v, want *BlockedError", err)
+	}
+
+	// Allowed to patch title even with open prereq.
+	_, _, err = st.PatchTask(t2, map[string]any{"title": "New Title"}, "alice")
+	if err != nil {
+		t.Fatalf("PatchTask(title) should succeed: %v", err)
+	}
+
+	// Allowed to patch to blocked/todo even with open prereq.
+	_, _, err = st.PatchTask(t2, map[string]any{"status": "blocked"}, "alice")
+	if err != nil {
+		t.Fatalf("PatchTask(blocked) should succeed: %v", err)
+	}
+
+	// Mark t1 done → now patch t2 to doing should work.
+	if _, _, err := st.PatchTask(t1, map[string]any{"status": "done"}, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = st.PatchTask(t2, map[string]any{"status": "doing"}, "alice")
+	if err != nil {
+		t.Fatalf("PatchTask(doing) after prereq done: %v", err)
+	}
+}
+
+func TestTaskDepsTableExistsOnReopenedDB(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "fresh.db")
+	st, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatalf("first OpenStore: %v", err)
+	}
+	st.Close()
+
+	// Reopen — task_deps must exist (IF NOT EXISTS path).
+	st2, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatalf("second OpenStore: %v", err)
+	}
+	defer st2.Close()
+
+	var count int
+	if err := st2.db.QueryRow("SELECT COUNT(*) FROM task_deps").Scan(&count); err != nil {
+		t.Fatalf("task_deps table missing after reopen: %v", err)
+	}
+}
+
+// Suppress unused import warning for fmt (used in TestAddDepCycleRejected).
+var _ = fmt.Sprintf
