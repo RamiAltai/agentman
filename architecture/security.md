@@ -76,7 +76,7 @@ a credential.
   the version comes from a local CLI arg, the module path is a constant → low risk (no shell string
   interpolation; args passed as a slice).
 - **Startup update check** fetches a **fixed** `proxy.golang.org` URL → not SSRF-prone.
-- **500 responses leak raw error strings** (`writeErr` default branch) — minor info disclosure.
+- ~~**500 responses leak raw error strings**~~ — **fixed (Phase D1)**. `writeErr`'s default branch now logs the real error server-side (`log.Printf("agentman: internal error: %v", err)` to stderr) and returns a generic `{"error":"internal"}` body. Internal detail is no longer sent to clients.
 - **`am db export`/`am db import`** (`cmd/am/db.go`) are **CLI-only and add no HTTP route or network
   surface**. Export reads the DB read-only and `VACUUM INTO` a snapshot; import replaces the local DB
   file. See *Local DB Snapshot & Restore* below for the file-handling and liveness controls.
@@ -122,7 +122,7 @@ the server. Their security-relevant properties:
    guard (ADR-011). Residual: these are not auth, so any *local* process can still call the API.
 3. No TLS (a token over plain HTTP would be sniffable).
 4. No rate limiting / brute-force protection.
-5. 500s expose internal error text.
+5. ~~500s expose internal error text~~ — **fixed (Phase D1)**; 500s return `{"error":"internal"}`; detail only in server-side logs.
 6. No dependency vulnerability scanning.
 7. Audit actor is spoofable (no identity verification).
 
@@ -133,7 +133,7 @@ Before merging a change, confirm:
       sanctioned exception is the escaped-literal `VACUUM INTO` path in `exportDB` — don't add more.
 - [ ] Any new dashboard rendering uses `el()`/`textContent`, never `innerHTML`/`insertAdjacentHTML`.
 - [ ] The server still binds `127.0.0.1` **unless** you also added authentication.
-- [ ] New endpoints validate inputs and map errors via `writeErr` (no raw 500 text for expected cases).
+- [ ] New endpoints validate inputs and map errors via `writeErr` (no raw 500 text for expected cases; the `default` branch now returns a generic `{"error":"internal"}` body and logs detail server-side).
 - [ ] No secrets added to the repo, logs, or query strings.
 - [ ] If you added remote access: auth + CSRF/`Host` guard + TLS are all present, not just one.
 - [ ] Any new local file written from a DB path (snapshots, backups) is created `0o600` / `0o700`,

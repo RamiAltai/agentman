@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,8 +19,9 @@ import (
 var webFS embed.FS
 
 type Server struct {
-	store *Store
-	hub   *Hub
+	store       *Store
+	hub         *Hub
+	logRequests bool
 }
 
 func NewServer(store *Store) *Server {
@@ -50,7 +52,11 @@ func (s *Server) Handler() http.Handler {
 	// Loopback browser hardening. securityHeaders is outermost so its headers
 	// (and nosniff) also apply to the 403s emitted by hostGuard/csrfGuard.
 	// Order of checks: host first (cheapest reject), then CSRF, then the mux.
-	return securityHeaders(hostGuard(csrfGuard(mux)))
+	handler := http.Handler(securityHeaders(hostGuard(csrfGuard(mux))))
+	if s.logRequests {
+		handler = requestLogger(handler)
+	}
+	return handler
 }
 
 // ---------- security middleware ----------
@@ -109,6 +115,37 @@ func securityHeaders(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Content-Security-Policy", csp)
 		next.ServeHTTP(w, r)
+	})
+}
+
+// statusRecorder wraps http.ResponseWriter to capture the status code written
+// by the handler. It also implements http.Flusher so SSE connections (which do
+// w.(http.Flusher).Flush()) continue to work when logging is enabled.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (sr *statusRecorder) WriteHeader(code int) {
+	sr.status = code
+	sr.ResponseWriter.WriteHeader(code)
+}
+
+// Flush delegates to the underlying writer if it supports http.Flusher.
+func (sr *statusRecorder) Flush() {
+	if f, ok := sr.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// requestLogger is middleware that logs method, path, status, latency, and
+// actor for every request. It is only installed when s.logRequests is true.
+func requestLogger(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		log.Printf("%s %s %d %s %s", r.Method, r.URL.Path, rec.status, time.Since(start), actorOf(r))
 	})
 }
 
@@ -487,7 +524,8 @@ func writeErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrConflict):
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "conflict"})
 	default:
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		log.Printf("agentman: internal error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 	}
 }
 

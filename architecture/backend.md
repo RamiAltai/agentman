@@ -41,12 +41,21 @@ operations. The `db` command is dispatched in `cmd/am/main.go` *before* the HTTP
 
 ## Request Flow
 
-**guardrail middleware** (`securityHeaders(hostGuard(csrfGuard(mux)))`, Phase 0/ADR-011) → `mux` →
-`handleX(w, r)` → decode JSON body (`decode`, capped at 1 MiB via `io.LimitReader`) → call a
-`store.*` method → on success `hub.Broadcast(event)` **after** the store commits → `writeJSON`. The
-actor for writes comes from the `X-Agent` header (`actorOf`, default `"human"`). The middleware
-rejects non-loopback `Host` (403) and cross-origin browser writes (403) without affecting the CLI,
-reads, or SSE.
+When `--log` / `AGENTMAN_LOG` is enabled, the chain is wrapped OUTERMOST by `requestLogger`
+(so guard 403s are also logged): `requestLogger(securityHeaders(hostGuard(csrfGuard(mux))))`.
+Otherwise the chain is `securityHeaders(hostGuard(csrfGuard(mux)))` (Phase 0/ADR-011). Then:
+`mux` → `handleX(w, r)` → decode JSON body (`decode`, capped at 1 MiB via `io.LimitReader`) →
+call a `store.*` method → on success `hub.Broadcast(event)` **after** the store commits →
+`writeJSON`. The actor for writes comes from the `X-Agent` header (`actorOf`, default `"human"`).
+The security middleware rejects non-loopback `Host` (403) and cross-origin browser writes (403)
+without affecting the CLI, reads, or SSE.
+
+`requestLogger` wraps the response writer in a `statusRecorder` (captures the status code,
+defaulting to 200; also implements `http.Flusher` so SSE connections continue to work when
+logging is enabled). It logs one line per request after completion:
+`METHOD PATH STATUS LATENCY ACTOR` (actor = `X-Agent`, default `"human"`), via the standard
+`log` package to stderr. Note: a long-lived SSE connection logs once on disconnect with a
+large latency (inherent).
 
 ## Business Logic
 
@@ -136,15 +145,23 @@ Sentinel errors in `store.go`: `ErrNotFound`, `ErrConflict`, `ErrValidation`, `E
 and a typed `*ConflictError{Assignee}`. `writeErr` (`server.go`) maps them: 404 / 409 / 400, with
 `ConflictError` → `409 {"error":"already_claimed","assignee":…}`,
 `ErrProjectArchived` → `400 {"error":"project_archived"}`,
-`ErrValidation` → `400`; anything else → 500 with the raw
-message. Delete handlers (`handleDeleteTask`, `handleDeleteComment`, `handleDeleteProject`) return
-`404` via `writeErr` when the target is missing (`ErrNotFound`). The CLI re-maps HTTP status to **exit codes** in `client.go doOrFail`
+`ErrValidation` → `400`; anything else → **HTTP 500 with a generic `{"error":"internal"}` body**
+(the real error is logged server-side via `log.Printf("agentman: internal error: %v", err)` to
+stderr — it is never sent to the client). Delete handlers (`handleDeleteTask`,
+`handleDeleteComment`, `handleDeleteProject`) return `404` via `writeErr` when the target is
+missing (`ErrNotFound`). The CLI re-maps HTTP status to **exit codes** in `client.go doOrFail`
 (`3` not found · `4` conflict · `5` validation/project_archived · `6` server down · `1` other).
 
 ## Observability
 
 Minimal: `log.Printf` to stderr for startup, shutdown, the update banner, and `log.Fatalf` on a
-fatal listen error. **No structured logging, request logging, metrics, or tracing.** (Gap.)
+fatal listen error. **No structured logging, metrics, or tracing.**
+
+**Opt-in request logging** is available via `am serve --log` or the `AGENTMAN_LOG` env var (any
+non-empty value; use `AGENTMAN_LOG=1`). When enabled, `runServe` logs `request logging enabled`
+at startup and installs the `requestLogger` middleware outermost in the chain. It logs one line
+per request after completion: `METHOD PATH STATUS LATENCY ACTOR` (actor = `X-Agent`, default
+`"human"`). Plain `log.Printf` lines to stderr — not structured logging. Off by default.
 
 ## Testing
 
@@ -156,8 +173,10 @@ There are six test files (run `go test ./...`):
   `TestDeleteCommentRemovesOnlyComment`, `TestDeleteProjectCascades`).
 - `cmd/am/server_test.go` — validation→status mapping (400/404/409), `hostGuard`, `csrfGuard`,
   `securityHeaders`, `listenAddr` loopback regression, archive/unarchive endpoints + 404,
-  and hard-delete HTTP endpoints (`TestDeleteTaskEndpoint`, `TestDeleteProjectEndpoint`,
-  `TestDeleteCommentEndpoint`) (via `net/http/httptest`).
+  hard-delete HTTP endpoints (`TestDeleteTaskEndpoint`, `TestDeleteProjectEndpoint`,
+  `TestDeleteCommentEndpoint`), and Phase D: `TestWriteErrHidesInternalDetail` (500 returns
+  generic body, not raw error), `TestRequestLoggerPassesThrough`, `TestRequestLoggerPreservesFlusher`
+  (via `net/http/httptest`).
 - `cmd/am/migrate_test.go` — migration runner (apply/skip/idempotent/rollback), incl. the v2 step
   that adds `projects.archived_at`.
 - `cmd/am/db_test.go` — `db export`/`import` roundtrip + file perms (0o600), backup creation + perms,
@@ -186,5 +205,5 @@ streaming/reconnect, the rest of the CLI commands, identity, and the dashboard. 
   step (`ALTER TABLE projects ADD COLUMN archived_at TEXT`, `currentSchemaVersion = 2`) proves the
   additive-column path end-to-end. A DB *newer* than the binary is still accepted silently today.
 - **Single-writer** caps write throughput; fine for a personal board, unproven at scale.
-- **500s leak raw error strings** to clients (`writeErr` default branch) — minor info exposure.
+- ~~**500s leak raw error strings**~~ — **fixed (Phase D1)**; 500s now return a generic `{"error":"internal"}` body; detail is logged server-side only.
 - **No request size/time limits** beyond a 1 MiB body cap and `ReadHeaderTimeout`.

@@ -75,16 +75,20 @@ Archiving currently hides a project's **tab** (`ListProjects`) and its **board t
   - **Phase C is now COMPLETE.** Residuals: prune is manual/offline; `isServerRunning` guard is
     bypassable on non-default ports (applies to `import` + `prune`); `comments` growth still unbounded.
 
-## Phase D — Error handling & observability
+## Phase D — Error handling & observability — **COMPLETE**
 
-- [ ] **D1 · Stop leaking raw error strings on 500** — _S_
-  - Why: `writeErr`'s default branch returns the raw Go error to the client (minor info exposure).
-  - Do: log the detail server-side; return a generic `{"error":"internal"}` body. (`cmd/am/server.go`)
-  - Accept: 500s no longer echo internal messages; the detail still hits stderr.
-- [ ] **D2 · Minimal request/observability logging** — _S–M, optional_
-  - Why: today only startup/shutdown/update are logged — no request logging, metrics, or tracing.
-  - Do: a lightweight request-log middleware (method, path, status, latency) behind a flag or env.
-    → `backend.md` (Observability gap).
+- [x] **D1 · Stop leaking raw error strings on 500** — _S_ — **shipped (Phase D1)**
+  - `writeErr`'s default branch now logs the real error server-side
+    (`log.Printf("agentman: internal error: %v", err)`) and returns `{"error":"internal"}`.
+    All sentinel mappings unchanged. Test: `TestWriteErrHidesInternalDetail`. (`cmd/am/server.go`)
+- [x] **D2 · Minimal request/observability logging** — _S–M_ — **shipped (Phase D2)**
+  - `requestLogger` middleware + `statusRecorder` (proxies `http.Flusher` for SSE). Enabled by
+    `am serve --log` or `AGENTMAN_LOG=1` (any non-empty value). Off by default. Installed outermost
+    so guard 403s are also logged. Logs `METHOD PATH STATUS LATENCY ACTOR` to stderr.
+    Tests: `TestRequestLoggerPassesThrough`, `TestRequestLoggerPreservesFlusher`.
+    Residuals: still no metrics, tracing, or structured logging; `AGENTMAN_LOG` treats any
+    non-empty value as on (`=0`/`=false` also enable it — document `=1` as canonical).
+    → `backend.md`, ADR-017. (`cmd/am/server.go`, `cmd/am/main.go`, `cmd/am/cli.go`)
 
 ## Phase E — Test coverage (the untested areas)
 

@@ -22,7 +22,7 @@ convention is loose, it's called out.
 - Event kinds: dotted `noun.verb` strings — `task.created`, `task.claimed`, `task.status`,
   `task.assign`, `task.patched`, `task.deleted`, `comment.added`, `comment.deleted`,
   `project.created`, `project.archived`, `project.unarchived`, `project.deleted` (12 total).
-- Env vars: `AGENTMAN_*` (`AGENTMAN_URL/PROJECT/AGENT/AGENT_FILE/DB/PORT/NO_UPDATE_CHECK`).
+- Env vars: `AGENTMAN_*` (`AGENTMAN_URL/PROJECT/AGENT/AGENT_FILE/DB/PORT/NO_UPDATE_CHECK/LOG`).
 
 ## API Conventions
 
@@ -59,14 +59,21 @@ convention is loose, it's called out.
 
 ## Logging
 
-- `log.Printf`/`log.Fatalf` to stderr, sparingly (startup line, shutdown, update banner). No
-  structured logging or request logs. If you add logging, don't log task/comment contents or tokens.
+- `log.Printf`/`log.Fatalf` to stderr, sparingly (startup line, shutdown, update banner, and
+  internal server errors). No structured logging, metrics, or tracing. If you add logging, don't
+  log task/comment contents or tokens.
+- **Opt-in request logging** — the `requestLogger` middleware (Phase D2) logs
+  `METHOD PATH STATUS LATENCY ACTOR` per request when `am serve --log` is passed or
+  `AGENTMAN_LOG` is set (any non-empty value). Off by default.
 
 ## Configuration
 
-- Flags on `am serve`: `--port`, `--db`. Everything else is env (`AGENTMAN_*`) with sensible
-  defaults (`defaultDBPath` → `~/.agentman/agentman.db`, port `8787`). Flags override env where both
-  exist. Add new config as an `AGENTMAN_*` env var and/or a flag, default-off / backward-compatible.
+- Flags on `am serve`: `--port`, `--db`, `--log`. Everything else is env (`AGENTMAN_*`) with
+  sensible defaults (`defaultDBPath` → `~/.agentman/agentman.db`, port `8787`). Flags override
+  env where both exist. Add new config as an `AGENTMAN_*` env var and/or a flag, default-off /
+  backward-compatible.
+- Env vars: `AGENTMAN_URL`, `AGENTMAN_PROJECT`, `AGENTMAN_AGENT`, `AGENTMAN_AGENT_FILE`,
+  `AGENTMAN_DB`, `AGENTMAN_PORT`, `AGENTMAN_NO_UPDATE_CHECK`, `AGENTMAN_LOG`.
 
 ## Testing
 

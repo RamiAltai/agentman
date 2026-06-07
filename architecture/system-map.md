@@ -44,8 +44,9 @@ Unknown/absent: no `internal/`, `pkg/`, `.github/`, `Makefile`, `Dockerfile`, or
   dispatches before the `Client` is built, operating directly on the SQLite file (`export`,
   `import`, and `prune` all refuse while a server is running); everything else
   constructs a `Client` (`NewClient()`); `serve` calls `runServe()`.
-- **Server entry:** `runServe()` opens the store, builds `Server` (`NewServer`), and runs
-  `http.Server{Addr: "127.0.0.1:"+port}`.
+- **Server entry:** `runServe()` opens the store, builds `Server` (`NewServer`), optionally
+  enables request logging (`--log` flag or `AGENTMAN_LOG` env var, any non-empty value; use
+  `AGENTMAN_LOG=1`), and runs `http.Server{Addr: "127.0.0.1:"+port}`.
 - **HTTP route table:** `Server.Handler()` in `cmd/am/server.go` (see Major Modules).
 
 ## Runtime Flow
@@ -61,8 +62,12 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
 
 ## Major Modules
 
-- **HTTP API + routing** — `cmd/am/server.go` `Handler()`:
-  `GET/POST /api/projects` (`GET …?archived=true` includes archived),
+- **HTTP API + routing** — `cmd/am/server.go` `Handler()`. The middleware chain is
+  `securityHeaders(hostGuard(csrfGuard(mux)))`. When request logging is enabled (`--log` /
+  `AGENTMAN_LOG`), `requestLogger` wraps the entire chain outermost (so guard 403s are also
+  logged); it captures the status code via `statusRecorder` (which also proxies `http.Flusher`
+  to keep SSE working) and logs `METHOD PATH STATUS LATENCY ACTOR` per request.
+  Routes: `GET/POST /api/projects` (`GET …?archived=true` includes archived),
   `POST /api/projects/{slug}/archive`, `POST /api/projects/{slug}/unarchive`,
   `DELETE /api/projects/{slug}` (hard-delete + cascade),
   `GET/POST /api/tasks`, `GET/PATCH /api/tasks/{id}`,

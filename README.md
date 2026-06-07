@@ -153,7 +153,7 @@ Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting 
 | `am project archive <slug>` · `am project unarchive <slug>` | soft-archive (hide) / restore a project |
 | `am project rm <slug> --yes` | hard-delete a project **and ALL its tasks/comments** (permanent; `--yes` required) |
 | `am init <tasktype>` · `am whoami` | identity |
-| `am serve [--port 8787] [--db PATH]` | run the dashboard + API |
+| `am serve [--port 8787] [--db PATH] [--log]` | run the dashboard + API |
 | `am db export [path] [--db PATH]` | write a consistent DB snapshot (prints the path) |
 | `am db import <path> [--db PATH] [--yes]` | restore a snapshot (stop `am serve` first; backs up current DB) |
 | `am db prune (--before <YYYY-MM-DD> \| --keep <N>) [--db PATH] [--yes]` | trim old events from the DB (offline; events only; stop `am serve` first) |
@@ -193,6 +193,7 @@ curl -s -H 'X-Agent: claude-1' -X POST 127.0.0.1:8787/api/tasks/13/claim
 | `AGENTMAN_PORT` / `--port` | server port (default `8787`) |
 | `AGENTMAN_DB` / `--db` | database path (default `~/.agentman/agentman.db`) |
 | `AGENTMAN_NO_UPDATE_CHECK` | set to `1` to disable the startup "update available" check |
+| `AGENTMAN_LOG` / `--log` | set to `1` (or pass `--log`) to enable per-request logging to stderr: `METHOD PATH STATUS LATENCY ACTOR` |
 
 ## Backups
 

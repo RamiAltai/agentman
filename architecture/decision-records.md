@@ -250,6 +250,34 @@ without evidence.
   `cmd/am/store_test.go` (`TestListEventsBefore`); `cmd/am/server_test.go` (`TestEventsBeforeEndpoint`);
   `cmd/am/db_test.go` (`TestPruneEventsKeep`, `TestPruneEventsBefore`, `TestPruneEventsBeforeSameDayBoundary`).
 
+### ADR-017: Generic 500 responses + opt-in request logging (Phase D)
+- Status: Active
+- Context: `writeErr`'s default branch returned raw Go error text (SQL messages, file paths) to
+  clients — minor info exposure. There was also no visibility into request traffic without adding
+  a full logging framework.
+- Decision:
+  1. **D1 — opaque 500s.** The `writeErr` default branch now logs the real error server-side
+     (`log.Printf("agentman: internal error: %v", err)` to stderr) and returns a generic
+     `{"error":"internal"}` body. All sentinel mappings are unchanged.
+  2. **D2 — opt-in request logging.** A `requestLogger` middleware + `statusRecorder` wrapper
+     (captures status, defaults 200, proxies `http.Flusher` for SSE). Enabled by `am serve --log`
+     or `AGENTMAN_LOG=1` (any non-empty value enables it). Off by default. Installed outermost so
+     security-guard 403s are also logged. Logs `METHOD PATH STATUS LATENCY ACTOR` via the
+     standard `log` package to stderr (plain lines, not structured).
+- Rationale: keep internal detail out of HTTP responses (good practice even on loopback); a
+  lightweight opt-in log line is useful for debugging without imposing structured logging on a
+  personal board. Plain `log.Printf` stays consistent with the existing logging convention.
+- Consequences: clients receive `{"error":"internal"}` on unexpected errors; detail is in the
+  server's stderr. `AGENTMAN_LOG` treats any non-empty value as on — document `=1` as the
+  canonical form (`=0`/`=false` also enable it). SSE connections log once on disconnect with a
+  large latency (inherent to long-lived connections). Still no metrics, tracing, or structured
+  logging.
+- Evidence: `cmd/am/server.go` (`writeErr` default, `requestLogger`, `statusRecorder`,
+  `Server.logRequests`, `Handler()` wrapping); `cmd/am/main.go` (`runServe` log toggle,
+  `usage()` `[--log]`); `cmd/am/cli.go` (`boolFlags["log"]`); `cmd/am/server_test.go`
+  (`TestWriteErrHidesInternalDetail`, `TestRequestLoggerPassesThrough`,
+  `TestRequestLoggerPreservesFlusher`).
+
 ## Inferred Decisions
 
 ### IADR-001: SSE chosen over WebSockets

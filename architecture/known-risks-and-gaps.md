@@ -61,7 +61,7 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   guard, ADR-011). Residual (Low): not auth — any local non-browser process is still trusted; reads
   are not CSRF-gated.
 - **No TLS, no rate limiting** (Medium if exposed).
-- **500 responses leak raw error strings** (Low).
+- ~~**500 responses leak raw error strings** (Low)~~ — **RESOLVED (Phase D1)**. `writeErr`'s default branch now returns `{"error":"internal"}` and logs the real error server-side; no internal detail reaches the client.
 - **No dependency vulnerability scanning** (Medium, unmonitored) — run `govulncheck ./...` manually.
 - **Spoofable audit actor** (Low) — `events.actor` comes from the unauthenticated `X-Agent` header.
 
@@ -80,6 +80,8 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   `server_test.go`), **events backward pagination** (`TestListEventsBefore` in `store_test.go`;
   `TestEventsBeforeEndpoint` in `server_test.go`), and **events prune** (`TestPruneEventsKeep`,
   `TestPruneEventsBefore`, `TestPruneEventsBeforeSameDayBoundary` in `db_test.go`) are all covered.
+  Phase D added `TestWriteErrHidesInternalDetail` (500 returns generic body, not raw error),
+  `TestRequestLoggerPassesThrough`, and `TestRequestLoggerPreservesFlusher` (in `server_test.go`).
   **Still untested:** SSE streaming/reconnect, identity, most CLI command paths, and the entire
   dashboard — including the "Manage projects" modal, the new delete confirm flows
   (task/comment/project), and the feed pagination button — as no JS test runner exists.

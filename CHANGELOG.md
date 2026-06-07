@@ -13,6 +13,15 @@ _Target: **v0.4.0** — not yet tagged._
 
 ### Added
 
+- **Opt-in request logging (Phase D2)** — `am serve --log` or `AGENTMAN_LOG=1` installs a
+  `requestLogger` middleware that logs one line per request after completion:
+  `METHOD PATH STATUS LATENCY ACTOR` (actor = `X-Agent`, default `"human"`) to stderr via the
+  standard `log` package. Off by default. The middleware is installed outermost so security-guard
+  403s are also logged. `statusRecorder` proxies `http.Flusher` so SSE connections continue to
+  work. A long-lived SSE connection logs once on disconnect with a large latency (inherent).
+  `AGENTMAN_LOG` treats any non-empty value as on; `=1` is canonical.
+  (`cmd/am/server.go`, `cmd/am/main.go`, `cmd/am/cli.go`)
+
 - **Events pagination + retention (Phase C2)** — completes Phase C:
   - **`GET /api/events?before=<id>`** — backward cursor: returns events with `id < before`,
     newest-first (default 40, cap 200). Applies the same archived-project filter as `?since=`/`?tail=`
@@ -31,7 +40,7 @@ _Target: **v0.4.0** — not yet tagged._
     stdout stays clean. `--before <date>`: same-day events are kept (date-only string sorts before
     same-day ISO timestamps). `--keep N`: keeps the newest N events by id. (`cmd/am/db.go`)
   - Tests: `TestListEventsBefore` (store), `TestEventsBeforeEndpoint` (HTTP); `TestPruneEventsKeep`,
-    `TestPruneEventsBefore`, `TestPruneEventsBeforeSameDayBoundary` (prune). 43 tests pass total.
+    `TestPruneEventsBefore`, `TestPruneEventsBeforeSameDayBoundary` (prune).
 
 - **Hard delete (Phase C1)** — permanent removal for tasks, comments, and projects:
   - CLI: `am rm <id>` hard-deletes a task and all its comments (silent success; exit 3 if not found).
@@ -75,6 +84,15 @@ _Target: **v0.4.0** — not yet tagged._
   (`cmd/am/web/app.js`, `cmd/am/web/app.css`)
 
 ### Fixed
+
+- **500 responses leaked internal error detail (Phase D1).** `writeErr`'s default branch
+  previously returned the raw Go error string (SQL messages, file paths, etc.) to the client.
+  It now logs the real error server-side (`log.Printf("agentman: internal error: %v", err)` to
+  stderr) and returns a generic `{"error":"internal"}` body. All sentinel mappings
+  (`ErrNotFound`→404, `ErrValidation`→400, `ErrProjectArchived`→400, `ErrConflict`→409,
+  `*ConflictError`→409) are unchanged. Tests: `TestWriteErrHidesInternalDetail`,
+  `TestRequestLoggerPassesThrough`, `TestRequestLoggerPreservesFlusher`. 46 tests pass total.
+  (`cmd/am/server.go`)
 
 - **Archived projects' events appeared in the activity feed.** `ListEvents` and `RecentEvents`
   had no archived filter, so the "All"-view feed kept streaming events from archived projects.

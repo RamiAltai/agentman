@@ -97,6 +97,10 @@ func runServe(argv []string) {
 	}
 
 	srv := NewServer(store)
+	if a.has("log") || envOr("AGENTMAN_LOG", "") != "" {
+		srv.logRequests = true
+		log.Printf("agentman: request logging enabled")
+	}
 	baseCtx, cancelBase := context.WithCancel(context.Background())
 	httpServer := &http.Server{
 		Addr:              listenAddr(port),
@@ -142,7 +146,7 @@ func defaultDBPath() string {
 func usage() {
 	fmt.Print(`agentman (am) — a tiny ticketing board for agents
 
-  am serve [--port 8787] [--db PATH]     run the dashboard + API
+  am serve [--port 8787] [--db PATH] [--log]   run the dashboard + API
 
   am init <tasktype>                     set this session's identity (e.g. bugfix_050626_4821)
   am whoami                              print the current identity

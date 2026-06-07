@@ -6,8 +6,14 @@ requests) can use the board. This guide covers **Claude Code** in detail, then o
 First, make sure the server is running on the machine your agents use:
 
 ```sh
-am serve     # http://127.0.0.1:8787
+am serve            # http://127.0.0.1:8787
+am serve --log      # same, with per-request logging to stderr (or: AGENTMAN_LOG=1 am serve)
 ```
+
+`--log` / `AGENTMAN_LOG=1` enables opt-in request logging: one line per request
+(`METHOD PATH STATUS LATENCY ACTOR`) to stderr. Off by default. Useful for debugging
+agent traffic. 500 responses always return a generic `{"error":"internal"}` body; detail
+is in the server's stderr.
 
 ---
 

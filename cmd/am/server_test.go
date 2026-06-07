@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -551,4 +555,97 @@ func mustCreateTask(t *testing.T, ts *httptest.Server, project, title string) st
 		t.Fatalf("decode task: %v", err)
 	}
 	return strconv.FormatInt(tk.ID, 10)
+}
+
+// ---------- D1: writeErr hides internal detail ----------
+
+func TestWriteErrHidesInternalDetail(t *testing.T) {
+	secret := "secret SQL detail /Users/x/agentman.db"
+
+	// Default branch: unknown error → 500 with generic body, no secret leaked.
+	rec := httptest.NewRecorder()
+	writeErr(rec, errors.New(secret))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+	body := strings.TrimSpace(rec.Body.String())
+	if body != `{"error":"internal"}` {
+		t.Fatalf("body = %q, want {\"error\":\"internal\"}", body)
+	}
+	if strings.Contains(body, secret) {
+		t.Fatalf("response body leaked secret: %q", body)
+	}
+
+	// Sentinel case: ErrNotFound must still map to 404 / not_found.
+	rec2 := httptest.NewRecorder()
+	writeErr(rec2, ErrNotFound)
+	if rec2.Code != http.StatusNotFound {
+		t.Fatalf("ErrNotFound status = %d, want 404", rec2.Code)
+	}
+	body2 := strings.TrimSpace(rec2.Body.String())
+	if body2 != `{"error":"not_found"}` {
+		t.Fatalf("ErrNotFound body = %q, want {\"error\":\"not_found\"}", body2)
+	}
+}
+
+// ---------- D2: requestLogger middleware ----------
+
+func TestRequestLoggerPassesThrough(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+		w.Write([]byte("hello"))
+	})
+	handler := requestLogger(inner)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTeapot {
+		t.Fatalf("status = %d, want 418", rec.Code)
+	}
+	if got := rec.Body.String(); got != "hello" {
+		t.Fatalf("body = %q, want hello", got)
+	}
+}
+
+func TestRequestLoggerPreservesFlusher(t *testing.T) {
+	store := openTestStore(t)
+	srv := NewServer(store)
+	srv.logRequests = true
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/api/stream", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("GET /api/stream: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (streaming unsupported if 500)", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
+	}
+
+	// Read lines until we see "retry:" (proving SSE started) or an error.
+	scanner := bufio.NewScanner(io.LimitReader(resp.Body, 4096))
+	found := false
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "retry:") {
+			found = true
+			break
+		}
+	}
+	cancel() // stop the SSE stream
+	if !found {
+		t.Fatal("never received retry: line from SSE stream — flusher may not be preserved")
+	}
 }
