@@ -62,7 +62,13 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   are not CSRF-gated.
 - **No TLS, no rate limiting** (Medium if exposed).
 - ~~**500 responses leak raw error strings** (Low)~~ — **RESOLVED (Phase D1)**. `writeErr`'s default branch now returns `{"error":"internal"}` and logs the real error server-side; no internal detail reaches the client.
-- **No dependency vulnerability scanning** (Medium, unmonitored) — run `govulncheck ./...` manually.
+- ~~**No dependency vulnerability scanning** (Medium, unmonitored)~~ — **mitigated (Phase F)**.
+  `govulncheck ./...` now runs in CI on every push/PR; it blocks on **reachable** vulnerabilities.
+  Current state: **0 reachable vulnerabilities**. One known non-blocking advisory:
+  - **`GO-2026-5024`** — integer overflow in `golang.org/x/sys@v0.42.0`
+    (`windows.NewNTUnicodeString`). **Windows-only; not reachable from agentman** (govulncheck's
+    symbol/package scan finds nothing; module-level hit only). Transitive dep via `modernc.org/libc`.
+    Clears by upgrading `golang.org/x/sys` to ≥ v0.44.0 if ever desired. Does not affect CI.
 - **Spoofable audit actor** (Low) — `events.actor` comes from the unauthenticated `X-Agent` header.
 
 ## Testing Gaps
@@ -104,7 +110,9 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 ## Documentation Gaps
 
-- No CI to enforce doc/code sync, so drift is possible. → `architecture/README.md`.
+- ~~No CI to enforce doc/code sync~~ — **RESOLVED (Phase F)**. CI (`.github/workflows/ci.yml`)
+  runs build/vet/gofmt/test(-race)/JS-syntax/govulncheck on every push to `main` and on every PR.
+  Drift is still possible for prose docs, but code/format/test regressions are now gated.
 - Several decisions are **undocumented** (auth model, testing strategy, migrations, deletes, CI,
   versioning) → `decision-records.md` "Missing Decisions".
 - ~~No CHANGELOG despite tagged releases~~ — **added** (`CHANGELOG.md`, Keep a Changelog format);
@@ -118,7 +126,9 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   formatted; `gofmt -l cmd/am` is now empty).
 - `store.go` (~1000 lines) and `app.js` (~854 lines) are the largest files and mix several
   responsibilities; fine now, watch for growth.
-- No linter beyond `gofmt`/`go vet`; no pre-commit hooks.
+- No linter beyond `gofmt`/`go vet`; no pre-commit hooks. CI now enforces `gofmt`/`go vet`/
+  `go test -race`/`govulncheck` on every push and PR, so format/vet/test drift is caught
+  automatically. Pre-commit hooks are still absent (local runs remain manual).
 
 ## Scalability Concerns
 
@@ -135,7 +145,8 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 - Intended scale (concurrent agents, task volume) — undocumented.
 - Whether multiple `am serve` processes are ever meant to share one DB (single-writer implies no).
-- PR/review/branching process (single-maintainer repo, no CI).
+- PR/review/branching process (single-maintainer repo; CI now gates pushes/PRs via GitHub Actions,
+  but a formal branching/review policy is still undocumented).
 - Target OS/arch matrix for releases (cross-compiles cleanly, but no release matrix is defined).
 
 ## Recommended Follow-Ups
@@ -143,7 +154,8 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 1. **Add behavioral tests** for the atomic claim, validation/status mapping, and an XSS regression
    (`net/http/httptest` + a temp DB). Highest risk-reduction per effort.
 2. **Decide & document the migration strategy** before any schema change to an existing table.
-3. **Add `go vet` + `go test` + `gofmt` + `govulncheck` CI** (no `.github/` exists) to stop drift.
+3. ~~**Add `go vet` + `go test` + `gofmt` + `govulncheck` CI**~~ — **DONE (Phase F)**. CI runs
+   build/vet/gofmt/test(-race)/JS-syntax/govulncheck on push to `main` and PRs. (`/.github/workflows/ci.yml`)
 4. **Run `gofmt -w cmd/am`** to clear current formatting drift (as its own small change).
 5. **Record the missing decisions** (auth, testing, deletes, CI, versioning) as ADRs once chosen.
 6. If remote access is ever wanted, treat it as an **auth + CSRF/`Host` + TLS** project per

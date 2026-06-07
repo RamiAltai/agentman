@@ -108,11 +108,16 @@ Archiving currently hides a project's **tab** (`ListProjects`) and its **board t
       embed.FS. Behavioral dashboard JS remains manually verified (documented gap). → `frontend.md`,
       `decision-records.md` ADR-018.
 
-## Phase F — CI & tooling
+## Phase F — CI & tooling — **COMPLETE**
 
-- [ ] **F1 · Add CI** — _M_ — a GitHub Actions workflow running `go build`, `go vet`, `go test
-      -race`, `gofmt -l` (fail if non-empty), and `govulncheck ./...` on push/PR. No `.github/`
-      exists today, so doc/code drift and regressions go uncaught. → `known-risks-and-gaps.md`.
+- [x] **F1 · Add CI** — _M_ — **shipped (Phase F)**. `.github/workflows/ci.yml`: GitHub Actions,
+      `ubuntu-latest`, triggers on push to `main` and on PRs. Steps: `actions/checkout@v4` →
+      `actions/setup-go@v5` (go-version-file + cache) → `go build ./...` → `go vet ./...` →
+      `gofmt -l` (fail if non-empty) → `go test -race -count=1 ./...` → `node --check
+      cmd/am/web/app.js` → `govulncheck @latest` (blocks on reachable vulns). CI is green;
+      0 reachable vulnerabilities. One known non-blocking advisory (`GO-2026-5024`, Windows-only,
+      unreachable) documented in `known-risks-and-gaps.md` and `decision-records.md` ADR-019.
+      → `architecture/known-risks-and-gaps.md`, ADR-019.
 
 ## Phase G — Security posture (deferred by design)
 
@@ -129,6 +134,6 @@ and only matter if the network bind ever widens. (`architecture/security.md`)
 
 ### Suggested order
 
-**B1 → B2** (ship v0.4.0 with the current fixes) → **A1 → A2 → A3** (finish archive) → **F1** (CI to
-lock it in) → **E1–E4** (close the biggest test gaps) → **D1**, then **C1/C2** as the product grows.
-**G** stays parked unless the access model changes.
+Phases A, C, D, E, and F are **complete**. Remaining open work:
+
+**B1 → B2** (commit pending fixes + tag v0.4.0). **G** stays parked unless the access model changes.

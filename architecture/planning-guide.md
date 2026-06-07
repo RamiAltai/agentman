@@ -89,6 +89,8 @@ Flag the change if it touches any of these invariants:
   `textContent` only, and add the new sink pattern to `TestDashboardNoXSSSinks` in `web_test.go`
   if needed (ADR-018).
 - [ ] `go vet ./...` and `go test -race ./...` pass; `gofmt -l cmd/am` empty.
+  CI (`.github/workflows/ci.yml`) enforces these on every push to `main` and on every PR — passing
+  locally before pushing avoids a CI round-trip.
 
 ## Approval Gates
 

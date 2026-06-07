@@ -31,11 +31,12 @@ broadcast → dashboard**. Confirmed via `cmd/am/main.go`, `cmd/am/server.go`, `
 | `cmd/am/db.go` | `am db` export/import/prune (offline snapshot/restore/retention) | `cmdDB`, `exportDB`, `importDB`, `pruneEvents` |
 | `cmd/am/*_test.go` | Tests: `update_test`, `store_test`, `server_test`, `migrate_test`, `db_test` | claim race, HTTP guards, migrations, export/import |
 | `cmd/am/web/` | Embedded dashboard: `index.html`, `app.css`, `app.js` | Vanilla, no build step |
+| `.github/workflows/ci.yml` | GitHub Actions CI — build/vet/gofmt/test(-race)/JS-syntax/govulncheck | Runs on push to `main` and on PRs |
 | `docs/agent-integration.md` | How to wire agents (Claude Code) to the board | User docs |
 | `README.md`, `LICENSE` | User guide; MIT license | — |
 | `architecture/` | This documentation | — |
 
-Unknown/absent: no `internal/`, `pkg/`, `.github/`, `Makefile`, `Dockerfile`, or `.goreleaser*`.
+Unknown/absent: no `internal/`, `pkg/`, `Makefile`, `Dockerfile`, or `.goreleaser*`.
 
 ## Entry Points
 

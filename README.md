@@ -1,5 +1,6 @@
 # agentman (`am`)
 
+[![CI](https://github.com/RamiAltai/agentman/actions/workflows/ci.yml/badge.svg)](https://github.com/RamiAltai/agentman/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)
 ![Single binary](https://img.shields.io/badge/deploy-single%20static%20binary-success)
@@ -271,6 +272,9 @@ Layout: `cmd/am/` holds the single `main` package — `server.go` (API + SSE), `
 (broadcast), `store.go` + `schema.sql` (SQLite), `client.go` + `cli.go` (CLI),
 `db.go` (`am db` export/import), `identity.go`, `version.go`, `update.go`, and `web/`
 (dashboard).
+
+CI runs `go build`, `go vet`, `gofmt -l`, `go test -race`, a JS syntax check, and `govulncheck`
+on every push to `main` and on every pull request (`.github/workflows/ci.yml`).
 
 Contributions welcome — open an issue or PR.
 

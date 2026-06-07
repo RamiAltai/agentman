@@ -16,7 +16,10 @@ go build -o am ./cmd/am
 ./am version
 ```
 
-There is no Makefile, Dockerfile, or CI config — `go` is the whole toolchain.
+There is no Makefile or Dockerfile — `go` is the whole toolchain. CI is configured in
+`.github/workflows/ci.yml` (GitHub Actions): it runs `go build`, `go vet`, `gofmt -l`,
+`go test -race -count=1 ./...`, `node --check cmd/am/web/app.js`, and `govulncheck` on
+every push to `main` and on every pull request. Contributors should expect CI to gate PRs.
 
 ## Commands
 
@@ -182,5 +185,5 @@ sink guard in `web_test.go`. Behavioral dashboard JS logic is not automatically 
 
 ## Unknowns
 
-- No documented PR/branch/review process (single-maintainer repo, no CI). Confirm with the maintainer
-  before assuming one.
+- No documented PR/branch/review process (single-maintainer repo). CI gates code quality on push/PR,
+  but a formal review/branching policy has not been written down. Confirm with the maintainer before assuming one.

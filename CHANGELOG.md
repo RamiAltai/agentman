@@ -13,6 +13,14 @@ _Target: **v0.4.0** — not yet tagged._
 
 ### Added
 
+- **CI via GitHub Actions (Phase F)** — `.github/workflows/ci.yml` is the project's first CI.
+  Triggers on push to `main` and on pull requests. Single `ubuntu-latest` job runs, in order:
+  `go build ./...`, `go vet ./...`, `gofmt -l` (fails if non-empty), `go test -race -count=1 ./...`,
+  `node --check cmd/am/web/app.js` (JS syntax), and `govulncheck ./...` (blocks on reachable
+  vulnerabilities; `@latest` keeps the advisory DB current). All checks pass; 0 reachable
+  vulnerabilities. One known non-blocking module-level advisory (`GO-2026-5024`, Windows-only,
+  unreachable) is documented in `architecture/known-risks-and-gaps.md`.
+
 - **Expanded automated test coverage (Phase E)** — 9 test files, 71 tests, all green under
   `-race`. Four new test files close the previously-untested layers:
   - **`cli_test.go` (E1)** — CLI verb output (`cmdNew`/`cmdLs`/`cmdStatus`/`cmdNote`/`cmdDrop`)

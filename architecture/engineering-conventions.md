@@ -105,6 +105,8 @@ gofmt -w cmd/am             # auto-format
 
 **Before submitting:** `gofmt -w`, `go vet ./...`, `go test ./...` all clean, and update the
 matching `architecture/` doc. (`gofmt -l cmd/am` is currently empty — no outstanding format drift.)
+CI (`.github/workflows/ci.yml`) enforces the same checks — build, vet, gofmt, test(-race),
+JS syntax (`node --check`), and `govulncheck` — on every push to `main` and on every PR.
 
 ## Anti-Patterns
 

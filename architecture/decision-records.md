@@ -303,6 +303,36 @@ without evidence.
 - Evidence: `cmd/am/web_test.go` (`TestDashboardNoXSSSinks`); `cmd/am/server.go`
   (`//go:embed web`, `webFS`); `cmd/am/web/app.js` (`el()` helper, no `.innerHTML` usage).
 
+### ADR-019: GitHub Actions CI (Phase F)
+- Status: Active
+- Context: No CI existed (no `.github/`), so format drift, vet failures, test regressions, and
+  dependency vulnerabilities went undetected between manual runs. The project had a working
+  `govulncheck`-clean codebase but no automated enforcement.
+- Decision: Add `.github/workflows/ci.yml` — a single `ubuntu-latest` job triggered on **push to
+  `main`** and on **pull_request**. Steps in order:
+  1. `actions/checkout@v4`
+  2. `actions/setup-go@v5` with `go-version-file: go.mod` and `cache: true` (pins Go to the
+     `go 1.25.0` directive in `go.mod`; no separate version pin to drift)
+  3. **Build** — `go build ./...`
+  4. **Vet** — `go vet ./...`
+  5. **gofmt** — `gofmt -l .` fails if any file is unformatted (enforces the zero-drift state)
+  6. **Test (race)** — `go test -race -count=1 ./...` (matches the local command in contribution-guide.md)
+  7. **JS syntax check** — `node --check cmd/am/web/app.js` (Node is preinstalled on `ubuntu-latest`)
+  8. **govulncheck** — `go install golang.org/x/vuln/cmd/govulncheck@latest` then
+     `govulncheck ./...`; **blocks on reachable vulnerabilities only**. `@latest` ensures the
+     advisory DB is always current without pinning a version that would need manual bumps.
+- Rationale: closes the long-standing "no CI" and "no dependency vulnerability scanning" gaps
+  (see `known-risks-and-gaps.md`). Single job keeps setup simple; `go-version-file` avoids a
+  second place to update when Go is bumped. `govulncheck`'s reachability analysis means
+  transitive-but-unused advisories do not break CI; only exploitable paths block.
+- Known advisory (non-blocking): **`GO-2026-5024`** in `golang.org/x/sys@v0.42.0` (integer
+  overflow in `windows.NewNTUnicodeString`). Windows-only; **not reachable** from agentman
+  (govulncheck's symbol/package scan finds nothing). Transitive dep via `modernc.org/libc`.
+  Clears by upgrading `golang.org/x/sys` to ≥ v0.44.0 if ever desired. CI is green.
+- Consequences: every push to `main` and every PR is gated on build/vet/format/test/vuln.
+  Pre-commit hooks are still absent (local runs are manual). No CD/release automation added.
+- Evidence: `.github/workflows/ci.yml`; `known-risks-and-gaps.md` (Phase F notes).
+
 ## Inferred Decisions
 
 ### IADR-001: SSE chosen over WebSockets
@@ -347,7 +377,9 @@ These are **undecided/undocumented** in the repo (decide + record before buildin
 - **Delete / archival semantics** — archive resolved as a reversible soft-delete (ADR-013); hard
   delete resolved (ADR-015, Phase C1); `events` retention resolved (ADR-016, Phase C2: offline prune
   + `?before=` cursor pagination); `comments` retention remains undecided (no bulk prune).
-- **CI/CD & release automation** — no `.github/`; releases are manual `git tag` + push.
+- ~~**CI/CD & release automation**~~ — **CI resolved (Phase F / ADR-019)**. `.github/workflows/ci.yml`
+  gates push/PR with build/vet/gofmt/test(-race)/JS-syntax/govulncheck. Release automation (CD)
+  and a stated versioning policy remain undecided — releases are still manual `git tag` + push.
 - **Versioning / CHANGELOG policy** — tags exist (`v0.1.0`–`v0.3.0`); `CHANGELOG.md` (Keep a
   Changelog format) and `ROADMAP.md` now exist in the repo root. Release automation and a stated
   versioning policy remain undocumented.
