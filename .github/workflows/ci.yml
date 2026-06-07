@@ -14,7 +14,12 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # Build/test on the latest stable Go, NOT the exact `go 1.25.0` pinned in go.mod.
+          # govulncheck reports stdlib advisories against the toolchain it runs under, so an
+          # exact-pinned (and quickly stale) patch version makes CI red as stdlib CVEs accrue.
+          # `stable` always carries the latest stdlib security patches. go.mod still declares
+          # the 1.25 *minimum* for users.
+          go-version: 'stable'
           cache: true
 
       - name: Build

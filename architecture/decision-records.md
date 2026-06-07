@@ -311,8 +311,10 @@ without evidence.
 - Decision: Add `.github/workflows/ci.yml` — a single `ubuntu-latest` job triggered on **push to
   `main`** and on **pull_request**. Steps in order:
   1. `actions/checkout@v4`
-  2. `actions/setup-go@v5` with `go-version-file: go.mod` and `cache: true` (pins Go to the
-     `go 1.25.0` directive in `go.mod`; no separate version pin to drift)
+  2. `actions/setup-go@v5` with `go-version: 'stable'` and `cache: true` — build/test on the
+     latest stable Go (always carrying current stdlib security patches), NOT the exact `go 1.25.0`
+     pin. (An exact pin makes `govulncheck` red as stdlib CVEs accrue against that frozen patch
+     version; `go.mod` still declares the 1.25 *minimum* for users.)
   3. **Build** — `go build ./...`
   4. **Vet** — `go vet ./...`
   5. **gofmt** — `gofmt -l .` fails if any file is unformatted (enforces the zero-drift state)
@@ -322,9 +324,11 @@ without evidence.
      `govulncheck ./...`; **blocks on reachable vulnerabilities only**. `@latest` ensures the
      advisory DB is always current without pinning a version that would need manual bumps.
 - Rationale: closes the long-standing "no CI" and "no dependency vulnerability scanning" gaps
-  (see `known-risks-and-gaps.md`). Single job keeps setup simple; `go-version-file` avoids a
-  second place to update when Go is bumped. `govulncheck`'s reachability analysis means
-  transitive-but-unused advisories do not break CI; only exploitable paths block.
+  (see `known-risks-and-gaps.md`). Single job keeps setup simple. `govulncheck`'s reachability
+  analysis means transitive-but-unused advisories do not break CI; only exploitable paths block —
+  but note that stdlib advisories ARE reachable, so CI must run on a patched toolchain
+  (`go-version: 'stable'`), not a frozen patch version (lesson learned: pinning `go 1.25.0` made CI
+  red against 21 accrued stdlib CVEs even though the code was unaffected when built with a current Go).
 - Known advisory (non-blocking): **`GO-2026-5024`** in `golang.org/x/sys@v0.42.0` (integer
   overflow in `windows.NewNTUnicodeString`). Windows-only; **not reachable** from agentman
   (govulncheck's symbol/package scan finds nothing). Transitive dep via `modernc.org/libc`.
