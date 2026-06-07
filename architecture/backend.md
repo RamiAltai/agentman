@@ -2,7 +2,7 @@
 
 ## Framework and Runtime
 
-- **Go** (module `go 1.25.0`; `go.mod`). Standard-library HTTP — `net/http` with the Go 1.22+
+- **Go** (module `go 1.25.11`; `go.mod`). Standard-library HTTP — `net/http` with the Go 1.22+
   **method+pattern ServeMux** (e.g. `mux.HandleFunc("GET /api/tasks/{id}", …)` in
   `cmd/am/server.go`). No web framework.
 - **SQLite** via `modernc.org/sqlite` v1.51.0 (pure Go, no cgo) — the only direct dependency.

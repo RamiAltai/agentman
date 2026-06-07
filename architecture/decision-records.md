@@ -12,7 +12,7 @@ without evidence.
 - Decision: One Go binary embedding everything; SQLite via `modernc.org/sqlite` (no cgo).
 - Rationale: cross-compiles to all platforms, no C toolchain, no DB server, "back up = copy one file".
 - Consequences: requires Go **1.25+** (modernc's floor); binary ~15 MB; single artifact for CLI+server.
-- Evidence: `go.mod` (`modernc.org/sqlite v1.51.0`, `go 1.25.0`); `README.md` "Why"/"Install".
+- Evidence: `go.mod` (`modernc.org/sqlite v1.51.0`, `go 1.25.11`); `README.md` "Why"/"Install".
 
 ### ADR-002: Localhost-only, no authentication
 - Status: Active
@@ -312,9 +312,9 @@ without evidence.
   `main`** and on **pull_request**. Steps in order:
   1. `actions/checkout@v4`
   2. `actions/setup-go@v5` with `go-version: 'stable'` and `cache: true` — build/test on the
-     latest stable Go (always carrying current stdlib security patches), NOT the exact `go 1.25.0`
-     pin. (An exact pin makes `govulncheck` red as stdlib CVEs accrue against that frozen patch
-     version; `go.mod` still declares the 1.25 *minimum* for users.)
+     latest stable Go (always carrying current stdlib security patches), NOT the exact version
+     pinned in `go.mod`. (An exact pin makes `govulncheck` red as stdlib CVEs accrue against that
+     frozen patch version; `go.mod` still declares the `1.25.11` *minimum* for users.)
   3. **Build** — `go build ./...`
   4. **Vet** — `go vet ./...`
   5. **gofmt** — `gofmt -l .` fails if any file is unformatted (enforces the zero-drift state)

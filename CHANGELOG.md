@@ -9,6 +9,18 @@ fresh `[Unreleased]` section.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-06-07
+
+### Changed
+
+- **Minimum Go raised to `1.25.11`** (`go.mod`). Go 1.25.0–1.25.10 ship a standard library with 21
+  known advisories (`crypto/tls`, `crypto/x509`, `net/url`, `net/http`, …). With this floor,
+  `go install` always builds against a security-patched stdlib — even for installers on an older Go,
+  whose toolchain auto-upgrades to ≥ 1.25.11. No source changes; agentman's own code was unaffected.
+- **CI builds on the latest stable Go** (`go-version: 'stable'` in `.github/workflows/ci.yml`,
+  replacing the exact `go.mod` pin), so `govulncheck` scans a current/patched stdlib instead of a
+  frozen one that goes red as CVEs accrue.
+
 ## [0.4.1] - 2026-06-07
 
 > Note: `v0.4.0` was accidentally tagged on a stale commit (and that tag was already cached by the

@@ -5,7 +5,8 @@ Practical onboarding. Pair this with `engineering-conventions.md` (how to write 
 
 ## Setup
 
-- Install **Go 1.25+** (`go.mod` requires `go 1.25.0`; modernc's floor). No other toolchain — no
+- Install **Go 1.25.11+** (`go.mod` requires `go 1.25.11` for a security-patched stdlib; older
+  1.25.x auto-upgrades via the Go toolchain). No other toolchain — no
   npm/node, no C compiler (pure-Go SQLite).
 - Clone and build:
 
