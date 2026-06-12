@@ -78,6 +78,34 @@ func TestWaitDoneEventArrives(t *testing.T) {
 	}
 }
 
+// Regression: AGENTMAN_PROJECT naming a different project than the watched
+// task's must not scope the SSE stream under --done — a scoped stream drops
+// the task's events and the wait runs to the full timeout.
+func TestWaitDoneCrossProject(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "alpha")
+	mustCreateProject(t, ts, "beta")
+	id := mustCreateTask(t, ts, "beta", "Other Project")
+	t.Setenv("AGENTMAN_PROJECT", "alpha")
+
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		patchTask(ts.URL, id, `{"status":"done"}`)
+	}()
+
+	c := newWaitClient(ts.URL)
+	start := time.Now()
+	code := captureExit(t, func() {
+		cmdWait(c, parse([]string{id, "--done", "--timeout", "10s"}))
+	})
+	if code != -1 {
+		t.Fatalf("expected normal return (exit 0), got exit %d", code)
+	}
+	if elapsed := time.Since(start); elapsed >= 5*time.Second {
+		t.Fatalf("wait took %v, should have returned on the event, not the timeout", elapsed)
+	}
+}
+
 func TestWaitReadyOnPrereqDone(t *testing.T) {
 	ts := newTestServer(t)
 	mustCreateProject(t, ts, "waitproj")

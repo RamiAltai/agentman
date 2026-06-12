@@ -16,19 +16,20 @@ broadcast → dashboard**. Confirmed via `cmd/am/main.go`, `cmd/am/server.go`, `
 
 | Path | Purpose | Notes |
 |------|---------|-------|
-| `cmd/am/` | The entire `main` package (server + CLI) | Flat package; ~10 `.go` files |
+| `cmd/am/` | The entire `main` package (server + CLI) | Flat package; ~11 `.go` files |
 | `cmd/am/main.go` | Entry point; subcommand dispatch; `runServe` | `main()` + `runServe()` + `usage()` |
 | `cmd/am/server.go` | HTTP handlers, routing, SSE endpoint, `go:embed web` | `Server`, `Handler()`, `handle*` |
 | `cmd/am/hub.go` | SSE subscriber hub (broadcast/fan-out) | `Hub`, `subscriber` |
 | `cmd/am/store.go` | All SQLite access; types; atomic claim; events | `Store` + domain structs |
 | `cmd/am/db.go` | `am db export`/`import`/`prune` (offline snapshot/restore/retention) | `cmdDB`, `exportDB`, `importDB`, `pruneEvents` |
 | `cmd/am/schema.sql` | DB schema (embedded) | `meta/projects/tasks/task_deps/comments/events` |
-| `cmd/am/client.go` | CLI HTTP client; HTTP-status → exit-code mapping | `Client`, `doOrFail` |
+| `cmd/am/client.go` | CLI HTTP client; HTTP-status → exit-code mapping | `Client`, `doOrFail`, `exitCodeFor` |
 | `cmd/am/cli.go` | CLI verb parsing + terse/JSON formatters | `cmd*`, `parse`, `fail` |
+| `cmd/am/wait.go` | `am wait` (SSE-driven blocking waits, exit 7 on timeout) | `cmdWait`, `waiter`, `readSSEFrame` |
 | `cmd/am/identity.go` | Per-directory agent identity (`am init`/`am whoami`) | `resolveAgent`, `identityFile` |
 | `cmd/am/version.go` | Version reporting (`am version`) | `version()`, `injectedVersion` (ldflags) |
 | `cmd/am/update.go` | `am update` + startup update check | `cmdUpdate`, `checkForUpdate` |
-| `cmd/am/*_test.go` | Tests: `update/store/server/migrate/db/cli/sse/identity/web_test` | claim race, HTTP guards, migrations, deletes, CLI/exit codes, SSE replay, identity, XSS guard |
+| `cmd/am/*_test.go` | Tests: `update/store/server/migrate/db/cli/sse/identity/wait/web_test` | claim race, HTTP guards, migrations, deletes, CLI/exit codes, SSE replay, identity, waits/timeouts, XSS guard |
 | `.github/workflows/ci.yml` | CI: build/vet/gofmt/test(-race)/JS-check/govulncheck on push + PR | — |
 | `cmd/am/web/` | Embedded dashboard: `index.html`, `app.css`, `app.js` | Vanilla, no build step |
 | `.github/workflows/ci.yml` | GitHub Actions CI — build/vet/gofmt/test(-race)/JS-syntax/govulncheck | Runs on push to `main` and on PRs |
@@ -56,7 +57,8 @@ Unknown/absent: no `internal/`, `pkg/`, `Makefile`, `Dockerfile`, or `.gorelease
 `cmd/am/cli.go cmdClaim` → `Client.do` (HTTP POST `/api/tasks/13/claim`, `X-Agent` header) →
 `server.go handleClaim` → `store.go ClaimTask` (atomic `UPDATE … RETURNING`, inserts an `events`
 row in the same tx) → on commit `Hub.Broadcast(event)` → every SSE subscriber (open dashboards)
-receives it → exit code mapped from HTTP status in `client.go doOrFail`.
+receives it → exit code mapped from HTTP status via `client.go exitCodeFor` (the single source,
+used by `doOrFail` and the bulk `status`/`assign` loop).
 
 **Human action on the dashboard:** identical path — the browser calls the same JSON API; its
 own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
@@ -75,6 +77,7 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   filters to assigned, not-done tasks with no activity for ≥ dur),
   `GET/PATCH /api/tasks/{id}` (GET returns `depends_on`/`blocks`),
   `DELETE /api/tasks/{id}` (hard-delete + cascade to comments + dep edges),
+  `POST /api/tasks/next` (atomic pick+claim of the best ready task; 404 if none),
   `POST /api/tasks/{id}/claim` (body `{"steal_stale":"<dur>"}` = stale-claim takeover, 409
   `not_stale` if still fresh), `POST /api/tasks/{id}/comments`,
   `DELETE /api/tasks/{id}/comments/{cid}`,
@@ -107,6 +110,11 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   prereq ids. Stale-claim recovery: `am ls --stale <dur>` lists assigned, not-done tasks with no
   activity for ≥ dur (Go duration syntax, e.g. `30m`, `48h`); `am claim <id> --steal-stale <dur>`
   atomically takes over a stale claim (exit 4 with `not stale yet` if the claim is still fresh).
+  Agent work loop: `am next [-p P]` atomically picks + claims the best ready task via
+  `POST /api/tasks/next` (prints the claimed id; exit 3 if none); `am wait <id> --done` /
+  `am wait --ready [-p P]` block until the condition holds (SSE-driven, in `cmd/am/wait.go`;
+  exit 7 on timeout, default 10m); `am status <id...> <st>` and `am assign <id...> <who>` accept
+  multiple ids (client-side loop, one event per task; exit = first failure's code).
 - **Dashboard** — `cmd/am/web/app.js`: vanilla SPA; SSE consumer; board/modal/feed rendering.
   Includes a `⋯` "Manage projects" button in the tab bar that opens a modal (`openManageProjects`/
   `renderManageList`) listing all projects (active + archived via `GET /api/projects?archived=true`),
@@ -148,8 +156,8 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
 
 ## Dependency Direction
 
-`main.go` → {`server.go` (serve) | `client.go`+`cli.go` (CLI)}. `server.go` → `store.go` +
-`hub.go`. `store.go` → `schema.sql` (embedded) + `modernc.org/sqlite`. `cli.go`/`client.go` →
+`main.go` → {`server.go` (serve) | `client.go`+`cli.go`+`wait.go` (CLI)}. `server.go` → `store.go` +
+`hub.go`. `store.go` → `schema.sql` (embedded) + `modernc.org/sqlite`. `cli.go`/`client.go`/`wait.go` →
 the HTTP API (process boundary), not `store.go` directly. The browser (`web/app.js`) depends only
 on the JSON API. No circular dependencies; it is a flat `main` package, so module boundaries are
 by convention, not by Go package walls (see `engineering-conventions.md`).

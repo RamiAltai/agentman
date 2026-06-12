@@ -66,7 +66,10 @@ func cmdWait(c *Client, a Args) {
 
 	for { // (re)connect loop; ctx deadline bounds everything
 		qs := url.Values{"since": {strconv.FormatInt(cursor, 10)}}
-		if project != "" {
+		// Project-scope the stream only for --ready: under --done the watched
+		// task may live in a different project than AGENTMAN_PROJECT, and a
+		// scoped stream would drop its events (the waiter would never re-check).
+		if waitReady && project != "" {
 			qs.Set("project", project)
 		}
 		resp := w.stream("/api/stream?" + qs.Encode())

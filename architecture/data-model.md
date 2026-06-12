@@ -28,7 +28,7 @@ lexically.
 - **`tasks.priority`** — INTEGER, `0=urgent … 3=low`, default `2`.
 - **`tasks.assignee`** — TEXT, **NULL = unclaimed** (the claim guard depends on this).
 - **`tasks.claimed_at`** — TEXT, **NULL = never claimed / dropped**; set by `ClaimTask`,
-  `StealStaleClaim`, and PATCH-assign; cleared when the assignee is removed (`am drop`).
+  `StealStaleClaim`, `NextTask`, and PATCH-assign; cleared when the assignee is removed (`am drop`).
   Added by schema **migration v3** (`ALTER TABLE tasks ADD COLUMN claimed_at TEXT` — not in
   `schema.sql`, same precedent as `projects.archived_at`). Staleness itself is judged from
   `updated_at` (any activity counts), not `claimed_at`; the stale cutoff is computed in Go by
