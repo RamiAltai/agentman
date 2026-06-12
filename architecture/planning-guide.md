@@ -33,7 +33,7 @@ invariants (single-writer DB, atomic claims, localhost-no-auth, XSS-safe UI, tok
 
 Flag the change if it touches any of these invariants:
 - [ ] DB writer count (must stay 1 — `SetMaxOpenConns(1)`).
-- [ ] Atomic claim semantics (`store.go ClaimTask` / `StealStaleClaim`).
+- [ ] Atomic claim semantics (`store.go ClaimTask` / `StealStaleClaim` / `NextTask`).
 - [ ] "Event in same tx, broadcast after commit" ordering.
 - [ ] The `events.id` cursor / SSE `Last-Event-ID` contract.
 - [ ] The `127.0.0.1` bind / absence of auth.

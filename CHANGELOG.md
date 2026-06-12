@@ -43,9 +43,9 @@ fresh `[Unreleased]` section.
     `TestNextTaskEmptyAgentValidation` (store); `TestNextEndpoint`, `TestNextEndpointProjectBody`
     (HTTP); `TestCmdNextPrintsOnlyID`, `TestExitNextNoneReady`, `TestCmdStatusBulk`,
     `TestCmdStatusBulkPartialFailure`, `TestCmdAssignBulk` (CLI); new `wait_test.go` —
-    `TestWaitDoneAlreadySatisfied`, `TestWaitDoneEventArrives`, `TestWaitReadyOnPrereqDone`,
-    `TestWaitTimeout`, `TestWaitTaskNotFound`, `TestWaitServerDown`, `TestWaitUsageErrors`,
-    `TestParseWaitTimeout`, `TestWaitBadTimeoutExit5`.
+    `TestWaitDoneAlreadySatisfied`, `TestWaitDoneEventArrives`, `TestWaitDoneCrossProject`,
+    `TestWaitReadyOnPrereqDone`, `TestWaitTimeout`, `TestWaitTaskNotFound`, `TestWaitServerDown`,
+    `TestWaitUsageErrors`, `TestParseWaitTimeout`, `TestWaitBadTimeoutExit5`.
 
 - **Stale-claim recovery (Phase K)** — agents that crash after `am claim` no longer hold tasks
   forever.

@@ -559,7 +559,7 @@ without evidence.
   (`exitCodeFor`); `cmd/am/store_test.go` (`TestNextTask*` incl. `TestNextTaskRaceDistinctWinners`);
   `cmd/am/server_test.go` (`TestNextEndpoint`, `TestNextEndpointProjectBody`); `cmd/am/cli_test.go`
   (`TestCmdNextPrintsOnlyID`, `TestExitNextNoneReady`, `TestCmdStatusBulk`,
-  `TestCmdStatusBulkPartialFailure`, `TestCmdAssignBulk`); `cmd/am/wait_test.go` (9 wait tests).
+  `TestCmdStatusBulkPartialFailure`, `TestCmdAssignBulk`); `cmd/am/wait_test.go` (10 wait tests).
 
 ## Inferred Decisions
 

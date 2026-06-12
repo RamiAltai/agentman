@@ -93,7 +93,8 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   `project.created` event reaches all subscribers regardless of filter.
 - **Data layer** — `cmd/am/store.go`: opens SQLite with `SetMaxOpenConns(1)` (single writer),
   WAL via DSN pragmas; all queries parameterized; atomic claim (+ the stale-claim takeover
-  `StealStaleClaim`, the same conditional-UPDATE trick); event insertion helper.
+  `StealStaleClaim` and the pick+claim `NextTask`, the same conditional-UPDATE trick); event
+  insertion helper.
   Hard-delete methods: `DeleteTask`, `DeleteComment`, `DeleteProject` (each inserts `*.deleted`
   event in the same tx before the DELETE, then commits; cascade via FK).
 - **CLI** — `cmd/am/cli.go` + `cmd/am/client.go`: verb parsing, terse output, exit-code mapping.

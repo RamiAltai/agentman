@@ -223,7 +223,7 @@ per request after completion: `METHOD PATH STATUS LATENCY ACTOR` (actor = `X-Age
 
 ## Testing
 
-There are ten test files (run `go test -race ./cmd/am/`; 129 tests, all green):
+There are ten test files (run `go test -race ./cmd/am/`; 130 tests, all green):
 - `cmd/am/update_test.go` — version-comparison logic.
 - `cmd/am/store_test.go` — atomic-claim race (concurrent, `-race`-clean), events-cursor monotonicity,
   store CRUD + validation (`ErrValidation`), project archive/unarchive round-trip + idempotency,
@@ -264,7 +264,8 @@ There are ten test files (run `go test -race ./cmd/am/`; 129 tests, all green):
   `TestCmdStatusBulk`, `TestCmdStatusBulkPartialFailure` (loop continues, stderr names the failing
   id, exit = first failure's code), `TestCmdAssignBulk` (incl. `me`/`-` and single-id regression).
 - `cmd/am/wait_test.go` — `am wait` (Phase L). `TestWaitDoneAlreadySatisfied`,
-  `TestWaitDoneEventArrives`, `TestWaitReadyOnPrereqDone` (blocked task becomes ready when its
+  `TestWaitDoneEventArrives`, `TestWaitDoneCrossProject` (`AGENTMAN_PROJECT` must not scope the
+  `--done` stream), `TestWaitReadyOnPrereqDone` (blocked task becomes ready when its
   prereq is done), `TestWaitTimeout` (exit 7), `TestWaitTaskNotFound` (exit 3),
   `TestWaitServerDown` (exit 6), `TestWaitUsageErrors`, `TestParseWaitTimeout` (bare seconds +
   Go durations), `TestWaitBadTimeoutExit5`.
@@ -288,7 +289,7 @@ rejection, idempotent add/remove, cascade on task delete, `NPrereqs`/`NOpenPrere
 response for claim and patch). The +4 graph tests (`TestProjectGraph`, `TestProjectGraphMissingProject`
 in `store_test.go`; `TestProjectGraphEndpoint`, `TestProjectGraphEndpoint404` in `server_test.go`)
 brought the total to **95** at the time; Phase J's hygiene tests and Phase K's 10 stale-claim
-tests brought it to **107**; Phase L's 22 work-loop tests (listed above) bring it to **129**.
+tests brought it to **107**; Phase L's 23 work-loop tests (listed above) bring it to **130**.
 
 SSE streaming/reconnect, CLI verbs, exit-code mapping, and identity are now covered. The
 dashboard has a source-level XSS-sink guard but **no behavioral JS tests** — the project
