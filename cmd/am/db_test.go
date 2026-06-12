@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,7 +16,7 @@ func TestPruneEventsKeep(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Seed: create a project and several tasks (each generates events).
-	if _, _, err := st.CreateProject("keepproj", "Keep"); err != nil {
+	if _, _, err := st.CreateProject("keepproj", "Keep", ""); err != nil {
 		t.Fatal(err)
 	}
 	for _, title := range []string{"t1", "t2", "t3", "t4", "t5"} {
@@ -86,7 +87,7 @@ func TestPruneEventsBefore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := st.CreateProject("bproj", "Before"); err != nil {
+	if _, _, err := st.CreateProject("bproj", "Before", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -152,7 +153,7 @@ func TestPruneEventsBeforeSameDayBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := st.CreateProject("dproj", "Day"); err != nil {
+	if _, _, err := st.CreateProject("dproj", "Day", ""); err != nil {
 		t.Fatal(err)
 	}
 	// One event timestamped midday on 2024-03-15.
@@ -193,7 +194,7 @@ func TestExportImportRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, err = store.CreateProject("testproj", "Test Project")
+	_, _, err = store.CreateProject("testproj", "Test Project", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +233,7 @@ func TestExportImportRoundtrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store2.Close()
-	projs, err := store2.ListProjects(false)
+	projs, err := store2.ListProjects(false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,5 +322,113 @@ func TestIsServerRunning(t *testing.T) {
 	// There should be no server on a random high port
 	if isServerRunning("http://127.0.0.1:19999") {
 		t.Error("expected isServerRunning=false on unused port")
+	}
+}
+
+// ---------- Phase O: snapshots across the v4 boundary ----------
+
+// TestExportContainsCategories: a snapshot of a current DB carries the
+// categories table (VACUUM INTO copies everything).
+func TestExportContainsCategories(t *testing.T) {
+	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+
+	srcDB := filepath.Join(t.TempDir(), "src.db")
+	st, err := OpenStore(srcDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateCategory("work", "Work"); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+
+	exportPath := filepath.Join(t.TempDir(), "export.db")
+	if err := exportDB(srcDB, exportPath); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", exportPath+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM categories").Scan(&n); err != nil {
+		t.Fatalf("categories table missing from export: %v", err)
+	}
+	if n != 2 { // general (seeded) + work
+		t.Fatalf("exported categories = %d, want 2", n)
+	}
+}
+
+// TestImportPreCategorySnapshot: a v3-shaped DB (no categories table) passes
+// validation — the required-table set is the v1 baseline on purpose — imports
+// cleanly, and migrates to v4 on the next OpenStore.
+func TestImportPreCategorySnapshot(t *testing.T) {
+	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+
+	// Hand-build a v3 DB (schema.sql baseline + v2/v3 only), with one project.
+	srcDB := filepath.Join(t.TempDir(), "v3src.db")
+	db, err := sql.Open("sqlite", "file:"+srcDB+"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(schemaSQL); err != nil {
+		t.Fatal(err)
+	}
+	if err := runMigrations(db, 3, schemaMigrations[:2]); err != nil {
+		t.Fatal(err)
+	}
+	// Make it truly pre-category: drop the table schema.sql just created.
+	if _, err := db.Exec("DROP TABLE categories"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO projects(slug,name) VALUES('oldproj','Old')"); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	if err := validateImportCandidate(srcDB); err != nil {
+		t.Fatalf("v3 snapshot rejected: %v", err)
+	}
+
+	destDB := filepath.Join(t.TempDir(), "dest.db")
+	if err := importDB(srcDB, destDB, t.TempDir(), true); err != nil {
+		t.Fatalf("importDB: %v", err)
+	}
+
+	// OpenStore migrates the imported DB to v4.
+	st, err := OpenStore(destDB)
+	if err != nil {
+		t.Fatalf("OpenStore after import: %v", err)
+	}
+	defer st.Close()
+	if v, _ := readSchemaVersion(st.db); v != 4 {
+		t.Fatalf("schema_version after import+open = %d, want 4", v)
+	}
+	ps, err := st.ListProjects(false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ps) != 1 || ps[0].Slug != "oldproj" || ps[0].Category != "general" {
+		t.Fatalf("imported project = %+v, want oldproj in general", ps)
+	}
+}
+
+// TestImportRejectsNewerSchema: a snapshot stamped with a future schema_version
+// must be refused.
+func TestImportRejectsNewerSchema(t *testing.T) {
+	srcDB := filepath.Join(t.TempDir(), "future.db")
+	st, err := OpenStore(srcDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','5')"); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	if err := validateImportCandidate(srcDB); err == nil {
+		t.Fatal("schema_version 5 snapshot accepted, want rejection")
 	}
 }

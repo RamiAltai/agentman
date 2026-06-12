@@ -30,8 +30,13 @@ func NewServer(store *Store) *Server {
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/categories", s.handleListCategories)
+	mux.HandleFunc("POST /api/categories", s.handleCreateCategory)
+	mux.HandleFunc("POST /api/categories/{slug}/archive", s.handleArchiveCategory)
+	mux.HandleFunc("POST /api/categories/{slug}/unarchive", s.handleUnarchiveCategory)
 	mux.HandleFunc("GET /api/projects", s.handleListProjects)
 	mux.HandleFunc("POST /api/projects", s.handleCreateProject)
+	mux.HandleFunc("PATCH /api/projects/{slug}", s.handlePatchProject)
 	mux.HandleFunc("POST /api/projects/{slug}/archive", s.handleArchiveProject)
 	mux.HandleFunc("POST /api/projects/{slug}/unarchive", s.handleUnarchiveProject)
 	mux.HandleFunc("GET /api/tasks", s.handleListTasks)
@@ -157,14 +162,84 @@ func requestLogger(next http.Handler) http.Handler {
 
 // ---------- handlers ----------
 
-func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleListCategories(w http.ResponseWriter, r *http.Request) {
 	includeArchived := r.URL.Query().Get("archived") == "true"
-	ps, err := s.store.ListProjects(includeArchived)
+	cs, err := s.store.ListCategories(includeArchived)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, cs)
+}
+
+func (s *Server) handleCreateCategory(w http.ResponseWriter, r *http.Request) {
+	var in struct{ Slug, Name string }
+	if err := decode(r, &in); err != nil {
+		writeErr(w, ErrValidation)
+		return
+	}
+	c, ev, err := s.store.CreateCategory(in.Slug, in.Name)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	s.hub.Broadcast(ev)
+	writeJSON(w, http.StatusCreated, c)
+}
+
+func (s *Server) handleArchiveCategory(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	c, ev, err := s.store.ArchiveCategory(slug, actorOf(r))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if ev != nil {
+		s.hub.Broadcast(ev)
+	}
+	writeJSON(w, http.StatusOK, c)
+}
+
+func (s *Server) handleUnarchiveCategory(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	c, ev, err := s.store.UnarchiveCategory(slug, actorOf(r))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if ev != nil {
+		s.hub.Broadcast(ev)
+	}
+	writeJSON(w, http.StatusOK, c)
+}
+
+func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	includeArchived := q.Get("archived") == "true"
+	ps, err := s.store.ListProjects(includeArchived, q.Get("category"))
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, ps)
+}
+
+func (s *Server) handlePatchProject(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	var patch map[string]any
+	if err := decode(r, &patch); err != nil {
+		writeErr(w, ErrValidation)
+		return
+	}
+	p, ev, err := s.store.PatchProject(slug, patch, actorOf(r))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if ev != nil { // no-op patch returns no event
+		s.hub.Broadcast(ev)
+	}
+	writeJSON(w, http.StatusOK, p)
 }
 
 func (s *Server) handleArchiveProject(w http.ResponseWriter, r *http.Request) {
@@ -194,12 +269,14 @@ func (s *Server) handleUnarchiveProject(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
-	var in struct{ Slug, Name string }
+	var in struct{ Slug, Name, Category string }
 	if err := decode(r, &in); err != nil {
 		writeErr(w, ErrValidation)
 		return
 	}
-	p, ev, err := s.store.CreateProject(in.Slug, in.Name)
+	// Empty category defaults to "general" in the store — keeps the dashboard's
+	// existing {slug,name} POST working unchanged.
+	p, ev, err := s.store.CreateProject(in.Slug, in.Name, in.Category)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -212,6 +289,7 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	f := TaskFilter{
 		Project:  q.Get("project"),
+		Category: q.Get("category"),
 		Status:   q.Get("status"),
 		Assignee: q.Get("assignee"),
 		Label:    q.Get("label"), // store validates/normalizes
@@ -448,13 +526,14 @@ func (s *Server) handleNext(w http.ResponseWriter, r *http.Request) {
 	agent := actorOf(r)
 	var in struct {
 		Project  string `json:"project"`
+		Category string `json:"category"`
 		Assignee string `json:"assignee"`
 	}
 	_ = decode(r, &in)
 	if in.Assignee != "" {
 		agent = in.Assignee
 	}
-	t, ev, err := s.store.NextTask(in.Project, agent)
+	t, ev, err := s.store.NextTask(in.Project, in.Category, agent)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -704,6 +783,8 @@ func writeErr(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "validation"})
 	case errors.Is(err, ErrProjectArchived):
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "project_archived"})
+	case errors.Is(err, ErrCategoryArchived):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "category_archived"})
 	case errors.Is(err, ErrConflict):
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "conflict"})
 	default:

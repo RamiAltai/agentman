@@ -235,3 +235,109 @@ func TestWaitBadTimeoutExit5(t *testing.T) {
 		t.Fatalf("expected exit 5 (bad --timeout), got %d", code)
 	}
 }
+
+// ---------- Phase O: wait --ready -c ----------
+
+// createTaskRaw creates a task without test helpers, safe from goroutines
+// (no t.Fatalf off the test goroutine).
+func createTaskRaw(base, project, title string) {
+	req, err := http.NewRequest(http.MethodPost, base+"/api/tasks",
+		strings.NewReader(`{"project":"`+project+`","title":"`+title+`"}`))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err == nil {
+		resp.Body.Close()
+	}
+}
+
+// TestWaitReadyCategoryScoped: a ready task in another category must NOT
+// release a category-scoped wait; a ready task inside the category must.
+// The stream stays unscoped (no ?category= on /api/stream in Phase O) — the
+// REST re-check carries the scope.
+func TestWaitReadyCategoryScoped(t *testing.T) {
+	ts := newTestServer(t)
+	r := do(t, ts, http.MethodPost, "/api/categories", `{"slug":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	r = do(t, ts, http.MethodPost, "/api/projects", `{"slug":"wproj","category":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	mustCreateProject(t, ts, "gproj") // lands in general
+
+	// Out-of-category ready task exists BEFORE the wait starts: must not satisfy it.
+	mustCreateTask(t, ts, "gproj", "general ready")
+
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		createTaskRaw(ts.URL, "wproj", "work ready")
+	}()
+
+	c := newWaitClient(ts.URL)
+	var code int
+	start := time.Now()
+	out := captureStdout(t, func() {
+		code = captureExit(t, func() {
+			cmdWait(c, parse([]string{"--ready", "-c", "work", "--timeout", "10s"}))
+		})
+	})
+	if code != -1 {
+		t.Fatalf("expected normal return (exit 0), got exit %d", code)
+	}
+	// Must have blocked until the in-category task appeared, not returned on the
+	// pre-existing general one (which would be ~instant).
+	if elapsed := time.Since(start); elapsed < 200*time.Millisecond {
+		t.Fatalf("wait returned after %v — released by the out-of-category task?", elapsed)
+	}
+	if elapsed := time.Since(start); elapsed >= 10*time.Second {
+		t.Fatalf("wait took %v, should have released on the in-category task", elapsed)
+	}
+	if strings.TrimSpace(out) == "" {
+		t.Fatal("wait --ready printed nothing, want the ready task id")
+	}
+}
+
+func TestWaitReadyCategoryEnv(t *testing.T) {
+	ts := newTestServer(t)
+	r := do(t, ts, http.MethodPost, "/api/categories", `{"slug":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	r = do(t, ts, http.MethodPost, "/api/projects", `{"slug":"wproj","category":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	id := mustCreateTask(t, ts, "wproj", "already ready")
+
+	t.Setenv("AGENTMAN_CATEGORY", "work")
+	c := newWaitClient(ts.URL)
+	var code int
+	out := captureStdout(t, func() {
+		code = captureExit(t, func() {
+			cmdWait(c, parse([]string{"--ready", "--timeout", "5s"}))
+		})
+	})
+	if code != -1 {
+		t.Fatalf("expected normal return (exit 0), got exit %d", code)
+	}
+	if strings.TrimSpace(out) != id {
+		t.Fatalf("wait --ready stdout = %q, want %q", out, id)
+	}
+}
+
+func TestWaitReadyCategoryTimeout(t *testing.T) {
+	ts := newTestServer(t)
+	r := do(t, ts, http.MethodPost, "/api/categories", `{"slug":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	mustCreateProject(t, ts, "gproj")
+	mustCreateTask(t, ts, "gproj", "general ready") // out of scope forever
+
+	c := newWaitClient(ts.URL)
+	code := captureExit(t, func() {
+		cmdWait(c, parse([]string{"--ready", "-c", "work", "--timeout", "1s"}))
+	})
+	if code != 7 {
+		t.Fatalf("expected exit 7 (timeout, scope never satisfied), got %d", code)
+	}
+}

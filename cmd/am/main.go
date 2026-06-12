@@ -31,6 +31,10 @@ func main() {
 		return
 	}
 
+	if cmd == "show" {
+		rest = rewriteShowComments(rest)
+	}
+
 	a := parse(rest)
 	switch cmd {
 	case "init":
@@ -80,6 +84,10 @@ func main() {
 		cmdProjects(c, a)
 	case "project":
 		cmdProject(c, a)
+	case "categories":
+		cmdCategories(c, a)
+	case "category":
+		cmdCategory(c, a)
 	case "dep":
 		cmdDep(c, a)
 	case "help", "-h", "--help":
@@ -141,6 +149,22 @@ func runServe(argv []string) {
 	store.Close()
 }
 
+// rewriteShowComments rewrites -c tokens to --comments for `am show` only:
+// -c is the global category flag (canonFlag), but show documents `am show
+// <id> -c` as the comments toggle. Runs before parse() so the alias never
+// reaches canonFlag.
+func rewriteShowComments(rest []string) []string {
+	out := make([]string, len(rest))
+	for i, tok := range rest {
+		if tok == "-c" {
+			out[i] = "--comments"
+		} else {
+			out[i] = tok
+		}
+	}
+	return out
+}
+
 // listenAddr is the server bind address. It is pinned to the 127.0.0.1 loopback
 // interface — there is no authentication, so the bind is the only access control
 // (see security.md). Tests guard that this never widens beyond loopback.
@@ -162,12 +186,12 @@ func usage() {
   am init <tasktype>                     set this session's identity (e.g. bugfix_050626_4821)
   am whoami                              print the current identity
 
-  am ls [--mine] [--status S] [-p P] [--all] [--ready] [--blocked] [--stale DUR] [--grep TEXT] [--label L]   list tasks (hides done)
+  am ls [--mine] [--status S] [-p P] [-c CAT] [--all] [--ready] [--blocked] [--stale DUR] [--grep TEXT] [--label L]   list tasks (hides done)
   am show <id> [-c]                            task detail (+comments +deps)
   am new "title" [--body B] [-p P] [--priority N]   create, prints id
   am claim <id> [--steal-stale DUR]           assign me + ->doing (atomic; DUR is Go syntax, e.g. 30m, 48h)
-  am next [-p P]                              atomically pick + claim the best ready task (prints id; exit 3 if none)
-  am wait <id> --done | am wait --ready [-p P] [--timeout D]   block until done / a ready task exists (exit 7 on timeout)
+  am next [-p P] [-c CAT]                     atomically pick + claim the best ready task (prints id; exit 3 if none)
+  am wait <id> --done | am wait --ready [-p P] [-c CAT] [--timeout D]   block until done / a ready task exists (exit 7 on timeout)
   am status <id...> <todo|doing|blocked|done> change status (multiple ids allowed)
   am assign <id...> <agent|me|->              reassign ("-" = unassign; multiple ids allowed)
   am note <id> "text"                         add a comment
@@ -178,10 +202,15 @@ func usage() {
   am dep rm <id> <prereq>                     remove a prerequisite
   am label <id> [+l ...] [-l ...]             print / add / remove labels (lowercase a-z 0-9 . _ -)
   am projects [--all]                    list projects (--all includes archived)
-  am project new <slug> [name]                create a project
+  am project new <slug> [name] -c <category>  create a project (category required)
+  am project edit <slug> [--slug NEW] [--name N] [--vault-id X] [--vault-path Y]   rename / set vault binding
   am project archive <slug>              soft-archive a project (hides it)
   am project unarchive <slug>            restore an archived project
   am project rm <slug> --yes             hard-delete a project + ALL its tasks/comments
+  am categories [--all]                  list categories (--all includes archived)
+  am category new <slug> [name]               create a category
+  am category archive <slug>             soft-archive a category (hides its projects)
+  am category unarchive <slug>           restore an archived category
   am version                                  print version
   am update [version]                         reinstall the latest (or a given) version
   am db export [path] [--db PATH]                            export a DB snapshot (prints path)
@@ -189,7 +218,8 @@ func usage() {
   am db prune [--db PATH] (--before YYYY-MM-DD | --keep N) [--yes]  delete old events rows
 
 Identity: run 'am init <tasktype>' once per session (or set AGENTMAN_AGENT).
-Env: AGENTMAN_URL (default http://127.0.0.1:8787), AGENTMAN_PROJECT (default project).
+Env: AGENTMAN_URL (default http://127.0.0.1:8787), AGENTMAN_PROJECT (default project),
+     AGENTMAN_CATEGORY (default category scope for ls/next/wait/project new).
      Add --json to any read to parse output.
 Exit codes: 0 ok · 3 not found · 4 already claimed · 5 invalid · 6 server down · 7 timed out.
 `)

@@ -69,7 +69,9 @@ func canonFlag(k string) string {
 	case "s":
 		return "status"
 	case "c":
-		return "comments"
+		// -c is the category flag everywhere; main.go rewrites -c → --comments
+		// for `am show` only, preserving the documented `am show <id> -c`.
+		return "category"
 	case "a":
 		return "assign"
 	case "l":
@@ -89,6 +91,14 @@ func projectFor(a Args) string {
 	return os.Getenv("AGENTMAN_PROJECT")
 }
 
+// categoryFor resolves the active category: -c/--category, else AGENTMAN_CATEGORY.
+func categoryFor(a Args) string {
+	if c := a.flag("category"); c != "" {
+		return c
+	}
+	return os.Getenv("AGENTMAN_CATEGORY")
+}
+
 // ---------- verbs ----------
 
 func cmdLs(c *Client, a Args) {
@@ -96,6 +106,9 @@ func cmdLs(c *Client, a Args) {
 	proj := projectFor(a)
 	if proj != "" && !a.has("all") {
 		qs.Set("project", proj)
+	}
+	if cat := categoryFor(a); cat != "" && !a.has("all") {
+		qs.Set("category", cat)
 	}
 	switch {
 	case a.flag("status") != "":
@@ -257,9 +270,16 @@ func cmdNext(c *Client, a Args) {
 	if me() == "" {
 		fail(5, "set AGENTMAN_AGENT to pick up tasks")
 	}
-	var body any
+	scope := map[string]any{}
 	if proj := projectFor(a); proj != "" {
-		body = map[string]any{"project": proj}
+		scope["project"] = proj
+	}
+	if cat := categoryFor(a); cat != "" {
+		scope["category"] = cat
+	}
+	var body any
+	if len(scope) > 0 {
+		body = scope
 	}
 	st, data := c.do("POST", "/api/tasks/next", body)
 	switch {
@@ -274,7 +294,7 @@ func cmdNext(c *Client, a Args) {
 		}
 		fmt.Println(t.ID)
 	case st == 404:
-		// Also covers a bad -p slug (the server can't tell them apart).
+		// Also covers a bad -p/-c slug (the server can't tell them apart).
 		fail(3, "next: no ready task")
 	case st == 400:
 		fail(5, "next: %s", apiErr(data, "invalid request"))
@@ -388,17 +408,44 @@ func cmdProject(c *Client, a Args) {
 	switch a.at(0) {
 	case "new":
 		if a.at(1) == "" {
-			fail(1, "usage: am project new <slug> [name]")
+			fail(1, "usage: am project new <slug> [name] -c <category>")
+		}
+		cat := categoryFor(a)
+		if cat == "" {
+			fail(5, "no category: pass -c <slug> or set AGENTMAN_CATEGORY")
 		}
 		slug := a.at(1)
 		name := slug
 		if a.at(2) != "" {
 			name = a.at(2)
 		}
-		data := c.doOrFail("POST", "/api/projects", map[string]any{"slug": slug, "name": name})
+		data := c.doOrFail("POST", "/api/projects", map[string]any{"slug": slug, "name": name, "category": cat})
 		var p Project
 		json.Unmarshal(data, &p)
 		fmt.Println(p.Slug)
+	case "edit":
+		slug := a.at(1)
+		if slug == "" {
+			fail(1, "usage: am project edit <slug> [--slug NEW] [--name N] [--vault-id X] [--vault-path Y]")
+		}
+		patch := map[string]any{}
+		if v := a.flag("slug"); v != "" {
+			patch["slug"] = v
+		}
+		if v := a.flag("name"); v != "" {
+			patch["name"] = v
+		}
+		// ok-form so empty values clear the vault binding (cmdEdit --body precedent).
+		if v, ok := a.flags["vault-id"]; ok {
+			patch["vault_project_id"] = v
+		}
+		if v, ok := a.flags["vault-path"]; ok {
+			patch["vault_path"] = v
+		}
+		if len(patch) == 0 {
+			fail(1, "project edit: nothing to change (use --slug/--name/--vault-id/--vault-path)")
+		}
+		c.doOrFail("PATCH", "/api/projects/"+slug, patch)
 	case "archive":
 		if a.at(1) == "" {
 			fail(1, "usage: am project archive <slug>")
@@ -419,7 +466,58 @@ func cmdProject(c *Client, a Args) {
 		}
 		c.doOrFail("DELETE", "/api/projects/"+slug, nil)
 	default:
-		fail(1, "usage: am project <new|archive|unarchive|rm> ...")
+		fail(1, "usage: am project <new|edit|archive|unarchive|rm> ...")
+	}
+}
+
+func cmdCategories(c *Client, a Args) {
+	path := "/api/categories"
+	if a.has("all") {
+		path += "?archived=true"
+	}
+	data := c.doOrFail("GET", path, nil)
+	var cs []Category
+	json.Unmarshal(data, &cs)
+	if a.has("json") {
+		printJSON(cs)
+		return
+	}
+	for _, cat := range cs {
+		archived := ""
+		if cat.ArchivedAt != "" {
+			archived = " (archived)"
+		}
+		fmt.Printf("%-10s %-20s%s\n", cat.Slug, trunc(cat.Name, 20), archived)
+	}
+}
+
+func cmdCategory(c *Client, a Args) {
+	switch a.at(0) {
+	case "new":
+		if a.at(1) == "" {
+			fail(1, "usage: am category new <slug> [name]")
+		}
+		slug := a.at(1)
+		name := slug
+		if a.at(2) != "" {
+			name = a.at(2)
+		}
+		data := c.doOrFail("POST", "/api/categories", map[string]any{"slug": slug, "name": name})
+		var cat Category
+		json.Unmarshal(data, &cat)
+		fmt.Println(cat.Slug)
+	case "archive":
+		if a.at(1) == "" {
+			fail(1, "usage: am category archive <slug>")
+		}
+		c.doOrFail("POST", "/api/categories/"+a.at(1)+"/archive", nil)
+	case "unarchive":
+		if a.at(1) == "" {
+			fail(1, "usage: am category unarchive <slug>")
+		}
+		c.doOrFail("POST", "/api/categories/"+a.at(1)+"/unarchive", nil)
+	default:
+		fail(1, "usage: am category <new|archive|unarchive> ...")
 	}
 }
 

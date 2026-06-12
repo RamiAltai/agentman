@@ -14,10 +14,10 @@ func TestListEventsBefore(t *testing.T) {
 	st := openTestStore(t)
 
 	// Create two projects, one active and one to be archived.
-	if _, _, err := st.CreateProject("active", "Active"); err != nil {
+	if _, _, err := st.CreateProject("active", "Active", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := st.CreateProject("archproj", "Archived"); err != nil {
+	if _, _, err := st.CreateProject("archproj", "Archived", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -110,7 +110,7 @@ func TestListEventsBefore(t *testing.T) {
 
 func TestCreateProjectAndTaskHappyPath(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
 	task, ev, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Do a thing", Actor: "alice"})
@@ -141,7 +141,7 @@ func TestCreateProjectAndTaskHappyPath(t *testing.T) {
 
 func TestCreateTaskEmptyTitleValidation(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
 	if _, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "   "}); !errors.Is(err, ErrValidation) {
@@ -151,7 +151,7 @@ func TestCreateTaskEmptyTitleValidation(t *testing.T) {
 
 func TestPatchTaskInvalidStatusValidation(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
 	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "T"})
@@ -165,7 +165,7 @@ func TestPatchTaskInvalidStatusValidation(t *testing.T) {
 
 func TestClaimRaceExactlyOneWinner(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
 	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Race me"})
@@ -441,7 +441,7 @@ func TestStealStaleClaim(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			st := openTestStore(t)
-			if _, _, err := st.CreateProject("web", "Web"); err != nil {
+			if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
 				t.Fatalf("CreateProject: %v", err)
 			}
 			id := c.setup(t, st)
@@ -453,7 +453,7 @@ func TestStealStaleClaim(t *testing.T) {
 
 func TestStealRaceExactlyOneWinner(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
 	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Steal me"})
@@ -523,7 +523,7 @@ func TestStealRaceExactlyOneWinner(t *testing.T) {
 
 func TestListTasksStaleFilter(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
 	mk := func(title string) int64 {
@@ -586,7 +586,7 @@ func TestListTasksStaleFilter(t *testing.T) {
 
 func TestClaimSetsClaimedAt(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
 	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "claim me"})
@@ -607,7 +607,7 @@ func TestClaimSetsClaimedAt(t *testing.T) {
 
 func TestDropClearsClaimedAt(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
 	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "drop me"})
@@ -638,13 +638,13 @@ func TestDropClearsClaimedAt(t *testing.T) {
 func TestArchiveUnarchiveProject(t *testing.T) {
 	st := openTestStore(t)
 	// Create a project
-	_, _, err := st.CreateProject("testproj", "Test")
+	_, _, err := st.CreateProject("testproj", "Test", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Default list excludes nothing (not archived yet)
-	ps, err := st.ListProjects(false)
+	ps, err := st.ListProjects(false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -665,7 +665,7 @@ func TestArchiveUnarchiveProject(t *testing.T) {
 	}
 
 	// Default list now excludes it
-	ps, err = st.ListProjects(false)
+	ps, err = st.ListProjects(false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -674,7 +674,7 @@ func TestArchiveUnarchiveProject(t *testing.T) {
 	}
 
 	// All list includes it
-	ps, err = st.ListProjects(true)
+	ps, err = st.ListProjects(true, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -704,7 +704,7 @@ func TestArchiveUnarchiveProject(t *testing.T) {
 	}
 
 	// Default list includes it again
-	ps, err = st.ListProjects(false)
+	ps, err = st.ListProjects(false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -715,10 +715,10 @@ func TestArchiveUnarchiveProject(t *testing.T) {
 
 func TestListTasksHidesArchivedProjectTasks(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("alpha", "Alpha"); err != nil {
+	if _, _, err := st.CreateProject("alpha", "Alpha", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := st.CreateProject("beta", "Beta"); err != nil {
+	if _, _, err := st.CreateProject("beta", "Beta", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := st.CreateTask(CreateTaskInput{Project: "alpha", Title: "a1"}); err != nil {
@@ -774,10 +774,10 @@ func TestListTasksHidesArchivedProjectTasks(t *testing.T) {
 
 func TestFeedHidesArchivedProjectEvents(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("alpha", "Alpha"); err != nil {
+	if _, _, err := st.CreateProject("alpha", "Alpha", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := st.CreateProject("beta", "Beta"); err != nil {
+	if _, _, err := st.CreateProject("beta", "Beta", ""); err != nil {
 		t.Fatal(err)
 	}
 	// Create tasks — generates task.created events for each project.
@@ -857,10 +857,10 @@ func TestFeedHidesArchivedProjectEvents(t *testing.T) {
 
 func TestCreateTaskRejectsArchivedProject(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("active", "Active"); err != nil {
+	if _, _, err := st.CreateProject("active", "Active", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := st.CreateProject("archived", "Archived"); err != nil {
+	if _, _, err := st.CreateProject("archived", "Archived", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := st.ArchiveProject("archived", "tester"); err != nil {
@@ -885,7 +885,7 @@ func TestCreateTaskRejectsArchivedProject(t *testing.T) {
 
 func TestDeleteTaskCascadesComments(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
 	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "to delete"})
@@ -944,7 +944,7 @@ func TestDeleteTaskNotFound(t *testing.T) {
 
 func TestDeleteCommentRemovesOnlyComment(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
 	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "task with comments"})
@@ -993,7 +993,7 @@ func TestDeleteCommentRemovesOnlyComment(t *testing.T) {
 
 func TestDeleteProjectCascades(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("alpha", "Alpha"); err != nil {
+	if _, _, err := st.CreateProject("alpha", "Alpha", ""); err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
 	task, _, err := st.CreateTask(CreateTaskInput{Project: "alpha", Title: "child task"})
@@ -1013,7 +1013,7 @@ func TestDeleteProjectCascades(t *testing.T) {
 	}
 
 	// Project gone.
-	ps, err := st.ListProjects(true)
+	ps, err := st.ListProjects(true, "")
 	if err != nil {
 		t.Fatalf("ListProjects: %v", err)
 	}
@@ -1052,7 +1052,7 @@ func TestDeleteProjectCascades(t *testing.T) {
 
 func TestEventsCursorStrictlyIncreasing(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
 	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "T"})
@@ -1118,7 +1118,7 @@ func TestEventsCursorStrictlyIncreasing(t *testing.T) {
 func setupDepFixture(t *testing.T) (*Store, int64, int64, int64) {
 	t.Helper()
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
 		t.Fatal(err)
 	}
 	t1, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Task 1"})
@@ -1179,10 +1179,10 @@ func TestAddDepSelfRejected(t *testing.T) {
 
 func TestAddDepCrossProjectRejected(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("proj1", "P1"); err != nil {
+	if _, _, err := st.CreateProject("proj1", "P1", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := st.CreateProject("proj2", "P2"); err != nil {
+	if _, _, err := st.CreateProject("proj2", "P2", ""); err != nil {
 		t.Fatal(err)
 	}
 	ta, _, _ := st.CreateTask(CreateTaskInput{Project: "proj1", Title: "A"})
@@ -1515,11 +1515,11 @@ var _ = fmt.Sprintf
 
 func TestProjectGraph(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("gproj", "Graph Project"); err != nil {
+	if _, _, err := st.CreateProject("gproj", "Graph Project", ""); err != nil {
 		t.Fatal(err)
 	}
 	// Second project — its tasks must not appear in gproj's graph.
-	if _, _, err := st.CreateProject("other", "Other"); err != nil {
+	if _, _, err := st.CreateProject("other", "Other", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1598,7 +1598,7 @@ func TestProjectGraphMissingProject(t *testing.T) {
 // are rejected with ErrValidation on both create and patch paths.
 func TestInputLimits(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("lim", "Limits"); err != nil {
+	if _, _, err := st.CreateProject("lim", "Limits", ""); err != nil {
 		t.Fatal(err)
 	}
 	longTitle := strings.Repeat("x", maxTitleLen+1)
@@ -1670,7 +1670,7 @@ func nextTaskMk(t *testing.T, st *Store, project, title string, priority int, as
 func TestNextTaskPicksHighestPriorityReady(t *testing.T) {
 	st := openTestStore(t)
 	for _, slug := range []string{"web", "attic"} {
-		if _, _, err := st.CreateProject(slug, slug); err != nil {
+		if _, _, err := st.CreateProject(slug, slug, ""); err != nil {
 			t.Fatalf("CreateProject %s: %v", slug, err)
 		}
 	}
@@ -1697,7 +1697,7 @@ func TestNextTaskPicksHighestPriorityReady(t *testing.T) {
 	// Eligible: the p1 winner and a p3 also-ran (the prereq task itself).
 	winner := nextTaskMk(t, st, "web", "winner p1", 1, "")
 
-	tk, ev, err := st.NextTask("", "agent-x")
+	tk, ev, err := st.NextTask("", "", "agent-x")
 	if err != nil {
 		t.Fatalf("NextTask: %v", err)
 	}
@@ -1723,13 +1723,13 @@ func TestNextTaskPicksHighestPriorityReady(t *testing.T) {
 
 func TestNextTaskFIFOWithinPriority(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
 	first := nextTaskMk(t, st, "web", "older", 2, "")
 	nextTaskMk(t, st, "web", "newer", 2, "")
 
-	tk, _, err := st.NextTask("", "agent-x")
+	tk, _, err := st.NextTask("", "", "agent-x")
 	if err != nil {
 		t.Fatalf("NextTask: %v", err)
 	}
@@ -1741,7 +1741,7 @@ func TestNextTaskFIFOWithinPriority(t *testing.T) {
 func TestNextTaskProjectScoping(t *testing.T) {
 	st := openTestStore(t)
 	for _, slug := range []string{"web", "api"} {
-		if _, _, err := st.CreateProject(slug, slug); err != nil {
+		if _, _, err := st.CreateProject(slug, slug, ""); err != nil {
 			t.Fatalf("CreateProject %s: %v", slug, err)
 		}
 	}
@@ -1749,7 +1749,7 @@ func TestNextTaskProjectScoping(t *testing.T) {
 	webTask := nextTaskMk(t, st, "web", "web slow", 3, "")
 
 	// Project scope beats global priority order.
-	tk, _, err := st.NextTask("web", "agent-x")
+	tk, _, err := st.NextTask("web", "", "agent-x")
 	if err != nil {
 		t.Fatalf("NextTask(web): %v", err)
 	}
@@ -1757,7 +1757,7 @@ func TestNextTaskProjectScoping(t *testing.T) {
 		t.Fatalf("NextTask(web) picked #%d, want #%d", tk.ID, webTask)
 	}
 	// No scope: best remaining across all projects.
-	tk2, _, err := st.NextTask("", "agent-y")
+	tk2, _, err := st.NextTask("", "", "agent-y")
 	if err != nil {
 		t.Fatalf("NextTask(\"\"): %v", err)
 	}
@@ -1765,20 +1765,20 @@ func TestNextTaskProjectScoping(t *testing.T) {
 		t.Fatalf("NextTask(\"\") picked #%d, want #%d", tk2.ID, apiTask)
 	}
 	// Bad slug → ErrNotFound.
-	if _, _, err := st.NextTask("nosuch", "agent-z"); !errors.Is(err, ErrNotFound) {
+	if _, _, err := st.NextTask("nosuch", "", "agent-z"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("NextTask(nosuch) err = %v, want ErrNotFound", err)
 	}
 }
 
 func TestNextTaskNoneReady(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
 	// Only an assigned todo task — not a candidate.
 	nextTaskMk(t, st, "web", "taken", 0, "someone-else")
 
-	if _, _, err := st.NextTask("", "agent-x"); !errors.Is(err, ErrNotFound) {
+	if _, _, err := st.NextTask("", "", "agent-x"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("NextTask err = %v, want ErrNotFound", err)
 	}
 	var n int
@@ -1791,7 +1791,7 @@ func TestNextTaskNoneReady(t *testing.T) {
 func TestNextTaskRaceDistinctWinners(t *testing.T) {
 	// N callers, M>N ready tasks: everyone wins a DISTINCT task.
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
 	const n = 4
@@ -1811,7 +1811,7 @@ func TestNextTaskRaceDistinctWinners(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			tk, _, err := st.NextTask("", fmt.Sprintf("agent-%d", i))
+			tk, _, err := st.NextTask("", "", fmt.Sprintf("agent-%d", i))
 			results[i] = result{task: tk, err: err}
 		}(i)
 	}
@@ -1831,7 +1831,7 @@ func TestNextTaskRaceDistinctWinners(t *testing.T) {
 
 	// N callers, 1 ready task: exactly one winner, the rest ErrNotFound.
 	st2 := openTestStore(t)
-	if _, _, err := st2.CreateProject("web", "Web"); err != nil {
+	if _, _, err := st2.CreateProject("web", "Web", ""); err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
 	nextTaskMk(t, st2, "web", "only one", 2, "")
@@ -1843,7 +1843,7 @@ func TestNextTaskRaceDistinctWinners(t *testing.T) {
 		go func(i int) {
 			defer wg2.Done()
 			<-start2
-			tk, _, err := st2.NextTask("", fmt.Sprintf("agent-%d", i))
+			tk, _, err := st2.NextTask("", "", fmt.Sprintf("agent-%d", i))
 			results2[i] = result{task: tk, err: err}
 		}(i)
 	}
@@ -1868,7 +1868,7 @@ func TestNextTaskRaceDistinctWinners(t *testing.T) {
 
 func TestNextTaskEmptyAgentValidation(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.NextTask("", ""); !errors.Is(err, ErrValidation) {
+	if _, _, err := st.NextTask("", "", ""); !errors.Is(err, ErrValidation) {
 		t.Fatalf("NextTask empty agent err = %v, want ErrValidation", err)
 	}
 }
@@ -1877,10 +1877,10 @@ func TestNextTaskEmptyAgentValidation(t *testing.T) {
 
 func TestListTasksQueryFilter(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := st.CreateProject("api", "API"); err != nil {
+	if _, _, err := st.CreateProject("api", "API", ""); err != nil {
 		t.Fatal(err)
 	}
 	titleHit, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Fix login page"})
@@ -1955,7 +1955,7 @@ func TestListTasksQueryFilter(t *testing.T) {
 
 func TestListTasksQueryEscapesLikeWildcards(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
 		t.Fatal(err)
 	}
 	for _, title := range []string{"100% done", "100 done", "a_b", "axb", `back\slash`} {
@@ -2197,7 +2197,486 @@ func TestTaskLabelsTableExistsOnReopenedDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != 3 {
-		t.Fatalf("schema_version = %d, want 3 (labels need no migration)", v)
+	if v != currentSchemaVersion {
+		t.Fatalf("schema_version = %d, want %d (labels need no migration)", v, currentSchemaVersion)
+	}
+}
+
+// ===================== Phase O: categories, stable ids, vault binding =====================
+
+func TestCreateCategory(t *testing.T) {
+	st := openTestStore(t)
+
+	// Slug is trimmed + lowercased; name defaults to slug.
+	c, ev, err := st.CreateCategory("  Work ", "")
+	if err != nil {
+		t.Fatalf("CreateCategory: %v", err)
+	}
+	if c.Slug != "work" || c.Name != "work" {
+		t.Fatalf("category = %+v, want slug/name work", c)
+	}
+	if !uidRe("amc_").MatchString(c.UID) {
+		t.Fatalf("category uid = %q, want amc_<16 hex>", c.UID)
+	}
+	if ev == nil || ev.Kind != "category.created" {
+		t.Fatalf("event = %+v, want kind category.created", ev)
+	}
+	if ev.ProjectID != 0 {
+		t.Fatalf("category.created project_id = %d, want 0 (NULL)", ev.ProjectID)
+	}
+
+	// Duplicate slug → ErrConflict (case-insensitive via lowercasing).
+	if _, _, err := st.CreateCategory("WORK", "Work"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("dup category err = %v, want ErrConflict", err)
+	}
+	// Invalid slugs → ErrValidation.
+	for _, bad := range []string{"", "  ", "has space", "has/slash", "has\ttab"} {
+		if _, _, err := st.CreateCategory(bad, ""); !errors.Is(err, ErrValidation) {
+			t.Errorf("CreateCategory(%q) err = %v, want ErrValidation", bad, err)
+		}
+	}
+
+	// uids are distinct across categories.
+	c2, _, err := st.CreateCategory("personal", "Personal")
+	if err != nil {
+		t.Fatalf("CreateCategory personal: %v", err)
+	}
+	if c2.UID == c.UID {
+		t.Fatalf("uid collision: %q", c.UID)
+	}
+
+	// ListCategories: ordered by id, default category first (seeded by v4).
+	cs, err := st.ListCategories(false)
+	if err != nil {
+		t.Fatalf("ListCategories: %v", err)
+	}
+	if len(cs) != 3 || cs[0].Slug != "general" || cs[1].Slug != "work" || cs[2].Slug != "personal" {
+		t.Fatalf("ListCategories = %+v, want [general work personal]", cs)
+	}
+}
+
+func TestArchiveUnarchiveCategory(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateCategory("work", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	c, ev, err := st.ArchiveCategory("work", "tester")
+	if err != nil {
+		t.Fatalf("ArchiveCategory: %v", err)
+	}
+	if c.ArchivedAt == "" || ev == nil || ev.Kind != "category.archived" {
+		t.Fatalf("archive = %+v ev=%+v, want archived_at set + category.archived", c, ev)
+	}
+	// Idempotent re-archive: success, no event.
+	c2, ev2, err := st.ArchiveCategory("work", "tester")
+	if err != nil || ev2 != nil || c2.ArchivedAt == "" {
+		t.Fatalf("re-archive = %+v ev=%+v err=%v, want idempotent no-event", c2, ev2, err)
+	}
+
+	// Hidden from the default list, visible with includeArchived.
+	cs, _ := st.ListCategories(false)
+	for _, cat := range cs {
+		if cat.Slug == "work" {
+			t.Fatal("archived category in default ListCategories")
+		}
+	}
+	all, _ := st.ListCategories(true)
+	found := false
+	for _, cat := range all {
+		if cat.Slug == "work" && cat.ArchivedAt != "" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("archived category missing from ListCategories(true)")
+	}
+
+	u, ev3, err := st.UnarchiveCategory("work", "tester")
+	if err != nil || ev3 == nil || ev3.Kind != "category.unarchived" || u.ArchivedAt != "" {
+		t.Fatalf("unarchive = %+v ev=%+v err=%v, want cleared + category.unarchived", u, ev3, err)
+	}
+	// Idempotent re-unarchive: success, no event.
+	if _, ev4, err := st.UnarchiveCategory("work", "tester"); err != nil || ev4 != nil {
+		t.Fatalf("re-unarchive ev=%+v err=%v, want idempotent no-event", ev4, err)
+	}
+
+	// Unknown slug → ErrNotFound.
+	if _, _, err := st.ArchiveCategory("nosuch", "t"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("archive nosuch err = %v, want ErrNotFound", err)
+	}
+	if _, _, err := st.UnarchiveCategory("nosuch", "t"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unarchive nosuch err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestCreateProjectWithCategory(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateCategory("work", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Explicit category resolves.
+	p, _, err := st.CreateProject("pentest", "Pentest X", "work")
+	if err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	if p.Category != "work" {
+		t.Fatalf("project category = %q, want work", p.Category)
+	}
+	if !uidRe("amp_").MatchString(p.UID) {
+		t.Fatalf("project uid = %q, want amp_<16 hex>", p.UID)
+	}
+
+	// Empty category defaults to general.
+	pg, _, err := st.CreateProject("misc", "", "")
+	if err != nil {
+		t.Fatalf("CreateProject default category: %v", err)
+	}
+	if pg.Category != "general" {
+		t.Fatalf("default category = %q, want general", pg.Category)
+	}
+
+	// Unknown category → ErrNotFound.
+	if _, _, err := st.CreateProject("x", "", "nosuch"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown category err = %v, want ErrNotFound", err)
+	}
+
+	// Archived category → ErrCategoryArchived.
+	if _, _, err := st.ArchiveCategory("work", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateProject("y", "", "work"); !errors.Is(err, ErrCategoryArchived) {
+		t.Fatalf("archived category err = %v, want ErrCategoryArchived", err)
+	}
+
+	// Slugs are globally unique across categories.
+	if _, _, err := st.CreateProject("pentest", "", ""); !errors.Is(err, ErrConflict) {
+		t.Fatalf("dup slug across categories err = %v, want ErrConflict", err)
+	}
+}
+
+func TestPatchProject(t *testing.T) {
+	st := openTestStore(t)
+	p, _, err := st.CreateProject("web", "Web", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateProject("api", "API", ""); err != nil {
+		t.Fatal(err)
+	}
+	tk, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "T"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Slug rename: uid unchanged, project.patched delta, old slug gone.
+	p2, ev, err := st.PatchProject("web", map[string]any{"slug": "frontend"}, "tester")
+	if err != nil {
+		t.Fatalf("PatchProject slug: %v", err)
+	}
+	if p2.Slug != "frontend" || p2.UID != p.UID {
+		t.Fatalf("patched = slug %q uid %q, want frontend + unchanged uid %q", p2.Slug, p2.UID, p.UID)
+	}
+	if ev == nil || ev.Kind != "project.patched" || !strings.Contains(string(ev.Data), `"slug":["web","frontend"]`) {
+		t.Fatalf("event = %+v, want project.patched with slug delta", ev)
+	}
+	if _, _, err := st.PatchProject("web", map[string]any{"name": "x"}, "t"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("patch old slug err = %v, want ErrNotFound", err)
+	}
+	// Task refs keep working via the new slug.
+	if got, err := st.GetTask(tk.ID); err != nil || got.Project != "frontend" {
+		t.Fatalf("task project after rename = %v err=%v, want frontend", got, err)
+	}
+
+	// Rename onto an existing slug → ErrConflict; invalid slug → ErrValidation.
+	if _, _, err := st.PatchProject("frontend", map[string]any{"slug": "api"}, "t"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("dup rename err = %v, want ErrConflict", err)
+	}
+	if _, _, err := st.PatchProject("frontend", map[string]any{"slug": "has space"}, "t"); !errors.Is(err, ErrValidation) {
+		t.Fatalf("invalid rename err = %v, want ErrValidation", err)
+	}
+	if _, _, err := st.PatchProject("frontend", map[string]any{"name": " "}, "t"); !errors.Is(err, ErrValidation) {
+		t.Fatalf("blank name err = %v, want ErrValidation", err)
+	}
+
+	// Vault fields: set, then clear with empty strings.
+	p3, ev3, err := st.PatchProject("frontend",
+		map[string]any{"vault_project_id": "p_123", "vault_path": "/vault/frontend"}, "tester")
+	if err != nil || ev3 == nil {
+		t.Fatalf("vault patch = %v ev=%v, want event", err, ev3)
+	}
+	if p3.VaultProjectID != "p_123" || p3.VaultPath != "/vault/frontend" {
+		t.Fatalf("vault fields = %q/%q, want p_123 //vault/frontend", p3.VaultProjectID, p3.VaultPath)
+	}
+	p4, _, err := st.PatchProject("frontend", map[string]any{"vault_project_id": "", "vault_path": ""}, "tester")
+	if err != nil || p4.VaultProjectID != "" || p4.VaultPath != "" {
+		t.Fatalf("vault clear = %+v err=%v, want empty fields", p4, err)
+	}
+
+	// No-op patch: idempotent success, no event. uid/category are ignored keys.
+	p5, ev5, err := st.PatchProject("frontend",
+		map[string]any{"slug": "frontend", "uid": "amp_hacked", "category_id": 99}, "tester")
+	if err != nil || ev5 != nil {
+		t.Fatalf("no-op patch ev=%+v err=%v, want no event", ev5, err)
+	}
+	if p5.UID != p.UID {
+		t.Fatalf("uid changed by patch: %q → %q", p.UID, p5.UID)
+	}
+}
+
+func TestCategoryArchiveCascade(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateCategory("work", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateProject("pentest", "", "work"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateProject("misc", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	tk, _, err := st.CreateTask(CreateTaskInput{Project: "pentest", Title: "hidden later"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.ArchiveCategory("work", "tester"); err != nil {
+		t.Fatal(err)
+	}
+
+	// ListProjects default hides the archived category's projects…
+	ps, err := st.ListProjects(false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ps) != 1 || ps[0].Slug != "misc" {
+		t.Fatalf("default ListProjects = %+v, want only misc", ps)
+	}
+	// …includeArchived shows them…
+	all, err := st.ListProjects(true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("ListProjects(true) = %+v, want 2", all)
+	}
+	// …and an explicit category scope keeps them inspectable.
+	scoped, err := st.ListProjects(false, "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scoped) != 1 || scoped[0].Slug != "pentest" {
+		t.Fatalf("ListProjects(false, work) = %+v, want pentest", scoped)
+	}
+
+	// ListTasks default hides the cascade; explicit category still returns.
+	ts, err := st.ListTasks(TaskFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, x := range ts {
+		if x.ID == tk.ID {
+			t.Fatal("task under archived category leaked into default ListTasks")
+		}
+	}
+	scopedTasks, err := st.ListTasks(TaskFilter{Category: "work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scopedTasks) != 1 || scopedTasks[0].ID != tk.ID {
+		t.Fatalf("ListTasks(Category:work) = %+v, want the hidden task", scopedTasks)
+	}
+
+	// Default event feed hides events from projects in archived categories.
+	evs, _, err := st.ListEvents(0, "", 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, _ := st.projectID("pentest")
+	for _, e := range evs {
+		if e.ProjectID == pid {
+			t.Fatalf("default feed leaked event %s from archived-category project", e.Kind)
+		}
+	}
+	// Explicit ?project= still returns them (unchanged branch).
+	pevs, _, err := st.ListEvents(0, "pentest", 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pevs) == 0 {
+		t.Fatal("explicit project feed returned nothing for archived-category project")
+	}
+}
+
+func TestListTasksCategoryFilterComposes(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateCategory("work", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateProject("wproj", "", "work"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateProject("gproj", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	w1, _, err := st.CreateTask(CreateTaskInput{Project: "wproj", Title: "fix login"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w2, _, err := st.CreateTask(CreateTaskInput{Project: "wproj", Title: "blocked one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddDep(w2.ID, w1.ID, "t"); err != nil {
+		t.Fatal(err)
+	}
+	g1, _, err := st.CreateTask(CreateTaskInput{Project: "gproj", Title: "fix login too"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddLabel(w1.ID, "bug", "t"); err != nil {
+		t.Fatal(err)
+	}
+
+	ids := func(ts []Task) map[int64]bool {
+		m := map[int64]bool{}
+		for _, x := range ts {
+			m[x.ID] = true
+		}
+		return m
+	}
+
+	// Category alone: only work tasks.
+	got, err := st.ListTasks(TaskFilter{Category: "work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := ids(got); len(m) != 2 || !m[w1.ID] || !m[w2.ID] {
+		t.Fatalf("Category=work = %+v, want w1+w2", got)
+	}
+	// + Status.
+	got, _ = st.ListTasks(TaskFilter{Category: "work", Status: "todo"})
+	if m := ids(got); len(m) != 2 {
+		t.Fatalf("Category+Status = %+v, want 2", got)
+	}
+	// + Ready (w2 is blocked).
+	got, _ = st.ListTasks(TaskFilter{Category: "work", Ready: true})
+	if m := ids(got); len(m) != 1 || !m[w1.ID] {
+		t.Fatalf("Category+Ready = %+v, want only w1", got)
+	}
+	// + Blocked.
+	got, _ = st.ListTasks(TaskFilter{Category: "work", Blocked: true})
+	if m := ids(got); len(m) != 1 || !m[w2.ID] {
+		t.Fatalf("Category+Blocked = %+v, want only w2", got)
+	}
+	// + Label.
+	got, _ = st.ListTasks(TaskFilter{Category: "work", Label: "bug"})
+	if m := ids(got); len(m) != 1 || !m[w1.ID] {
+		t.Fatalf("Category+Label = %+v, want only w1", got)
+	}
+	// + Query: "fix login" matches tasks in both categories; the filter narrows to work.
+	got, _ = st.ListTasks(TaskFilter{Category: "work", Query: "fix login"})
+	if m := ids(got); len(m) != 1 || !m[w1.ID] || m[g1.ID] {
+		t.Fatalf("Category+Query = %+v, want only w1", got)
+	}
+	// + Project (consistent pair narrows; mismatched pair is empty).
+	got, _ = st.ListTasks(TaskFilter{Category: "work", Project: "wproj"})
+	if m := ids(got); len(m) != 2 {
+		t.Fatalf("Category+Project = %+v, want 2", got)
+	}
+	got, _ = st.ListTasks(TaskFilter{Category: "work", Project: "gproj"})
+	if len(got) != 0 {
+		t.Fatalf("mismatched Category+Project = %+v, want empty", got)
+	}
+	// + Stale: claim w1 then backdate it.
+	if _, _, err := st.ClaimTask(w1.ID, "agent-a"); err != nil {
+		t.Fatal(err)
+	}
+	backdateTask(t, st, w1.ID)
+	got, _ = st.ListTasks(TaskFilter{Category: "work", Stale: time.Hour})
+	if m := ids(got); len(m) != 1 || !m[w1.ID] {
+		t.Fatalf("Category+Stale = %+v, want only w1", got)
+	}
+	// Unknown category slug: no rows (it's a plain equality filter).
+	got, _ = st.ListTasks(TaskFilter{Category: "nosuch"})
+	if len(got) != 0 {
+		t.Fatalf("Category=nosuch = %+v, want empty", got)
+	}
+}
+
+func TestNextTaskCategoryScoping(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateCategory("work", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateCategory("personal", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateProject("wproj", "", "work"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateProject("pproj", "", "personal"); err != nil {
+		t.Fatal(err)
+	}
+	// Higher-priority ready task in WORK; the personal-scoped pick must skip it
+	// (acceptance sketch 3).
+	if _, _, err := st.CreateTask(CreateTaskInput{Project: "wproj", Title: "urgent work", Priority: 0}); err != nil {
+		t.Fatal(err)
+	}
+	p1, _, err := st.CreateTask(CreateTaskInput{Project: "pproj", Title: "personal one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, _, err := st.CreateTask(CreateTaskInput{Project: "pproj", Title: "personal two"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tk, _, err := st.NextTask("", "personal", "agent-a")
+	if err != nil {
+		t.Fatalf("NextTask(personal): %v", err)
+	}
+	if tk.ID != p1.ID {
+		t.Fatalf("NextTask(personal) picked #%d, want #%d (never the work task)", tk.ID, p1.ID)
+	}
+	// Sequential pickers get distinct in-scope tasks.
+	tk2, _, err := st.NextTask("", "personal", "agent-b")
+	if err != nil {
+		t.Fatalf("second NextTask(personal): %v", err)
+	}
+	if tk2.ID != p2.ID {
+		t.Fatalf("second pick = #%d, want #%d", tk2.ID, p2.ID)
+	}
+	// Scope drained → ErrNotFound even though work still has a ready task.
+	if _, _, err := st.NextTask("", "personal", "agent-c"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("drained scope err = %v, want ErrNotFound", err)
+	}
+	// Bad category slug → ErrNotFound.
+	if _, _, err := st.NextTask("", "nosuch", "agent-d"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("bad category err = %v, want ErrNotFound", err)
+	}
+
+	// Archived category is excluded UNCONDITIONALLY (even unscoped).
+	if _, _, err := st.ArchiveCategory("work", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.NextTask("", "", "agent-e"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unscoped next with only archived-category work err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestCreateTaskArchivedCategory(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateCategory("work", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateProject("wproj", "", "work"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.ArchiveCategory("work", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateTask(CreateTaskInput{Project: "wproj", Title: "nope"}); !errors.Is(err, ErrCategoryArchived) {
+		t.Fatalf("create task under archived category err = %v, want ErrCategoryArchived", err)
 	}
 }

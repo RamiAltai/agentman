@@ -809,7 +809,8 @@ function onEvent(ev) {
   if (fe) fe.remove();
   $("feedList").prepend(feedItem(ev));
   trimFeed();
-  if (ev.kind === "project.created" || ev.kind === "project.unarchived") loadProjects().catch(() => {});
+  if (ev.kind === "project.created" || ev.kind === "project.unarchived" ||
+      ev.kind === "category.archived" || ev.kind === "category.unarchived") loadProjects().catch(() => {});
   if (ev.kind === "project.archived") {
     const archivedSlug = (ev.data || {}).slug;
     if (selected.has(archivedSlug)) {
@@ -924,6 +925,11 @@ function evText(ev) {
     case "project.created": span.append(who, " created project ", el("b", {}, d.slug || "")); break;
     case "project.archived": span.append(who, " archived project ", el("b", {}, d.slug || "")); break;
     case "project.unarchived": span.append(who, " unarchived project ", el("b", {}, d.slug || "")); break;
+    // category.* events carry no project/task ref, so the default branch would
+    // render a literal "null" ref — they need explicit cases.
+    case "category.created": span.append(who, " created category ", el("b", {}, d.slug || "")); break;
+    case "category.archived": span.append(who, " archived category ", el("b", {}, d.slug || "")); break;
+    case "category.unarchived": span.append(who, " unarchived category ", el("b", {}, d.slug || "")); break;
     case "task.deleted": span.append(who, " deleted ", ref || document.createTextNode("#" + ev.task_id)); break;
     case "comment.deleted": span.append(who, " deleted a comment on ", ref || document.createTextNode("#" + ev.task_id)); break;
     case "project.deleted": span.append(who, " deleted project ", el("b", {}, d.slug || "")); break;
@@ -951,6 +957,9 @@ function describeText(ev) {
     case "project.created": return `${who} created project ${d.slug || ""}`;
     case "project.archived": return `${who} archived project ${d.slug || ""}`;
     case "project.unarchived": return `${who} unarchived project ${d.slug || ""}`;
+    case "category.created": return `${who} created category ${d.slug || ""}`;
+    case "category.archived": return `${who} archived category ${d.slug || ""}`;
+    case "category.unarchived": return `${who} unarchived category ${d.slug || ""}`;
     case "task.deleted": return `${who} deleted task`;
     case "comment.deleted": return `${who} deleted a comment on ${t}`;
     case "project.deleted": return `${who} deleted project ${d.slug || ""}`;

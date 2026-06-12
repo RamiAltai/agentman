@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -690,5 +691,219 @@ func TestCmdLabelUsage(t *testing.T) {
 	})
 	if code != 5 || !strings.Contains(msg, "-p is a global flag") {
 		t.Fatalf("-p exit = %d, stderr = %q, want 5 with global flag message", code, msg)
+	}
+}
+
+// ---------- Phase O: category CLI ----------
+
+func TestCmdCategoryVerbs(t *testing.T) {
+	ts := newTestServer(t)
+	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+
+	// am category new prints only the slug.
+	out := captureStdout(t, func() {
+		cmdCategory(c, parse([]string{"new", "work", "Work"}))
+	})
+	if strings.TrimSpace(out) != "work" {
+		t.Fatalf("category new stdout = %q, want work", out)
+	}
+
+	// am categories --json includes the uid.
+	out = captureStdout(t, func() {
+		cmdCategories(c, parse([]string{"--json"}))
+	})
+	if !strings.Contains(out, `"uid":"amc_`) {
+		t.Fatalf("categories --json = %q, want amc_ uid", out)
+	}
+
+	// archive/unarchive are silent successes.
+	out = captureStdout(t, func() {
+		cmdCategory(c, parse([]string{"archive", "work"}))
+	})
+	if strings.TrimSpace(out) != "" {
+		t.Fatalf("category archive stdout = %q, want empty", out)
+	}
+	out = captureStdout(t, func() {
+		cmdCategory(c, parse([]string{"unarchive", "work"}))
+	})
+	if strings.TrimSpace(out) != "" {
+		t.Fatalf("category unarchive stdout = %q, want empty", out)
+	}
+
+	// Usage errors exit 1.
+	code := captureExit(t, func() { cmdCategory(c, parse([]string{"new"})) })
+	if code != 1 {
+		t.Fatalf("category new (no slug) exit = %d, want 1", code)
+	}
+	code = captureExit(t, func() { cmdCategory(c, parse([]string{"bogus"})) })
+	if code != 1 {
+		t.Fatalf("category bogus exit = %d, want 1", code)
+	}
+}
+
+func TestCmdProjectNewRequiresCategory(t *testing.T) {
+	ts := newTestServer(t)
+	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+
+	// Without -c and without AGENTMAN_CATEGORY → exit 5.
+	t.Setenv("AGENTMAN_CATEGORY", "")
+	var code int
+	msg := captureStderr(t, func() {
+		code = captureExit(t, func() {
+			cmdProject(c, parse([]string{"new", "pslug"}))
+		})
+	})
+	if code != 5 {
+		t.Fatalf("project new without category exit = %d, want 5", code)
+	}
+	if !strings.Contains(msg, "AGENTMAN_CATEGORY") {
+		t.Fatalf("stderr = %q, want hint about AGENTMAN_CATEGORY", msg)
+	}
+
+	// With AGENTMAN_CATEGORY set it succeeds and prints the slug.
+	t.Setenv("AGENTMAN_CATEGORY", "general")
+	out := captureStdout(t, func() {
+		cmdProject(c, parse([]string{"new", "pslug"}))
+	})
+	if strings.TrimSpace(out) != "pslug" {
+		t.Fatalf("project new stdout = %q, want pslug", out)
+	}
+
+	// With an explicit -c flag.
+	mustCreateCategory(t, ts, "work")
+	out = captureStdout(t, func() {
+		cmdProject(c, parse([]string{"new", "wproj", "-c", "work"}))
+	})
+	if strings.TrimSpace(out) != "wproj" {
+		t.Fatalf("project new -c stdout = %q, want wproj", out)
+	}
+}
+
+func TestCmdProjectEdit(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+
+	// Silent success for rename + vault binding.
+	out := captureStdout(t, func() {
+		cmdProject(c, parse([]string{"edit", "web", "--slug", "frontend", "--vault-id", "p_7", "--vault-path", "/v/x"}))
+	})
+	if strings.TrimSpace(out) != "" {
+		t.Fatalf("project edit stdout = %q, want empty", out)
+	}
+	resp := do(t, ts, http.MethodGet, "/api/projects", "", nil)
+	defer resp.Body.Close()
+	var ps []Project
+	if err := json.NewDecoder(resp.Body).Decode(&ps); err != nil {
+		t.Fatalf("decode projects: %v", err)
+	}
+	if len(ps) != 1 || ps[0].Slug != "frontend" || ps[0].VaultProjectID != "p_7" || ps[0].VaultPath != "/v/x" {
+		t.Fatalf("project after edit = %+v", ps)
+	}
+
+	// Clearing a vault field with an explicit empty value works (ok-form flags).
+	captureStdout(t, func() {
+		cmdProject(c, parse([]string{"edit", "frontend", "--vault-path="}))
+	})
+	resp2 := do(t, ts, http.MethodGet, "/api/projects", "", nil)
+	defer resp2.Body.Close()
+	ps = nil
+	json.NewDecoder(resp2.Body).Decode(&ps)
+	if ps[0].VaultPath != "" {
+		t.Fatalf("vault_path after clear = %q, want empty", ps[0].VaultPath)
+	}
+
+	// Nothing to change → exit 1.
+	code := captureExit(t, func() { cmdProject(c, parse([]string{"edit", "frontend"})) })
+	if code != 1 {
+		t.Fatalf("project edit (no flags) exit = %d, want 1", code)
+	}
+}
+
+func TestCmdLsCategoryWireFormat(t *testing.T) {
+	var lsQuery string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		lsQuery = r.URL.RawQuery
+		w.Write([]byte("[]"))
+	}))
+	t.Cleanup(stub.Close)
+	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+
+	captureStdout(t, func() { cmdLs(c, parse([]string{"-c", "work"})) })
+	if !strings.Contains(lsQuery, "category=work") {
+		t.Fatalf("ls query = %q, want category=work (short -c)", lsQuery)
+	}
+
+	// AGENTMAN_CATEGORY is the fallback; --all suppresses the scope.
+	t.Setenv("AGENTMAN_CATEGORY", "personal")
+	captureStdout(t, func() { cmdLs(c, parse([]string{})) })
+	if !strings.Contains(lsQuery, "category=personal") {
+		t.Fatalf("ls query = %q, want category=personal from env", lsQuery)
+	}
+	captureStdout(t, func() { cmdLs(c, parse([]string{"--all"})) })
+	if strings.Contains(lsQuery, "category=") {
+		t.Fatalf("ls --all query = %q, want no category scope", lsQuery)
+	}
+}
+
+func TestCmdNextCategory(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateCategory(t, ts, "work")
+	t.Setenv("AGENTMAN_AGENT", "tester")
+	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+
+	// No ready task in the category → exit 3.
+	code := captureExit(t, func() {
+		cmdNext(c, parse([]string{"-c", "work"}))
+	})
+	if code != 3 {
+		t.Fatalf("next -c work (none ready) exit = %d, want 3", code)
+	}
+
+	// Bogus category slug → also exit 3 (the server can't tell them apart).
+	code = captureExit(t, func() {
+		cmdNext(c, parse([]string{"-c", "bogus"}))
+	})
+	if code != 3 {
+		t.Fatalf("next -c bogus exit = %d, want 3", code)
+	}
+
+	// A ready task in scope is picked and its id printed.
+	r := do(t, ts, http.MethodPost, "/api/projects", `{"slug":"wproj","category":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	want := mustCreateTask(t, ts, "wproj", "Pick Me")
+	out := captureStdout(t, func() {
+		cmdNext(c, parse([]string{"-c", "work"}))
+	})
+	if strings.TrimSpace(out) != want {
+		t.Fatalf("next -c work stdout = %q, want %q", out, want)
+	}
+}
+
+// Regression: `am show <id> -c` still means --comments after -c became the
+// global category flag (main.go rewrites the token for show only).
+func TestCmdShowDashCStillPrintsComments(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "showproj")
+	id := mustCreateTask(t, ts, "showproj", "Has Comment")
+	r := do(t, ts, http.MethodPost, "/api/tasks/"+id+"/comments", `{"body":"the comment body"}`,
+		map[string]string{"Content-Type": "application/json", "X-Agent": "alice"})
+	r.Body.Close()
+
+	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	out := captureStdout(t, func() {
+		cmdShow(c, parse(rewriteShowComments([]string{id, "-c"})))
+	})
+	if !strings.Contains(out, "the comment body") {
+		t.Fatalf("show -c output missing comment:\n%s", out)
+	}
+}
+
+func TestRewriteShowComments(t *testing.T) {
+	got := rewriteShowComments([]string{"12", "-c", "--json"})
+	if got[0] != "12" || got[1] != "--comments" || got[2] != "--json" {
+		t.Fatalf("rewriteShowComments = %v", got)
 	}
 }

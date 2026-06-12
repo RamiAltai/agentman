@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/rand"
 	"database/sql"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,10 +22,11 @@ var schemaSQL string
 
 // Sentinel errors mapped to HTTP status / CLI exit codes by callers.
 var (
-	ErrNotFound        = errors.New("not_found")
-	ErrConflict        = errors.New("conflict")
-	ErrValidation      = errors.New("validation")
-	ErrProjectArchived = errors.New("project_archived")
+	ErrNotFound         = errors.New("not_found")
+	ErrConflict         = errors.New("conflict")
+	ErrValidation       = errors.New("validation")
+	ErrProjectArchived  = errors.New("project_archived")
+	ErrCategoryArchived = errors.New("category_archived")
 )
 
 // ConflictError carries the current owner of a task that lost a claim race.
@@ -47,13 +50,27 @@ var validStatus = map[string]bool{"todo": true, "doing": true, "blocked": true, 
 
 // ---------- types ----------
 
+// Category is the layer above projects (instance → category → project → task).
+type Category struct {
+	ID         int64  `json:"id"`
+	UID        string `json:"uid"` // stable id, amc_<16 hex>, never changes
+	Slug       string `json:"slug"`
+	Name       string `json:"name"`
+	CreatedAt  string `json:"created_at"`
+	ArchivedAt string `json:"archived_at,omitempty"`
+}
+
 type Project struct {
-	ID         int64          `json:"id"`
-	Slug       string         `json:"slug"`
-	Name       string         `json:"name"`
-	CreatedAt  string         `json:"created_at"`
-	ArchivedAt string         `json:"archived_at,omitempty"`
-	Counts     map[string]int `json:"counts,omitempty"`
+	ID             int64          `json:"id"`
+	UID            string         `json:"uid"` // stable id, amp_<16 hex>, never changes
+	Slug           string         `json:"slug"`
+	Name           string         `json:"name"`
+	Category       string         `json:"category"` // category slug
+	CreatedAt      string         `json:"created_at"`
+	ArchivedAt     string         `json:"archived_at,omitempty"`
+	VaultProjectID string         `json:"vault_project_id,omitempty"`
+	VaultPath      string         `json:"vault_path,omitempty"`
+	Counts         map[string]int `json:"counts,omitempty"`
 }
 
 // DepRef is a lightweight reference to a task used in dependency lists.
@@ -108,6 +125,7 @@ type Event struct {
 
 type TaskFilter struct {
 	Project  string
+	Category string // category slug; composes with Project and every other filter
 	Status   string
 	Assignee string
 	Query    string // substring match on title OR body (LIKE, ASCII-case-insensitive)
@@ -147,7 +165,7 @@ func OpenStore(path string) (*Store, error) {
 // currentSchemaVersion is the version OpenStore migrates to. schema.sql seeds a
 // fresh DB at version 1; runMigrations applies any steps with version > the DB's
 // recorded version to reach this target.
-const currentSchemaVersion = 3
+const currentSchemaVersion = 4
 
 // migration is one forward-only, idempotent step. apply runs inside the same tx
 // that bumps meta.schema_version, so a step + its version bump commit atomically.
@@ -168,6 +186,64 @@ var schemaMigrations = []migration{
 	{version: 3, apply: func(tx *sql.Tx) error {
 		_, err := tx.Exec("ALTER TABLE tasks ADD COLUMN claimed_at TEXT")
 		return err
+	}},
+	// v4: category layer + stable ids + vault binding. The categories table
+	// itself comes from schema.sql (CREATE TABLE IF NOT EXISTS runs before
+	// migrations on both fresh and existing DBs); this step extends projects,
+	// seeds the default category, and backfills.
+	{version: 4, apply: func(tx *sql.Tx) error {
+		// category_id is added WITHOUT NOT NULL: SQLite's ADD COLUMN cannot add
+		// a NOT NULL column unless it has a non-NULL constant default, which is
+		// wrong for an FK. The NOT NULL invariant is enforced by the app instead
+		// (CreateProject always sets it; the UPDATE below backfills old rows).
+		// UNIQUE is likewise not allowed in ADD COLUMN, hence the uid index.
+		for _, q := range []string{
+			"ALTER TABLE projects ADD COLUMN category_id INTEGER REFERENCES categories(id)",
+			"ALTER TABLE projects ADD COLUMN uid TEXT",
+			"ALTER TABLE projects ADD COLUMN vault_project_id TEXT",
+			"ALTER TABLE projects ADD COLUMN vault_path TEXT",
+			"CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_uid ON projects(uid)",
+			"CREATE INDEX IF NOT EXISTS idx_projects_category ON projects(category_id)",
+		} {
+			if _, err := tx.Exec(q); err != nil {
+				return err
+			}
+		}
+		// Default category, created unconditionally so fresh installs have one.
+		if _, err := tx.Exec(
+			"INSERT INTO categories(uid,slug,name) SELECT ?, 'general', 'General' "+
+				"WHERE NOT EXISTS (SELECT 1 FROM categories WHERE slug='general')",
+			newUID("amc_")); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(
+			"UPDATE projects SET category_id=(SELECT id FROM categories WHERE slug='general') WHERE category_id IS NULL"); err != nil {
+			return err
+		}
+		// Backfill stable ids row by row — each project needs a distinct uid.
+		rows, err := tx.Query("SELECT id FROM projects WHERE uid IS NULL")
+		if err != nil {
+			return err
+		}
+		var ids []int64
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return err
+			}
+			ids = append(ids, id)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, id := range ids {
+			if _, err := tx.Exec("UPDATE projects SET uid=? WHERE id=?", newUID("amp_"), id); err != nil {
+				return err
+			}
+		}
+		return nil
 	}},
 }
 
@@ -261,20 +337,186 @@ func (s *Store) resolveTaskID(ref string) (int64, error) {
 	return id, err
 }
 
+// ---------- categories ----------
+
+// CreateCategory creates a category. The slug is trimmed and lowercased (it is
+// the canonical handle the `?category=` filters compare against); name defaults
+// to the slug.
+func (s *Store) CreateCategory(slug, name string) (*Category, *Event, error) {
+	slug = strings.ToLower(strings.TrimSpace(slug))
+	if slug == "" || strings.ContainsAny(slug, " /\t") {
+		return nil, nil, ErrValidation
+	}
+	if name == "" {
+		name = slug
+	}
+	var exists int
+	s.db.QueryRow("SELECT 1 FROM categories WHERE slug=?", slug).Scan(&exists)
+	if exists == 1 {
+		return nil, nil, ErrConflict
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	var id int64
+	for attempt := 0; ; attempt++ {
+		res, err := tx.Exec("INSERT INTO categories(uid,slug,name) VALUES(?,?,?)", newUID("amc_"), slug, name)
+		if isUniqueErr(err, "categories.uid") && attempt < 2 {
+			continue // astronomically unlikely uid collision — retry with a fresh uid
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		id, _ = res.LastInsertId()
+		break
+	}
+	// Category events carry no project_id (projectID 0 → NULL in insertEvent).
+	ev, err := insertEvent(tx, 0, 0, "human", "category.created", map[string]any{"slug": slug})
+	if err != nil {
+		return nil, nil, err
+	}
+	var c Category
+	if err := tx.QueryRow("SELECT id,uid,slug,name,created_at FROM categories WHERE id=?", id).
+		Scan(&c.ID, &c.UID, &c.Slug, &c.Name, &c.CreatedAt); err != nil {
+		return nil, nil, err
+	}
+	return &c, ev, tx.Commit()
+}
+
+func (s *Store) ListCategories(includeArchived bool) ([]Category, error) {
+	q := "SELECT id, uid, slug, name, created_at, COALESCE(archived_at,'') FROM categories"
+	if !includeArchived {
+		q += " WHERE archived_at IS NULL"
+	}
+	q += " ORDER BY id"
+	rows, err := s.db.Query(q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Category{}
+	for rows.Next() {
+		var c Category
+		if err := rows.Scan(&c.ID, &c.UID, &c.Slug, &c.Name, &c.CreatedAt, &c.ArchivedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ArchiveCategory soft-archives a category (sets archived_at). Idempotent.
+func (s *Store) ArchiveCategory(slug, actor string) (*Category, *Event, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+
+	var c Category
+	var archivedAt string
+	err = tx.QueryRow("SELECT id, uid, slug, name, created_at, COALESCE(archived_at,'') FROM categories WHERE slug=?", slug).
+		Scan(&c.ID, &c.UID, &c.Slug, &c.Name, &c.CreatedAt, &archivedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if archivedAt != "" {
+		// Already archived — idempotent success, no event
+		c.ArchivedAt = archivedAt
+		return &c, nil, tx.Commit()
+	}
+	if _, err := tx.Exec(
+		"UPDATE categories SET archived_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?", c.ID); err != nil {
+		return nil, nil, err
+	}
+	ev, err := insertEvent(tx, 0, 0, actorOr(actor), "category.archived", map[string]any{"slug": slug})
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := tx.QueryRow("SELECT COALESCE(archived_at,'') FROM categories WHERE id=?", c.ID).Scan(&c.ArchivedAt); err != nil {
+		return nil, nil, err
+	}
+	return &c, ev, tx.Commit()
+}
+
+// UnarchiveCategory restores a category (clears archived_at). Idempotent.
+func (s *Store) UnarchiveCategory(slug, actor string) (*Category, *Event, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+
+	var c Category
+	var archivedAt string
+	err = tx.QueryRow("SELECT id, uid, slug, name, created_at, COALESCE(archived_at,'') FROM categories WHERE slug=?", slug).
+		Scan(&c.ID, &c.UID, &c.Slug, &c.Name, &c.CreatedAt, &archivedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if archivedAt == "" {
+		// Not archived — idempotent success, no event
+		return &c, nil, tx.Commit()
+	}
+	if _, err := tx.Exec("UPDATE categories SET archived_at=NULL WHERE id=?", c.ID); err != nil {
+		return nil, nil, err
+	}
+	ev, err := insertEvent(tx, 0, 0, actorOr(actor), "category.unarchived", map[string]any{"slug": slug})
+	if err != nil {
+		return nil, nil, err
+	}
+	c.ArchivedAt = "" // explicitly clear; was scanned into a local var, not c.ArchivedAt
+	return &c, ev, tx.Commit()
+}
+
+func (s *Store) categoryID(slug string) (int64, error) {
+	var id int64
+	err := s.db.QueryRow("SELECT id FROM categories WHERE slug=?", slug).Scan(&id)
+	if err == sql.ErrNoRows {
+		return 0, ErrNotFound
+	}
+	return id, err
+}
+
 // ---------- projects ----------
 
-func (s *Store) ListProjects(includeArchived bool) ([]Project, error) {
-	q := `SELECT p.id, p.slug, p.name, p.created_at, COALESCE(p.archived_at,''),
+// ListProjects lists projects with task counts. By default a project is hidden
+// when it OR its category is archived (cascade); an explicit category scope
+// drops the category-archived condition so an archived category's projects stay
+// inspectable (mirroring the ListTasks explicit-project rule).
+func (s *Store) ListProjects(includeArchived bool, category string) ([]Project, error) {
+	q := `SELECT p.id, p.uid, p.slug, p.name, c.slug, p.created_at, COALESCE(p.archived_at,''),
+	          COALESCE(p.vault_project_id,''), COALESCE(p.vault_path,''),
 	          COALESCE(SUM(t.status='todo'),0),
 	          COALESCE(SUM(t.status='doing'),0),
 	          COALESCE(SUM(t.status='blocked'),0),
 	          COALESCE(SUM(t.status='done'),0)
-	      FROM projects p LEFT JOIN tasks t ON t.project_id = p.id`
-	if !includeArchived {
-		q += " WHERE p.archived_at IS NULL"
+	      FROM projects p JOIN categories c ON c.id=p.category_id
+	      LEFT JOIN tasks t ON t.project_id = p.id`
+	var where []string
+	var args []any
+	if category != "" {
+		where = append(where, "c.slug=?")
+		args = append(args, category)
+		if !includeArchived {
+			where = append(where, "p.archived_at IS NULL")
+		}
+	} else if !includeArchived {
+		where = append(where, "p.archived_at IS NULL AND c.archived_at IS NULL")
+	}
+	if len(where) > 0 {
+		q += " WHERE " + strings.Join(where, " AND ")
 	}
 	q += " GROUP BY p.id ORDER BY p.id"
-	rows, err := s.db.Query(q)
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -283,8 +525,8 @@ func (s *Store) ListProjects(includeArchived bool) ([]Project, error) {
 	for rows.Next() {
 		var p Project
 		var todo, doing, blocked, done int
-		if err := rows.Scan(&p.ID, &p.Slug, &p.Name, &p.CreatedAt, &p.ArchivedAt,
-			&todo, &doing, &blocked, &done); err != nil {
+		if err := rows.Scan(&p.ID, &p.UID, &p.Slug, &p.Name, &p.Category, &p.CreatedAt, &p.ArchivedAt,
+			&p.VaultProjectID, &p.VaultPath, &todo, &doing, &blocked, &done); err != nil {
 			return nil, err
 		}
 		p.Counts = map[string]int{"todo": todo, "doing": doing, "blocked": blocked, "done": done}
@@ -301,10 +543,10 @@ func (s *Store) ArchiveProject(slug, actor string) (*Project, *Event, error) {
 	}
 	defer tx.Rollback()
 
-	var p Project
+	var id int64
 	var archivedAt string
-	err = tx.QueryRow("SELECT id, slug, name, created_at, COALESCE(archived_at,'') FROM projects WHERE slug=?", slug).
-		Scan(&p.ID, &p.Slug, &p.Name, &p.CreatedAt, &archivedAt)
+	err = tx.QueryRow("SELECT id, COALESCE(archived_at,'') FROM projects WHERE slug=?", slug).
+		Scan(&id, &archivedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil, ErrNotFound
 	}
@@ -313,21 +555,25 @@ func (s *Store) ArchiveProject(slug, actor string) (*Project, *Event, error) {
 	}
 	if archivedAt != "" {
 		// Already archived — idempotent success, no event
-		p.ArchivedAt = archivedAt
-		return &p, nil, tx.Commit()
+		p, err := getProjectTx(tx, id)
+		if err != nil {
+			return nil, nil, err
+		}
+		return p, nil, tx.Commit()
 	}
 	if _, err := tx.Exec(
-		"UPDATE projects SET archived_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?", p.ID); err != nil {
+		"UPDATE projects SET archived_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?", id); err != nil {
 		return nil, nil, err
 	}
-	ev, err := insertEvent(tx, p.ID, 0, actorOr(actor), "project.archived", map[string]any{"slug": slug})
+	ev, err := insertEvent(tx, id, 0, actorOr(actor), "project.archived", map[string]any{"slug": slug})
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := tx.QueryRow("SELECT COALESCE(archived_at,'') FROM projects WHERE id=?", p.ID).Scan(&p.ArchivedAt); err != nil {
+	p, err := getProjectTx(tx, id)
+	if err != nil {
 		return nil, nil, err
 	}
-	return &p, ev, tx.Commit()
+	return p, ev, tx.Commit()
 }
 
 // UnarchiveProject restores a project (clears archived_at). Idempotent.
@@ -338,10 +584,10 @@ func (s *Store) UnarchiveProject(slug, actor string) (*Project, *Event, error) {
 	}
 	defer tx.Rollback()
 
-	var p Project
+	var id int64
 	var archivedAt string
-	err = tx.QueryRow("SELECT id, slug, name, created_at, COALESCE(archived_at,'') FROM projects WHERE slug=?", slug).
-		Scan(&p.ID, &p.Slug, &p.Name, &p.CreatedAt, &archivedAt)
+	err = tx.QueryRow("SELECT id, COALESCE(archived_at,'') FROM projects WHERE slug=?", slug).
+		Scan(&id, &archivedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil, ErrNotFound
 	}
@@ -350,26 +596,52 @@ func (s *Store) UnarchiveProject(slug, actor string) (*Project, *Event, error) {
 	}
 	if archivedAt == "" {
 		// Not archived — idempotent success, no event
-		return &p, nil, tx.Commit()
+		p, err := getProjectTx(tx, id)
+		if err != nil {
+			return nil, nil, err
+		}
+		return p, nil, tx.Commit()
 	}
-	if _, err := tx.Exec("UPDATE projects SET archived_at=NULL WHERE id=?", p.ID); err != nil {
+	if _, err := tx.Exec("UPDATE projects SET archived_at=NULL WHERE id=?", id); err != nil {
 		return nil, nil, err
 	}
-	ev, err := insertEvent(tx, p.ID, 0, actorOr(actor), "project.unarchived", map[string]any{"slug": slug})
+	ev, err := insertEvent(tx, id, 0, actorOr(actor), "project.unarchived", map[string]any{"slug": slug})
 	if err != nil {
 		return nil, nil, err
 	}
-	p.ArchivedAt = "" // explicitly clear; was scanned into a local var, not p.ArchivedAt
-	return &p, ev, tx.Commit()
+	p, err := getProjectTx(tx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	return p, ev, tx.Commit()
 }
 
-func (s *Store) CreateProject(slug, name string) (*Project, *Event, error) {
+// CreateProject creates a project inside a category (empty category defaults
+// to "general"). Project slugs are globally unique — a slug names exactly one
+// project regardless of category, so existing task refs like "web-3" stay
+// unambiguous. Returns ErrNotFound for an unknown category and
+// ErrCategoryArchived for an archived one.
+func (s *Store) CreateProject(slug, name, category string) (*Project, *Event, error) {
 	slug = strings.TrimSpace(slug)
 	if slug == "" || strings.ContainsAny(slug, " /\t") {
 		return nil, nil, ErrValidation
 	}
 	if name == "" {
 		name = slug
+	}
+	if category == "" {
+		category = "general"
+	}
+	cid, err := s.categoryID(category)
+	if err != nil {
+		return nil, nil, err // ErrNotFound for a bad slug
+	}
+	var catArchived sql.NullString
+	if err := s.db.QueryRow("SELECT archived_at FROM categories WHERE id=?", cid).Scan(&catArchived); err != nil {
+		return nil, nil, err
+	}
+	if catArchived.Valid && catArchived.String != "" {
+		return nil, nil, ErrCategoryArchived
 	}
 	var exists int
 	s.db.QueryRow("SELECT 1 FROM projects WHERE slug=?", slug).Scan(&exists)
@@ -381,21 +653,142 @@ func (s *Store) CreateProject(slug, name string) (*Project, *Event, error) {
 		return nil, nil, err
 	}
 	defer tx.Rollback()
-	res, err := tx.Exec("INSERT INTO projects(slug,name) VALUES(?,?)", slug, name)
-	if err != nil {
-		return nil, nil, err
+	var id int64
+	for attempt := 0; ; attempt++ {
+		res, err := tx.Exec("INSERT INTO projects(slug,name,category_id,uid) VALUES(?,?,?,?)",
+			slug, name, cid, newUID("amp_"))
+		if isUniqueErr(err, "projects.uid") && attempt < 2 {
+			continue // astronomically unlikely uid collision — retry with a fresh uid
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		id, _ = res.LastInsertId()
+		break
 	}
-	id, _ := res.LastInsertId()
 	ev, err := insertEvent(tx, id, 0, "human", "project.created", map[string]any{"slug": slug})
 	if err != nil {
 		return nil, nil, err
 	}
-	var p Project
-	if err := tx.QueryRow("SELECT id,slug,name,created_at FROM projects WHERE id=?", id).
-		Scan(&p.ID, &p.Slug, &p.Name, &p.CreatedAt); err != nil {
+	p, err := getProjectTx(tx, id)
+	if err != nil {
 		return nil, nil, err
 	}
-	return &p, ev, tx.Commit()
+	return p, ev, tx.Commit()
+}
+
+// getProjectTx loads one extended project row (no counts) by id.
+func getProjectTx(q queryer, id int64) (*Project, error) {
+	var p Project
+	err := q.QueryRow(`SELECT p.id, p.uid, p.slug, p.name, c.slug, p.created_at,
+	         COALESCE(p.archived_at,''), COALESCE(p.vault_project_id,''), COALESCE(p.vault_path,'')
+	       FROM projects p JOIN categories c ON c.id=p.category_id WHERE p.id=?`, id).
+		Scan(&p.ID, &p.UID, &p.Slug, &p.Name, &p.Category, &p.CreatedAt,
+			&p.ArchivedAt, &p.VaultProjectID, &p.VaultPath)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// PatchProject applies allowed field changes to a project and records a single
+// project.patched event (modeled on PatchTask). Allowed keys: slug, name,
+// vault_project_id, vault_path. uid and category_id are deliberately NOT
+// patchable — the uid is the immutable correlation key and category moves are
+// out of scope. Unknown keys are ignored; a no-op patch is idempotent success
+// with no event.
+func (s *Store) PatchProject(slug string, patch map[string]any, actor string) (*Project, *Event, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	var id int64
+	err = tx.QueryRow("SELECT id FROM projects WHERE slug=?", slug).Scan(&id)
+	if err == sql.ErrNoRows {
+		return nil, nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	cur, err := getProjectTx(tx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	var sets []string
+	var args []any
+	delta := map[string]any{}
+
+	if v, ok := patch["slug"]; ok {
+		ns, _ := v.(string)
+		ns = strings.TrimSpace(ns)
+		if ns == "" || strings.ContainsAny(ns, " /\t") || len(ns) > maxTitleLen {
+			return nil, nil, ErrValidation
+		}
+		if ns != cur.Slug {
+			var exists int
+			tx.QueryRow("SELECT 1 FROM projects WHERE slug=? AND id!=?", ns, id).Scan(&exists)
+			if exists == 1 {
+				return nil, nil, ErrConflict
+			}
+			sets = append(sets, "slug=?")
+			args = append(args, ns)
+			delta["slug"] = []any{cur.Slug, ns}
+		}
+	}
+	if v, ok := patch["name"]; ok {
+		nm, _ := v.(string)
+		if strings.TrimSpace(nm) == "" || len(nm) > maxTitleLen {
+			return nil, nil, ErrValidation
+		}
+		if nm != cur.Name {
+			sets = append(sets, "name=?")
+			args = append(args, nm)
+			delta["name"] = []any{cur.Name, nm}
+		}
+	}
+	if v, ok := patch["vault_project_id"]; ok {
+		vid, _ := v.(string)
+		if len(vid) > maxTitleLen {
+			return nil, nil, ErrValidation
+		}
+		if vid != cur.VaultProjectID {
+			sets = append(sets, "vault_project_id=?")
+			args = append(args, nullStr(vid))
+			delta["vault_project_id"] = []any{nullable(cur.VaultProjectID), nullable(vid)}
+		}
+	}
+	if v, ok := patch["vault_path"]; ok {
+		vp, _ := v.(string)
+		if len(vp) > maxTitleLen {
+			return nil, nil, ErrValidation
+		}
+		if vp != cur.VaultPath {
+			sets = append(sets, "vault_path=?")
+			args = append(args, nullStr(vp))
+			delta["vault_path"] = []any{nullable(cur.VaultPath), nullable(vp)}
+		}
+	}
+
+	if len(sets) == 0 { // no-op: idempotent success, no event
+		return cur, nil, tx.Commit()
+	}
+	args = append(args, id)
+	if _, err := tx.Exec("UPDATE projects SET "+strings.Join(sets, ",")+" WHERE id=?", args...); err != nil {
+		return nil, nil, err
+	}
+	ev, err := insertEvent(tx, id, 0, actorOr(actor), "project.patched", delta)
+	if err != nil {
+		return nil, nil, err
+	}
+	p, err := getProjectTx(tx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	return p, ev, tx.Commit()
 }
 
 func (s *Store) projectID(slug string) (int64, error) {
@@ -415,11 +808,21 @@ func (s *Store) ListTasks(f TaskFilter) ([]Task, error) {
 	if f.Project != "" {
 		where = append(where, "p.slug=?")
 		args = append(args, f.Project)
-	} else {
-		// No explicit project: hide tasks belonging to archived projects from the
-		// unfiltered board/list. An explicit project filter still returns that
-		// project's tasks (so an archived project can still be inspected directly).
+	} else if f.Category != "" {
+		// Explicit category, no project: still hide archived projects, but keep
+		// the category itself inspectable even when archived (same rule as the
+		// explicit-project case below).
 		where = append(where, "p.archived_at IS NULL")
+	} else {
+		// No explicit scope: hide tasks belonging to archived projects OR
+		// archived categories (cascade) from the unfiltered board/list. An
+		// explicit project filter still returns that project's tasks (so an
+		// archived project can still be inspected directly).
+		where = append(where, "p.archived_at IS NULL AND c.archived_at IS NULL")
+	}
+	if f.Category != "" {
+		where = append(where, "c.slug=?")
+		args = append(args, f.Category)
 	}
 	if f.Status != "" {
 		// allow comma list, e.g. "todo,doing"
@@ -467,7 +870,7 @@ func (s *Store) ListTasks(f TaskFilter) ([]Task, error) {
 	         COALESCE((SELECT COUNT(*) FROM task_deps d WHERE d.task_id=t.id),0),
 	         COALESCE((SELECT COUNT(*) FROM task_deps d JOIN tasks pt ON pt.id=d.depends_on_id WHERE d.task_id=t.id AND pt.status!='done'),0),
 	         COALESCE((SELECT GROUP_CONCAT(label) FROM task_labels tl WHERE tl.task_id=t.id),'')
-	       FROM tasks t JOIN projects p ON p.id=t.project_id`
+	       FROM tasks t JOIN projects p ON p.id=t.project_id JOIN categories c ON c.id=p.category_id`
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
@@ -676,6 +1079,16 @@ func (s *Store) CreateTask(in CreateTaskInput) (*Task, *Event, error) {
 	}
 	if archivedAt.Valid && archivedAt.String != "" {
 		return nil, nil, ErrProjectArchived
+	}
+	// Archived-category cascade: a hidden board must not accept new tasks either.
+	var catArchived sql.NullString
+	if err := s.db.QueryRow(
+		"SELECT c.archived_at FROM projects p JOIN categories c ON c.id=p.category_id WHERE p.id=?", pid).
+		Scan(&catArchived); err != nil {
+		return nil, nil, err
+	}
+	if catArchived.Valid && catArchived.String != "" {
+		return nil, nil, ErrCategoryArchived
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -984,11 +1397,12 @@ func (s *Store) StealStaleClaim(id int64, agent string, staleFor time.Duration) 
 }
 
 // NextTask atomically picks and claims the best ready task: status todo,
-// unassigned, no open prerequisites, in a non-archived project — optionally
-// scoped to a project slug. Returns ErrNotFound when nothing qualifies (or the
-// slug does not exist). Tasks pre-assigned to the caller are deliberately
-// skipped (candidates require assignee IS NULL) — claim those with `am claim`.
-func (s *Store) NextTask(project, agent string) (*Task, *Event, error) {
+// unassigned, no open prerequisites, in a non-archived project AND non-archived
+// category — optionally scoped to a project and/or category slug. Returns
+// ErrNotFound when nothing qualifies (or a slug does not exist). Tasks
+// pre-assigned to the caller are deliberately skipped (candidates require
+// assignee IS NULL) — claim those with `am claim`.
+func (s *Store) NextTask(project, category, agent string) (*Task, *Event, error) {
 	if agent == "" {
 		return nil, nil, ErrValidation
 	}
@@ -999,8 +1413,16 @@ func (s *Store) NextTask(project, agent string) (*Task, *Event, error) {
 		if err != nil {
 			return nil, nil, err // ErrNotFound for a bad slug
 		}
-		scope = " AND t.project_id=?"
+		scope += " AND t.project_id=?"
 		args = append(args, pid)
+	}
+	if category != "" {
+		cid, err := s.categoryID(category)
+		if err != nil {
+			return nil, nil, err // ErrNotFound for a bad slug
+		}
+		scope += " AND p.category_id=?"
+		args = append(args, cid)
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -1023,7 +1445,9 @@ func (s *Store) NextTask(project, agent string) (*Task, *Event, error) {
 		       updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		 WHERE id = (
 		   SELECT t.id FROM tasks t JOIN projects p ON p.id=t.project_id
-		   WHERE t.status='todo' AND t.assignee IS NULL AND p.archived_at IS NULL`+scope+`
+		                           JOIN categories c ON c.id=p.category_id
+		   WHERE t.status='todo' AND t.assignee IS NULL AND p.archived_at IS NULL
+		     AND c.archived_at IS NULL`+scope+`
 		     AND NOT EXISTS (SELECT 1 FROM task_deps d JOIN tasks pt ON pt.id=d.depends_on_id
 		                     WHERE d.task_id=t.id AND pt.status!='done')
 		   ORDER BY t.priority ASC, t.id ASC LIMIT 1)
@@ -1355,6 +1779,7 @@ func (s *Store) ListEvents(since int64, project string, limit int) ([]Event, int
 	var args []any
 	q := `SELECT events.id,COALESCE(events.project_id,0),COALESCE(events.task_id,0),events.actor,events.kind,events.data,events.created_at
 	      FROM events LEFT JOIN projects p ON p.id = events.project_id
+	      LEFT JOIN categories c ON c.id = p.category_id
 	      WHERE events.id>?`
 	args = append(args, since)
 	if project != "" {
@@ -1365,7 +1790,7 @@ func (s *Store) ListEvents(since int64, project string, limit int) ([]Event, int
 		q += " AND events.project_id=?"
 		args = append(args, pid)
 	} else {
-		q += " AND (events.project_id IS NULL OR p.archived_at IS NULL)"
+		q += " AND (events.project_id IS NULL OR (p.archived_at IS NULL AND c.archived_at IS NULL))"
 	}
 	q += " ORDER BY events.id ASC LIMIT ?"
 	args = append(args, limit)
@@ -1399,6 +1824,7 @@ func (s *Store) ListEventsBefore(before int64, project string, limit int) ([]Eve
 	var args []any
 	q := `SELECT events.id,COALESCE(events.project_id,0),COALESCE(events.task_id,0),events.actor,events.kind,events.data,events.created_at
 	      FROM events LEFT JOIN projects p ON p.id = events.project_id
+	      LEFT JOIN categories c ON c.id = p.category_id
 	      WHERE events.id<?`
 	args = append(args, before)
 	if project != "" {
@@ -1409,7 +1835,7 @@ func (s *Store) ListEventsBefore(before int64, project string, limit int) ([]Eve
 		q += " AND events.project_id=?"
 		args = append(args, pid)
 	} else {
-		q += " AND (events.project_id IS NULL OR p.archived_at IS NULL)"
+		q += " AND (events.project_id IS NULL OR (p.archived_at IS NULL AND c.archived_at IS NULL))"
 	}
 	q += " ORDER BY events.id DESC LIMIT ?"
 	args = append(args, limit)
@@ -1445,7 +1871,8 @@ func (s *Store) RecentEvents(project string, limit int) ([]Event, int64, error) 
 	}
 	var args []any
 	q := `SELECT events.id,COALESCE(events.project_id,0),COALESCE(events.task_id,0),events.actor,events.kind,events.data,events.created_at
-	      FROM events LEFT JOIN projects p ON p.id = events.project_id`
+	      FROM events LEFT JOIN projects p ON p.id = events.project_id
+	      LEFT JOIN categories c ON c.id = p.category_id`
 	if project != "" {
 		pid, err := s.projectID(project)
 		if err != nil {
@@ -1454,7 +1881,7 @@ func (s *Store) RecentEvents(project string, limit int) ([]Event, int64, error) 
 		q += " WHERE events.project_id=?"
 		args = append(args, pid)
 	} else {
-		q += " WHERE (events.project_id IS NULL OR p.archived_at IS NULL)"
+		q += " WHERE (events.project_id IS NULL OR (p.archived_at IS NULL AND c.archived_at IS NULL))"
 	}
 	q += " ORDER BY events.id DESC LIMIT ?"
 	args = append(args, limit)
@@ -1540,6 +1967,23 @@ func (s *Store) ProjectGraph(slug string) (*ProjectGraphData, error) {
 // queryer is satisfied by both *sql.DB and *sql.Tx.
 type queryer interface {
 	QueryRow(query string, args ...any) *sql.Row
+}
+
+// newUID returns a stable identifier: prefix + 16 lowercase hex chars (8 bytes
+// of crypto/rand). Used for category ("amc_") and project ("amp_") uids — the
+// immutable correlation keys that survive slug renames. crypto/rand.Read never
+// fails (it always fills the buffer or aborts the program).
+func newUID(prefix string) string {
+	var b [8]byte
+	rand.Read(b[:])
+	return prefix + hex.EncodeToString(b[:])
+}
+
+// isUniqueErr reports whether err is a SQLite UNIQUE-constraint failure on the
+// named column (e.g. "projects.uid"). Insert callers use it to retry with a
+// fresh uid on the astronomically unlikely 64-bit collision.
+func isUniqueErr(err error, col string) bool {
+	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed: "+col)
 }
 
 func insertEvent(tx *sql.Tx, projectID, taskID int64, actor, kind string, data any) (*Event, error) {

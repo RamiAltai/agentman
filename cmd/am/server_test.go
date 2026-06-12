@@ -1139,3 +1139,294 @@ func TestLabelEndpoints(t *testing.T) {
 		t.Fatalf("labeled=%d unlabeled=%d, want 1 and 1 (idempotent dup adds no event)", labeled, unlabeled)
 	}
 }
+
+// ---------- Phase O: categories over HTTP ----------
+
+func mustCreateCategory(t *testing.T, ts *httptest.Server, slug string) {
+	t.Helper()
+	resp := do(t, ts, http.MethodPost, "/api/categories",
+		`{"slug":"`+slug+`","name":"`+slug+`"}`,
+		map[string]string{"Content-Type": "application/json"})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create category %q = %d, want 201", slug, resp.StatusCode)
+	}
+}
+
+func TestCategoryEndpoints(t *testing.T) {
+	ts := newTestServer(t)
+
+	// POST → 201 with uid.
+	r := do(t, ts, http.MethodPost, "/api/categories", `{"slug":"work","name":"Work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/categories = %d, want 201", r.StatusCode)
+	}
+	var cat Category
+	if err := json.NewDecoder(r.Body).Decode(&cat); err != nil {
+		t.Fatalf("decode category: %v", err)
+	}
+	if !strings.HasPrefix(cat.UID, "amc_") || len(cat.UID) != 20 {
+		t.Fatalf("category uid = %q, want amc_<16 hex>", cat.UID)
+	}
+
+	// Duplicate → 409; invalid slug → 400.
+	rd := do(t, ts, http.MethodPost, "/api/categories", `{"slug":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	rd.Body.Close()
+	if rd.StatusCode != http.StatusConflict {
+		t.Fatalf("dup category = %d, want 409", rd.StatusCode)
+	}
+	rb := do(t, ts, http.MethodPost, "/api/categories", `{"slug":"has space"}`,
+		map[string]string{"Content-Type": "application/json"})
+	rb.Body.Close()
+	if rb.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid category = %d, want 400", rb.StatusCode)
+	}
+
+	// GET default list: general (seeded) + work.
+	rg := do(t, ts, http.MethodGet, "/api/categories", "", nil)
+	defer rg.Body.Close()
+	var cs []Category
+	if err := json.NewDecoder(rg.Body).Decode(&cs); err != nil {
+		t.Fatalf("decode categories: %v", err)
+	}
+	if len(cs) != 2 || cs[0].Slug != "general" || cs[1].Slug != "work" {
+		t.Fatalf("GET /api/categories = %+v, want [general work]", cs)
+	}
+
+	// Archive → hidden by default, shown with ?archived=true.
+	ra := do(t, ts, http.MethodPost, "/api/categories/work/archive", "", nil)
+	ra.Body.Close()
+	if ra.StatusCode != http.StatusOK {
+		t.Fatalf("archive category = %d, want 200", ra.StatusCode)
+	}
+	rg2 := do(t, ts, http.MethodGet, "/api/categories", "", nil)
+	cs = nil
+	json.NewDecoder(rg2.Body).Decode(&cs)
+	rg2.Body.Close()
+	if len(cs) != 1 || cs[0].Slug != "general" {
+		t.Fatalf("default list after archive = %+v, want [general]", cs)
+	}
+	rg3 := do(t, ts, http.MethodGet, "/api/categories?archived=true", "", nil)
+	cs = nil
+	json.NewDecoder(rg3.Body).Decode(&cs)
+	rg3.Body.Close()
+	if len(cs) != 2 {
+		t.Fatalf("?archived=true list = %+v, want 2", cs)
+	}
+
+	// Unarchive restores; unknown slug → 404.
+	ru := do(t, ts, http.MethodPost, "/api/categories/work/unarchive", "", nil)
+	ru.Body.Close()
+	if ru.StatusCode != http.StatusOK {
+		t.Fatalf("unarchive category = %d, want 200", ru.StatusCode)
+	}
+	rn := do(t, ts, http.MethodPost, "/api/categories/nosuch/archive", "", nil)
+	rn.Body.Close()
+	if rn.StatusCode != http.StatusNotFound {
+		t.Fatalf("archive nosuch = %d, want 404", rn.StatusCode)
+	}
+}
+
+func TestProjectPayloadAndCategoryFilter(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateCategory(t, ts, "work")
+
+	// POST /api/projects with category; payload carries uid/category.
+	r := do(t, ts, http.MethodPost, "/api/projects",
+		`{"slug":"pentest","name":"Pentest","category":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusCreated {
+		t.Fatalf("POST project with category = %d, want 201", r.StatusCode)
+	}
+	var p Project
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		t.Fatalf("decode project: %v", err)
+	}
+	if p.Category != "work" || !strings.HasPrefix(p.UID, "amp_") || len(p.UID) != 20 {
+		t.Fatalf("project payload = %+v, want category work + amp_ uid", p)
+	}
+
+	// Dashboard compatibility: POST without category defaults to general.
+	mustCreateProject(t, ts, "misc")
+	rg := do(t, ts, http.MethodGet, "/api/projects?category=general", "", nil)
+	defer rg.Body.Close()
+	var ps []Project
+	if err := json.NewDecoder(rg.Body).Decode(&ps); err != nil {
+		t.Fatalf("decode projects: %v", err)
+	}
+	if len(ps) != 1 || ps[0].Slug != "misc" || ps[0].Category != "general" {
+		t.Fatalf("?category=general = %+v, want only misc", ps)
+	}
+	rw := do(t, ts, http.MethodGet, "/api/projects?category=work", "", nil)
+	defer rw.Body.Close()
+	ps = nil
+	json.NewDecoder(rw.Body).Decode(&ps)
+	if len(ps) != 1 || ps[0].Slug != "pentest" {
+		t.Fatalf("?category=work = %+v, want only pentest", ps)
+	}
+
+	// Archived category → 400 category_archived.
+	ra := do(t, ts, http.MethodPost, "/api/categories/work/archive", "", nil)
+	ra.Body.Close()
+	rc := do(t, ts, http.MethodPost, "/api/projects",
+		`{"slug":"another","category":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	defer rc.Body.Close()
+	if rc.StatusCode != http.StatusBadRequest {
+		t.Fatalf("create project in archived category = %d, want 400", rc.StatusCode)
+	}
+	var body map[string]string
+	json.NewDecoder(rc.Body).Decode(&body)
+	if body["error"] != "category_archived" {
+		t.Fatalf("error body = %v, want category_archived", body)
+	}
+	// Unknown category on create → 404.
+	rn := do(t, ts, http.MethodPost, "/api/projects",
+		`{"slug":"zzz","category":"nosuch"}`,
+		map[string]string{"Content-Type": "application/json"})
+	rn.Body.Close()
+	if rn.StatusCode != http.StatusNotFound {
+		t.Fatalf("create project unknown category = %d, want 404", rn.StatusCode)
+	}
+}
+
+func TestListTasksCategoryParam(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateCategory(t, ts, "work")
+	r := do(t, ts, http.MethodPost, "/api/projects", `{"slug":"wproj","category":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	mustCreateProject(t, ts, "gproj")
+	wID := mustCreateTask(t, ts, "wproj", "work task")
+	mustCreateTask(t, ts, "gproj", "general task")
+
+	rg := do(t, ts, http.MethodGet, "/api/tasks?category=work", "", nil)
+	defer rg.Body.Close()
+	var tasks []Task
+	if err := json.NewDecoder(rg.Body).Decode(&tasks); err != nil {
+		t.Fatalf("decode tasks: %v", err)
+	}
+	if len(tasks) != 1 || strconv.FormatInt(tasks[0].ID, 10) != wID {
+		t.Fatalf("?category=work = %+v, want only %s", tasks, wID)
+	}
+
+	// Composes with status=.
+	rs := do(t, ts, http.MethodGet, "/api/tasks?category=work&status=done", "", nil)
+	defer rs.Body.Close()
+	tasks = nil
+	json.NewDecoder(rs.Body).Decode(&tasks)
+	if len(tasks) != 0 {
+		t.Fatalf("?category=work&status=done = %+v, want empty", tasks)
+	}
+}
+
+func TestNextEndpointCategoryBody(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateCategory(t, ts, "work")
+	r := do(t, ts, http.MethodPost, "/api/projects", `{"slug":"wproj","category":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	mustCreateProject(t, ts, "gproj")
+	// The general task is more urgent — a category-scoped next must skip it.
+	rg := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"gproj","title":"urgent general","priority":0}`,
+		map[string]string{"Content-Type": "application/json"})
+	rg.Body.Close()
+	wID := mustCreateTask(t, ts, "wproj", "work pick")
+
+	rn := do(t, ts, http.MethodPost, "/api/tasks/next", `{"category":"work"}`,
+		map[string]string{"X-Agent": "agent-a", "Content-Type": "application/json"})
+	defer rn.Body.Close()
+	if rn.StatusCode != http.StatusOK {
+		t.Fatalf("category next = %d, want 200", rn.StatusCode)
+	}
+	var tk Task
+	if err := json.NewDecoder(rn.Body).Decode(&tk); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	if strconv.FormatInt(tk.ID, 10) != wID {
+		t.Fatalf("category next picked #%d, want #%s", tk.ID, wID)
+	}
+
+	// project+category compose; a mismatched pair finds nothing → 404.
+	rm := do(t, ts, http.MethodPost, "/api/tasks/next", `{"project":"gproj","category":"work"}`,
+		map[string]string{"X-Agent": "agent-b", "Content-Type": "application/json"})
+	rm.Body.Close()
+	if rm.StatusCode != http.StatusNotFound {
+		t.Fatalf("mismatched project+category next = %d, want 404", rm.StatusCode)
+	}
+	rc := do(t, ts, http.MethodPost, "/api/tasks/next", `{"project":"gproj","category":"general"}`,
+		map[string]string{"X-Agent": "agent-b", "Content-Type": "application/json"})
+	defer rc.Body.Close()
+	if rc.StatusCode != http.StatusOK {
+		t.Fatalf("matched project+category next = %d, want 200", rc.StatusCode)
+	}
+}
+
+func TestPatchProjectEndpoint(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+	mustCreateProject(t, ts, "api")
+
+	// Happy path: rename + vault binding in one PATCH.
+	r := do(t, ts, http.MethodPatch, "/api/projects/web",
+		`{"slug":"frontend","vault_project_id":"p_9","vault_path":"/v/f"}`,
+		map[string]string{"Content-Type": "application/json"})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH project = %d, want 200", r.StatusCode)
+	}
+	var p Project
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		t.Fatalf("decode project: %v", err)
+	}
+	if p.Slug != "frontend" || p.VaultProjectID != "p_9" || p.VaultPath != "/v/f" {
+		t.Fatalf("patched project = %+v", p)
+	}
+
+	// Old slug 404s; rename onto existing → 409; invalid slug → 400.
+	r404 := do(t, ts, http.MethodPatch, "/api/projects/web", `{"name":"x"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r404.Body.Close()
+	if r404.StatusCode != http.StatusNotFound {
+		t.Fatalf("PATCH old slug = %d, want 404", r404.StatusCode)
+	}
+	r409 := do(t, ts, http.MethodPatch, "/api/projects/frontend", `{"slug":"api"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r409.Body.Close()
+	if r409.StatusCode != http.StatusConflict {
+		t.Fatalf("PATCH dup slug = %d, want 409", r409.StatusCode)
+	}
+	r400 := do(t, ts, http.MethodPatch, "/api/projects/frontend", `{"slug":"has space"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r400.Body.Close()
+	if r400.StatusCode != http.StatusBadRequest {
+		t.Fatalf("PATCH invalid slug = %d, want 400", r400.StatusCode)
+	}
+}
+
+func TestCreateTaskArchivedCategory400(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateCategory(t, ts, "work")
+	r := do(t, ts, http.MethodPost, "/api/projects", `{"slug":"wproj","category":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	ra := do(t, ts, http.MethodPost, "/api/categories/work/archive", "", nil)
+	ra.Body.Close()
+
+	rc := do(t, ts, http.MethodPost, "/api/tasks", `{"project":"wproj","title":"nope"}`,
+		map[string]string{"Content-Type": "application/json"})
+	defer rc.Body.Close()
+	if rc.StatusCode != http.StatusBadRequest {
+		t.Fatalf("create task in archived category = %d, want 400", rc.StatusCode)
+	}
+	var body map[string]string
+	json.NewDecoder(rc.Body).Decode(&body)
+	if body["error"] != "category_archived" {
+		t.Fatalf("error body = %v, want category_archived", body)
+	}
+}
