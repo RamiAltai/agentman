@@ -22,6 +22,7 @@ GET   /api/tasks                    handleListTasks         ?project=&status=&as
 POST  /api/tasks                    handleCreateTask        {project,title,body?,priority?,assignee?}
 GET   /api/tasks/{id}               handleGetTask           (task + comments + recent events + depends_on + blocks)
 PATCH /api/tasks/{id}               handlePatchTask         {status?,assignee?,title?,body?,priority?}  (hard-blocked if open prereqs + doing/done target)
+POST  /api/tasks/next               handleNext              {project?,assignee?} atomic pick+claim of the best ready task (todo, unassigned, no open prereqs, non-archived); 404 when none qualifies (or bad slug)
 POST  /api/tasks/{id}/claim         handleClaim             (atomic; X-Agent = claimant; hard-blocked if open prereqs → 409 blocked; body {"steal_stale":"<dur>"} → StealStaleClaim stale takeover, 409 not_stale if still fresh)
 POST  /api/tasks/{id}/comments      handleComment           {body}
 POST  /api/tasks/{id}/deps          handleAddDep            {depends_on: <id-or-ref>}  add prerequisite edge
@@ -66,7 +67,7 @@ Lives in `cmd/am/store.go` (there is no separate "service" layer — the store *
 logic). Each mutating method returns `(result, *Event, error)`; the handler broadcasts the event.
 Key methods: `CreateProject`, `ListProjects(includeArchived bool)`, `ArchiveProject`,
 `UnarchiveProject`, `DeleteProject`, `ListTasks`, `GetTask`, `CreateTask`, `PatchTask`,
-`ClaimTask`, `StealStaleClaim`, `AddComment`, `DeleteComment`, `ListEvents`, `RecentEvents`,
+`ClaimTask`, `StealStaleClaim`, `NextTask`, `AddComment`, `DeleteComment`, `ListEvents`, `RecentEvents`,
 `ListEventsBefore`, `DeleteTask`, `AddDep`, `RemoveDep`, `ProjectGraph`. `ArchiveProject`/`UnarchiveProject` are transactional and
 idempotent (no event when already in the target state).
 `CreateTask` checks the target project's `archived_at` before the insert and returns
@@ -118,6 +119,18 @@ takeover emits `task.reclaimed` with `{"assignee":[prev,new],"status":…,"stale
 tx. Both claim paths set `tasks.claimed_at`; `am drop` (unassign) clears it. The staleness filter
 (`TaskFilter.Stale`, `?stale=<dur>` / `am ls --stale <dur>`) uses `updated_at`, not `claimed_at` —
 any activity (claim, patch, status, comment) keeps a claim fresh.
+
+**Atomic pick+claim** (`NextTask`, Phase L / ADR-023) extends the primitive with a subquery:
+`UPDATE … WHERE id = (SELECT t.id … WHERE t.status='todo' AND t.assignee IS NULL AND
+p.archived_at IS NULL [AND t.project_id=?] AND NOT EXISTS (<open-prereq>) ORDER BY t.priority ASC,
+t.id ASC LIMIT 1) RETURNING id, project_id`. The open-prereq `NOT EXISTS` matches ListTasks' Ready
+filter exactly; ordering is priority ASC (0 = most urgent) with an id-ASC FIFO tiebreak
+(deliberately not `am ls`'s `updated_at DESC` display order — a pickup queue drains oldest-first).
+Zero rows ⇒ `ErrNotFound` (nothing ready, or — same 404, accepted ambiguity — a bad project slug).
+Emits the existing `task.claimed` event with the same payload shape as `ClaimTask`. Tasks already
+assigned to the caller are skipped (candidates require `assignee IS NULL`). `am wait` has **no
+server-side component** — it is a CLI-side SSE consumer over the existing `/api/stream` (see
+`cmd/am/wait.go` and ADR-023).
 
 ## Data Access
 
@@ -188,10 +201,14 @@ typed `*ConflictError{Assignee}`, typed `*BlockedError{OpenPrereqs []int64}`, an
 (the real error is logged server-side via `log.Printf("agentman: internal error: %v", err)` to
 stderr — it is never sent to the client). Delete handlers (`handleDeleteTask`,
 `handleDeleteComment`, `handleDeleteProject`) return `404` via `writeErr` when the target is
-missing (`ErrNotFound`). The CLI re-maps HTTP status to **exit codes** in `client.go doOrFail`
-(`3` not found · `4` conflict/blocked/not-stale · `5` validation/project_archived · `6` server down · `1` other);
-a `blocked` 409 prints e.g. `claim: #3 blocked — prereqs not done (#1 #2)`; a `not_stale` 409
-prints e.g. `claim: #3 held by agent-a (not stale yet)`.
+missing (`ErrNotFound`). The CLI re-maps HTTP status to **exit codes** via `client.go
+exitCodeFor` (the single source, used by `doOrFail` and the bulk `status`/`assign` loop):
+`3` not found · `4` conflict/blocked/not-stale · `5` validation/project_archived · `6` server down
+· `1` other; plus `7` = `am wait` timeout (CLI-side, no HTTP status involved).
+A `blocked` 409 prints e.g. `claim: #3 blocked — prereqs not done (#1 #2)`; a `not_stale` 409
+prints e.g. `claim: #3 held by agent-a (not stale yet)`. Bulk `am status`/`am assign` print one
+stderr line per failing id (`status: #13 not_found`), continue, and exit with the first failure's
+mapped code.
 
 ## Observability
 
@@ -206,7 +223,7 @@ per request after completion: `METHOD PATH STATUS LATENCY ACTOR` (actor = `X-Age
 
 ## Testing
 
-There are nine test files (run `go test -race ./cmd/am/`; 107 tests, all green):
+There are ten test files (run `go test -race ./cmd/am/`; 129 tests, all green):
 - `cmd/am/update_test.go` — version-comparison logic.
 - `cmd/am/store_test.go` — atomic-claim race (concurrent, `-race`-clean), events-cursor monotonicity,
   store CRUD + validation (`ErrValidation`), project archive/unarchive round-trip + idempotency,
@@ -215,15 +232,19 @@ There are nine test files (run `go test -race ./cmd/am/`; 107 tests, all green):
   `TestProjectGraph` (nodes + edges shape), `TestProjectGraphMissingProject` (ErrNotFound), and
   stale-claim recovery (Phase K): `TestStealStaleClaim`, `TestStealRaceExactlyOneWinner`
   (concurrent stealers, exactly one winner), `TestListTasksStaleFilter`, `TestClaimSetsClaimedAt`,
-  `TestDropClearsClaimedAt`.
+  `TestDropClearsClaimedAt`, and `am next` (Phase L): `TestNextTaskPicksHighestPriorityReady`,
+  `TestNextTaskFIFOWithinPriority`, `TestNextTaskProjectScoping`, `TestNextTaskNoneReady`,
+  `TestNextTaskRaceDistinctWinners` (concurrent pickers get distinct tasks; one task → one winner),
+  `TestNextTaskEmptyAgentValidation`.
 - `cmd/am/server_test.go` — validation→status mapping (400/404/409), `hostGuard`, `csrfGuard`,
   `securityHeaders`, `listenAddr` loopback regression, archive/unarchive endpoints + 404,
   hard-delete HTTP endpoints (`TestDeleteTaskEndpoint`, `TestDeleteProjectEndpoint`,
   `TestDeleteCommentEndpoint`), Phase D: `TestWriteErrHidesInternalDetail` (500 returns generic
   body, not raw error), `TestRequestLoggerPassesThrough`, `TestRequestLoggerPreservesFlusher`, and
   graph endpoint: `TestProjectGraphEndpoint` (200 with correct nodes + edges),
-  `TestProjectGraphEndpoint404` (missing project → 404), and Phase K: `TestListTasksStaleParam`
-  (`?stale=` filter + 400 on bad duration), `TestStealStaleEndpoint` (steal body, `not_stale` 409)
+  `TestProjectGraphEndpoint404` (missing project → 404), Phase K: `TestListTasksStaleParam`
+  (`?stale=` filter + 400 on bad duration), `TestStealStaleEndpoint` (steal body, `not_stale` 409),
+  and Phase L: `TestNextEndpoint` (FIFO picks, 404 when drained), `TestNextEndpointProjectBody`
   (via `net/http/httptest`).
 - `cmd/am/migrate_test.go` — migration runner (apply/skip/idempotent/rollback), incl. the v2 step
   that adds `projects.archived_at` and the v3 step that adds `tasks.claimed_at`
@@ -239,7 +260,14 @@ There are nine test files (run `go test -race ./cmd/am/`; 107 tests, all green):
   down). Also table-tests for `parse`/`Args` and the pure formatters
   (`taskLine`/`statusShort`/`assignee`/`trunc`/`apiErr`); Phase K added `TestExitNotStale`
   (exit 4 + `not stale yet` message) and `TestStaleFlagsWireFormat` (`--stale` / `--steal-stale`
-  wire encoding).
+  wire encoding); Phase L added `TestCmdNextPrintsOnlyID`, `TestExitNextNoneReady` (exit 3),
+  `TestCmdStatusBulk`, `TestCmdStatusBulkPartialFailure` (loop continues, stderr names the failing
+  id, exit = first failure's code), `TestCmdAssignBulk` (incl. `me`/`-` and single-id regression).
+- `cmd/am/wait_test.go` — `am wait` (Phase L). `TestWaitDoneAlreadySatisfied`,
+  `TestWaitDoneEventArrives`, `TestWaitReadyOnPrereqDone` (blocked task becomes ready when its
+  prereq is done), `TestWaitTimeout` (exit 7), `TestWaitTaskNotFound` (exit 3),
+  `TestWaitServerDown` (exit 6), `TestWaitUsageErrors`, `TestParseWaitTimeout` (bare seconds +
+  Go durations), `TestWaitBadTimeoutExit5`.
 - `cmd/am/sse_test.go` — SSE streaming + reconnect (Phase E2). `TestSSEDeliversLiveEvent`
   subscribes to `/api/stream`, creates a task, and asserts the `task.created` event arrives live.
   `TestSSEReplayOnReconnect` reconnects with `Last-Event-ID` and asserts that events created while
@@ -260,7 +288,7 @@ rejection, idempotent add/remove, cascade on task delete, `NPrereqs`/`NOpenPrere
 response for claim and patch). The +4 graph tests (`TestProjectGraph`, `TestProjectGraphMissingProject`
 in `store_test.go`; `TestProjectGraphEndpoint`, `TestProjectGraphEndpoint404` in `server_test.go`)
 brought the total to **95** at the time; Phase J's hygiene tests and Phase K's 10 stale-claim
-tests (listed above) bring it to **107**.
+tests brought it to **107**; Phase L's 22 work-loop tests (listed above) bring it to **129**.
 
 SSE streaming/reconnect, CLI verbs, exit-code mapping, and identity are now covered. The
 dashboard has a source-level XSS-sink guard but **no behavioral JS tests** — the project

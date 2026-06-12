@@ -943,3 +943,68 @@ func TestRequestLoggerPreservesFlusher(t *testing.T) {
 		t.Fatal("never received retry: line from SSE stream — flusher may not be preserved")
 	}
 }
+
+// ---------- Phase L: POST /api/tasks/next ----------
+
+func TestNextEndpoint(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+	id1 := mustCreateTask(t, ts, "web", "first")
+	id2 := mustCreateTask(t, ts, "web", "second")
+
+	pick := func(want string) {
+		t.Helper()
+		r := do(t, ts, http.MethodPost, "/api/tasks/next", "",
+			map[string]string{"X-Agent": "agent-a"})
+		defer r.Body.Close()
+		if r.StatusCode != http.StatusOK {
+			t.Fatalf("POST /api/tasks/next = %d, want 200", r.StatusCode)
+		}
+		var tk Task
+		if err := json.NewDecoder(r.Body).Decode(&tk); err != nil {
+			t.Fatalf("decode task: %v", err)
+		}
+		if strconv.FormatInt(tk.ID, 10) != want {
+			t.Fatalf("next picked #%d, want #%s", tk.ID, want)
+		}
+		if tk.Status != "doing" || tk.Assignee != "agent-a" {
+			t.Fatalf("task = %s/%s, want doing/agent-a", tk.Status, tk.Assignee)
+		}
+	}
+	pick(id1) // FIFO: lower id first
+	pick(id2)
+
+	// Board drained → 404 not_found.
+	r := do(t, ts, http.MethodPost, "/api/tasks/next", "",
+		map[string]string{"X-Agent": "agent-a"})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusNotFound {
+		t.Fatalf("drained next = %d, want 404", r.StatusCode)
+	}
+}
+
+func TestNextEndpointProjectBody(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+	mustCreateProject(t, ts, "api")
+	// api task is more urgent (p0); web task is default p2.
+	resp := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"api","title":"urgent","priority":0}`,
+		map[string]string{"Content-Type": "application/json"})
+	resp.Body.Close()
+	webID := mustCreateTask(t, ts, "web", "scoped pick")
+
+	r := do(t, ts, http.MethodPost, "/api/tasks/next", `{"project":"web"}`,
+		map[string]string{"X-Agent": "agent-a", "Content-Type": "application/json"})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("scoped next = %d, want 200", r.StatusCode)
+	}
+	var tk Task
+	if err := json.NewDecoder(r.Body).Decode(&tk); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	if strconv.FormatInt(tk.ID, 10) != webID {
+		t.Fatalf("scoped next picked #%d, want web task #%s", tk.ID, webID)
+	}
+}

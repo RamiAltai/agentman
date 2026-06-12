@@ -55,6 +55,10 @@ func main() {
 		cmdNew(c, a)
 	case "claim":
 		cmdClaim(c, a)
+	case "next":
+		cmdNext(c, a)
+	case "wait":
+		cmdWait(c, a)
 	case "status":
 		cmdStatus(c, a)
 	case "assign":
@@ -157,8 +161,10 @@ func usage() {
   am show <id> [-c]                            task detail (+comments +deps)
   am new "title" [--body B] [-p P] [--priority N]   create, prints id
   am claim <id> [--steal-stale DUR]           assign me + ->doing (atomic; DUR is Go syntax, e.g. 30m, 48h)
-  am status <id> <todo|doing|blocked|done>    change status
-  am assign <id> <agent|me|->                 reassign ("-" = unassign)
+  am next [-p P]                              atomically pick + claim the best ready task (prints id; exit 3 if none)
+  am wait <id> --done | am wait --ready [-p P] [--timeout D]   block until done / a ready task exists (exit 7 on timeout)
+  am status <id...> <todo|doing|blocked|done> change status (multiple ids allowed)
+  am assign <id...> <agent|me|->              reassign ("-" = unassign; multiple ids allowed)
   am note <id> "text"                         add a comment
   am edit <id> [--title T] [--body B] [--priority N]
   am drop <id>                                release back to todo
@@ -179,6 +185,6 @@ func usage() {
 Identity: run 'am init <tasktype>' once per session (or set AGENTMAN_AGENT).
 Env: AGENTMAN_URL (default http://127.0.0.1:8787), AGENTMAN_PROJECT (default project).
      Add --json to any read to parse output.
-Exit codes: 0 ok · 3 not found · 4 already claimed · 5 invalid · 6 server down.
+Exit codes: 0 ok · 3 not found · 4 already claimed · 5 invalid · 6 server down · 7 timed out.
 `)
 }

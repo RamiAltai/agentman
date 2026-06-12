@@ -1653,3 +1653,222 @@ func TestInputLimits(t *testing.T) {
 		t.Errorf("AddComment at limit: %v", err)
 	}
 }
+
+// ===================== am next (Phase L) tests =====================
+
+// nextTaskMk creates a task with explicit priority/assignee for NextTask tests.
+func nextTaskMk(t *testing.T, st *Store, project, title string, priority int, assignee string) int64 {
+	t.Helper()
+	tk, _, err := st.CreateTask(CreateTaskInput{
+		Project: project, Title: title, Priority: priority, Assignee: assignee})
+	if err != nil {
+		t.Fatalf("CreateTask %s: %v", title, err)
+	}
+	return tk.ID
+}
+
+func TestNextTaskPicksHighestPriorityReady(t *testing.T) {
+	st := openTestStore(t)
+	for _, slug := range []string{"web", "attic"} {
+		if _, _, err := st.CreateProject(slug, slug); err != nil {
+			t.Fatalf("CreateProject %s: %v", slug, err)
+		}
+	}
+
+	// Decoys, all of which would beat the winner if they were eligible:
+	// p0 but blocked by an open prereq.
+	prereq := nextTaskMk(t, st, "web", "prereq", 3, "")
+	blocked := nextTaskMk(t, st, "web", "blocked p0", 0, "")
+	if _, err := st.AddDep(blocked, prereq, "alice"); err != nil {
+		t.Fatalf("AddDep: %v", err)
+	}
+	// p0 but already assigned (still todo).
+	nextTaskMk(t, st, "web", "assigned p0", 0, "someone-else")
+	// p0 but done.
+	doneID := nextTaskMk(t, st, "web", "done p0", 0, "")
+	if _, _, err := st.PatchTask(doneID, map[string]any{"status": "done"}, "alice"); err != nil {
+		t.Fatalf("PatchTask done: %v", err)
+	}
+	// p0 but in an archived project.
+	nextTaskMk(t, st, "attic", "archived p0", 0, "")
+	if _, _, err := st.ArchiveProject("attic", "alice"); err != nil {
+		t.Fatalf("ArchiveProject: %v", err)
+	}
+	// Eligible: the p1 winner and a p3 also-ran (the prereq task itself).
+	winner := nextTaskMk(t, st, "web", "winner p1", 1, "")
+
+	tk, ev, err := st.NextTask("", "agent-x")
+	if err != nil {
+		t.Fatalf("NextTask: %v", err)
+	}
+	if tk.ID != winner {
+		t.Fatalf("NextTask picked #%d (%s), want winner #%d", tk.ID, tk.Title, winner)
+	}
+	if tk.Status != "doing" || tk.Assignee != "agent-x" {
+		t.Fatalf("task = %s/%s, want doing/agent-x", tk.Status, tk.Assignee)
+	}
+	if tk.ClaimedAt == "" {
+		t.Fatal("claimed_at not set by NextTask")
+	}
+	if ev == nil || ev.Kind != "task.claimed" {
+		t.Fatalf("event = %+v, want kind task.claimed", ev)
+	}
+	if !strings.Contains(string(ev.Data), `"assignee":[null,"agent-x"]`) {
+		t.Fatalf("event data = %s, want assignee [null,agent-x]", ev.Data)
+	}
+	if !strings.Contains(string(ev.Data), `"status":"doing"`) {
+		t.Fatalf("event data = %s, want status doing", ev.Data)
+	}
+}
+
+func TestNextTaskFIFOWithinPriority(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	first := nextTaskMk(t, st, "web", "older", 2, "")
+	nextTaskMk(t, st, "web", "newer", 2, "")
+
+	tk, _, err := st.NextTask("", "agent-x")
+	if err != nil {
+		t.Fatalf("NextTask: %v", err)
+	}
+	if tk.ID != first {
+		t.Fatalf("NextTask picked #%d, want FIFO winner #%d (lower id)", tk.ID, first)
+	}
+}
+
+func TestNextTaskProjectScoping(t *testing.T) {
+	st := openTestStore(t)
+	for _, slug := range []string{"web", "api"} {
+		if _, _, err := st.CreateProject(slug, slug); err != nil {
+			t.Fatalf("CreateProject %s: %v", slug, err)
+		}
+	}
+	apiTask := nextTaskMk(t, st, "api", "api urgent", 0, "")
+	webTask := nextTaskMk(t, st, "web", "web slow", 3, "")
+
+	// Project scope beats global priority order.
+	tk, _, err := st.NextTask("web", "agent-x")
+	if err != nil {
+		t.Fatalf("NextTask(web): %v", err)
+	}
+	if tk.ID != webTask {
+		t.Fatalf("NextTask(web) picked #%d, want #%d", tk.ID, webTask)
+	}
+	// No scope: best remaining across all projects.
+	tk2, _, err := st.NextTask("", "agent-y")
+	if err != nil {
+		t.Fatalf("NextTask(\"\"): %v", err)
+	}
+	if tk2.ID != apiTask {
+		t.Fatalf("NextTask(\"\") picked #%d, want #%d", tk2.ID, apiTask)
+	}
+	// Bad slug → ErrNotFound.
+	if _, _, err := st.NextTask("nosuch", "agent-z"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("NextTask(nosuch) err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestNextTaskNoneReady(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	// Only an assigned todo task — not a candidate.
+	nextTaskMk(t, st, "web", "taken", 0, "someone-else")
+
+	if _, _, err := st.NextTask("", "agent-x"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("NextTask err = %v, want ErrNotFound", err)
+	}
+	var n int
+	st.db.QueryRow("SELECT COUNT(*) FROM events WHERE kind='task.claimed'").Scan(&n)
+	if n != 0 {
+		t.Fatalf("task.claimed event rows = %d, want 0 (no event on miss)", n)
+	}
+}
+
+func TestNextTaskRaceDistinctWinners(t *testing.T) {
+	// N callers, M>N ready tasks: everyone wins a DISTINCT task.
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	const n = 4
+	for i := 0; i < n+2; i++ {
+		nextTaskMk(t, st, "web", fmt.Sprintf("ready %d", i), 2, "")
+	}
+
+	type result struct {
+		task *Task
+		err  error
+	}
+	results := make([]result, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			tk, _, err := st.NextTask("", fmt.Sprintf("agent-%d", i))
+			results[i] = result{task: tk, err: err}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	seen := map[int64]bool{}
+	for i, r := range results {
+		if r.err != nil {
+			t.Fatalf("agent-%d: %v", i, r.err)
+		}
+		if seen[r.task.ID] {
+			t.Fatalf("task #%d claimed twice", r.task.ID)
+		}
+		seen[r.task.ID] = true
+	}
+
+	// N callers, 1 ready task: exactly one winner, the rest ErrNotFound.
+	st2 := openTestStore(t)
+	if _, _, err := st2.CreateProject("web", "Web"); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	nextTaskMk(t, st2, "web", "only one", 2, "")
+	results2 := make([]result, n)
+	var wg2 sync.WaitGroup
+	start2 := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg2.Add(1)
+		go func(i int) {
+			defer wg2.Done()
+			<-start2
+			tk, _, err := st2.NextTask("", fmt.Sprintf("agent-%d", i))
+			results2[i] = result{task: tk, err: err}
+		}(i)
+	}
+	close(start2)
+	wg2.Wait()
+
+	winners, misses := 0, 0
+	for i, r := range results2 {
+		switch {
+		case r.err == nil:
+			winners++
+		case errors.Is(r.err, ErrNotFound):
+			misses++
+		default:
+			t.Fatalf("agent-%d: unexpected error %v", i, r.err)
+		}
+	}
+	if winners != 1 || misses != n-1 {
+		t.Fatalf("winners=%d misses=%d, want 1 and %d", winners, misses, n-1)
+	}
+}
+
+func TestNextTaskEmptyAgentValidation(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.NextTask("", ""); !errors.Is(err, ErrValidation) {
+		t.Fatalf("NextTask empty agent err = %v, want ErrValidation", err)
+	}
+}

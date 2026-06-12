@@ -444,3 +444,136 @@ func TestApiErr(t *testing.T) {
 		}
 	}
 }
+
+// ---------- Phase L: am next + bulk status/assign ----------
+
+func TestCmdNextPrintsOnlyID(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "nextproj")
+	want := mustCreateTask(t, ts, "nextproj", "Pick Me")
+
+	t.Setenv("AGENTMAN_AGENT", "tester")
+	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	out := captureStdout(t, func() {
+		cmdNext(c, parse([]string{"-p", "nextproj"}))
+	})
+	if strings.TrimSpace(out) != want {
+		t.Fatalf("cmdNext stdout = %q, want only id %q", out, want)
+	}
+}
+
+func TestExitNextNoneReady(t *testing.T) {
+	ts := newTestServer(t)
+	t.Setenv("AGENTMAN_AGENT", "tester")
+	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+
+	code := captureExit(t, func() {
+		cmdNext(c, parse([]string{}))
+	})
+	if code != 3 {
+		t.Fatalf("expected exit 3 (no ready task), got %d", code)
+	}
+}
+
+func TestCmdStatusBulk(t *testing.T) {
+	var patched []string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch {
+			patched = append(patched, strings.TrimPrefix(r.URL.Path, "/api/tasks/"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":1}`))
+	}))
+	t.Cleanup(stub.Close)
+	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+
+	out := captureStdout(t, func() {
+		cmdStatus(c, parse([]string{"1", "2", "3", "done"}))
+	})
+	if strings.TrimSpace(out) != "" {
+		t.Errorf("bulk cmdStatus stdout = %q, want empty", out)
+	}
+	if len(patched) != 3 || patched[0] != "1" || patched[1] != "2" || patched[2] != "3" {
+		t.Fatalf("patched ids = %v, want [1 2 3]", patched)
+	}
+}
+
+func TestCmdStatusBulkPartialFailure(t *testing.T) {
+	var patched []string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/api/tasks/")
+		w.Header().Set("Content-Type", "application/json")
+		if id == "2" {
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"error":"not_found"}`))
+			return
+		}
+		patched = append(patched, id)
+		w.Write([]byte(`{"id":1}`))
+	}))
+	t.Cleanup(stub.Close)
+	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+
+	var code int
+	msg := captureStderr(t, func() {
+		code = captureExit(t, func() {
+			cmdStatus(c, parse([]string{"1", "2", "3", "done"}))
+		})
+	})
+	if code != 3 {
+		t.Fatalf("expected exit 3 (first failure was 404), got %d", code)
+	}
+	if len(patched) != 2 || patched[0] != "1" || patched[1] != "3" {
+		t.Fatalf("patched ids = %v, want [1 3] (loop continues past the failure)", patched)
+	}
+	if !strings.Contains(msg, "#2") || !strings.Contains(msg, "not_found") {
+		t.Fatalf("stderr = %q, want a line naming #2 not_found", msg)
+	}
+}
+
+func TestCmdAssignBulk(t *testing.T) {
+	var bodies []string
+	var ids []string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		ids = append(ids, strings.TrimPrefix(r.URL.Path, "/api/tasks/"))
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":1}`))
+	}))
+	t.Cleanup(stub.Close)
+	t.Setenv("AGENTMAN_AGENT", "tester")
+	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+
+	// Last positional is the assignee; the rest are ids.
+	cmdAssign(c, parse([]string{"1", "2", "bob"}))
+	if len(ids) != 2 || ids[0] != "1" || ids[1] != "2" {
+		t.Fatalf("assigned ids = %v, want [1 2]", ids)
+	}
+	for _, b := range bodies {
+		if !strings.Contains(b, `"assignee":"bob"`) {
+			t.Fatalf("assign body = %q, want assignee bob", b)
+		}
+	}
+
+	// "me" resolves to the current agent.
+	bodies, ids = nil, nil
+	cmdAssign(c, parse([]string{"3", "me"}))
+	if len(bodies) != 1 || !strings.Contains(bodies[0], `"assignee":"tester"`) {
+		t.Fatalf("assign me bodies = %v, want assignee tester", bodies)
+	}
+
+	// "-" unassigns.
+	bodies, ids = nil, nil
+	cmdAssign(c, parse([]string{"4", "-"}))
+	if len(bodies) != 1 || !strings.Contains(bodies[0], `"assignee":""`) {
+		t.Fatalf("assign - bodies = %v, want empty assignee", bodies)
+	}
+
+	// Single-id regression: `am assign <id> <agent>` still works.
+	bodies, ids = nil, nil
+	cmdAssign(c, parse([]string{"5", "alice"}))
+	if len(ids) != 1 || ids[0] != "5" || !strings.Contains(bodies[0], `"assignee":"alice"`) {
+		t.Fatalf("single assign = ids %v bodies %v", ids, bodies)
+	}
+}

@@ -924,6 +924,70 @@ func (s *Store) StealStaleClaim(id int64, agent string, staleFor time.Duration) 
 	return t, ev, tx.Commit()
 }
 
+// NextTask atomically picks and claims the best ready task: status todo,
+// unassigned, no open prerequisites, in a non-archived project — optionally
+// scoped to a project slug. Returns ErrNotFound when nothing qualifies (or the
+// slug does not exist). Tasks pre-assigned to the caller are deliberately
+// skipped (candidates require assignee IS NULL) — claim those with `am claim`.
+func (s *Store) NextTask(project, agent string) (*Task, *Event, error) {
+	if agent == "" {
+		return nil, nil, ErrValidation
+	}
+	scope := ""
+	args := []any{agent}
+	if project != "" {
+		pid, err := s.projectID(project)
+		if err != nil {
+			return nil, nil, err // ErrNotFound for a bad slug
+		}
+		scope = " AND t.project_id=?"
+		args = append(args, pid)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+
+	// Pick + claim in ONE conditional UPDATE — the project's race primitive
+	// (ADR-022/ADR-023); serialized by SetMaxOpenConns(1), so concurrent callers
+	// get distinct tasks. The NOT EXISTS open-prereq predicate matches ListTasks'
+	// Ready filter exactly. Ordering: priority ASC (0 = most urgent, matching
+	// ListTasks), then id ASC — a FIFO tiebreak, deliberately NOT the
+	// updated_at DESC display order of `am ls`: a pickup queue drains oldest-first.
+	var id, pid int64
+	err = tx.QueryRow(`
+		UPDATE tasks
+		   SET assignee=?,
+		       claimed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+		       status='doing',
+		       updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		 WHERE id = (
+		   SELECT t.id FROM tasks t JOIN projects p ON p.id=t.project_id
+		   WHERE t.status='todo' AND t.assignee IS NULL AND p.archived_at IS NULL`+scope+`
+		     AND NOT EXISTS (SELECT 1 FROM task_deps d JOIN tasks pt ON pt.id=d.depends_on_id
+		                     WHERE d.task_id=t.id AND pt.status!='done')
+		   ORDER BY t.priority ASC, t.id ASC LIMIT 1)
+		RETURNING id, project_id`, args...).Scan(&id, &pid)
+	if err == sql.ErrNoRows {
+		return nil, nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	// Same event kind + payload shape as ClaimTask — a next pickup IS a claim.
+	ev, err := insertEvent(tx, pid, id, agent, "task.claimed",
+		map[string]any{"assignee": []any{nil, agent}, "status": "doing"})
+	if err != nil {
+		return nil, nil, err
+	}
+	t, err := s.getTaskTx(tx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	return t, ev, tx.Commit()
+}
+
 // DeleteTask hard-deletes a task (and its comments via FK cascade) and records
 // a task.deleted event in the same transaction. Returns ErrNotFound if the task
 // does not exist.

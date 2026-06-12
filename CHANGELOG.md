@@ -11,6 +11,42 @@ fresh `[Unreleased]` section.
 
 ### Added
 
+- **Agent work loop (Phase L)** — the verbs an agent loop needs between "what should I do?" and
+  "is my prerequisite finished?".
+  - **`am next [-p P]`** (`POST /api/tasks/next {"project"?}`) — atomic pick + claim of the best
+    ready task: `todo`, **unassigned**, no open prerequisites, non-archived project. Pick and claim
+    are ONE conditional `UPDATE … WHERE id = (SELECT … ORDER BY priority ASC, id ASC LIMIT 1)`, so
+    concurrent callers always get distinct tasks. Ordering is priority ASC (0 = most urgent) with an
+    **id-ASC FIFO tiebreak** (a pickup queue drains oldest-first — deliberately not the
+    `updated_at DESC` display order of `am ls`). Prints only the claimed id (`--json` for the full
+    task); nothing ready → `404 not_found` → exit 3 (`next: no ready task`). Tasks pre-assigned to
+    the caller are skipped (candidates require `assignee IS NULL`) — use `am claim` for those.
+    Emits the existing `task.claimed` event (same payload shape as a claim). New store method
+    `NextTask`.
+  - **`am wait <id> --done [--timeout D]` / `am wait --ready [-p P] [--timeout D]`** — block until
+    a task is `done`, or until some ready task exists. Pure CLI-side SSE consumer (`cmd/am/wait.go`):
+    snapshots the event cursor (`/api/events?tail=1`), checks the condition via REST, then follows
+    `/api/stream?since=<cursor>` and **re-checks via REST on each relevant event** (event payloads
+    are never trusted as state); reconnects from the last seen id on disconnect. The server is
+    untouched. `--timeout` accepts a Go duration (`5m`) or bare seconds (`300`); default **10m**.
+    Met → exit 0 (`--done` prints nothing; `--ready` prints one ready task id; `--json` prints the
+    satisfying task). **New exit code `7`** on timeout (`wait: timeout`); missing task → 3;
+    server down → 6.
+  - **Bulk `am status <id...> <status>` / `am assign <id...> <agent|me|->`** — the last positional
+    is the status/assignee, everything before it is task ids. Client-side loop, one PATCH (and one
+    event) per task. Partial failure: each failing id gets its own stderr line
+    (`status: #13 not_found`) and the loop continues; exit code is the first failure's mapping
+    (0 if all succeeded; server down aborts immediately with 6). New helper `exitCodeFor` in
+    `client.go` is now the single status→exit-code source for `doOrFail` and the bulk loop.
+  - Tests: `TestNextTaskPicksHighestPriorityReady`, `TestNextTaskFIFOWithinPriority`,
+    `TestNextTaskProjectScoping`, `TestNextTaskNoneReady`, `TestNextTaskRaceDistinctWinners`,
+    `TestNextTaskEmptyAgentValidation` (store); `TestNextEndpoint`, `TestNextEndpointProjectBody`
+    (HTTP); `TestCmdNextPrintsOnlyID`, `TestExitNextNoneReady`, `TestCmdStatusBulk`,
+    `TestCmdStatusBulkPartialFailure`, `TestCmdAssignBulk` (CLI); new `wait_test.go` —
+    `TestWaitDoneAlreadySatisfied`, `TestWaitDoneEventArrives`, `TestWaitReadyOnPrereqDone`,
+    `TestWaitTimeout`, `TestWaitTaskNotFound`, `TestWaitServerDown`, `TestWaitUsageErrors`,
+    `TestParseWaitTimeout`, `TestWaitBadTimeoutExit5`.
+
 - **Stale-claim recovery (Phase K)** — agents that crash after `am claim` no longer hold tasks
   forever.
   - **`am ls --stale <dur>`** (`GET /api/tasks?stale=<dur>`) — lists tasks that are assigned, not
