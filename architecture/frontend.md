@@ -33,6 +33,14 @@ All built imperatively in `app.js` (no component framework):
   badge and an **Unarchive** button. Both buttons call `POST /api/projects/{slug}/archive|unarchive`
   via `api()`, then refresh the list. If the just-archived project was selected, the tab bar and
   board reload automatically.
+- **Search + label filter (header)** — a `#searchBox` input in the header `.actions` filters the
+  board **server-side** (`?q=` on `GET /api/tasks` — substring match over title *and* body, which
+  the client couldn't do since the list payload has no body). Input is **debounced 250 ms**
+  (`searchTimer`) before `loadBoard()` re-fetches; the **`/`** keyboard shortcut focuses the box.
+  Because the filter is applied in `loadBoard()` (state in `filterQ`/`filterLabel`, deliberately
+  *not* in the shared `qstr()` used by the feed/SSE), the debounced SSE board reload keeps the
+  filter across live refreshes. An active label filter shows a **`#labelFilterChip`** chip next to
+  the search box (`setLabelFilter`) with a **✕** clear button (`clearLabelFilter`).
 - **Board** — `renderBoard`, `card(t)`: four status columns (`COLS`), priority via card left-border
   + chip, avatar initials, project tag (shown when `selected.size !== 1`, i.e. only when the board
   isn't already scoped to a single project), comment count. Cards now also show a dependency tag in
@@ -41,14 +49,18 @@ All built imperatively in `app.js` (no component framework):
   counts (`nprereq`/`nopen` on the task object); there is no stored "ready" status field. A card in
   `doing` with an assignee and no activity for 30+ minutes (`Date.now() - Date.parse(t.updated_at)
   > STALE_MS`, `STALE_MS = 30 * 60 * 1000`) additionally shows an amber **⏳ stale** chip
-  (`.tag-stale`) — purely client-side, computed at render time from `updated_at`.
+  (`.tag-stale`) — purely client-side, computed at render time from `updated_at`. Cards also show
+  the task's **label chips** (`.tag-label`) in the footer — at most 3, then a **`+N`** overflow
+  chip; clicking a label chip calls `setLabelFilter(l)` to filter the whole board by that label
+  (the chips are `role="button"`/`tabindex=0` and stop click propagation so the card doesn't open).
 - **Activity feed** — `feedItem`, `evText`, `evKind`: color-coded events with clickable `#refs`.
   Event kinds include the project lifecycle: `project.created`, `project.archived`,
   `project.unarchived` (render via `evText`/`describeText`; `evKind` colors them as generic "other"),
   and the new delete kinds: `task.deleted`, `comment.deleted`, `project.deleted`. A
   `task.reclaimed` event (stale-claim takeover) renders as *"X reclaimed #N from Y"* (the previous
   assignee comes from `data.assignee[0]`) and is colored like a claim (`evKind` maps it to
-  `"claimed"`). The feed supports
+  `"claimed"`). `task.labeled` / `task.unlabeled` events render as *"X labeled #N +l"* /
+  *"X unlabeled #N -l"* (new cases in both `evText` and `describeText`). The feed supports
   **backward pagination** via a "Load older activity" button appended **outside** `#feedList` (so
   `trimFeed` can't remove it); clicking it fetches `GET /api/events?before=<oldest-loaded-id>` and
   appends the results. `feedOldest` tracks the lowest event id currently in the feed; `feedPaginated`
@@ -74,6 +86,10 @@ All built imperatively in `app.js` (no component framework):
   Hard-block UX: if a claim or status-change to `doing`/`done` is rejected with a 409 `blocked`
   response, the dashboard surfaces the blocking prereq ids (e.g. "blocked by #1 #2 (prereq not
   done)") and reverts the card/modal to its previous state.
+  The modal also has a **Labels** section (`.labels-row`): one chip per label with a **✕ remove**
+  button (`DELETE /api/tasks/{id}/labels/{label}`), plus an **"Add label…" input** that submits on
+  **Enter** (`POST /api/tasks/{id}/labels {label}`); a validation 400 shows an inline `.ferr` hint
+  ("labels are 1-50 chars of a-z 0-9 . _ -").
 - **Dependency-graph overlay** — `openGraphOverlay` / `closeGraphOverlay` / `renderGraph` /
   `renderGraphDetail`: a full-screen overlay (`#graphOverlay`) that visualises the task dependency
   DAG for a project. Entry points: the **"Graph"** button in the header `.actions` (`#graphBtn`)
@@ -192,7 +208,7 @@ Deliberately addressed in this codebase (see `decision-records.md` IADR / UX his
   **focus restore** to the trigger (`lastFocus`).
 - Cards are `role="button"`, `tabindex=0`, openable with Enter/Space; status moves via `[` / `]`.
 - Keyboard shortcuts (`onKey`): `n` new task, `a` toggle activity, `g` toggle graph overlay
-  (open/close), `Esc` close. The graph detail panel's "Open task" closes the overlay, then opens the
+  (open/close), `/` focus the search box, `Esc` close. The graph detail panel's "Open task" closes the overlay, then opens the
   task modal on the board (so the modal isn't hidden behind the overlay).
 - `aria-pressed` on tabs, `aria-expanded` on the activity toggle, labels on all fields.
 - Drawer resize handle is a `role="separator"` with arrow-key support.

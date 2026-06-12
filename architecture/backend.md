@@ -18,7 +18,7 @@ GET   /api/projects                 handleListProjects      ?archived=true inclu
 POST  /api/projects                 handleCreateProject     {slug,name}
 POST  /api/projects/{slug}/archive    handleArchiveProject
 POST  /api/projects/{slug}/unarchive  handleUnarchiveProject
-GET   /api/tasks                    handleListTasks         ?project=&status=&assignee=&limit=&ready=true|&blocked=true|&stale=<dur>  (no project ⇒ hides archived-project tasks; stale = assigned + not done + no activity for ≥ dur)
+GET   /api/tasks                    handleListTasks         ?project=&status=&assignee=&limit=&ready=true|&blocked=true|&stale=<dur>|&q=<text>|&label=<l>  (no project ⇒ hides archived-project tasks; stale = assigned + not done + no activity for ≥ dur; q = substring match on title OR body, ASCII-case-insensitive, > 500 bytes → 400; label = exact match after normalization, invalid → 400)
 POST  /api/tasks                    handleCreateTask        {project,title,body?,priority?,assignee?}
 GET   /api/tasks/{id}               handleGetTask           (task + comments + recent events + depends_on + blocks)
 PATCH /api/tasks/{id}               handlePatchTask         {status?,assignee?,title?,body?,priority?}  (hard-blocked if open prereqs + doing/done target)
@@ -27,6 +27,8 @@ POST  /api/tasks/{id}/claim         handleClaim             (atomic; X-Agent = c
 POST  /api/tasks/{id}/comments      handleComment           {body}
 POST  /api/tasks/{id}/deps          handleAddDep            {depends_on: <id-or-ref>}  add prerequisite edge
 DELETE /api/tasks/{id}/deps/{depId} handleRemoveDep         remove prerequisite edge
+POST  /api/tasks/{id}/labels        handleAddLabel          {label}  attach a label (idempotent; normalized)
+DELETE /api/tasks/{id}/labels/{label} handleRemoveLabel     detach a label (idempotent no-op if absent)
 GET   /api/events                   handleEvents            ?since=  | ?tail=  | ?before=  | ?project=  (no project ⇒ hides archived-project events)
 GET   /api/stream                   handleStream            text/event-stream (SSE)
 DELETE /api/tasks/{id}              handleDeleteTask        hard-delete task + comments + dep edges (cascade); 200 {"status":"deleted"}
@@ -68,7 +70,7 @@ logic). Each mutating method returns `(result, *Event, error)`; the handler broa
 Key methods: `CreateProject`, `ListProjects(includeArchived bool)`, `ArchiveProject`,
 `UnarchiveProject`, `DeleteProject`, `ListTasks`, `GetTask`, `CreateTask`, `PatchTask`,
 `ClaimTask`, `StealStaleClaim`, `NextTask`, `AddComment`, `DeleteComment`, `ListEvents`, `RecentEvents`,
-`ListEventsBefore`, `DeleteTask`, `AddDep`, `RemoveDep`, `ProjectGraph`. `ArchiveProject`/`UnarchiveProject` are transactional and
+`ListEventsBefore`, `DeleteTask`, `AddDep`, `RemoveDep`, `AddLabel`, `RemoveLabel`, `ProjectGraph`. `ArchiveProject`/`UnarchiveProject` are transactional and
 idempotent (no event when already in the target state).
 `CreateTask` checks the target project's `archived_at` before the insert and returns
 `ErrProjectArchived` if archived — creation into an archived project is rejected.
@@ -90,6 +92,20 @@ Returns `ErrNotFound` for a missing project. `ListTasks` now accepts `TaskFilter
 prereqs) and `TaskFilter.Blocked` (tasks with ≥1 open prereq); it also selects `NPrereqs` and
 `NOpenPrereqs` counts for every row via subqueries. `GetTask` additionally populates `DependsOn`
 and `Blocks` slices (full `DepRef` objects).
+
+**Labels & search** (Phase M): `AddLabel(taskID, label, actor)` / `RemoveLabel(taskID, label,
+actor)` first run the input through `normalizeLabel` (trim + ASCII-lowercase, then validate:
+1–50 bytes matching `^[a-z0-9._-]+$`; failure → `ErrValidation`). Both are idempotent —
+re-adding a present label or removing an absent one commits with no event (`nil, nil`-style
+no-op); otherwise they emit `task.labeled` / `task.unlabeled` with payload `{"label": l}` in the
+same tx. Labeling deliberately does **not** bump `updated_at` (metadata only — refreshing the
+activity timestamp would keep a stale claim alive, same precedent as dep edges). `ListTasks`
+selects each task's labels via a `GROUP_CONCAT` subquery on `task_labels`; `TaskFilter.Label`
+filters with an `EXISTS` equality match on the normalized label, and `TaskFilter.Query` (`?q=`)
+matches `title LIKE ? ESCAPE '\' OR body LIKE ? ESCAPE '\'` with the pattern run through
+`likeEscape` (escapes `%`, `_`, and `\` so user input can't act as wildcards) — substring,
+ASCII-case-insensitive (SQLite LIKE semantics). The handler caps `?q=` at `maxTitleLen`
+(500 bytes) → 400, bounding LIKE work.
 
 `ClaimTask` and `PatchTask` call the helper `hasOpenPrereqs` before writing: if any prerequisite
 task is not `done`, they return a `*BlockedError{OpenPrereqs: []int64{…}}`. `ClaimTask` blocks
@@ -223,7 +239,7 @@ per request after completion: `METHOD PATH STATUS LATENCY ACTOR` (actor = `X-Age
 
 ## Testing
 
-There are ten test files (run `go test -race ./cmd/am/`; 130 tests, all green):
+There are ten test files (run `go test -race ./cmd/am/`; 144 tests, all green):
 - `cmd/am/update_test.go` — version-comparison logic.
 - `cmd/am/store_test.go` — atomic-claim race (concurrent, `-race`-clean), events-cursor monotonicity,
   store CRUD + validation (`ErrValidation`), project archive/unarchive round-trip + idempotency,
@@ -235,7 +251,11 @@ There are ten test files (run `go test -race ./cmd/am/`; 130 tests, all green):
   `TestDropClearsClaimedAt`, and `am next` (Phase L): `TestNextTaskPicksHighestPriorityReady`,
   `TestNextTaskFIFOWithinPriority`, `TestNextTaskProjectScoping`, `TestNextTaskNoneReady`,
   `TestNextTaskRaceDistinctWinners` (concurrent pickers get distinct tasks; one task → one winner),
-  `TestNextTaskEmptyAgentValidation`.
+  `TestNextTaskEmptyAgentValidation`, and search + labels (Phase M): `TestListTasksQueryFilter`,
+  `TestListTasksQueryEscapesLikeWildcards` (LIKE wildcards in `?q=` are escaped, not interpreted),
+  `TestAddRemoveLabel`, `TestLabelValidation`, `TestListTasksLabelFilter`,
+  `TestAddLabelDoesNotBumpUpdatedAt`, `TestDeleteTaskCascadesLabels`,
+  `TestTaskLabelsTableExistsOnReopenedDB`.
 - `cmd/am/server_test.go` — validation→status mapping (400/404/409), `hostGuard`, `csrfGuard`,
   `securityHeaders`, `listenAddr` loopback regression, archive/unarchive endpoints + 404,
   hard-delete HTTP endpoints (`TestDeleteTaskEndpoint`, `TestDeleteProjectEndpoint`,
@@ -244,7 +264,9 @@ There are ten test files (run `go test -race ./cmd/am/`; 130 tests, all green):
   graph endpoint: `TestProjectGraphEndpoint` (200 with correct nodes + edges),
   `TestProjectGraphEndpoint404` (missing project → 404), Phase K: `TestListTasksStaleParam`
   (`?stale=` filter + 400 on bad duration), `TestStealStaleEndpoint` (steal body, `not_stale` 409),
-  and Phase L: `TestNextEndpoint` (FIFO picks, 404 when drained), `TestNextEndpointProjectBody`
+  Phase L: `TestNextEndpoint` (FIFO picks, 404 when drained), `TestNextEndpointProjectBody`,
+  and Phase M: `TestListTasksQueryParam` (`?q=` filter + 400 on over-long input),
+  `TestLabelEndpoints` (add/remove label endpoints + validation 400)
   (via `net/http/httptest`).
 - `cmd/am/migrate_test.go` — migration runner (apply/skip/idempotent/rollback), incl. the v2 step
   that adds `projects.archived_at` and the v3 step that adds `tasks.claimed_at`
@@ -262,7 +284,10 @@ There are ten test files (run `go test -race ./cmd/am/`; 130 tests, all green):
   (exit 4 + `not stale yet` message) and `TestStaleFlagsWireFormat` (`--stale` / `--steal-stale`
   wire encoding); Phase L added `TestCmdNextPrintsOnlyID`, `TestExitNextNoneReady` (exit 3),
   `TestCmdStatusBulk`, `TestCmdStatusBulkPartialFailure` (loop continues, stderr names the failing
-  id, exit = first failure's code), `TestCmdAssignBulk` (incl. `me`/`-` and single-id regression).
+  id, exit = first failure's code), `TestCmdAssignBulk` (incl. `me`/`-` and single-id regression);
+  Phase M added `TestCmdLsGrepWireFormat` (`--grep`/`--label` → `?q=`/`?label=` wire encoding),
+  `TestCmdLabelAddRemove` (`+add`/`-remove` token dispatch), `TestCmdLabelPrintsLabels` (bare
+  `am label <id>` prints the labels), `TestCmdLabelUsage` (usage errors).
 - `cmd/am/wait_test.go` — `am wait` (Phase L). `TestWaitDoneAlreadySatisfied`,
   `TestWaitDoneEventArrives`, `TestWaitDoneCrossProject` (`AGENTMAN_PROJECT` must not scope the
   `--done` stream), `TestWaitReadyOnPrereqDone` (blocked task becomes ready when its
@@ -289,7 +314,8 @@ rejection, idempotent add/remove, cascade on task delete, `NPrereqs`/`NOpenPrere
 response for claim and patch). The +4 graph tests (`TestProjectGraph`, `TestProjectGraphMissingProject`
 in `store_test.go`; `TestProjectGraphEndpoint`, `TestProjectGraphEndpoint404` in `server_test.go`)
 brought the total to **95** at the time; Phase J's hygiene tests and Phase K's 10 stale-claim
-tests brought it to **107**; Phase L's 23 work-loop tests (listed above) bring it to **130**.
+tests brought it to **107**; Phase L's 23 work-loop tests brought it to **130**; Phase M's 14
+findability tests (8 store, 2 server, 4 CLI — listed above) bring it to **144**.
 
 SSE streaming/reconnect, CLI verbs, exit-code mapping, and identity are now covered. The
 dashboard has a source-level XSS-sink guard but **no behavioral JS tests** — the project
@@ -303,10 +329,10 @@ deliberately adopts no JS test runner (preserves the single-binary/no-npm ethos)
 - **New task field:** add the column in `schema.sql`, the struct field in `store.go`, thread it
   through `CreateTask`/`PatchTask`/`getTaskTx`, the API, and the dashboard (`web/`).
 - **New event kind:** emit via `insertEvent(...)` and handle it in `web/app.js` `evText`/`describeText`.
-  Current kinds (15 total): `task.created`, `task.claimed`, `task.reclaimed`, `task.status`,
+  Current kinds (17 total): `task.created`, `task.claimed`, `task.reclaimed`, `task.status`,
   `task.assign`, `task.patched`, `task.deleted`, `task.dep_added`, `task.dep_removed`,
-  `comment.added`, `comment.deleted`, `project.created`, `project.archived`, `project.unarchived`,
-  `project.deleted`.
+  `task.labeled`, `task.unlabeled`, `comment.added`, `comment.deleted`, `project.created`,
+  `project.archived`, `project.unarchived`, `project.deleted`.
 
 ## Risks and Gaps
 

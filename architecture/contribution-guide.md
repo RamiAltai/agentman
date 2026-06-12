@@ -40,7 +40,7 @@ via `//go:embed`, so a running/old binary serves stale assets. Hard-refresh the 
 ## Running Tests
 
 ```sh
-go test -race ./cmd/am/                     # run all tests with the race detector (130 tests)
+go test -race ./cmd/am/                     # run all tests with the race detector (144 tests)
 go test ./...                               # equivalent short form
 go test -run TestUpdateAvailable -v ./cmd/am/
 ```

@@ -102,7 +102,8 @@ Evidence:
 
 Inferred (Confidence: Medium–High) from `README.md` "Security" and the localhost bind:
 - **Not** a multi-tenant / authenticated / internet-facing service. No auth, binds `127.0.0.1`.
-- **Not** a heavyweight project manager (no sprints, labels, due dates, attachments today).
+- **Not** a heavyweight project manager (no sprints, due dates, or attachments today; the only
+  metadata beyond status/priority/assignee is lightweight free-form labels, added in Phase M).
 - **Not** a hosted SaaS — it's a single local binary; "back up = copy one file."
 
 ## Evidence
@@ -115,6 +116,6 @@ Inferred (Confidence: Medium–High) from `README.md` "Security" and the localho
 
 - **Intended scale.** No stated target for concurrent agents / task volume. The single-writer
   SQLite design (`SetMaxOpenConns(1)`) implies modest scale, but this is not documented.
-- **Roadmap.** Near-term gap-closing work is now tracked in `ROADMAP.md` (repo root). Longer-term
-  ideas (auth, remote access, labels/due-dates, prebuilt binaries) remain discussion-only — treat
-  those as unconfirmed.
+- **Roadmap.** Near-term gap-closing work is now tracked in `ROADMAP.md` (repo root). Labels and
+  search shipped in Phase M; longer-term ideas (auth, remote access, due dates, prebuilt binaries)
+  remain discussion-only — treat those as unconfirmed.

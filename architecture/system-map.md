@@ -22,7 +22,7 @@ broadcast → dashboard**. Confirmed via `cmd/am/main.go`, `cmd/am/server.go`, `
 | `cmd/am/hub.go` | SSE subscriber hub (broadcast/fan-out) | `Hub`, `subscriber` |
 | `cmd/am/store.go` | All SQLite access; types; atomic claim; events | `Store` + domain structs |
 | `cmd/am/db.go` | `am db export`/`import`/`prune` (offline snapshot/restore/retention) | `cmdDB`, `exportDB`, `importDB`, `pruneEvents` |
-| `cmd/am/schema.sql` | DB schema (embedded) | `meta/projects/tasks/task_deps/comments/events` |
+| `cmd/am/schema.sql` | DB schema (embedded) | `meta/projects/tasks/task_deps/task_labels/comments/events` |
 | `cmd/am/client.go` | CLI HTTP client; HTTP-status → exit-code mapping | `Client`, `doOrFail`, `exitCodeFor` |
 | `cmd/am/cli.go` | CLI verb parsing + terse/JSON formatters | `cmd*`, `parse`, `fail` |
 | `cmd/am/wait.go` | `am wait` (SSE-driven blocking waits, exit 7 on timeout) | `cmdWait`, `waiter`, `readSSEFrame` |
@@ -83,6 +83,8 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   `DELETE /api/tasks/{id}/comments/{cid}`,
   `POST /api/tasks/{id}/deps` (add prerequisite edge),
   `DELETE /api/tasks/{id}/deps/{depId}` (remove prerequisite edge),
+  `POST /api/tasks/{id}/labels` (attach a label; idempotent),
+  `DELETE /api/tasks/{id}/labels/{label}` (detach a label; idempotent),
   `GET /api/projects/{slug}/graph` (read-only DAG: all tasks as nodes + dep edges; 404 on missing
   project; no events emitted),
   `GET /api/events` (`?since=` ascending / `?tail=` newest-first / `?before=` backward cursor),
@@ -116,6 +118,11 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   `am wait --ready [-p P]` block until the condition holds (SSE-driven, in `cmd/am/wait.go`;
   exit 7 on timeout, default 10m); `am status <id...> <st>` and `am assign <id...> <who>` accept
   multiple ids (client-side loop, one event per task; exit = first failure's code).
+  Findability: `am ls --grep TEXT` (substring search over title + body, ASCII-case-insensitive)
+  and `am ls --label L` (or `-l L`; exact label match) map to `?q=` / `?label=` on
+  `GET /api/tasks`; `am label <id> [+add ...] [-remove ...]` adds/removes labels (bare token =
+  add; lowercase 1-50 chars of `a-z 0-9 . _ -`), and bare `am label <id>` prints the task's
+  labels on one line.
 - **Dashboard** — `cmd/am/web/app.js`: vanilla SPA; SSE consumer; board/modal/feed rendering.
   Includes a `⋯` "Manage projects" button in the tab bar that opens a modal (`openManageProjects`/
   `renderManageList`) listing all projects (active + archived via `GET /api/projects?archived=true`),
