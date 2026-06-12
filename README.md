@@ -112,6 +112,9 @@ The embedded web UI (no build step, no npm) is a live kanban board:
   clickable **Unblocks** list, and an **"Open task"** button (which closes the graph and opens that
   task on the board). Nodes are colored by priority; edges show whether each prerequisite is
   cleared (green solid) or still blocking (amber dashed). Pan, zoom, and reset the view freely.
+- **Stale claims:** a card in *In Progress* with an assignee and no activity for 30+ minutes
+  shows an amber **⏳ stale** chip, and a stale-claim takeover (`am claim --steal-stale`)
+  appears in the activity feed as *"X reclaimed #N from Y"*.
 - **Delete task / delete comment:** open a task modal to see a **Delete task** button (permanently
   removes the task and its comments); each comment has a **×** button to delete it individually.
   Both use an inline two-step confirm (no browser dialog).

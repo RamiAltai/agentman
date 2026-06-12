@@ -7,8 +7,9 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 - **Schema-migration runner: forward-only, no rollback path** (was High → now Low). The forward-only
   runner that reads/bumps `meta.schema_version` (ADR-010) is now exercised end-to-end: Phase 2 shipped
-  the first real step (`ALTER TABLE projects ADD COLUMN archived_at TEXT` at `version: 2`,
-  `currentSchemaVersion = 2`), applied with its version bump in one tx and covered by tests. Residual:
+  the first real step (`ALTER TABLE projects ADD COLUMN archived_at TEXT` at `version: 2`) and
+  Phase K the second (`ALTER TABLE tasks ADD COLUMN claimed_at TEXT` at `version: 3`,
+  `currentSchemaVersion = 3`), each applied with its version bump in one tx and covered by tests. Residual:
   no down-migrations; a DB recorded at a version newer than the binary is accepted leniently (its
   unknown steps are simply skipped, no error). → `data-model.md`, `decision-records.md` ADR-010.
 - **Single-writer throughput ceiling** (Low for stated scope). `SetMaxOpenConns(1)` serializes all
@@ -96,7 +97,7 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 ## Testing Gaps
 
-- Coverage now spans store/server/migrate/db/cli/sse/identity/web tests (9 files, 95 tests,
+- Coverage now spans store/server/migrate/db/cli/sse/identity/web tests (9 files, 107 tests,
   `-race`-clean): the **atomic claim** (race, `-race`-clean), events cursor, store CRUD/validation,
   validation→status mapping, the Host/CSRF/CSP guards, project archive/unarchive (store round-trip
   + idempotency and the HTTP endpoints incl. 404), the v2 migration (adds `archived_at` +
@@ -132,6 +133,12 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   The +4 graph tests cover: `TestProjectGraph` (store: correct nodes + edges shape),
   `TestProjectGraphMissingProject` (store: `ErrNotFound`), `TestProjectGraphEndpoint` (HTTP 200
   with correct shape), `TestProjectGraphEndpoint404` (HTTP 404 for missing project).
+  Phase K added 10 stale-claim tests: the steal + exactly-one-winner race
+  (`TestStealStaleClaim`, `TestStealRaceExactlyOneWinner`), the stale filter
+  (`TestListTasksStaleFilter`), `claimed_at` set/clear (`TestClaimSetsClaimedAt`,
+  `TestDropClearsClaimedAt`), the v3 migration (`TestMigrationV3AddsClaimedAt`), the HTTP
+  surfaces (`TestListTasksStaleParam`, `TestStealStaleEndpoint`), and the CLI mapping
+  (`TestExitNotStale`, `TestStaleFlagsWireFormat`).
   **Still untested:** behavioral dashboard JS — the "Manage projects" modal, the delete confirm
   flows (task/comment/project), the feed pagination button, the dependency section UI (prereq chips,
   add-prereq dropdown, blocks list), the **graph overlay** (layout, pan/zoom, transitive highlight,

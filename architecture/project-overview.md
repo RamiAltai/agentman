@@ -48,6 +48,12 @@ Evidence:
   assignee, comments. Evidence: `cmd/am/schema.sql`.
 - **Atomic task claim** so two agents never grab the same ticket — conditional
   `UPDATE … RETURNING` in `cmd/am/store.go` `ClaimTask`.
+- **Stale-claim recovery** so a crashed agent doesn't hold a task forever: `am ls --stale <dur>`
+  lists assigned, not-done tasks with no activity for the given window, and
+  `am claim <id> --steal-stale <dur>` atomically takes one over (same conditional-UPDATE trick,
+  `StealStaleClaim`; exactly one stealer wins; a `task.reclaimed` event records the handoff; the
+  dashboard shows a ⏳ stale chip on idle claimed cards). Evidence: `cmd/am/store.go`,
+  `cmd/am/cli.go`, `cmd/am/web/app.js`.
 - **Live activity feed** backed by an append-only `events` table (also the SSE replay cursor).
 - **Per-directory agent identity** that survives the fresh-shell-per-command model agents run in
   (`cmd/am/identity.go`).

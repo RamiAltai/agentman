@@ -80,7 +80,7 @@ convention is loose, it's called out.
 
 - `go test -race ./cmd/am/` (or `go test ./...`); table-driven tests (see `cmd/am/update_test.go`).
   Coverage spans pure logic, the store, HTTP, migrations, offline DB tooling, CLI verbs + exit codes,
-  SSE streaming/reconnect, identity, and the dashboard XSS-sink guard — 9 test files, 95 tests.
+  SSE streaming/reconnect, identity, and the dashboard XSS-sink guard — 9 test files, 107 tests.
 - **`osExit` testability var** — `cli.go` declares `var osExit = os.Exit`; `fail()` calls `osExit`
   rather than `os.Exit` directly. Tests in `cli_test.go` replace it via `captureExit(t, fn)`,
   which substitutes a panic-based stub so exit codes can be asserted without terminating the process.

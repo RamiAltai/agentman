@@ -40,7 +40,7 @@ via `//go:embed`, so a running/old binary serves stale assets. Hard-refresh the 
 ## Running Tests
 
 ```sh
-go test -race ./cmd/am/                     # run all tests with the race detector (71 tests)
+go test -race ./cmd/am/                     # run all tests with the race detector (107 tests)
 go test ./...                               # equivalent short form
 go test -run TestUpdateAvailable -v ./cmd/am/
 ```
@@ -50,14 +50,18 @@ Tests live next to the code in `cmd/am/` (9 test files):
 - `update_test.go` — version-comparison logic.
 - `store_test.go` — CRUD + validation, the atomic claim race (exactly one winner), archive/unarchive
   round-trip + idempotency, the strictly-increasing events cursor, feed hiding archived-project events
-  (`TestFeedHidesArchivedProjectEvents`), and task creation rejected into an archived project
-  (`TestCreateTaskRejectsArchivedProject`).
+  (`TestFeedHidesArchivedProjectEvents`), task creation rejected into an archived project
+  (`TestCreateTaskRejectsArchivedProject`), and stale-claim recovery (`TestStealStaleClaim`,
+  `TestStealRaceExactlyOneWinner` — exactly one concurrent stealer wins, `TestListTasksStaleFilter`,
+  `TestClaimSetsClaimedAt`, `TestDropClearsClaimedAt`).
 - `server_test.go` — HTTP status mapping (404 / 400 / lost-claim 409), the Host/CSRF guards and
   security headers, the archive/unarchive endpoints, HTTP 400 on task creation into an archived
   project (`TestCreateTaskIntoArchivedProject400`), `TestWriteErrHidesInternalDetail` (500 returns
-  generic body), `TestRequestLoggerPassesThrough`, `TestRequestLoggerPreservesFlusher`.
+  generic body), `TestRequestLoggerPassesThrough`, `TestRequestLoggerPreservesFlusher`, the
+  `?stale=` filter (`TestListTasksStaleParam`), and the steal-stale claim body
+  (`TestStealStaleEndpoint`).
 - `migrate_test.go` — the forward-only migration runner (apply + version bump, skip ≤ current,
-  idempotency, rollback) and the v2 `archived_at` column.
+  idempotency, rollback) and the v2 `archived_at` / v3 `claimed_at` columns.
 - `db_test.go` — `am db` export/import (roundtrip + perms, backup creation, garbage rejection,
   server-liveness probe), and prune (`TestPruneEventsKeep`, `TestPruneEventsBefore`,
   `TestPruneEventsBeforeSameDayBoundary`).
@@ -65,7 +69,9 @@ Tests live next to the code in `cmd/am/` (9 test files):
   against an `httptest` server. `captureStdout` captures os.Stdout via a pipe; `captureExit` stubs
   the `osExit` var (see "Test Seams" below) to intercept exit codes as panics. Covers: `cmdNew`
   prints only the numeric id; `cmdLs` terse output; mutations (`cmdStatus`/`cmdNote`/`cmdDrop`)
-  silent on success; exit-code mapping 3/4/5/6; and pure formatter/parse table tests.
+  silent on success; exit-code mapping 3/4/5/6 (incl. `TestExitNotStale` — exit 4 with `not stale
+  yet`); `--stale`/`--steal-stale` wire encoding (`TestStaleFlagsWireFormat`); and pure
+  formatter/parse table tests.
 - `sse_test.go` — SSE streaming + reconnect (Phase E2). `TestSSEDeliversLiveEvent` opens
   `/api/stream`, creates a task, and asserts the `task.created` event arrives live.
   `TestSSEReplayOnReconnect` reconnects with `Last-Event-ID` and verifies gap-replay with

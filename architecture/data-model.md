@@ -90,8 +90,9 @@ deleted** (append-only).
   validates same-project + no-cycle and emits a `task.dep_added` event. Removing an edge uses
   `DELETE /api/tasks/{id}/deps/{depId}` (`RemoveDep`), emitting `task.dep_removed`. Edges cascade
   on task delete (both directions).
-- **Update:** `tasks` only (status/assignee/title/body/priority); `updated_at` set explicitly in
-  each `UPDATE` (no trigger).
+- **Update:** `tasks` only (status/assignee/title/body/priority, plus `claimed_at` kept in step
+  with the assignee — set on claim/steal/assign, NULLed on unassign); `updated_at` set explicitly
+  in each `UPDATE` (no trigger).
 - **Archive (soft, projects only):** a project can be **soft-archived** — `ArchiveProject` sets
   `projects.archived_at` (and `UnarchiveProject` clears it). This is **reversible** and hides the
   project from default lists; it is **not** a hard delete (the row and its tasks/comments stay).
@@ -142,8 +143,9 @@ deleted** (append-only).
 bumps `meta.schema_version` in one transaction; steps are integer-ordered and idempotent.
 
 To add a column/table change, append a `{version, apply}` step to `schemaMigrations` and raise
-`currentSchemaVersion` (`cmd/am/store.go`, now `2`). `schemaMigrations` is **no longer empty**: its
-first real step is `{version: 2}`, which runs `ALTER TABLE projects ADD COLUMN archived_at TEXT`.
+`currentSchemaVersion` (`cmd/am/store.go`, now `3`). `schemaMigrations` is **no longer empty**: its
+first real step is `{version: 2}`, which runs `ALTER TABLE projects ADD COLUMN archived_at TEXT`,
+and Phase K added `{version: 3}`, which runs `ALTER TABLE tasks ADD COLUMN claimed_at TEXT`.
 `schema.sql` still seeds a fresh DB at version 1, so the forward-only runner is now **exercised
 end-to-end** — each step applies its change and commits the `meta.schema_version` bump in the same
 transaction (was foundation-only in Phase 0). Known limitations: forward-only (no down-migrations);
@@ -154,8 +156,8 @@ a DB at a **newer** version than the binary is accepted silently today; an unpar
 entirely new table (rather than altering an existing one), placing a `CREATE TABLE IF NOT EXISTS`
 in `schema.sql` is sufficient — `OpenStore` runs `schema.sql` on every start, so the new table
 appears in existing DBs automatically. The migration runner is only needed for `ALTER TABLE` on
-existing tables (where `IF NOT EXISTS` can't help). Example: `task_deps` was added this way;
-`currentSchemaVersion` remained at `2`.
+existing tables (where `IF NOT EXISTS` can't help). Example: `task_deps` was added this way,
+with no `schemaMigrations` step and no `currentSchemaVersion` bump.
 
 Backup/restore:
 
