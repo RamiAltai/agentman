@@ -41,6 +41,10 @@ the port can read and mutate every project/task/comment.
   rejected (`ErrValidation` → HTTP 400). Unknown `PATCH` fields are ignored (`PatchTask`).
 - Request bodies capped at **1 MiB** (`io.LimitReader` in `server.go decode`); `ReadHeaderTimeout`
   set. `{id}` path values resolved/validated by `resolveTaskID`.
+- The `?q=` search input is parameterized like everything else, run through `likeEscape` (so
+  `%`/`_`/`\` can't act as LIKE wildcards) and capped at 500 bytes (→ 400); labels are validated by
+  `normalizeLabel` against a strict charset (`^[a-z0-9._-]+$`, 1–50 bytes) before any SQL
+  (`cmd/am/store.go`).
 
 ## Output Encoding
 

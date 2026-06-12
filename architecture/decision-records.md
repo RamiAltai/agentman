@@ -596,7 +596,10 @@ without evidence.
      event, like deps.
   8. **`cmdLabel` takes raw argv** — dispatched in `main.go` before `parse()`, because the parser
      would consume a removal token (`-bar`) as a value flag. `am label <id>` alone prints the
-     labels space-separated.
+     labels space-separated. Flag-like tokens are rejected, not interpreted: a `--…` token is a
+     usage error, and the known global value flags `-p`/`-c` are refused by name with a hint
+     (both exit 5) — so a habitual `am label 12 --json` or `-p web` can't silently add or remove
+     a label.
   9. **Deliberately deferred:** no `--label` on `am next` / `am new` (keep the pickup predicate
      uniform; add when demand appears), and **no labels in `taskLine`** (`am ls` row token budget;
      labels are in `--json` and `am show`).

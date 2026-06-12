@@ -1,7 +1,7 @@
 # Frontend Architecture
 
 There **is** a frontend: a small single-page dashboard in `cmd/am/web/`
-(`index.html` 67 lines, `app.css` 576 lines, `app.js` 1708 lines), embedded into the binary via
+(`index.html` 69 lines, `app.css` 607 lines, `app.js` 1796 lines), embedded into the binary via
 `//go:embed web` (`cmd/am/server.go`) and served at `/`. It is the human-facing view; agents do
 not use it.
 
@@ -143,7 +143,9 @@ Module-level mutable variables in `app.js` (no store/framework):
 (`Map<id,task>`), `cursor` (highest seen `events.id` for SSE `since=`), `es` (EventSource),
 `openTaskId`, `dragId`, `lastFocus`, `feedOldest` (lowest event id currently in `#feedList`; `0`
 if none loaded), `feedPaginated` (`true` once the user has paginated; disables `trimFeed` cap),
-`loadOlderBtn` (reference to the "Load older" button outside `#feedList`). Graph overlay state:
+`loadOlderBtn` (reference to the "Load older" button outside `#feedList`), `filterQ` /
+`filterLabel` (active server-side search/label filters, applied by `loadBoard()`), `searchTimer`
+(the search box's 250 ms input debounce). Graph overlay state:
 `graphOpen` (bool), `graphSlug` (slug of the project currently shown), `graphData`
 (`{nodes, edges}` from the last fetch), `graphViewState` / `graphInitialView` (current and
 reset-target `viewBox`), `graphSelectedId` (currently highlighted node id), `graphDragState`,

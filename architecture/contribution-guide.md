@@ -53,13 +53,16 @@ Tests live next to the code in `cmd/am/` (10 test files):
   (`TestFeedHidesArchivedProjectEvents`), task creation rejected into an archived project
   (`TestCreateTaskRejectsArchivedProject`), and stale-claim recovery (`TestStealStaleClaim`,
   `TestStealRaceExactlyOneWinner` — exactly one concurrent stealer wins, `TestListTasksStaleFilter`,
-  `TestClaimSetsClaimedAt`, `TestDropClearsClaimedAt`).
+  `TestClaimSetsClaimedAt`, `TestDropClearsClaimedAt`), and findability (Phase M): the `?q=` search
+  filter incl. LIKE-wildcard escaping, and labels (add/remove idempotency, validation, `?label=`
+  filter, delete cascade, no `updated_at` bump, fresh-table existence).
 - `server_test.go` — HTTP status mapping (404 / 400 / lost-claim 409), the Host/CSRF guards and
   security headers, the archive/unarchive endpoints, HTTP 400 on task creation into an archived
   project (`TestCreateTaskIntoArchivedProject400`), `TestWriteErrHidesInternalDetail` (500 returns
   generic body), `TestRequestLoggerPassesThrough`, `TestRequestLoggerPreservesFlusher`, the
-  `?stale=` filter (`TestListTasksStaleParam`), and the steal-stale claim body
-  (`TestStealStaleEndpoint`).
+  `?stale=` filter (`TestListTasksStaleParam`), the steal-stale claim body
+  (`TestStealStaleEndpoint`), the `?q=` search param incl. 400 on over-long input
+  (`TestListTasksQueryParam`), and the label endpoints (`TestLabelEndpoints`).
 - `migrate_test.go` — the forward-only migration runner (apply + version bump, skip ≤ current,
   idempotency, rollback) and the v2 `archived_at` / v3 `claimed_at` columns.
 - `db_test.go` — `am db` export/import (roundtrip + perms, backup creation, garbage rejection,
@@ -72,7 +75,9 @@ Tests live next to the code in `cmd/am/` (10 test files):
   silent on success; exit-code mapping 3/4/5/6/7 (incl. `TestExitNotStale` — exit 4 with `not stale
   yet`; 7, the wait timeout, is exercised in `wait_test.go`); `cmdNext` prints only the claimed id
   and exits 3 when nothing is ready; bulk `status`/`assign` (multiple ids, partial-failure exit
-  codes); `--stale`/`--steal-stale` wire encoding (`TestStaleFlagsWireFormat`); and pure
+  codes); `--stale`/`--steal-stale` wire encoding (`TestStaleFlagsWireFormat`); `--grep`/`--label`
+  wire encoding (`TestCmdLsGrepWireFormat`) and the `am label` verb (`TestCmdLabelAddRemove`,
+  `TestCmdLabelPrintsLabels`, `TestCmdLabelUsage` — incl. rejection of flag-like tokens); and pure
   formatter/parse table tests.
 - `sse_test.go` — SSE streaming + reconnect (Phase E2). `TestSSEDeliversLiveEvent` opens
   `/api/stream`, creates a task, and asserts the `task.created` event arrives live.

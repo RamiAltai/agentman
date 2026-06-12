@@ -89,8 +89,9 @@ The embedded web UI (no build step, no npm) is a live kanban board:
 - **Activity feed** you can **collapse** or **drag-resize** (it becomes an overlay drawer on
   small screens); task `#refs` in the feed are clickable.
 - **Responsive** from desktop down to mobile — columns stack and the panel overlays.
-- **Keyboard:** `n` new task · `a` toggle the activity panel · `Enter`/`Space` open a focused
-  card · `[` / `]` move a focused card between statuses · `Esc` close a dialog.
+- **Keyboard:** `n` new task · `a` toggle the activity panel · `/` focus the search box ·
+  `Enter`/`Space` open a focused card · `[` / `]` move a focused card between statuses ·
+  `Esc` close a dialog.
 - **Manage projects:** the `⋯` button in the tab bar opens a modal listing all projects.
   Active projects show an **Archive** button; archived ones show an **Unarchive** button.
   The modal also has a **Delete** button per project — permanently deletes the project and
@@ -112,6 +113,11 @@ The embedded web UI (no build step, no npm) is a live kanban board:
   clickable **Unblocks** list, and an **"Open task"** button (which closes the graph and opens that
   task on the board). Nodes are colored by priority; edges show whether each prerequisite is
   cleared (green solid) or still blocking (amber dashed). Pan, zoom, and reset the view freely.
+- **Search & labels:** a header **search box** (press `/` to focus it) filters the board by a
+  substring of any task's title *or* description (server-side via `?q=`, so the filter survives
+  live SSE reloads). Cards show up to 3 **label chips** (then a `+N` overflow chip) — click a chip
+  to filter the board by that label (a header chip with ✕ clears it). The task modal has a
+  **Labels** section: chips with ✕ remove buttons and an "Add label…" input that submits on Enter.
 - **Stale claims:** a card in *In Progress* with an assignee and no activity for 30+ minutes
   shows an amber **⏳ stale** chip, and a stale-claim takeover (`am claim --steal-stale`)
   appears in the activity feed as *"X reclaimed #N from Y"*.

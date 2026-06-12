@@ -23,7 +23,10 @@ fresh `[Unreleased]` section.
   - **Labels: `am label <id> [+add …] [-remove …]`** — free-form tags on tasks.
     `am label <id>` alone prints the task's labels space-separated (nothing if none); `+foo` or bare
     `foo` adds, `-bar` removes (silent success, scriptable). The verb takes **raw argv** (dispatched
-    before `parse()`, which would swallow `-bar` as a value flag). Labels are normalized at the
+    before `parse()`, which would swallow `-bar` as a value flag); flag-like tokens are rejected
+    rather than treated as labels — `--…` is a usage error and the global value flags `-p`/`-c` are
+    refused by name with a hint (both exit 5), so e.g. `am label 12 --json` can't silently remove a
+    `json` label. Labels are normalized at the
     boundary — trimmed, lowercased, 1–50 bytes of `a-z 0-9 . _ -` (charset excludes `,` for safe
     `GROUP_CONCAT` splitting and `+`/space for unambiguous CLI tokens); anything else is
     `400 invalid` → exit 5. API: `POST /api/tasks/{id}/labels {"label":…}` /

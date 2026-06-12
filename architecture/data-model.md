@@ -174,8 +174,9 @@ a DB at a **newer** version than the binary is accepted silently today; an unpar
 entirely new table (rather than altering an existing one), placing a `CREATE TABLE IF NOT EXISTS`
 in `schema.sql` is sufficient — `OpenStore` runs `schema.sql` on every start, so the new table
 appears in existing DBs automatically. The migration runner is only needed for `ALTER TABLE` on
-existing tables (where `IF NOT EXISTS` can't help). Example: `task_deps` was added this way,
-with no `schemaMigrations` step and no `currentSchemaVersion` bump.
+existing tables (where `IF NOT EXISTS` can't help). Examples: `task_deps` (Phase H) and
+`task_labels` (Phase M, ADR-024) were both added this way, with no `schemaMigrations` step and
+no `currentSchemaVersion` bump.
 
 Backup/restore:
 

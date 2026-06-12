@@ -74,7 +74,8 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   `POST /api/projects/{slug}/archive`, `POST /api/projects/{slug}/unarchive`,
   `DELETE /api/projects/{slug}` (hard-delete + cascade),
   `GET/POST /api/tasks` (`?ready=true` / `?blocked=true` filter by prereq state; `?stale=<dur>`
-  filters to assigned, not-done tasks with no activity for ≥ dur),
+  filters to assigned, not-done tasks with no activity for ≥ dur; `?q=<text>` substring search on
+  title OR body; `?label=<l>` exact label match),
   `GET/PATCH /api/tasks/{id}` (GET returns `depends_on`/`blocks`),
   `DELETE /api/tasks/{id}` (hard-delete + cascade to comments + dep edges),
   `POST /api/tasks/next` (atomic pick+claim of the best ready task; 404 if none),
