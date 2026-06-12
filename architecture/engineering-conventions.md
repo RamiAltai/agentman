@@ -18,11 +18,11 @@ convention is loose, it's called out.
 - HTTP handlers: `handleX` (e.g. `handleClaim`). Routes registered in `Server.Handler()`.
 - Store methods: exported PascalCase domain verbs (`CreateTask`, `ClaimTask`, `ListEvents`).
 - CLI verb implementations: `cmdX` (`cmdClaim`, `cmdNew`); dispatched in `main.go`.
-- Sentinel errors: `ErrNotFound`, `ErrConflict`, `ErrValidation`, `ErrProjectArchived` (→ HTTP 400 `project_archived`); typed `*ConflictError{Assignee}`; typed `*BlockedError{OpenPrereqs []int64}` (→ HTTP 409 `{"error":"blocked","open_prereqs":[…]}`).
-- Event kinds: dotted `noun.verb` strings — `task.created`, `task.claimed`, `task.status`,
-  `task.assign`, `task.patched`, `task.deleted`, `task.dep_added`, `task.dep_removed`,
-  `comment.added`, `comment.deleted`, `project.created`, `project.archived`, `project.unarchived`,
-  `project.deleted` (14 total).
+- Sentinel errors: `ErrNotFound`, `ErrConflict`, `ErrValidation`, `ErrProjectArchived` (→ HTTP 400 `project_archived`); typed `*ConflictError{Assignee}`; typed `*BlockedError{OpenPrereqs []int64}` (→ HTTP 409 `{"error":"blocked","open_prereqs":[…]}`); typed `*NotStaleError{Assignee}` (→ HTTP 409 `{"error":"not_stale","assignee":…}`).
+- Event kinds: dotted `noun.verb` strings — `task.created`, `task.claimed`, `task.reclaimed`,
+  `task.status`, `task.assign`, `task.patched`, `task.deleted`, `task.dep_added`,
+  `task.dep_removed`, `comment.added`, `comment.deleted`, `project.created`, `project.archived`,
+  `project.unarchived`, `project.deleted` (15 total).
 - Env vars: `AGENTMAN_*` (`AGENTMAN_URL/PROJECT/AGENT/AGENT_FILE/DB/PORT/NO_UPDATE_CHECK/LOG`).
 
 ## API Conventions

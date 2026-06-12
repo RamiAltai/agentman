@@ -246,9 +246,10 @@ deliberately adopts no JS test runner (preserves the single-binary/no-npm ethos)
 - **New task field:** add the column in `schema.sql`, the struct field in `store.go`, thread it
   through `CreateTask`/`PatchTask`/`getTaskTx`, the API, and the dashboard (`web/`).
 - **New event kind:** emit via `insertEvent(...)` and handle it in `web/app.js` `evText`/`describeText`.
-  Current kinds (14 total): `task.created`, `task.claimed`, `task.status`, `task.assign`,
-  `task.patched`, `task.deleted`, `task.dep_added`, `task.dep_removed`, `comment.added`,
-  `comment.deleted`, `project.created`, `project.archived`, `project.unarchived`, `project.deleted`.
+  Current kinds (15 total): `task.created`, `task.claimed`, `task.reclaimed`, `task.status`,
+  `task.assign`, `task.patched`, `task.deleted`, `task.dep_added`, `task.dep_removed`,
+  `comment.added`, `comment.deleted`, `project.created`, `project.archived`, `project.unarchived`,
+  `project.deleted`.
 
 ## Risks and Gaps
 
