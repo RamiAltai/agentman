@@ -562,6 +562,16 @@ func (s *Store) GetTask(id int64) (*Task, error) {
 	return t, nil
 }
 
+// Input size limits. A runaway agent should not be able to insert megabyte
+// titles that render into every board card and SSE event. Exceeding a limit
+// (or an out-of-range priority) maps to ErrValidation → HTTP 400 → CLI exit 5.
+const (
+	maxTitleLen = 500     // bytes
+	maxBodyLen  = 1 << 16 // 64 KiB; also the comment-body cap
+	minPriority = 0
+	maxPriority = 3
+)
+
 type CreateTaskInput struct {
 	Project  string
 	Title    string
@@ -573,6 +583,10 @@ type CreateTaskInput struct {
 
 func (s *Store) CreateTask(in CreateTaskInput) (*Task, *Event, error) {
 	if strings.TrimSpace(in.Title) == "" {
+		return nil, nil, ErrValidation
+	}
+	if len(in.Title) > maxTitleLen || len(in.Body) > maxBodyLen ||
+		in.Priority < minPriority || in.Priority > maxPriority {
 		return nil, nil, ErrValidation
 	}
 	pid, err := s.projectID(in.Project)
@@ -662,7 +676,7 @@ func (s *Store) PatchTask(id int64, patch map[string]any, actor string) (*Task, 
 	}
 	if v, ok := patch["title"]; ok {
 		ti, _ := v.(string)
-		if strings.TrimSpace(ti) == "" {
+		if strings.TrimSpace(ti) == "" || len(ti) > maxTitleLen {
 			return nil, nil, ErrValidation
 		}
 		if ti != cur.Title {
@@ -673,6 +687,9 @@ func (s *Store) PatchTask(id int64, patch map[string]any, actor string) (*Task, 
 	}
 	if v, ok := patch["body"]; ok {
 		bo, _ := v.(string)
+		if len(bo) > maxBodyLen {
+			return nil, nil, ErrValidation
+		}
 		if bo != cur.Body {
 			sets = append(sets, "body=?")
 			args = append(args, bo)
@@ -681,6 +698,9 @@ func (s *Store) PatchTask(id int64, patch map[string]any, actor string) (*Task, 
 	}
 	if v, ok := patch["priority"]; ok {
 		pr := toInt(v, cur.Priority)
+		if pr < minPriority || pr > maxPriority {
+			return nil, nil, ErrValidation
+		}
 		if pr != cur.Priority {
 			sets = append(sets, "priority=?")
 			args = append(args, pr)
@@ -999,7 +1019,7 @@ func wouldCycle(tx *sql.Tx, taskID, dependsOnID int64) (bool, error) {
 }
 
 func (s *Store) AddComment(id int64, author, body string) (*Comment, *Event, error) {
-	if strings.TrimSpace(body) == "" {
+	if strings.TrimSpace(body) == "" || len(body) > maxBodyLen {
 		return nil, nil, ErrValidation
 	}
 	tx, err := s.db.Begin()
@@ -1227,7 +1247,12 @@ type queryer interface {
 }
 
 func insertEvent(tx *sql.Tx, projectID, taskID int64, actor, kind string, data any) (*Event, error) {
-	b, _ := json.Marshal(data)
+	b, err := json.Marshal(data)
+	if err != nil {
+		// The events table is the durable replay cursor — never write a silently
+		// corrupted/empty payload.
+		return nil, fmt.Errorf("marshal event data: %w", err)
+	}
 	res, err := tx.Exec("INSERT INTO events(project_id,task_id,actor,kind,data) VALUES(?,?,?,?,?)",
 		nullableID(projectID), nullableID(taskID), actor, kind, string(b))
 	if err != nil {

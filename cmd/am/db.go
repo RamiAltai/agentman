@@ -14,11 +14,22 @@ import (
 	"time"
 )
 
+// validDate reports whether s is a real calendar date in YYYY-MM-DD form.
+func validDate(s string) bool {
+	_, err := time.Parse("2006-01-02", s)
+	return err == nil
+}
+
 // pruneEvents deletes old events rows from dbPath. Exactly one of before or keep
 // must be supplied (before as a YYYY-MM-DD string, keep as a positive count).
 // Returns the number of rows deleted. VACUUM is run afterwards on a best-effort
 // basis — a VACUUM error does NOT fail the prune.
 func pruneEvents(dbPath, before string, keep int) (int64, error) {
+	// Guard here too (not just in cmdDB): `before` feeds a string comparison
+	// against ISO-8601 timestamps, which is only correct for well-formed dates.
+	if before != "" && !validDate(before) {
+		return 0, fmt.Errorf("--before must be a valid YYYY-MM-DD date (got %q)", before)
+	}
 	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"+
 		"&_pragma=foreign_keys(1)&_pragma=synchronous(1)", dbPath)
 	db, err := sql.Open("sqlite", dsn)
@@ -88,6 +99,11 @@ func cmdDB(a Args) {
 		// Require exactly one of --before / --keep.
 		if (beforeDate == "") == (keepStr == "") {
 			fail(1, "am db prune: provide exactly one of --before <YYYY-MM-DD> or --keep <N>")
+		}
+		// Validate the date up front (before the confirmation prompt); a typo
+		// like 2026-13-99 would otherwise silently prune the wrong rows.
+		if beforeDate != "" && !validDate(beforeDate) {
+			fail(1, "am db prune: --before must be a valid YYYY-MM-DD date (got %q)", beforeDate)
 		}
 		var keepN int
 		if keepStr != "" {

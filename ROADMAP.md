@@ -44,15 +44,11 @@ Archiving currently hides a project's **tab** (`ListProjects`) and its **board t
 
 ## Phase B — Release hygiene (do now)
 
-- [ ] **B1 · Commit the pending fixes + docs** — _S_
-  - The archived-task hiding fix, the ultrawide centering fix, and the doc sync are uncommitted.
-    Commit them (e.g. `fix: hide archived projects' tasks from the board`,
-    `fix: center board on ultrawide screens`, `docs: …`).
-- [ ] **B2 · Tag and push v0.4.0** — _S_
-  - Rename the `CHANGELOG.md` `[Unreleased]` heading to `## [0.4.0] - <date>`; then
-    `git tag -a v0.4.0 -m "…" && git push origin v0.4.0`. `go install …/cmd/am@latest` resolves
-    `latest` from the highest semver tag. → `README.md` (Updating).
-- [ ] **B3 · Keep the CHANGELOG going** — _S, process_
+- [x] **B1 · Commit the pending fixes + docs** — _S_ — **done** (shipped across v0.4.x).
+- [x] **B2 · Tag and push releases** — _S_ — **done** (v0.4.1, v0.4.2, v0.5.0 tagged; v0.4.0 was
+  mis-tagged and superseded by v0.4.1). Note: the v0.5.0 CHANGELOG section was cut late —
+  remember to rename `[Unreleased]` **before** tagging.
+- [ ] **B3 · Keep the CHANGELOG going** — _S, ongoing process_
   - Add a `Fixed`/`Added`/`Changed` entry with every user-facing change from now on.
 
 ## Phase C — Data lifecycle (medium)
@@ -174,6 +170,6 @@ and only matter if the network bind ever widens. (`architecture/security.md`)
 
 ### Suggested order
 
-Phases A, C, D, E, F, H, and I are **complete**. Remaining open work:
-
-**B1 → B2** (commit pending fixes + tag v0.4.0). **G** stays parked unless the access model changes.
+Phases A, B (except the ongoing B3 process), C, D, E, F, H, and I are **complete**. **G** stays
+parked unless the access model changes. For newly proposed work (stale-claim recovery, `am next`,
+search, labels, release binaries), see `REVIEW.md` Phases J–N.

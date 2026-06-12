@@ -50,7 +50,10 @@ async function api(method, path, body) {
   if (body) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
   const r = await fetch(path, opt);
   const txt = await r.text();
-  const data = txt ? JSON.parse(txt) : null;
+  let data = null;
+  if (txt) {
+    try { data = JSON.parse(txt); } catch (e) { /* non-JSON body (proxy page, truncated response) — fall through to HTTP-status error */ }
+  }
   if (!r.ok) {
     let msg = (data && data.error) || ("HTTP " + r.status);
     // Surface the blocking prerequisites instead of a bare "blocked".
@@ -713,7 +716,8 @@ function connect() {
   es.onerror = () => {
     es.close();
     setStatus("reconnecting…", "warn");
-    setTimeout(connect, backoff);
+    // Jitter so multiple open tabs don't reconnect in lockstep.
+    setTimeout(connect, backoff + Math.random() * 250);
     backoff = Math.min(backoff * 2, 10000);
   };
 }
