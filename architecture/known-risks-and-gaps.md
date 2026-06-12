@@ -140,7 +140,7 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   `TestDropClearsClaimedAt`), the v3 migration (`TestMigrationV3AddsClaimedAt`), the HTTP
   surfaces (`TestListTasksStaleParam`, `TestStealStaleEndpoint`), and the CLI mapping
   (`TestExitNotStale`, `TestStaleFlagsWireFormat`).
-  Phase L added 24 work-loop tests: `NextTask` ordering/scoping and the pick+claim race
+  Phase L added 23 work-loop tests: `NextTask` ordering/scoping and the pick+claim race
   (`TestNextTaskPicksHighestPriorityReady`, `TestNextTaskFIFOWithinPriority`,
   `TestNextTaskProjectScoping`, `TestNextTaskNoneReady`, `TestNextTaskRaceDistinctWinners`,
   `TestNextTaskEmptyAgentValidation`), the HTTP surface (`TestNextEndpoint`,
