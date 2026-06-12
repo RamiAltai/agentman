@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -79,6 +81,7 @@ type Task struct {
 	CreatedAt    string    `json:"created_at"`
 	UpdatedAt    string    `json:"updated_at"`
 	ClaimedAt    string    `json:"claimed_at,omitempty"`
+	Labels       []string  `json:"labels,omitempty"`
 	Comments     []Comment `json:"comments,omitempty"`
 	Events       []Event   `json:"events,omitempty"`
 	DependsOn    []DepRef  `json:"depends_on,omitempty"`
@@ -107,6 +110,8 @@ type TaskFilter struct {
 	Project  string
 	Status   string
 	Assignee string
+	Query    string // substring match on title OR body (LIKE, ASCII-case-insensitive)
+	Label    string // tasks carrying this label (normalized before matching)
 	Limit    int
 	Ready    bool          // todo tasks with no open prereqs
 	Blocked  bool          // tasks with ≥1 open prereq
@@ -430,6 +435,19 @@ func (s *Store) ListTasks(f TaskFilter) ([]Task, error) {
 		where = append(where, "t.assignee=?")
 		args = append(args, f.Assignee)
 	}
+	if f.Query != "" {
+		where = append(where, `(t.title LIKE ? ESCAPE '\' OR t.body LIKE ? ESCAPE '\')`)
+		pat := "%" + likeEscape(f.Query) + "%"
+		args = append(args, pat, pat)
+	}
+	if f.Label != "" {
+		l, err := normalizeLabel(f.Label)
+		if err != nil {
+			return nil, err
+		}
+		where = append(where, "EXISTS (SELECT 1 FROM task_labels tl WHERE tl.task_id=t.id AND tl.label=?)")
+		args = append(args, l)
+	}
 	// open-prereq subquery reused for both Blocked and Ready filters.
 	const openPrereqExpr = `EXISTS (SELECT 1 FROM task_deps d JOIN tasks pt ON pt.id=d.depends_on_id WHERE d.task_id=t.id AND pt.status!='done')`
 	if f.Blocked {
@@ -447,7 +465,8 @@ func (s *Store) ListTasks(f TaskFilter) ([]Task, error) {
 	         t.created_at,t.updated_at,COALESCE(t.claimed_at,''),
 	         (SELECT COUNT(*) FROM comments c WHERE c.task_id=t.id),
 	         COALESCE((SELECT COUNT(*) FROM task_deps d WHERE d.task_id=t.id),0),
-	         COALESCE((SELECT COUNT(*) FROM task_deps d JOIN tasks pt ON pt.id=d.depends_on_id WHERE d.task_id=t.id AND pt.status!='done'),0)
+	         COALESCE((SELECT COUNT(*) FROM task_deps d JOIN tasks pt ON pt.id=d.depends_on_id WHERE d.task_id=t.id AND pt.status!='done'),0),
+	         COALESCE((SELECT GROUP_CONCAT(label) FROM task_labels tl WHERE tl.task_id=t.id),'')
 	       FROM tasks t JOIN projects p ON p.id=t.project_id`
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
@@ -465,9 +484,16 @@ func (s *Store) ListTasks(f TaskFilter) ([]Task, error) {
 	out := []Task{}
 	for rows.Next() {
 		var t Task
+		var labelsCSV string
 		if err := rows.Scan(&t.ID, &t.Ref, &t.Project, &t.Title, &t.Status, &t.Assignee,
-			&t.Priority, &t.CreatedAt, &t.UpdatedAt, &t.ClaimedAt, &t.NComments, &t.NPrereqs, &t.NOpenPrereqs); err != nil {
+			&t.Priority, &t.CreatedAt, &t.UpdatedAt, &t.ClaimedAt, &t.NComments, &t.NPrereqs, &t.NOpenPrereqs, &labelsCSV); err != nil {
 			return nil, err
+		}
+		if labelsCSV != "" {
+			// Sort in Go — GROUP_CONCAT order is not guaranteed. The label charset
+			// excludes ',', so splitting on it is safe.
+			t.Labels = strings.Split(labelsCSV, ",")
+			sort.Strings(t.Labels)
 		}
 		out = append(out, t)
 	}
@@ -569,6 +595,23 @@ func (s *Store) GetTask(id int64) (*Task, error) {
 		return nil, err
 	}
 
+	// Populate Labels (sorted for stable output).
+	lrows, err := s.db.Query("SELECT label FROM task_labels WHERE task_id=? ORDER BY label", id)
+	if err != nil {
+		return nil, err
+	}
+	defer lrows.Close()
+	for lrows.Next() {
+		var l string
+		if err := lrows.Scan(&l); err != nil {
+			return nil, err
+		}
+		t.Labels = append(t.Labels, l)
+	}
+	if err := lrows.Err(); err != nil {
+		return nil, err
+	}
+
 	// Also populate the terse counts for the full task view.
 	if err := s.db.QueryRow(`SELECT
 	       COALESCE((SELECT COUNT(*) FROM task_deps d WHERE d.task_id=?),0),
@@ -586,9 +629,25 @@ func (s *Store) GetTask(id int64) (*Task, error) {
 const (
 	maxTitleLen = 500     // bytes
 	maxBodyLen  = 1 << 16 // 64 KiB; also the comment-body cap
+	maxLabelLen = 50      // bytes
 	minPriority = 0
 	maxPriority = 3
 )
+
+// labelRe is the allowed label charset. It excludes ',' (so GROUP_CONCAT output
+// splits safely) and '+'/space (so CLI +add/-remove tokens stay unambiguous).
+var labelRe = regexp.MustCompile(`^[a-z0-9._-]+$`)
+
+// normalizeLabel trims, lowercases, and validates a label. Lowercasing happens
+// at this boundary so the `?label=` equality filter is predictable (SQL `=` is
+// case-sensitive even though LIKE is not).
+func normalizeLabel(s string) (string, error) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if len(s) < 1 || len(s) > maxLabelLen || !labelRe.MatchString(s) {
+		return "", fmt.Errorf("%w: label must be 1-50 chars of a-z 0-9 . _ -", ErrValidation)
+	}
+	return s, nil
+}
 
 type CreateTaskInput struct {
 	Project  string
@@ -1163,6 +1222,78 @@ func (s *Store) RemoveDep(taskID, dependsOnID int64, actor string) (*Event, erro
 	return ev, tx.Commit()
 }
 
+// ---------- labels ----------
+
+// AddLabel attaches a label to a task. The label is normalized (trimmed,
+// lowercased) before insertion. Idempotent (already present → nil,nil).
+// Deliberately does NOT bump updated_at — labeling is metadata, and refreshing
+// the task's activity timestamp would keep a stale claim alive (same precedent
+// as dep edges).
+func (s *Store) AddLabel(taskID int64, label, actor string) (*Event, error) {
+	l, err := normalizeLabel(label)
+	if err != nil {
+		return nil, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	task, err := s.getTaskTx(tx, taskID)
+	if err != nil {
+		return nil, err // ErrNotFound or real error
+	}
+	res, err := tx.Exec("INSERT OR IGNORE INTO task_labels(task_id,label) VALUES(?,?)", taskID, l)
+	if err != nil {
+		return nil, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		// Label already present — idempotent success.
+		return nil, tx.Commit()
+	}
+	ev, err := insertEvent(tx, task.ProjectID, taskID, actorOr(actor), "task.labeled",
+		map[string]any{"label": l})
+	if err != nil {
+		return nil, err
+	}
+	return ev, tx.Commit()
+}
+
+// RemoveLabel detaches a label from a task. No-op if the label is not present.
+func (s *Store) RemoveLabel(taskID int64, label, actor string) (*Event, error) {
+	l, err := normalizeLabel(label)
+	if err != nil {
+		return nil, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	res, err := tx.Exec("DELETE FROM task_labels WHERE task_id=? AND label=?", taskID, l)
+	if err != nil {
+		return nil, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return nil, tx.Commit() // already absent — idempotent
+	}
+	// Need project_id for the event.
+	task, err := s.getTaskTx(tx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	ev, err := insertEvent(tx, task.ProjectID, taskID, actorOr(actor), "task.unlabeled",
+		map[string]any{"label": l})
+	if err != nil {
+		return nil, err
+	}
+	return ev, tx.Commit()
+}
+
 // wouldCycle reports whether adding an edge taskID→dependsOnID would introduce
 // a cycle. It does so by checking if taskID is reachable from dependsOnID via
 // existing depends_on edges (recursive BFS over task_deps).
@@ -1478,6 +1609,16 @@ func toInt(v any, def int) int {
 // updated_at values is correct. Changing the format silently breaks it.
 func staleCutoff(d time.Duration) string {
 	return time.Now().UTC().Add(-d).Format("2006-01-02T15:04:05.000Z")
+}
+
+// likeEscape escapes the SQLite LIKE wildcards % and _ (and the escape char \
+// itself) so a search query matches them literally; the LIKE clause must use
+// ESCAPE '\'. Note: SQLite LIKE is ASCII-case-insensitive by default — that is
+// the documented behavior of `?q=` / `am ls --grep`. Unicode case folding is
+// deliberately not applied (fine at personal-board scale).
+func likeEscape(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
 }
 
 // orDash returns the assignee, or if empty (e.g. a done task) the status, so a

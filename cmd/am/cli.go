@@ -72,6 +72,8 @@ func canonFlag(k string) string {
 		return "comments"
 	case "a":
 		return "assign"
+	case "l":
+		return "label"
 	default:
 		return k
 	}
@@ -116,6 +118,12 @@ func cmdLs(c *Client, a Args) {
 	if v := a.flag("stale"); v != "" {
 		qs.Set("stale", v) // Go duration, e.g. 30m / 48h; server validates
 	}
+	if v := a.flag("grep"); v != "" {
+		qs.Set("q", v) // substring match on title OR body (ASCII-case-insensitive)
+	}
+	if v := a.flag("label"); v != "" {
+		qs.Set("label", v) // server validates/normalizes
+	}
 	qs.Set("limit", "50")
 
 	data := c.doOrFail("GET", "/api/tasks?"+qs.Encode(), nil)
@@ -147,6 +155,9 @@ func cmdShow(c *Client, a Args) {
 	fmt.Println(t.Title)
 	if strings.TrimSpace(t.Body) != "" {
 		fmt.Println(t.Body)
+	}
+	if len(t.Labels) > 0 {
+		fmt.Println("labels: " + strings.Join(t.Labels, " "))
 	}
 	fmt.Printf("created %s · %d comment%s\n", shortTime(t.CreatedAt), t.NComments, plural(t.NComments))
 	if len(t.DependsOn) > 0 {
@@ -454,6 +465,40 @@ func cmdDep(c *Client, a Args) {
 		c.doOrFail("DELETE", "/api/tasks/"+id+"/deps/"+prereq, nil)
 	default:
 		fail(1, "usage: am dep <add|rm> ...")
+	}
+}
+
+// cmdLabel adds/removes/prints task labels. It takes RAW argv (not parse()),
+// because parse() would treat a removal token like "-bar" as a value flag and
+// swallow the next token. Dispatched in main.go before the parse() call.
+//   - `am label <id>` prints the task's labels, space-separated, on one line.
+//   - `am label <id> +foo bar -baz` adds foo and bar, removes baz (silent success).
+func cmdLabel(c *Client, argv []string) {
+	const usage = "usage: am label <id> [+add ...] [-remove ...]"
+	if len(argv) == 0 {
+		fail(1, usage)
+	}
+	id := argv[0]
+	if len(argv) == 1 {
+		data := c.doOrFail("GET", "/api/tasks/"+id, nil)
+		var t Task
+		json.Unmarshal(data, &t)
+		if len(t.Labels) > 0 {
+			fmt.Println(strings.Join(t.Labels, " "))
+		}
+		return
+	}
+	for _, tok := range argv[1:] {
+		remove := strings.HasPrefix(tok, "-")
+		l := strings.TrimPrefix(strings.TrimPrefix(tok, "-"), "+")
+		if l == "" {
+			fail(5, usage)
+		}
+		if remove {
+			c.doOrFail("DELETE", "/api/tasks/"+id+"/labels/"+url.PathEscape(l), nil)
+		} else {
+			c.doOrFail("POST", "/api/tasks/"+id+"/labels", map[string]any{"label": l})
+		}
 	}
 }
 

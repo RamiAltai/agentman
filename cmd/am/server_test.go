@@ -1008,3 +1008,134 @@ func TestNextEndpointProjectBody(t *testing.T) {
 		t.Fatalf("scoped next picked #%d, want web task #%s", tk.ID, webID)
 	}
 }
+
+// ---------- Phase M: search + labels over HTTP ----------
+
+func TestListTasksQueryParam(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+	hitID := mustCreateTask(t, ts, "web", "Fix login page")
+	mustCreateTask(t, ts, "web", "Unrelated")
+
+	r := do(t, ts, http.MethodGet, "/api/tasks?q=login", "", nil)
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("GET ?q=login = %d, want 200", r.StatusCode)
+	}
+	var tasks []Task
+	if err := json.NewDecoder(r.Body).Decode(&tasks); err != nil {
+		t.Fatalf("decode tasks: %v", err)
+	}
+	if len(tasks) != 1 || strconv.FormatInt(tasks[0].ID, 10) != hitID {
+		t.Fatalf("?q=login returned %+v, want only task %s", tasks, hitID)
+	}
+
+	// Oversized query (501 bytes) → 400 validation.
+	long := strings.Repeat("a", 501)
+	rb := do(t, ts, http.MethodGet, "/api/tasks?q="+long, "", nil)
+	rb.Body.Close()
+	if rb.StatusCode != http.StatusBadRequest {
+		t.Fatalf("GET 501-byte ?q= = %d, want 400", rb.StatusCode)
+	}
+}
+
+func TestLabelEndpoints(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+	id := mustCreateTask(t, ts, "web", "Labeled task")
+	otherID := mustCreateTask(t, ts, "web", "Plain task")
+
+	// POST add → 200.
+	r := do(t, ts, http.MethodPost, "/api/tasks/"+id+"/labels", `{"label":"Bug"}`,
+		map[string]string{"X-Agent": "agent-a", "Content-Type": "application/json"})
+	r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("POST label = %d, want 200", r.StatusCode)
+	}
+
+	// GET shows the (normalized) label.
+	r = do(t, ts, http.MethodGet, "/api/tasks/"+id, "", nil)
+	var tk Task
+	if err := json.NewDecoder(r.Body).Decode(&tk); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	r.Body.Close()
+	if len(tk.Labels) != 1 || tk.Labels[0] != "bug" {
+		t.Fatalf("task labels = %v, want [bug]", tk.Labels)
+	}
+
+	// ?label= filters.
+	r = do(t, ts, http.MethodGet, "/api/tasks?label=bug", "", nil)
+	var tasks []Task
+	if err := json.NewDecoder(r.Body).Decode(&tasks); err != nil {
+		t.Fatalf("decode tasks: %v", err)
+	}
+	r.Body.Close()
+	if len(tasks) != 1 || strconv.FormatInt(tasks[0].ID, 10) != id {
+		t.Fatalf("?label=bug returned %+v, want only task %s (other: %s)", tasks, id, otherID)
+	}
+
+	// Duplicate add → 200, idempotent, no second event.
+	r = do(t, ts, http.MethodPost, "/api/tasks/"+id+"/labels", `{"label":"bug"}`,
+		map[string]string{"X-Agent": "agent-a", "Content-Type": "application/json"})
+	r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("duplicate POST label = %d, want 200", r.StatusCode)
+	}
+
+	// DELETE removes → 200; label gone.
+	r = do(t, ts, http.MethodDelete, "/api/tasks/"+id+"/labels/bug", "",
+		map[string]string{"X-Agent": "agent-a"})
+	r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE label = %d, want 200", r.StatusCode)
+	}
+	r = do(t, ts, http.MethodGet, "/api/tasks/"+id, "", nil)
+	tk = Task{}
+	if err := json.NewDecoder(r.Body).Decode(&tk); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	r.Body.Close()
+	if len(tk.Labels) != 0 {
+		t.Fatalf("labels after delete = %v, want empty", tk.Labels)
+	}
+
+	// Invalid label → 400; missing task → 404.
+	r = do(t, ts, http.MethodPost, "/api/tasks/"+id+"/labels", `{"label":"NO SPACES"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	if r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid label = %d, want 400", r.StatusCode)
+	}
+	r = do(t, ts, http.MethodPost, "/api/tasks/99999/labels", `{"label":"bug"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	if r.StatusCode != http.StatusNotFound {
+		t.Fatalf("label on missing task = %d, want 404", r.StatusCode)
+	}
+
+	// Exactly one task.labeled and one task.unlabeled event (dup add emitted none).
+	r = do(t, ts, http.MethodGet, "/api/events?since=0", "", nil)
+	defer r.Body.Close()
+	var feed struct {
+		Events []Event `json:"events"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&feed); err != nil {
+		t.Fatalf("decode events: %v", err)
+	}
+	var labeled, unlabeled int
+	for _, ev := range feed.Events {
+		switch ev.Kind {
+		case "task.labeled":
+			labeled++
+			if !strings.Contains(string(ev.Data), `"label":"bug"`) {
+				t.Fatalf("task.labeled data = %s, want label bug", ev.Data)
+			}
+		case "task.unlabeled":
+			unlabeled++
+		}
+	}
+	if labeled != 1 || unlabeled != 1 {
+		t.Fatalf("labeled=%d unlabeled=%d, want 1 and 1 (idempotent dup adds no event)", labeled, unlabeled)
+	}
+}

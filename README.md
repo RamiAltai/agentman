@@ -158,7 +158,7 @@ Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting 
 
 | Command | What it does |
 |---|---|
-| `am ls [--mine] [--status S] [-p P] [--all] [--ready] [--blocked] [--stale D]` | list tasks (hides done; `--ready` = todo with no open prereqs; `--blocked` = ≥1 open prereq; `--stale D` = assigned, not done, no activity for D — Go duration, e.g. `30m`, `48h`) |
+| `am ls [--mine] [--status S] [-p P] [--all] [--ready] [--blocked] [--stale D] [--grep TEXT] [--label L]` | list tasks (hides done; `--ready` = todo with no open prereqs; `--blocked` = ≥1 open prereq; `--stale D` = assigned, not done, no activity for D — Go duration, e.g. `30m`, `48h`; `--grep` = substring match on title or body, ASCII-case-insensitive; `--label`/`-l` = tasks carrying that label) |
 | `am show <id> [-c]` | task detail + `depends on:` / `blocks:` lines; comments with `-c` |
 | `am new "title" [--body B] [-p P] [--priority N]` | create a task; prints the new id |
 | `am claim <id> [--steal-stale D]` | atomic: assign me + → doing (exit 4 if already taken **or** has open prereqs); `--steal-stale D` takes over a claim idle for ≥ D (exit 4 with `not stale yet` if still fresh) |
@@ -173,6 +173,7 @@ Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting 
 | `am rm <id>` | hard-delete a task (permanent; cascades its comments + dep edges); exit 3 if not found |
 | `am dep add <id> <prereq> [prereq…]` | add one or more prerequisites to a task (same project; rejects cycles) |
 | `am dep rm <id> <prereq>` | remove a prerequisite edge |
+| `am label <id> [+l …] [-l …]` | with no args: print the task's labels; `+foo` (or bare `foo`) adds, `-bar` removes. Labels are lowercased, 1–50 chars of `a-z 0-9 . _ -` |
 | `am projects [--all]` · `am project new <slug> [name]` | list (`--all` includes archived) / create projects |
 | `am project archive <slug>` · `am project unarchive <slug>` | soft-archive (hide) / restore a project |
 | `am project rm <slug> --yes` | hard-delete a project **and ALL its tasks/comments** (permanent; `--yes` required) |
@@ -201,8 +202,10 @@ DELETE /api/projects/{slug}                       POST   /api/tasks/{id}/claim  
 POST   /api/projects/{slug}/archive              POST   /api/projects/{slug}/unarchive
 GET    /api/tasks?project=&status=&assignee=     POST   /api/tasks/{id}/comments {body}
        &ready=true|&blocked=true|&stale=<dur>    DELETE /api/tasks/{id}/comments/{cid}
-POST   /api/tasks {project,title,...}            POST   /api/tasks/{id}/deps {depends_on:<id-or-ref>}
-DELETE /api/tasks/{id}                           DELETE /api/tasks/{id}/deps/{depId}
+       |&q=<text>|&label=<l>                     POST   /api/tasks/{id}/deps {depends_on:<id-or-ref>}
+POST   /api/tasks {project,title,...}            DELETE /api/tasks/{id}/deps/{depId}
+DELETE /api/tasks/{id}                           POST   /api/tasks/{id}/labels {label}
+                                                 DELETE /api/tasks/{id}/labels/{label}
 GET    /api/events?since=|?tail=|?before=        GET    /api/stream  (SSE)
 GET    /api/projects/{slug}/graph               {nodes,edges}; read-only DAG (no events)
 ```

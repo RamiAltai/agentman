@@ -577,3 +577,104 @@ func TestCmdAssignBulk(t *testing.T) {
 		t.Fatalf("single assign = ids %v bodies %v", ids, bodies)
 	}
 }
+
+// ---------- Phase M: search + label CLI ----------
+
+// TestCmdLsGrepWireFormat asserts the exact wire encoding: `am ls --grep "x y"`
+// sends ?q=x+y and `-l bug` / `--label bug` send ?label=bug.
+func TestCmdLsGrepWireFormat(t *testing.T) {
+	var lsQuery string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		lsQuery = r.URL.RawQuery
+		w.Write([]byte("[]"))
+	}))
+	t.Cleanup(stub.Close)
+	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+
+	captureStdout(t, func() { cmdLs(c, parse([]string{"--grep", "x y"})) })
+	if !strings.Contains(lsQuery, "q=x+y") {
+		t.Fatalf("ls query = %q, want q=x+y", lsQuery)
+	}
+
+	captureStdout(t, func() { cmdLs(c, parse([]string{"-l", "bug"})) })
+	if !strings.Contains(lsQuery, "label=bug") {
+		t.Fatalf("ls query = %q, want label=bug (short -l)", lsQuery)
+	}
+
+	captureStdout(t, func() { cmdLs(c, parse([]string{"--label", "bug"})) })
+	if !strings.Contains(lsQuery, "label=bug") {
+		t.Fatalf("ls query = %q, want label=bug (long --label)", lsQuery)
+	}
+}
+
+func TestCmdLabelAddRemove(t *testing.T) {
+	type call struct{ method, path, body string }
+	var calls []call
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		calls = append(calls, call{r.Method, r.URL.Path, string(b)})
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"ok"}`))
+	}))
+	t.Cleanup(stub.Close)
+	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+
+	var code int
+	out := captureStdout(t, func() {
+		code = captureExit(t, func() { cmdLabel(c, []string{"12", "+a", "-b", "c"}) })
+	})
+	if code != -1 {
+		t.Fatalf("cmdLabel exited %d, want normal return", code)
+	}
+	if out != "" {
+		t.Fatalf("cmdLabel stdout = %q, want silent", out)
+	}
+	want := []call{
+		{http.MethodPost, "/api/tasks/12/labels", `{"label":"a"}`},
+		{http.MethodDelete, "/api/tasks/12/labels/b", ""},
+		{http.MethodPost, "/api/tasks/12/labels", `{"label":"c"}`},
+	}
+	if len(calls) != len(want) {
+		t.Fatalf("calls = %+v, want %+v", calls, want)
+	}
+	for i, w := range want {
+		if calls[i] != w {
+			t.Fatalf("call %d = %+v, want %+v", i, calls[i], w)
+		}
+	}
+}
+
+func TestCmdLabelPrintsLabels(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":12,"labels":["a","b"]}`))
+	}))
+	t.Cleanup(stub.Close)
+	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+
+	out := captureStdout(t, func() { cmdLabel(c, []string{"12"}) })
+	if out != "a b\n" {
+		t.Fatalf("cmdLabel output = %q, want \"a b\\n\"", out)
+	}
+}
+
+func TestCmdLabelUsage(t *testing.T) {
+	c := &Client{base: "http://127.0.0.1:1", agent: "tester", http: &http.Client{Timeout: time.Second}}
+
+	// Missing id → exit 1.
+	code := captureExit(t, func() { cmdLabel(c, nil) })
+	if code != 1 {
+		t.Fatalf("missing id exit = %d, want 1", code)
+	}
+
+	// Empty token after prefix strip → exit 5 (before any request is made).
+	code = captureExit(t, func() { cmdLabel(c, []string{"12", "+"}) })
+	if code != 5 {
+		t.Fatalf("empty +token exit = %d, want 5", code)
+	}
+	code = captureExit(t, func() { cmdLabel(c, []string{"12", "-"}) })
+	if code != 5 {
+		t.Fatalf("empty -token exit = %d, want 5", code)
+	}
+}

@@ -561,6 +561,58 @@ without evidence.
   (`TestCmdNextPrintsOnlyID`, `TestExitNextNoneReady`, `TestCmdStatusBulk`,
   `TestCmdStatusBulkPartialFailure`, `TestCmdAssignBulk`); `cmd/am/wait_test.go` (10 wait tests).
 
+### ADR-024: Findability — LIKE-with-ESCAPE search (no FTS5), inline label join table (no catalog), labels don't bump `updated_at` (Phase M)
+- Status: Active
+- Context: A grown board needs "find the task about X" (search) and "show me the frontend work"
+  (labels). Both must stay within the project's constraints: single binary, no migrations unless
+  unavoidable, token-cheap CLI output, event log as the only side channel.
+- Decision:
+  1. **Search is plain `LIKE` with `ESCAPE '\'`, not FTS5** (`TaskFilter.Query`, `likeEscape`).
+     `?q=` / `am ls --grep` matches a substring of **title OR body**; the query's `%`/`_`/`\` are
+     escaped so they match literally. FTS5 would add a virtual table + sync triggers (a real
+     migration) for a personal-scale board where a linear LIKE scan is fine.
+  2. **ASCII-case-insensitive, documented as such** — SQLite's default LIKE folds ASCII only;
+     Unicode case folding is deliberately not applied (would need ICU or lower() normalization
+     columns). This is the documented contract of `--grep`.
+  3. **Search scope exclusions:** `?q=` does **not** search comments or label names. Comments are
+     a thread, not the task's identity; labels have their own exact filter (`?label=`).
+  4. **Labels are an inline join table, no catalog** — `task_labels(task_id, label TEXT)` with a
+     composite PK and `ON DELETE CASCADE`; a label "exists" iff some task carries it. No separate
+     `labels` table to create/rename/garbage-collect. Added via `CREATE TABLE IF NOT EXISTS` in
+     `schema.sql` — **no migration step, no version bump** (schema version stays 3; the
+     `task_deps` precedent). Not added to `validateImportCandidate`'s required set, so pre-M
+     snapshots stay importable.
+  5. **Label normalization at the boundary** (`normalizeLabel`): trim, lowercase, 1–50 bytes
+     matching `^[a-z0-9._-]+$`. The charset excludes `,` (so `GROUP_CONCAT` output splits safely
+     into the list payload) and `+`/space (so the CLI's `+add`/`-remove` tokens are unambiguous).
+     Lowercasing at write AND filter time makes the `?label=` SQL `=` comparison predictable
+     (`=` is case-sensitive even though LIKE isn't).
+  6. **Labeling does NOT bump `updated_at`** — labels are metadata; refreshing the activity
+     timestamp would keep a stale claim alive (`--steal-stale` judges staleness from
+     `updated_at`, ADR-022). Same precedent as dep edges. Guarded by
+     `TestAddLabelDoesNotBumpUpdatedAt`.
+  7. **Two new event kinds** — `task.labeled` / `task.unlabeled` with `{"label": l}` payloads
+     (catalog 15 → **17**). Idempotent no-ops (duplicate add, absent remove) commit without an
+     event, like deps.
+  8. **`cmdLabel` takes raw argv** — dispatched in `main.go` before `parse()`, because the parser
+     would consume a removal token (`-bar`) as a value flag. `am label <id>` alone prints the
+     labels space-separated.
+  9. **Deliberately deferred:** no `--label` on `am next` / `am new` (keep the pickup predicate
+     uniform; add when demand appears), and **no labels in `taskLine`** (`am ls` row token budget;
+     labels are in `--json` and `am show`).
+- Rationale: both features ride existing machinery — the WHERE-clause builder in `ListTasks`, the
+  `AddDep`/`RemoveDep` tx + idempotency shape, the `CREATE TABLE IF NOT EXISTS` no-migration path —
+  so the change surface is small and convention-clean.
+- Consequences: LIKE search is O(n) over tasks (fine at personal scale; FTS5 is the upgrade path);
+  Unicode-cased titles ("Über") only match exact-case queries; the board can't list "all labels"
+  cheaply without a `SELECT DISTINCT` (acceptable — no catalog endpoint shipped); a label filter +
+  search box both filter server-side, so the dashboard's SSE debounce re-applies them on reload.
+- Evidence: `cmd/am/store.go` (`likeEscape`, `normalizeLabel`, `AddLabel`, `RemoveLabel`,
+  `TaskFilter.Query/Label`); `cmd/am/schema.sql` (`task_labels`); `cmd/am/server.go`
+  (`handleAddLabel`, `handleRemoveLabel`, `?q=`/`?label=` in `handleListTasks`); `cmd/am/cli.go`
+  (`cmdLabel`, `--grep`/`--label` in `cmdLs`); `cmd/am/web/app.js` (search box, label chips +
+  filter, modal Labels section); tests listed in the Phase M CHANGELOG entry.
+
 ## Inferred Decisions
 
 ### IADR-001: SSE chosen over WebSockets

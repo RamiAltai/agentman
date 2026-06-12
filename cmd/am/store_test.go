@@ -1872,3 +1872,332 @@ func TestNextTaskEmptyAgentValidation(t *testing.T) {
 		t.Fatalf("NextTask empty agent err = %v, want ErrValidation", err)
 	}
 }
+
+// ===================== Phase M: search (?q=) tests =====================
+
+func TestListTasksQueryFilter(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateProject("api", "API"); err != nil {
+		t.Fatal(err)
+	}
+	titleHit, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Fix login page"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodyHit, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Other thing", Body: "the login flow is broken"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Unrelated"}); err != nil {
+		t.Fatal(err)
+	}
+	apiHit, _, err := st.CreateTask(CreateTaskInput{Project: "api", Title: "login throttling"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ids := func(ts []Task) map[int64]bool {
+		m := map[int64]bool{}
+		for _, tk := range ts {
+			m[tk.ID] = true
+		}
+		return m
+	}
+
+	// Title and body matches, across projects.
+	got, err := st.ListTasks(TaskFilter{Query: "login"})
+	if err != nil {
+		t.Fatalf("ListTasks: %v", err)
+	}
+	if len(got) != 3 || !ids(got)[titleHit.ID] || !ids(got)[bodyHit.ID] || !ids(got)[apiHit.ID] {
+		t.Fatalf("Query login = %+v, want title+body+api hits", got)
+	}
+
+	// ASCII-case-insensitive (SQLite LIKE default).
+	got, err = st.ListTasks(TaskFilter{Query: "LOGIN"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("Query LOGIN matched %d tasks, want 3 (case-insensitive)", len(got))
+	}
+
+	// No match → empty.
+	got, err = st.ListTasks(TaskFilter{Query: "zebra"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("Query zebra = %+v, want empty", got)
+	}
+
+	// Empty query → unfiltered.
+	got, err = st.ListTasks(TaskFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("empty Query returned %d tasks, want 4", len(got))
+	}
+
+	// Combines with Project and Status.
+	got, err = st.ListTasks(TaskFilter{Query: "login", Project: "web", Status: "todo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || !ids(got)[titleHit.ID] || !ids(got)[bodyHit.ID] {
+		t.Fatalf("Query+Project+Status = %+v, want the two web hits", got)
+	}
+}
+
+func TestListTasksQueryEscapesLikeWildcards(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+		t.Fatal(err)
+	}
+	for _, title := range []string{"100% done", "100 done", "a_b", "axb", `back\slash`} {
+		if _, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: title}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cases := []struct {
+		query string
+		want  []string
+	}{
+		{"100%", []string{"100% done"}},        // % is literal, not wildcard
+		{"a_b", []string{"a_b"}},               // _ is literal, not single-char wildcard
+		{`back\slash`, []string{`back\slash`}}, // backslash doesn't break ESCAPE
+	}
+	for _, c := range cases {
+		got, err := st.ListTasks(TaskFilter{Query: c.query})
+		if err != nil {
+			t.Fatalf("Query %q: %v", c.query, err)
+		}
+		var titles []string
+		for _, tk := range got {
+			titles = append(titles, tk.Title)
+		}
+		if len(titles) != len(c.want) || (len(c.want) > 0 && titles[0] != c.want[0]) {
+			t.Fatalf("Query %q = %v, want %v", c.query, titles, c.want)
+		}
+	}
+}
+
+// ===================== Phase M: label tests =====================
+
+func TestAddRemoveLabel(t *testing.T) {
+	st, t1, _, _ := setupDepFixture(t)
+
+	// Add — normalized to lowercase, emits task.labeled.
+	ev, err := st.AddLabel(t1, "Bug", "alice")
+	if err != nil {
+		t.Fatalf("AddLabel: %v", err)
+	}
+	if ev == nil || ev.Kind != "task.labeled" {
+		t.Fatalf("AddLabel event = %+v, want task.labeled", ev)
+	}
+	if !strings.Contains(string(ev.Data), `"label":"bug"`) {
+		t.Fatalf("AddLabel event data = %s, want label bug", ev.Data)
+	}
+
+	// Duplicate add (any case) — idempotent, no event.
+	ev2, err := st.AddLabel(t1, "bug", "alice")
+	if err != nil {
+		t.Fatalf("duplicate AddLabel: %v", err)
+	}
+	if ev2 != nil {
+		t.Fatalf("duplicate AddLabel event = %+v, want nil", ev2)
+	}
+
+	// GetTask returns sorted labels.
+	if _, err := st.AddLabel(t1, "api", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	tk, err := st.GetTask(t1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tk.Labels) != 2 || tk.Labels[0] != "api" || tk.Labels[1] != "bug" {
+		t.Fatalf("GetTask labels = %v, want [api bug] sorted", tk.Labels)
+	}
+
+	// Remove — emits task.unlabeled.
+	ev3, err := st.RemoveLabel(t1, "bug", "alice")
+	if err != nil {
+		t.Fatalf("RemoveLabel: %v", err)
+	}
+	if ev3 == nil || ev3.Kind != "task.unlabeled" {
+		t.Fatalf("RemoveLabel event = %+v, want task.unlabeled", ev3)
+	}
+	if !strings.Contains(string(ev3.Data), `"label":"bug"`) {
+		t.Fatalf("RemoveLabel event data = %s, want label bug", ev3.Data)
+	}
+
+	// Absent remove — idempotent, no event.
+	ev4, err := st.RemoveLabel(t1, "bug", "alice")
+	if err != nil {
+		t.Fatalf("second RemoveLabel: %v", err)
+	}
+	if ev4 != nil {
+		t.Fatalf("second RemoveLabel event = %+v, want nil", ev4)
+	}
+
+	// Missing task → ErrNotFound.
+	if _, err := st.AddLabel(99999, "bug", "alice"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("AddLabel missing task err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestLabelValidation(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string // "" = expect ErrValidation
+	}{
+		{"", ""},
+		{strings.Repeat("a", 51), ""},
+		{strings.Repeat("a", 50), strings.Repeat("a", 50)}, // boundary ok
+		{"has space", ""},
+		{"a,b", ""},
+		{"a+b", ""},
+		{"Bug", "bug"},           // uppercase normalized
+		{"a.b_c-1", "a.b_c-1"},   // full allowed charset
+		{"  padded  ", "padded"}, // trimmed
+	}
+	for _, c := range cases {
+		got, err := normalizeLabel(c.in)
+		if c.want == "" {
+			if !errors.Is(err, ErrValidation) {
+				t.Errorf("normalizeLabel(%q) err = %v, want ErrValidation", c.in, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("normalizeLabel(%q): %v", c.in, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("normalizeLabel(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestListTasksLabelFilter(t *testing.T) {
+	st, t1, t2, _ := setupDepFixture(t)
+	if _, err := st.AddLabel(t1, "bug", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddLabel(t1, "api", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddLabel(t2, "docs", "alice"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.ListTasks(TaskFilter{Label: "bug"})
+	if err != nil {
+		t.Fatalf("ListTasks label: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != t1 {
+		t.Fatalf("Label bug = %+v, want only t1", got)
+	}
+	// The list payload carries the task's labels, sorted.
+	if len(got[0].Labels) != 2 || got[0].Labels[0] != "api" || got[0].Labels[1] != "bug" {
+		t.Fatalf("list Labels = %v, want [api bug] sorted", got[0].Labels)
+	}
+
+	// Filter input is normalized (uppercase matches).
+	got, err = st.ListTasks(TaskFilter{Label: "BUG"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != t1 {
+		t.Fatalf("Label BUG = %+v, want only t1 (normalized)", got)
+	}
+
+	// Unknown label → empty.
+	got, err = st.ListTasks(TaskFilter{Label: "ghost"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("Label ghost = %+v, want empty", got)
+	}
+
+	// Invalid label → ErrValidation.
+	if _, err := st.ListTasks(TaskFilter{Label: "no spaces!"}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("invalid label err = %v, want ErrValidation", err)
+	}
+}
+
+func TestAddLabelDoesNotBumpUpdatedAt(t *testing.T) {
+	st, t1, _, _ := setupDepFixture(t)
+	before, err := st.GetTask(t1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddLabel(t1, "bug", "alice"); err != nil {
+		t.Fatalf("AddLabel: %v", err)
+	}
+	if _, err := st.RemoveLabel(t1, "bug", "alice"); err != nil {
+		t.Fatalf("RemoveLabel: %v", err)
+	}
+	after, err := st.GetTask(t1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.UpdatedAt != before.UpdatedAt {
+		t.Fatalf("updated_at changed %q → %q; labeling must not refresh a stale claim", before.UpdatedAt, after.UpdatedAt)
+	}
+}
+
+func TestDeleteTaskCascadesLabels(t *testing.T) {
+	st, t1, _, _ := setupDepFixture(t)
+	if _, err := st.AddLabel(t1, "bug", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DeleteTask(t1, "alice"); err != nil {
+		t.Fatalf("DeleteTask: %v", err)
+	}
+	var count int
+	st.db.QueryRow("SELECT COUNT(*) FROM task_labels WHERE task_id=?", t1).Scan(&count)
+	if count != 0 {
+		t.Fatalf("task_labels rows survived task deletion, count=%d", count)
+	}
+}
+
+func TestTaskLabelsTableExistsOnReopenedDB(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "fresh.db")
+	st, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatalf("first OpenStore: %v", err)
+	}
+	// Simulate a pre-Phase-M DB: drop the table, then reopen.
+	if _, err := st.db.Exec("DROP TABLE task_labels"); err != nil {
+		t.Fatalf("drop task_labels: %v", err)
+	}
+	st.Close()
+
+	// Reopen — task_labels must come back (CREATE TABLE IF NOT EXISTS path),
+	// with no migration step and no version bump.
+	st2, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatalf("second OpenStore: %v", err)
+	}
+	defer st2.Close()
+
+	var count int
+	if err := st2.db.QueryRow("SELECT COUNT(*) FROM task_labels").Scan(&count); err != nil {
+		t.Fatalf("task_labels table missing after reopen: %v", err)
+	}
+	v, err := readSchemaVersion(st2.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != 3 {
+		t.Fatalf("schema_version = %d, want 3 (labels need no migration)", v)
+	}
+}

@@ -14,6 +14,9 @@ let selected = new Set();    // selected project slugs; empty = "All"
 let tasks = new Map();       // id -> task (terse)
 let cursor = 0;              // highest event id seen (SSE since=)
 let es = null, backoff = 1000, refreshTimer = null, openTaskId = null, lastFocus = null, dragId = null;
+let filterQ = "";            // search-box text filter (server-side ?q=)
+let filterLabel = "";        // active label filter (server-side ?label=)
+let searchTimer = null;      // search-box input debounce
 let feedOldest = 0;          // lowest event id currently in #feedList (0 = none loaded)
 let feedPaginated = false;   // true once the user has clicked "Load older"; trimFeed is then skipped
                              // to avoid fighting pagination (raising the cap is the other option,
@@ -88,7 +91,14 @@ async function loadProjects() {
 }
 
 async function loadBoard() {
-  const list = await api("GET", "/api/tasks" + qstr({ limit: 500 }));
+  // q/label go here, NOT inside qstr() — qstr is shared by loadFeed/connect,
+  // where a search filter is meaningless. Filtering server-side means the SSE
+  // debounce (which re-calls loadBoard) keeps the filter across live reloads,
+  // and body text can match (the list payload has no body for client matching).
+  const extra = { limit: 500 };
+  if (filterQ) extra.q = filterQ;
+  if (filterLabel) extra.label = filterLabel;
+  const list = await api("GET", "/api/tasks" + qstr(extra));
   tasks = new Map(list.map((t) => [t.id, t]));
   renderBoard();
 }
@@ -229,6 +239,14 @@ function card(t) {
   else who.append("Unassigned");
   foot.append(who);
   if (selected.size !== 1) foot.append(el("span", { class: "ptag" }, t.project));
+  const labels = t.labels || [];
+  for (const l of labels.slice(0, 3)) {
+    foot.append(el("span", {
+      class: "tag-label", role: "button", tabindex: "0", title: "Filter by " + l,
+      onclick: (e) => { e.stopPropagation(); setLabelFilter(l); },
+    }, l));
+  }
+  if (labels.length > 3) foot.append(el("span", { class: "tag-label" }, "+" + (labels.length - 3)));
   if (t.nc > 0) foot.append(el("span", { class: "cc" }, "💬 " + t.nc));
   if (t.nopen > 0) foot.append(el("span", { class: "tag-blocked" }, "🔒 " + t.nopen));
   else if (t.nprereq > 0) foot.append(el("span", { class: "tag-ready" }, "✓ Ready"));
@@ -281,6 +299,26 @@ async function toggleProject(slug) {
   renderTabs();
   try { await loadBoard(); await loadFeed(); } catch (e) { setStatus("error", "warn"); }
   connect();
+}
+
+// ---------- label filter ----------
+
+function setLabelFilter(l) {
+  filterLabel = l;
+  const chip = $("labelFilterChip");
+  chip.replaceChildren(
+    document.createTextNode(l),
+    el("button", { class: "label-filter-x", "aria-label": "Clear label filter", onclick: clearLabelFilter }, "✕"));
+  chip.classList.remove("hidden");
+  loadBoard().catch(() => {});
+}
+
+function clearLabelFilter() {
+  filterLabel = "";
+  const chip = $("labelFilterChip");
+  chip.replaceChildren();
+  chip.classList.add("hidden");
+  loadBoard().catch(() => {});
 }
 
 function slugify(s) {
@@ -457,6 +495,44 @@ function renderModal(t) {
     depsSection.append(el("div", { class: "deps-group" }, el("span", { class: "deps-label" }, "Blocks"), blocksDiv));
   }
   s.append(depsSection);
+
+  // ---- Labels section ----
+  s.append(el("h3", {}, "Labels"));
+  const labelsDiv = el("div", { class: "labels-row" });
+  const labelErr = el("div", { class: "ferr" });
+  const tLabels = t.labels || [];
+  for (const l of tLabels) {
+    const chip = el("span", { class: "tag-label tag-label-modal" }, l);
+    const rmLbl = el("button", { class: "dep-rm", "aria-label": "Remove label " + l, title: "Remove" }, "✕");
+    rmLbl.onclick = async () => {
+      rmLbl.disabled = true;
+      labelErr.textContent = "";
+      try {
+        await api("DELETE", "/api/tasks/" + t.id + "/labels/" + encodeURIComponent(l));
+      } catch (e) {
+        rmLbl.disabled = false;
+        labelErr.textContent = e.message;
+      }
+    };
+    chip.append(rmLbl);
+    labelsDiv.append(chip);
+  }
+  const labelBox = el("input", { class: "field label-add", placeholder: "Add label…", "aria-label": "Add label" });
+  labelBox.onkeydown = async (e) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    const v = labelBox.value.trim();
+    if (!v) return;
+    labelErr.textContent = "";
+    try {
+      await api("POST", "/api/tasks/" + t.id + "/labels", { label: v });
+      labelBox.value = "";
+    } catch (err) {
+      labelErr.textContent = err.message === "validation" ? "labels are 1-50 chars of a-z 0-9 . _ -" : err.message;
+    }
+  };
+  labelsDiv.append(labelBox);
+  s.append(labelsDiv, labelErr);
 
   s.append(el("h3", {}, "Comments" + (t.comments && t.comments.length ? " (" + t.comments.length + ")" : "")));
   const cl = el("div", { class: "comments" });
@@ -853,6 +929,8 @@ function evText(ev) {
     case "project.deleted": span.append(who, " deleted project ", el("b", {}, d.slug || "")); break;
     case "task.dep_added": span.append(who, " linked ", ref, " → depends on #", String(d.depends_on || "")); break;
     case "task.dep_removed": span.append(who, " unlinked ", ref, " dep #", String(d.depends_on || "")); break;
+    case "task.labeled": span.append(who, " labeled ", ref, " +" + (d.label || "")); break;
+    case "task.unlabeled": span.append(who, " unlabeled ", ref, " -" + (d.label || "")); break;
     default: span.append(who, " " + ev.kind + " ", ref);
   }
   return span;
@@ -878,6 +956,8 @@ function describeText(ev) {
     case "project.deleted": return `${who} deleted project ${d.slug || ""}`;
     case "task.dep_added": return `${who} linked ${t} depends on #${d.depends_on || ""}`;
     case "task.dep_removed": return `${who} unlinked ${t} dep #${d.depends_on || ""}`;
+    case "task.labeled": return `${who} labeled ${t} +${d.label || ""}`;
+    case "task.unlabeled": return `${who} unlabeled ${t} -${d.label || ""}`;
     default: return `${who} ${ev.kind} ${t}`;
   }
 }
@@ -953,11 +1033,19 @@ function onKey(e) {
   if (k === "a") { e.preventDefault(); toggleFeed(); }
   else if (k === "n") { e.preventDefault(); openNew(); }
   else if (k === "g") { e.preventDefault(); if (graphOpen) closeGraphOverlay(); else openGraphOverlay(); }
+  else if (k === "/") { e.preventDefault(); $("searchBox").focus(); }
 }
 
 // ---------- init ----------
 
 $("newBtn").onclick = openNew;
+$("searchBox").oninput = (e) => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    filterQ = e.target.value.trim();
+    loadBoard().catch(() => {});
+  }, 250);
+};
 $("modal").onclick = (e) => { if (e.target.id === "modal") closeModal(); };
 document.addEventListener("keydown", onKey);
 initFeed();

@@ -43,6 +43,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/tasks/{id}/comments", s.handleComment)
 	mux.HandleFunc("POST /api/tasks/{id}/deps", s.handleAddDep)
 	mux.HandleFunc("DELETE /api/tasks/{id}/deps/{depId}", s.handleRemoveDep)
+	mux.HandleFunc("POST /api/tasks/{id}/labels", s.handleAddLabel)
+	mux.HandleFunc("DELETE /api/tasks/{id}/labels/{label}", s.handleRemoveLabel)
 	mux.HandleFunc("DELETE /api/tasks/{id}", s.handleDeleteTask)
 	mux.HandleFunc("DELETE /api/tasks/{id}/comments/{cid}", s.handleDeleteComment)
 	mux.HandleFunc("DELETE /api/projects/{slug}", s.handleDeleteProject)
@@ -212,9 +214,17 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		Project:  q.Get("project"),
 		Status:   q.Get("status"),
 		Assignee: q.Get("assignee"),
+		Label:    q.Get("label"), // store validates/normalizes
 		Limit:    atoiDefault(q.Get("limit"), 0),
 		Ready:    q.Get("ready") == "true",
 		Blocked:  q.Get("blocked") == "true",
+	}
+	if v := q.Get("q"); v != "" {
+		if len(v) > maxTitleLen { // cap search input like titles (bounds LIKE work)
+			writeErr(w, ErrValidation)
+			return
+		}
+		f.Query = v
 	}
 	if v := q.Get("stale"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -284,6 +294,47 @@ func (s *Server) handleRemoveDep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ev, err := s.store.RemoveDep(taskID, depID, actorOf(r))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if ev != nil {
+		s.hub.Broadcast(ev)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleAddLabel(w http.ResponseWriter, r *http.Request) {
+	taskID, err := s.store.resolveTaskID(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	var in struct {
+		Label string `json:"label"`
+	}
+	if err := decode(r, &in); err != nil || in.Label == "" {
+		writeErr(w, ErrValidation)
+		return
+	}
+	ev, err := s.store.AddLabel(taskID, in.Label, actorOf(r))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if ev != nil {
+		s.hub.Broadcast(ev)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleRemoveLabel(w http.ResponseWriter, r *http.Request) {
+	taskID, err := s.store.resolveTaskID(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	ev, err := s.store.RemoveLabel(taskID, r.PathValue("label"), actorOf(r))
 	if err != nil {
 		writeErr(w, err)
 		return

@@ -25,6 +25,11 @@ func main() {
 		runServe(rest)
 		return
 	}
+	if cmd == "label" {
+		// Raw argv — parse() would swallow a "-bar" removal token as a value flag.
+		cmdLabel(NewClient(), rest)
+		return
+	}
 
 	a := parse(rest)
 	switch cmd {
@@ -157,7 +162,7 @@ func usage() {
   am init <tasktype>                     set this session's identity (e.g. bugfix_050626_4821)
   am whoami                              print the current identity
 
-  am ls [--mine] [--status S] [-p P] [--all] [--ready] [--blocked] [--stale DUR]   list tasks (hides done)
+  am ls [--mine] [--status S] [-p P] [--all] [--ready] [--blocked] [--stale DUR] [--grep TEXT] [--label L]   list tasks (hides done)
   am show <id> [-c]                            task detail (+comments +deps)
   am new "title" [--body B] [-p P] [--priority N]   create, prints id
   am claim <id> [--steal-stale DUR]           assign me + ->doing (atomic; DUR is Go syntax, e.g. 30m, 48h)
@@ -171,6 +176,7 @@ func usage() {
   am rm <id>                                  hard-delete a task (permanent)
   am dep add <id> <prereq> [prereq…]          add prerequisite(s) to a task
   am dep rm <id> <prereq>                     remove a prerequisite
+  am label <id> [+l ...] [-l ...]             print / add / remove labels (lowercase a-z 0-9 . _ -)
   am projects [--all]                    list projects (--all includes archived)
   am project new <slug> [name]                create a project
   am project archive <slug>              soft-archive a project (hides it)

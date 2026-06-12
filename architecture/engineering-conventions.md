@@ -22,8 +22,8 @@ convention is loose, it's called out.
 - Sentinel errors: `ErrNotFound`, `ErrConflict`, `ErrValidation`, `ErrProjectArchived` (→ HTTP 400 `project_archived`); typed `*ConflictError{Assignee}`; typed `*BlockedError{OpenPrereqs []int64}` (→ HTTP 409 `{"error":"blocked","open_prereqs":[…]}`); typed `*NotStaleError{Assignee}` (→ HTTP 409 `{"error":"not_stale","assignee":…}`).
 - Event kinds: dotted `noun.verb` strings — `task.created`, `task.claimed`, `task.reclaimed`,
   `task.status`, `task.assign`, `task.patched`, `task.deleted`, `task.dep_added`,
-  `task.dep_removed`, `comment.added`, `comment.deleted`, `project.created`, `project.archived`,
-  `project.unarchived`, `project.deleted` (15 total).
+  `task.dep_removed`, `task.labeled`, `task.unlabeled`, `comment.added`, `comment.deleted`,
+  `project.created`, `project.archived`, `project.unarchived`, `project.deleted` (17 total).
 - Env vars: `AGENTMAN_*` (`AGENTMAN_URL/PROJECT/AGENT/AGENT_FILE/DB/PORT/NO_UPDATE_CHECK/LOG`).
 
 ## API Conventions
@@ -83,7 +83,7 @@ convention is loose, it's called out.
 - `go test -race ./cmd/am/` (or `go test ./...`); table-driven tests (see `cmd/am/update_test.go`).
   Coverage spans pure logic, the store, HTTP, migrations, offline DB tooling, CLI verbs + exit codes,
   SSE streaming/reconnect, `am wait`, identity, and the dashboard XSS-sink guard — 10 test files,
-  130 tests.
+  144 tests.
 - **`osExit` testability var** — `cli.go` declares `var osExit = os.Exit`; `fail()` calls `osExit`
   rather than `os.Exit` directly. Tests in `cli_test.go` replace it via `captureExit(t, fn)`,
   which substitutes a panic-based stub so exit codes can be asserted without terminating the process.
