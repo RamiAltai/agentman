@@ -18,11 +18,11 @@ GET   /api/projects                 handleListProjects      ?archived=true inclu
 POST  /api/projects                 handleCreateProject     {slug,name}
 POST  /api/projects/{slug}/archive    handleArchiveProject
 POST  /api/projects/{slug}/unarchive  handleUnarchiveProject
-GET   /api/tasks                    handleListTasks         ?project=&status=&assignee=&limit=&ready=true|&blocked=true  (no project ⇒ hides archived-project tasks)
+GET   /api/tasks                    handleListTasks         ?project=&status=&assignee=&limit=&ready=true|&blocked=true|&stale=<dur>  (no project ⇒ hides archived-project tasks; stale = assigned + not done + no activity for ≥ dur)
 POST  /api/tasks                    handleCreateTask        {project,title,body?,priority?,assignee?}
 GET   /api/tasks/{id}               handleGetTask           (task + comments + recent events + depends_on + blocks)
 PATCH /api/tasks/{id}               handlePatchTask         {status?,assignee?,title?,body?,priority?}  (hard-blocked if open prereqs + doing/done target)
-POST  /api/tasks/{id}/claim         handleClaim             (atomic; X-Agent = claimant; hard-blocked if open prereqs → 409 blocked)
+POST  /api/tasks/{id}/claim         handleClaim             (atomic; X-Agent = claimant; hard-blocked if open prereqs → 409 blocked; body {"steal_stale":"<dur>"} → StealStaleClaim stale takeover, 409 not_stale if still fresh)
 POST  /api/tasks/{id}/comments      handleComment           {body}
 POST  /api/tasks/{id}/deps          handleAddDep            {depends_on: <id-or-ref>}  add prerequisite edge
 DELETE /api/tasks/{id}/deps/{depId} handleRemoveDep         remove prerequisite edge

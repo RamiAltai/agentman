@@ -11,6 +11,32 @@ fresh `[Unreleased]` section.
 
 ### Added
 
+- **Stale-claim recovery (Phase K)** — agents that crash after `am claim` no longer hold tasks
+  forever.
+  - **`am ls --stale <dur>`** (`GET /api/tasks?stale=<dur>`) — lists tasks that are assigned, not
+    `done`, and have had no activity (`updated_at`) for at least the given duration (Go syntax,
+    e.g. `30m`, `48h`). A malformed or non-positive duration is `400 invalid` (CLI exit 5).
+  - **`am claim <id> --steal-stale <dur>`** (`POST /api/tasks/{id}/claim {"steal_stale":"<dur>"}`)
+    — atomic takeover of a stale claim via a single conditional `UPDATE … WHERE status!='done' AND
+    (assignee IS NULL OR updated_at < cutoff)`, so concurrent stealers get exactly one winner.
+    A still-fresh claim loses with `409 {"error":"not_stale","assignee":…}` (CLI exit 4,
+    `claim: #N held by X (not stale yet)`); a done task → `409 already_claimed`; stealing on an
+    unclaimed task degrades to a normal claim; re-stealing your own task is idempotent (no event).
+    Open prerequisites hard-block the steal like a normal claim. New store method
+    `StealStaleClaim`; new error type `NotStaleError`.
+  - **`tasks.claimed_at` column** (schema **migration v3** — `ALTER TABLE tasks ADD COLUMN
+    claimed_at TEXT`). Set by claim/steal and by PATCH-assign; cleared when the assignee is
+    removed (`am drop`). Returned as `claimed_at` in task JSON.
+  - **New event kind `task.reclaimed`** (total now 15) — emitted on a successful steal, naming the
+    previous assignee and the `stale_for` window; rendered in the dashboard feed as
+    *"X reclaimed #N from Y"*.
+  - **Dashboard stale badge** — a board card in *doing* with an assignee and no activity for 30+
+    minutes shows a **⏳ stale** chip.
+  - Tests: `TestStealStaleClaim`, `TestStealRaceExactlyOneWinner`, `TestListTasksStaleFilter`,
+    `TestClaimSetsClaimedAt`, `TestDropClearsClaimedAt`, `TestMigrationV3AddsClaimedAt` (store/
+    migrate); `TestListTasksStaleParam`, `TestStealStaleEndpoint` (HTTP); `TestExitNotStale`,
+    `TestStaleFlagsWireFormat` (CLI).
+
 - **Input size limits** — task titles are capped at 500 bytes; task bodies and comment bodies at
   64 KiB; priority must be 0–3. Exceeding a limit returns `400 invalid` (CLI exit 5) instead of
   silently inserting megabyte payloads that render into every board card and SSE event. Enforced

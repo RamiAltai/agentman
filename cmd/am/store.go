@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -33,6 +34,12 @@ func (e *ConflictError) Error() string { return "already_claimed" }
 type BlockedError struct{ OpenPrereqs []int64 }
 
 func (e *BlockedError) Error() string { return "blocked" }
+
+// NotStaleError is returned when a steal-stale claim loses because the task's
+// current claim is still fresh. Assignee names the current holder.
+type NotStaleError struct{ Assignee string }
+
+func (e *NotStaleError) Error() string { return "not_stale" }
 
 var validStatus = map[string]bool{"todo": true, "doing": true, "blocked": true, "done": true}
 
@@ -71,6 +78,7 @@ type Task struct {
 	NOpenPrereqs int       `json:"nopen,omitempty"`
 	CreatedAt    string    `json:"created_at"`
 	UpdatedAt    string    `json:"updated_at"`
+	ClaimedAt    string    `json:"claimed_at,omitempty"`
 	Comments     []Comment `json:"comments,omitempty"`
 	Events       []Event   `json:"events,omitempty"`
 	DependsOn    []DepRef  `json:"depends_on,omitempty"`
@@ -100,8 +108,9 @@ type TaskFilter struct {
 	Status   string
 	Assignee string
 	Limit    int
-	Ready    bool // todo tasks with no open prereqs
-	Blocked  bool // tasks with ≥1 open prereq
+	Ready    bool          // todo tasks with no open prereqs
+	Blocked  bool          // tasks with ≥1 open prereq
+	Stale    time.Duration // >0: assigned, not-done tasks with no activity since the cutoff
 }
 
 // ---------- store ----------
@@ -133,7 +142,7 @@ func OpenStore(path string) (*Store, error) {
 // currentSchemaVersion is the version OpenStore migrates to. schema.sql seeds a
 // fresh DB at version 1; runMigrations applies any steps with version > the DB's
 // recorded version to reach this target.
-const currentSchemaVersion = 2
+const currentSchemaVersion = 3
 
 // migration is one forward-only, idempotent step. apply runs inside the same tx
 // that bumps meta.schema_version, so a step + its version bump commit atomically.
@@ -149,6 +158,10 @@ type migration struct {
 var schemaMigrations = []migration{
 	{version: 2, apply: func(tx *sql.Tx) error {
 		_, err := tx.Exec("ALTER TABLE projects ADD COLUMN archived_at TEXT")
+		return err
+	}},
+	{version: 3, apply: func(tx *sql.Tx) error {
+		_, err := tx.Exec("ALTER TABLE tasks ADD COLUMN claimed_at TEXT")
 		return err
 	}},
 }
@@ -425,8 +438,13 @@ func (s *Store) ListTasks(f TaskFilter) ([]Task, error) {
 	if f.Ready {
 		where = append(where, "t.status='todo' AND NOT "+openPrereqExpr)
 	}
+	if f.Stale > 0 {
+		// Stale = assigned, not done, and no activity (updated_at) since the cutoff.
+		where = append(where, "t.assignee IS NOT NULL AND t.status!='done' AND t.updated_at < ?")
+		args = append(args, staleCutoff(f.Stale))
+	}
 	q := `SELECT t.id,t.ref,p.slug,t.title,t.status,COALESCE(t.assignee,''),t.priority,
-	         t.created_at,t.updated_at,
+	         t.created_at,t.updated_at,COALESCE(t.claimed_at,''),
 	         (SELECT COUNT(*) FROM comments c WHERE c.task_id=t.id),
 	         COALESCE((SELECT COUNT(*) FROM task_deps d WHERE d.task_id=t.id),0),
 	         COALESCE((SELECT COUNT(*) FROM task_deps d JOIN tasks pt ON pt.id=d.depends_on_id WHERE d.task_id=t.id AND pt.status!='done'),0)
@@ -448,7 +466,7 @@ func (s *Store) ListTasks(f TaskFilter) ([]Task, error) {
 	for rows.Next() {
 		var t Task
 		if err := rows.Scan(&t.ID, &t.Ref, &t.Project, &t.Title, &t.Status, &t.Assignee,
-			&t.Priority, &t.CreatedAt, &t.UpdatedAt, &t.NComments, &t.NPrereqs, &t.NOpenPrereqs); err != nil {
+			&t.Priority, &t.CreatedAt, &t.UpdatedAt, &t.ClaimedAt, &t.NComments, &t.NPrereqs, &t.NOpenPrereqs); err != nil {
 			return nil, err
 		}
 		out = append(out, t)
@@ -460,11 +478,11 @@ func (s *Store) getTaskTx(q queryer, id int64) (*Task, error) {
 	var t Task
 	var assignee sql.NullString
 	err := q.QueryRow(`SELECT t.id,t.project_id,p.slug,t.ref,t.title,t.body,t.status,t.assignee,
-	         t.priority,t.created_at,t.updated_at,
+	         t.priority,t.created_at,t.updated_at,COALESCE(t.claimed_at,''),
 	         (SELECT COUNT(*) FROM comments c WHERE c.task_id=t.id)
 	       FROM tasks t JOIN projects p ON p.id=t.project_id WHERE t.id=?`, id).
 		Scan(&t.ID, &t.ProjectID, &t.Project, &t.Ref, &t.Title, &t.Body, &t.Status,
-			&assignee, &t.Priority, &t.CreatedAt, &t.UpdatedAt, &t.NComments)
+			&assignee, &t.Priority, &t.CreatedAt, &t.UpdatedAt, &t.ClaimedAt, &t.NComments)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -670,6 +688,13 @@ func (s *Store) PatchTask(id int64, patch map[string]any, actor string) (*Task, 
 		if as != cur.Assignee {
 			sets = append(sets, "assignee=?")
 			args = append(args, nullStr(as))
+			// Keep claimed_at in step with the assignee: set on (re)assign, clear
+			// on unassign (so `am drop` resets it).
+			if as != "" {
+				sets = append(sets, "claimed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')")
+			} else {
+				sets = append(sets, "claimed_at=NULL")
+			}
 			delta["assignee"] = []any{nullable(cur.Assignee), nullable(as)}
 			assignChanged = true
 		}
@@ -793,6 +818,7 @@ func (s *Store) ClaimTask(id int64, agent string) (*Task, *Event, error) {
 	err = tx.QueryRow(`
 		UPDATE tasks
 		   SET assignee=?,
+		       claimed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),
 		       status=CASE WHEN status='todo' THEN 'doing' ELSE status END,
 		       updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		 WHERE id=? AND assignee IS NULL AND status!='done'
@@ -813,6 +839,81 @@ func (s *Store) ClaimTask(id int64, agent string) (*Task, *Event, error) {
 	}
 	ev, err := insertEvent(tx, pid, id, agent, "task.claimed",
 		map[string]any{"assignee": []any{nil, agent}, "status": newStatus})
+	if err != nil {
+		return nil, nil, err
+	}
+	t, err := s.getTaskTx(tx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	return t, ev, tx.Commit()
+}
+
+// StealStaleClaim atomically takes over a task whose current claim has gone
+// stale — no activity (updated_at) for at least staleFor. An unclaimed task
+// degrades to a normal claim. Returns (task, event, nil) on win; (task, nil,
+// nil) if agent already owns it (idempotent); (nil,nil,*NotStaleError) if held
+// by someone else and still fresh; (nil,nil,*ConflictError) if done; ErrNotFound.
+// Returns *BlockedError if the task has open prerequisites.
+func (s *Store) StealStaleClaim(id int64, agent string, staleFor time.Duration) (*Task, *Event, error) {
+	if agent == "" || staleFor <= 0 {
+		return nil, nil, ErrValidation
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+
+	// Hard-block: check prerequisites before attempting the takeover.
+	openIDs, err := hasOpenPrereqs(tx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(openIDs) > 0 {
+		return nil, nil, &BlockedError{OpenPrereqs: openIDs}
+	}
+
+	// Prior state, read in the same tx, so the event can name the previous holder.
+	cur, err := s.getTaskTx(tx, id)
+	if err != nil {
+		return nil, nil, err // ErrNotFound or real error
+	}
+	if cur.Assignee == agent {
+		return cur, nil, tx.Commit() // idempotent re-claim
+	}
+
+	// Conditional UPDATE is the atomicity guarantee: only one stealer can match
+	// the stale predicate; the row is then fresh, so concurrent stealers miss.
+	var newStatus string
+	var pid int64
+	err = tx.QueryRow(`
+		UPDATE tasks
+		   SET assignee=?,
+		       claimed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+		       status=CASE WHEN status='todo' THEN 'doing' ELSE status END,
+		       updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		 WHERE id=? AND status!='done' AND (assignee IS NULL OR updated_at < ?)
+		RETURNING project_id, status`, agent, id, staleCutoff(staleFor)).Scan(&pid, &newStatus)
+	if err == sql.ErrNoRows {
+		if cur.Status == "done" {
+			return nil, nil, &ConflictError{Assignee: orDash(cur.Assignee, cur.Status)}
+		}
+		return nil, nil, &NotStaleError{Assignee: cur.Assignee}
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	var ev *Event
+	if cur.Assignee != "" {
+		ev, err = insertEvent(tx, pid, id, agent, "task.reclaimed",
+			map[string]any{"assignee": []any{cur.Assignee, agent}, "status": newStatus,
+				"stale_for": staleFor.String()})
+	} else {
+		// Unclaimed: degrade to a normal claim (same payload shape as ClaimTask).
+		ev, err = insertEvent(tx, pid, id, agent, "task.claimed",
+			map[string]any{"assignee": []any{nil, agent}, "status": newStatus})
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1305,6 +1406,14 @@ func toInt(v any, def int) int {
 		}
 	}
 	return def
+}
+
+// staleCutoff returns the ISO-8601 UTC timestamp staleFor ago, formatted to
+// match SQLite's strftime('%Y-%m-%dT%H:%M:%fZ','now') exactly (3-digit
+// fractional seconds), so the lexicographic comparison against stored
+// updated_at values is correct. Changing the format silently breaks it.
+func staleCutoff(d time.Duration) string {
+	return time.Now().UTC().Add(-d).Format("2006-01-02T15:04:05.000Z")
 }
 
 // orDash returns the assignee, or if empty (e.g. a done task) the status, so a

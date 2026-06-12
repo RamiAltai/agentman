@@ -85,6 +85,133 @@ func TestLostClaim409(t *testing.T) {
 	}
 }
 
+// newTestServerWithStore is like newTestServer but also returns the store, so
+// tests can backdate rows directly (the stale-claim test seam).
+func newTestServerWithStore(t *testing.T) (*httptest.Server, *Store) {
+	t.Helper()
+	store := openTestStore(t)
+	ts := httptest.NewServer(NewServer(store).Handler())
+	t.Cleanup(ts.Close)
+	return ts, store
+}
+
+func TestListTasksStaleParam(t *testing.T) {
+	ts, store := newTestServerWithStore(t)
+	mustCreateProject(t, ts, "web")
+	staleID := mustCreateTask(t, ts, "web", "stale task")
+	freshID := mustCreateTask(t, ts, "web", "fresh task")
+
+	for _, id := range []string{staleID, freshID} {
+		r := do(t, ts, http.MethodPost, "/api/tasks/"+id+"/claim", "",
+			map[string]string{"X-Agent": "agent-" + id})
+		r.Body.Close()
+		if r.StatusCode != http.StatusOK {
+			t.Fatalf("claim %s = %d, want 200", id, r.StatusCode)
+		}
+	}
+	n, _ := strconv.ParseInt(staleID, 10, 64)
+	backdateTask(t, store, n)
+
+	// ?stale=1h returns only the backdated task.
+	r := do(t, ts, http.MethodGet, "/api/tasks?stale=1h", "", nil)
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("GET ?stale=1h = %d, want 200", r.StatusCode)
+	}
+	var tasks []Task
+	if err := json.NewDecoder(r.Body).Decode(&tasks); err != nil {
+		t.Fatalf("decode tasks: %v", err)
+	}
+	if len(tasks) != 1 || strconv.FormatInt(tasks[0].ID, 10) != staleID {
+		t.Fatalf("?stale=1h returned %+v, want only task %s", tasks, staleID)
+	}
+
+	// Malformed or non-positive durations → 400.
+	for _, bad := range []string{"bogus", "-1h", "0s"} {
+		rb := do(t, ts, http.MethodGet, "/api/tasks?stale="+bad, "", nil)
+		rb.Body.Close()
+		if rb.StatusCode != http.StatusBadRequest {
+			t.Fatalf("GET ?stale=%s = %d, want 400", bad, rb.StatusCode)
+		}
+	}
+}
+
+func TestStealStaleEndpoint(t *testing.T) {
+	ts, store := newTestServerWithStore(t)
+	mustCreateProject(t, ts, "web")
+	staleID := mustCreateTask(t, ts, "web", "abandoned")
+	freshID := mustCreateTask(t, ts, "web", "active")
+
+	for _, id := range []string{staleID, freshID} {
+		r := do(t, ts, http.MethodPost, "/api/tasks/"+id+"/claim", "",
+			map[string]string{"X-Agent": "agent-a"})
+		r.Body.Close()
+		if r.StatusCode != http.StatusOK {
+			t.Fatalf("claim %s = %d, want 200", id, r.StatusCode)
+		}
+	}
+	n, _ := strconv.ParseInt(staleID, 10, 64)
+	backdateTask(t, store, n)
+
+	// Stale → 200, assignee swapped, and a task.reclaimed event appears.
+	r := do(t, ts, http.MethodPost, "/api/tasks/"+staleID+"/claim",
+		`{"steal_stale":"1h"}`,
+		map[string]string{"X-Agent": "agent-b", "Content-Type": "application/json"})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("steal stale = %d, want 200", r.StatusCode)
+	}
+	var stolen Task
+	if err := json.NewDecoder(r.Body).Decode(&stolen); err != nil {
+		t.Fatalf("decode stolen task: %v", err)
+	}
+	if stolen.Assignee != "agent-b" {
+		t.Fatalf("assignee after steal = %q, want agent-b", stolen.Assignee)
+	}
+	re := do(t, ts, http.MethodGet, "/api/events?tail=50", "", nil)
+	defer re.Body.Close()
+	var feed struct {
+		Events []Event `json:"events"`
+	}
+	if err := json.NewDecoder(re.Body).Decode(&feed); err != nil {
+		t.Fatalf("decode events: %v", err)
+	}
+	found := false
+	for _, e := range feed.Events {
+		if e.Kind == "task.reclaimed" && strconv.FormatInt(e.TaskID, 10) == staleID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("task.reclaimed event not found in /api/events")
+	}
+
+	// Fresh → 409 not_stale naming the holder.
+	rf := do(t, ts, http.MethodPost, "/api/tasks/"+freshID+"/claim",
+		`{"steal_stale":"1h"}`,
+		map[string]string{"X-Agent": "agent-b", "Content-Type": "application/json"})
+	defer rf.Body.Close()
+	if rf.StatusCode != http.StatusConflict {
+		t.Fatalf("steal fresh = %d, want 409", rf.StatusCode)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(rf.Body).Decode(&body); err != nil {
+		t.Fatalf("decode 409 body: %v", err)
+	}
+	if body["error"] != "not_stale" || body["assignee"] != "agent-a" {
+		t.Fatalf("409 body = %v, want error=not_stale assignee=agent-a", body)
+	}
+
+	// Malformed duration → 400.
+	rb := do(t, ts, http.MethodPost, "/api/tasks/"+freshID+"/claim",
+		`{"steal_stale":"2 fortnights"}`,
+		map[string]string{"X-Agent": "agent-b", "Content-Type": "application/json"})
+	rb.Body.Close()
+	if rb.StatusCode != http.StatusBadRequest {
+		t.Fatalf("steal bad duration = %d, want 400", rb.StatusCode)
+	}
+}
+
 func TestHostGuard(t *testing.T) {
 	ts := newTestServer(t)
 	cases := []struct {

@@ -1,6 +1,7 @@
 "use strict";
 
 const COLS = [["todo", "Todo"], ["doing", "In Progress"], ["blocked", "Blocked"], ["done", "Done"]];
+const STALE_MS = 30 * 60 * 1000; // a doing+assigned card with no activity this long gets a stale badge
 const ST = { todo: "var(--st-todo)", doing: "var(--st-doing)", blocked: "var(--st-blocked)", done: "var(--st-done)" };
 const PRIO = ["#f4756b", "#f8b738", "#8b93a4", "#6e7681"]; // 0 urgent .. 3 low
 const PRIO_LABEL = ["Urgent", "High", "", ""];
@@ -231,6 +232,8 @@ function card(t) {
   if (t.nc > 0) foot.append(el("span", { class: "cc" }, "💬 " + t.nc));
   if (t.nopen > 0) foot.append(el("span", { class: "tag-blocked" }, "🔒 " + t.nopen));
   else if (t.nprereq > 0) foot.append(el("span", { class: "tag-ready" }, "✓ Ready"));
+  if (t.status === "doing" && t.assignee && Date.now() - Date.parse(t.updated_at) > STALE_MS)
+    foot.append(el("span", { class: "tag-stale", title: "no activity for 30+ min" }, "⏳ stale"));
   c.append(foot);
   return c;
 }
@@ -817,6 +820,7 @@ async function loadOlderActivity() {
 function evKind(ev) {
   if (ev.kind === "comment.added") return "comment";
   if (ev.kind === "task.claimed") return "claimed";
+  if (ev.kind === "task.reclaimed") return "claimed";
   if (ev.kind === "task.status") {
     const s = last((ev.data || {}).status);
     return s === "done" ? "done" : s === "blocked" ? "blocked" : "status";
@@ -836,6 +840,7 @@ function evText(ev) {
   switch (ev.kind) {
     case "task.created": span.append(who, " created ", ref); break;
     case "task.claimed": span.append(who, " claimed ", ref); break;
+    case "task.reclaimed": span.append(who, " reclaimed ", ref, " from ", String((d.assignee || [])[0] || "—")); break;
     case "task.status": span.append(who, " moved ", ref, " → ", String(last(d.status))); break;
     case "task.assign": span.append(who, " assigned ", ref, " → ", String(last(d.assignee) || "—")); break;
     case "task.patched": span.append(who, " edited ", ref); break;
@@ -860,6 +865,7 @@ function describeText(ev) {
   switch (ev.kind) {
     case "task.created": return `${who} created ${t}`;
     case "task.claimed": return `${who} claimed ${t}`;
+    case "task.reclaimed": return `${who} reclaimed ${t} from ${(d.assignee || [])[0] || "—"}`;
     case "task.status": return `${who} moved ${t} → ${last(d.status)}`;
     case "task.assign": return `${who} assigned ${t} → ${last(d.assignee) || "—"}`;
     case "task.patched": return `${who} edited ${t}`;
@@ -1649,7 +1655,7 @@ function buildGraphLegend() {
 // graphMaybeRefresh is called from onEvent (below) when the graph overlay is open.
 const GRAPH_REFRESH_KINDS = new Set([
   "task.dep_added", "task.dep_removed", "task.status", "task.created", "task.deleted",
-  "task.assign", "task.patched",
+  "task.assign", "task.patched", "task.reclaimed",
 ]);
 
 function graphMaybeRefresh(ev) {

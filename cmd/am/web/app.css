@@ -357,6 +357,12 @@ select:hover, .field:hover { border-color: var(--line-strong); }
   border: 1px solid rgba(53, 214, 164, .3); border-radius: 999px;
   padding: 1px 7px; font-size: 11px; font-weight: 600;
 }
+.tag-stale {
+  display: inline-flex; align-items: center; gap: 3px;
+  background: rgba(240, 136, 62, .14); color: #f0883e;
+  border: 1px solid rgba(240, 136, 62, .35); border-radius: 999px;
+  padding: 1px 7px; font-size: 11px; font-weight: 600;
+}
 
 /* ===================== dependency section (task modal) ===================== */
 .deps-section { margin: 10px 0 14px; }

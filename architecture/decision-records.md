@@ -452,6 +452,58 @@ without evidence.
   (`ProjectGraph`, `GraphEdge`, `ProjectGraphData`); `cmd/am/store_test.go` + `cmd/am/server_test.go`
   (4 new graph tests).
 
+### ADR-022: Stale-claim recovery — staleness from `updated_at`, steal via conditional UPDATE, no lease daemon (Phase K)
+- Status: Active
+- Context: Agents crash after `am claim`, leaving tasks assigned forever — nothing on the board
+  distinguishes "agent is working" from "agent is dead", and other agents have no safe way to take
+  the work over (`am assign` is an unconditional overwrite that could rob a live agent).
+- Decision:
+  1. **Staleness is judged from `updated_at`, not a heartbeat.** A task is stale when
+     `assignee IS NOT NULL AND status != 'done' AND updated_at < now - dur`. Every meaningful
+     action (claim, status change, comment, edit) already bumps `updated_at`, so an agent posting
+     `am note` progress keeps its claim fresh with zero new protocol. The caller chooses the
+     window per call (`--stale <dur>` / `--steal-stale <dur>`, Go duration syntax) — no global
+     config. The cutoff is computed in Go (`staleCutoff`) in the exact
+     `strftime('%Y-%m-%dT%H:%M:%fZ')` 3-digit-fraction format so the TEXT comparison sorts
+     correctly.
+  2. **`tasks.claimed_at` column (schema migration v3)** records when the current claim started —
+     set by claim/steal/PATCH-assign, cleared on unassign (`am drop`). It is informational
+     (returned in task JSON); the stale predicate deliberately uses `updated_at` so long-running
+     but active work is never considered stale.
+  3. **Steal is an atomic conditional UPDATE, mirroring ClaimTask:** `UPDATE … WHERE id=? AND
+     status!='done' AND (assignee IS NULL OR updated_at < cutoff) RETURNING …`
+     (`StealStaleClaim`). Exactly one concurrent stealer wins; losers get a typed
+     `*NotStaleError{Assignee}` → `409 {"error":"not_stale","assignee":…}` → CLI exit 4. A done
+     task → `*ConflictError`; open prereqs hard-block like a normal claim; stealing your own task
+     is idempotent (no event).
+  4. **Steal on an unclaimed task degrades to a normal claim** (the `assignee IS NULL` arm) —
+     `--steal-stale` is a strict superset of `claim`, so an orchestrator can use one code path;
+     the emitted event is then a plain `task.claimed`.
+  5. **New event kind `task.reclaimed`** (15 total), emitted in the same tx as the takeover, with
+     data `{"assignee":[prev,new],"status":…,"stale_for":"30m0s"}` — the audit log names who was
+     robbed and under what window.
+  6. **No lease/heartbeat daemon and no auto-reaper.** Recovery is pull-based: a human or
+     orchestrator decides when to steal. The server never reassigns work on its own.
+  7. **Plain `am assign` intentionally remains an unconditional overwrite** — it is the human
+     "I know what I'm doing" escape hatch; `--steal-stale` is the safe path agents should use.
+- Rationale: `updated_at` staleness needs no new agent protocol and is monotone with actual
+  activity; the conditional-UPDATE pattern is already the project's proven race-safety primitive
+  (ADR-020's hard-block, the original atomic claim); a reaper daemon would add background state
+  and policy (what window?) the caller can express better per call.
+- Consequences: an agent that works for hours without posting any update can be robbed — agents
+  should `am note` at milestones (already the documented flow); choosing too small a window is
+  the caller's risk. Stolen work may be half-done; the `task.reclaimed` event + comments are the
+  handoff context.
+- Evidence: `cmd/am/store.go` (`StealStaleClaim`, `NotStaleError`, `staleCutoff`,
+  `TaskFilter.Stale`, `Task.ClaimedAt`, migration v3); `cmd/am/server.go` (`steal_stale` body
+  field, `?stale=` param, `not_stale` 409); `cmd/am/cli.go` (`--stale`, `--steal-stale`, exit-code
+  mapping); `cmd/am/web/app.js` (`.tag-stale` badge, `task.reclaimed` feed rendering);
+  `cmd/am/store_test.go` (`TestStealStaleClaim`, `TestStealRaceExactlyOneWinner`,
+  `TestListTasksStaleFilter`, `TestClaimSetsClaimedAt`, `TestDropClearsClaimedAt`);
+  `cmd/am/server_test.go` (`TestListTasksStaleParam`, `TestStealStaleEndpoint`);
+  `cmd/am/cli_test.go` (`TestExitNotStale`, `TestStaleFlagsWireFormat`);
+  `cmd/am/migrate_test.go` (`TestMigrationV3AddsClaimedAt`).
+
 ## Inferred Decisions
 
 ### IADR-001: SSE chosen over WebSockets

@@ -110,6 +110,9 @@ func cmdLs(c *Client, a Args) {
 	if a.has("blocked") {
 		qs.Set("blocked", "true")
 	}
+	if v := a.flag("stale"); v != "" {
+		qs.Set("stale", v) // Go duration, e.g. 30m / 48h; server validates
+	}
 	qs.Set("limit", "50")
 
 	data := c.doOrFail("GET", "/api/tasks?"+qs.Encode(), nil)
@@ -194,7 +197,11 @@ func cmdClaim(c *Client, a Args) {
 	if me() == "" {
 		fail(5, "set AGENTMAN_AGENT to claim tasks")
 	}
-	st, data := c.do("POST", "/api/tasks/"+id+"/claim", nil)
+	var body any
+	if v := a.flag("steal-stale"); v != "" {
+		body = map[string]any{"steal_stale": v} // Go duration, e.g. 30m / 48h
+	}
+	st, data := c.do("POST", "/api/tasks/"+id+"/claim", body)
 	switch {
 	case st == 0:
 		fail(6, "agentman: cannot reach server (is `am serve` running?)")
@@ -219,7 +226,12 @@ func cmdClaim(c *Client, a Args) {
 			}
 			fail(4, "claim: #%s blocked — prereqs not done (%s)", id, strings.Join(parts, " "))
 		}
+		if e.Error == "not_stale" {
+			fail(4, "claim: #%s held by %s (not stale yet)", id, e.Assignee)
+		}
 		fail(4, "claim: #%s held by %s", id, e.Assignee)
+	case st == 400:
+		fail(5, "claim: %s", apiErr(data, "invalid request"))
 	default:
 		fail(1, "claim: %s", apiErr(data, "error"))
 	}

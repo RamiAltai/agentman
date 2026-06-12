@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestListEventsBefore(t *testing.T) {
@@ -223,6 +224,414 @@ func TestClaimRaceExactlyOneWinner(t *testing.T) {
 	}
 	if final.Status != "doing" {
 		t.Fatalf("final status = %q, want doing", final.Status)
+	}
+}
+
+// ===================== stale-claim recovery tests =====================
+
+// staleISO is a backdated updated_at value, in the exact strftime('%Y-%m-%dT%H:%M:%fZ')
+// format the store writes, far enough in the past to be stale for any test duration.
+const staleISO = "2026-01-01T00:00:00.000Z"
+
+// backdateTask rewinds a task's updated_at directly (same-package test seam).
+func backdateTask(t *testing.T, st *Store, id int64) {
+	t.Helper()
+	if _, err := st.db.Exec("UPDATE tasks SET updated_at=? WHERE id=?", staleISO, id); err != nil {
+		t.Fatalf("backdate task %d: %v", id, err)
+	}
+}
+
+func TestStealStaleClaim(t *testing.T) {
+	newTask := func(t *testing.T, st *Store, title string) int64 {
+		t.Helper()
+		tk, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: title})
+		if err != nil {
+			t.Fatalf("CreateTask: %v", err)
+		}
+		return tk.ID
+	}
+	mustClaim := func(t *testing.T, st *Store, id int64, agent string) {
+		t.Helper()
+		if _, _, err := st.ClaimTask(id, agent); err != nil {
+			t.Fatalf("ClaimTask(%d, %s): %v", id, agent, err)
+		}
+	}
+
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, st *Store) int64 // returns the id to steal
+		agent string
+		dur   time.Duration
+		check func(t *testing.T, st *Store, id int64, tk *Task, ev *Event, err error)
+	}{
+		{
+			name: "stale claim is stolen",
+			setup: func(t *testing.T, st *Store) int64 {
+				id := newTask(t, st, "stale")
+				mustClaim(t, st, id, "agent-old")
+				backdateTask(t, st, id)
+				return id
+			},
+			agent: "agent-new", dur: time.Hour,
+			check: func(t *testing.T, st *Store, id int64, tk *Task, ev *Event, err error) {
+				if err != nil {
+					t.Fatalf("steal: %v", err)
+				}
+				if tk.Assignee != "agent-new" {
+					t.Fatalf("assignee = %q, want agent-new", tk.Assignee)
+				}
+				if tk.ClaimedAt == "" || tk.ClaimedAt <= staleISO {
+					t.Fatalf("claimed_at = %q, want bumped past %s", tk.ClaimedAt, staleISO)
+				}
+				if tk.UpdatedAt <= staleISO {
+					t.Fatalf("updated_at = %q, want bumped past %s", tk.UpdatedAt, staleISO)
+				}
+				if ev == nil || ev.Kind != "task.reclaimed" {
+					t.Fatalf("event = %+v, want kind task.reclaimed", ev)
+				}
+				if !strings.Contains(string(ev.Data), "agent-old") {
+					t.Fatalf("event data %s does not name previous assignee", ev.Data)
+				}
+				var n int
+				st.db.QueryRow("SELECT COUNT(*) FROM events WHERE kind='task.reclaimed' AND task_id=?", id).Scan(&n)
+				if n != 1 {
+					t.Fatalf("task.reclaimed event rows = %d, want 1", n)
+				}
+			},
+		},
+		{
+			name: "fresh claim is not stealable",
+			setup: func(t *testing.T, st *Store) int64 {
+				id := newTask(t, st, "fresh")
+				mustClaim(t, st, id, "agent-old")
+				return id
+			},
+			agent: "agent-new", dur: time.Hour,
+			check: func(t *testing.T, st *Store, id int64, tk *Task, ev *Event, err error) {
+				var nse *NotStaleError
+				if !errors.As(err, &nse) {
+					t.Fatalf("err = %v, want *NotStaleError", err)
+				}
+				if nse.Assignee != "agent-old" {
+					t.Fatalf("NotStaleError.Assignee = %q, want agent-old", nse.Assignee)
+				}
+				final, _ := st.GetTask(id)
+				if final.Assignee != "agent-old" {
+					t.Fatalf("assignee after lost steal = %q, want agent-old", final.Assignee)
+				}
+			},
+		},
+		{
+			name: "unclaimed degrades to normal claim",
+			setup: func(t *testing.T, st *Store) int64 {
+				return newTask(t, st, "unclaimed")
+			},
+			agent: "agent-new", dur: time.Hour,
+			check: func(t *testing.T, st *Store, id int64, tk *Task, ev *Event, err error) {
+				if err != nil {
+					t.Fatalf("steal on unclaimed: %v", err)
+				}
+				if tk.Assignee != "agent-new" || tk.Status != "doing" {
+					t.Fatalf("task = %s/%s, want agent-new/doing", tk.Assignee, tk.Status)
+				}
+				if ev == nil || ev.Kind != "task.claimed" {
+					t.Fatalf("event = %+v, want kind task.claimed", ev)
+				}
+			},
+		},
+		{
+			name: "done task conflicts",
+			setup: func(t *testing.T, st *Store) int64 {
+				id := newTask(t, st, "done")
+				mustClaim(t, st, id, "agent-old")
+				if _, _, err := st.PatchTask(id, map[string]any{"status": "done"}, "agent-old"); err != nil {
+					t.Fatalf("PatchTask done: %v", err)
+				}
+				backdateTask(t, st, id)
+				return id
+			},
+			agent: "agent-new", dur: time.Hour,
+			check: func(t *testing.T, st *Store, id int64, tk *Task, ev *Event, err error) {
+				var ce *ConflictError
+				if !errors.As(err, &ce) {
+					t.Fatalf("err = %v, want *ConflictError", err)
+				}
+			},
+		},
+		{
+			name: "own claim is idempotent",
+			setup: func(t *testing.T, st *Store) int64 {
+				id := newTask(t, st, "mine")
+				mustClaim(t, st, id, "agent-new")
+				return id
+			},
+			agent: "agent-new", dur: time.Hour,
+			check: func(t *testing.T, st *Store, id int64, tk *Task, ev *Event, err error) {
+				if err != nil {
+					t.Fatalf("idempotent steal: %v", err)
+				}
+				if tk == nil || tk.Assignee != "agent-new" {
+					t.Fatalf("task = %+v, want owned by agent-new", tk)
+				}
+				if ev != nil {
+					t.Fatalf("event = %+v, want nil (idempotent)", ev)
+				}
+			},
+		},
+		{
+			name:  "missing id",
+			setup: func(t *testing.T, st *Store) int64 { return 99999 },
+			agent: "agent-new", dur: time.Hour,
+			check: func(t *testing.T, st *Store, id int64, tk *Task, ev *Event, err error) {
+				if !errors.Is(err, ErrNotFound) {
+					t.Fatalf("err = %v, want ErrNotFound", err)
+				}
+			},
+		},
+		{
+			name:  "empty agent",
+			setup: func(t *testing.T, st *Store) int64 { return newTask(t, st, "noagent") },
+			agent: "", dur: time.Hour,
+			check: func(t *testing.T, st *Store, id int64, tk *Task, ev *Event, err error) {
+				if !errors.Is(err, ErrValidation) {
+					t.Fatalf("err = %v, want ErrValidation", err)
+				}
+			},
+		},
+		{
+			name:  "zero duration",
+			setup: func(t *testing.T, st *Store) int64 { return newTask(t, st, "zerodur") },
+			agent: "agent-new", dur: 0,
+			check: func(t *testing.T, st *Store, id int64, tk *Task, ev *Event, err error) {
+				if !errors.Is(err, ErrValidation) {
+					t.Fatalf("err = %v, want ErrValidation", err)
+				}
+			},
+		},
+		{
+			name:  "negative duration",
+			setup: func(t *testing.T, st *Store) int64 { return newTask(t, st, "negdur") },
+			agent: "agent-new", dur: -time.Hour,
+			check: func(t *testing.T, st *Store, id int64, tk *Task, ev *Event, err error) {
+				if !errors.Is(err, ErrValidation) {
+					t.Fatalf("err = %v, want ErrValidation", err)
+				}
+			},
+		},
+		{
+			name: "open prereq blocks the steal",
+			setup: func(t *testing.T, st *Store) int64 {
+				prereq := newTask(t, st, "prereq")
+				dep := newTask(t, st, "dependent")
+				if _, err := st.AddDep(dep, prereq, "alice"); err != nil {
+					t.Fatalf("AddDep: %v", err)
+				}
+				return dep
+			},
+			agent: "agent-new", dur: time.Hour,
+			check: func(t *testing.T, st *Store, id int64, tk *Task, ev *Event, err error) {
+				var be *BlockedError
+				if !errors.As(err, &be) {
+					t.Fatalf("err = %v, want *BlockedError", err)
+				}
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			st := openTestStore(t)
+			if _, _, err := st.CreateProject("web", "Web"); err != nil {
+				t.Fatalf("CreateProject: %v", err)
+			}
+			id := c.setup(t, st)
+			tk, ev, err := st.StealStaleClaim(id, c.agent, c.dur)
+			c.check(t, st, id, tk, ev, err)
+		})
+	}
+}
+
+func TestStealRaceExactlyOneWinner(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Steal me"})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if _, _, err := st.ClaimTask(task.ID, "dead-agent"); err != nil {
+		t.Fatalf("ClaimTask: %v", err)
+	}
+	backdateTask(t, st, task.ID)
+
+	agents := []string{"stealer-a", "stealer-b", "stealer-c", "stealer-d"}
+	type result struct {
+		agent string
+		task  *Task
+		err   error
+	}
+	results := make([]result, len(agents))
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i, ag := range agents {
+		wg.Add(1)
+		go func(i int, ag string) {
+			defer wg.Done()
+			<-start
+			tk, _, err := st.StealStaleClaim(task.ID, ag, time.Hour)
+			results[i] = result{agent: ag, task: tk, err: err}
+		}(i, ag)
+	}
+	close(start)
+	wg.Wait()
+
+	winners, notStale := 0, 0
+	var winner string
+	for _, r := range results {
+		if r.err == nil {
+			winners++
+			winner = r.agent
+			if r.task == nil {
+				t.Fatalf("winner %s returned nil task", r.agent)
+			}
+			continue
+		}
+		var nse *NotStaleError
+		if errors.As(r.err, &nse) {
+			notStale++
+		} else {
+			t.Fatalf("unexpected error for %s: %v", r.agent, r.err)
+		}
+	}
+	if winners != 1 || notStale != len(agents)-1 {
+		t.Fatalf("winners=%d notStale=%d, want 1 and %d", winners, notStale, len(agents)-1)
+	}
+	final, err := st.GetTask(task.ID)
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if final.Assignee != winner {
+		t.Fatalf("final owner = %q, want winner %q", final.Assignee, winner)
+	}
+	var n int
+	st.db.QueryRow("SELECT COUNT(*) FROM events WHERE kind='task.reclaimed' AND task_id=?", task.ID).Scan(&n)
+	if n != 1 {
+		t.Fatalf("task.reclaimed event rows = %d, want exactly 1", n)
+	}
+}
+
+func TestListTasksStaleFilter(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	mk := func(title string) int64 {
+		t.Helper()
+		tk, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: title})
+		if err != nil {
+			t.Fatalf("CreateTask %s: %v", title, err)
+		}
+		return tk.ID
+	}
+
+	// Stale: claimed (doing+assigned) then backdated.
+	stale := mk("stale doing")
+	if _, _, err := st.ClaimTask(stale, "agent-a"); err != nil {
+		t.Fatal(err)
+	}
+	backdateTask(t, st, stale)
+
+	// Fresh: claimed just now.
+	fresh := mk("fresh doing")
+	if _, _, err := st.ClaimTask(fresh, "agent-b"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unassigned doing, backdated: not stale (nobody holds it).
+	unassigned := mk("unassigned doing")
+	if _, _, err := st.PatchTask(unassigned, map[string]any{"status": "doing"}, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	backdateTask(t, st, unassigned)
+
+	// Assigned done, backdated: not stale (finished work is never stale).
+	done := mk("assigned done")
+	if _, _, err := st.ClaimTask(done, "agent-c"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.PatchTask(done, map[string]any{"status": "done"}, "agent-c"); err != nil {
+		t.Fatal(err)
+	}
+	backdateTask(t, st, done)
+
+	// Backdated but then commented: the comment bumps updated_at → no longer stale.
+	revived := mk("commented doing")
+	if _, _, err := st.ClaimTask(revived, "agent-d"); err != nil {
+		t.Fatal(err)
+	}
+	backdateTask(t, st, revived)
+	if _, _, err := st.AddComment(revived, "agent-d", "still on it"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.ListTasks(TaskFilter{Project: "web", Stale: time.Hour, Status: "todo,doing,blocked,done"})
+	if err != nil {
+		t.Fatalf("ListTasks stale: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != stale {
+		t.Fatalf("stale filter returned %+v, want only task %d", got, stale)
+	}
+}
+
+func TestClaimSetsClaimedAt(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "claim me"})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if task.ClaimedAt != "" {
+		t.Fatalf("claimed_at before claim = %q, want empty", task.ClaimedAt)
+	}
+	claimed, _, err := st.ClaimTask(task.ID, "agent-a")
+	if err != nil {
+		t.Fatalf("ClaimTask: %v", err)
+	}
+	if claimed.ClaimedAt == "" {
+		t.Fatal("claimed_at not set by ClaimTask")
+	}
+}
+
+func TestDropClearsClaimedAt(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("web", "Web"); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "drop me"})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if _, _, err := st.ClaimTask(task.ID, "agent-a"); err != nil {
+		t.Fatalf("ClaimTask: %v", err)
+	}
+	// am drop = PATCH {assignee:"", status:"todo"}.
+	dropped, _, err := st.PatchTask(task.ID, map[string]any{"assignee": "", "status": "todo"}, "agent-a")
+	if err != nil {
+		t.Fatalf("PatchTask drop: %v", err)
+	}
+	if dropped.ClaimedAt != "" {
+		t.Fatalf("claimed_at after drop = %q, want cleared", dropped.ClaimedAt)
+	}
+	// Reassigning via PATCH sets it again.
+	reassigned, _, err := st.PatchTask(task.ID, map[string]any{"assignee": "agent-b"}, "alice")
+	if err != nil {
+		t.Fatalf("PatchTask assign: %v", err)
+	}
+	if reassigned.ClaimedAt == "" {
+		t.Fatal("claimed_at not set on PATCH reassign")
 	}
 }
 
