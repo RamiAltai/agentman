@@ -97,7 +97,7 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 ## Testing Gaps
 
-- Coverage now spans store/server/migrate/db/cli/sse/identity/web tests (9 files, 107 tests,
+- Coverage now spans store/server/migrate/db/cli/sse/identity/wait/web tests (10 files, 130 tests,
   `-race`-clean): the **atomic claim** (race, `-race`-clean), events cursor, store CRUD/validation,
   validation→status mapping, the Host/CSRF/CSP guards, project archive/unarchive (store round-trip
   + idempotency and the HTTP endpoints incl. 404), the v2 migration (adds `archived_at` +
@@ -115,7 +115,8 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   `TestRequestLoggerPreservesFlusher` (in `server_test.go`).
   Phase E added:
   - **CLI verbs + exit codes** (`cli_test.go`) — `cmdNew`, `cmdLs`, mutations (`cmdStatus`/
-    `cmdNote`/`cmdDrop`) silent-on-success, and the `doOrFail` exit-code mapping (3/4/5/6); plus
+    `cmdNote`/`cmdDrop`) silent-on-success, and the exit-code mapping 3/4/5/6/7 (now centralized
+    in `exitCodeFor`; 7 is the wait timeout, exercised in `wait_test.go`); plus
     table tests for `parse`/`Args` and formatters (`taskLine`/`statusShort`/`assignee`/`trunc`/
     `apiErr`).
   - **SSE streaming + reconnect** (`sse_test.go`) — `TestSSEDeliversLiveEvent` and
@@ -139,6 +140,14 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   `TestDropClearsClaimedAt`), the v3 migration (`TestMigrationV3AddsClaimedAt`), the HTTP
   surfaces (`TestListTasksStaleParam`, `TestStealStaleEndpoint`), and the CLI mapping
   (`TestExitNotStale`, `TestStaleFlagsWireFormat`).
+  Phase L added 23 work-loop tests: `NextTask` ordering/scoping and the pick+claim race
+  (`TestNextTaskPicksHighestPriorityReady`, `TestNextTaskFIFOWithinPriority`,
+  `TestNextTaskProjectScoping`, `TestNextTaskNoneReady`, `TestNextTaskRaceDistinctWinners`,
+  `TestNextTaskEmptyAgentValidation`), the HTTP surface (`TestNextEndpoint`,
+  `TestNextEndpointProjectBody`), the CLI (`TestCmdNextPrintsOnlyID`, `TestExitNextNoneReady`,
+  bulk `TestCmdStatusBulk`/`TestCmdStatusBulkPartialFailure`/`TestCmdAssignBulk`), and `am wait`
+  end to end in `wait_test.go` (already-done, event-driven, cross-project `--done`, ready-on-prereq,
+  timeout exit 7, not-found, server-down, usage, `parseWaitTimeout`).
   **Still untested:** behavioral dashboard JS — the "Manage projects" modal, the delete confirm
   flows (task/comment/project), the feed pagination button, the dependency section UI (prereq chips,
   add-prereq dropdown, blocks list), the **graph overlay** (layout, pan/zoom, transitive highlight,

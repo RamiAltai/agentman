@@ -112,7 +112,8 @@ the server. Their security-relevant properties:
   `Sec-Fetch-Site`/`Origin` while allowing the header-less CLI and the same-origin dashboard;
   mitigates malicious-website drive-by writes. (Added Phase 0, ADR-011.)
 - **`X-Content-Type-Options: nosniff` + a dashboard-safe CSP** (`server.go securityHeaders`).
-- **Atomic claim** prevents double-claim/race (`store.go ClaimTask`, conditional `UPDATE … RETURNING`).
+- **Atomic claim** prevents double-claim/race (`store.go ClaimTask` / `StealStaleClaim` /
+  `NextTask`, conditional `UPDATE … RETURNING`).
 - XSS-safe DOM rendering; parameterized SQL; request body size cap.
 - The **`events` table is a de-facto audit log** (actor, kind, timestamp, delta) — but the actor is
   spoofable since `X-Agent` is unauthenticated, so it's attribution, not non-repudiation.

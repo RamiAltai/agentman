@@ -504,6 +504,63 @@ without evidence.
   `cmd/am/cli_test.go` (`TestExitNotStale`, `TestStaleFlagsWireFormat`);
   `cmd/am/migrate_test.go` (`TestMigrationV3AddsClaimedAt`).
 
+### ADR-023: Agent work loop — atomic `am next` via conditional UPDATE-with-subquery, `am wait` as a CLI-side SSE consumer, bulk verbs as a client-side loop (Phase L)
+- Status: Active
+- Context: An agent loop needs three primitives the board lacked: "give me the best thing to work
+  on" without a list-then-claim race window, "block until my prerequisite is finished" without
+  polling, and "mark these five subtasks done" without five invocations.
+- Decision:
+  1. **`am next` is pick + claim in ONE statement** (`NextTask`): `UPDATE tasks SET assignee=…,
+     status='doing', claimed_at=…, updated_at=… WHERE id = (SELECT t.id … ORDER BY t.priority ASC,
+     t.id ASC LIMIT 1) RETURNING id, project_id` — the same conditional-UPDATE race primitive as
+     ClaimTask/StealStaleClaim (ADR-022), serialized by `SetMaxOpenConns(1)`, so N concurrent
+     callers get N distinct tasks. Candidates: `status='todo' AND assignee IS NULL`, no open
+     prerequisites (the exact `NOT EXISTS` predicate of ListTasks' Ready filter), non-archived
+     project, optional project scope.
+  2. **FIFO tiebreak: `priority ASC, id ASC`** — deliberately NOT the `updated_at DESC` display
+     order of `am ls`; a pickup queue should drain oldest-first, and recently-touched-first would
+     starve old tasks. 0 is the most urgent priority (matching ListTasks).
+  3. **`next` skips tasks pre-assigned to the caller** — candidates require `assignee IS NULL`,
+     so a task already assigned to you is never returned by `am next`; claim it explicitly with
+     `am claim <id>`. Keeps the predicate one uniform condition with no per-caller arm.
+  4. **No new event kind** — a `next` pickup IS a claim; it emits `task.claimed` with the same
+     payload shape (`{"assignee":[null,agent],"status":"doing"}`). Event-kind catalog stays at 15.
+  5. **404 ambiguity accepted on `am next`** — an empty board and a bad `-p` slug both map to
+     `404 not_found` → exit 3 (`next: no ready task`). An agent loop treats both as "nothing to
+     do here"; disambiguating would cost an extra round-trip or error shape for no loop benefit.
+  6. **`am wait` is a pure CLI-side SSE consumer; the server is untouched** (`cmd/am/wait.go`).
+     Exactly two conditions: `am wait <id> --done` and `am wait --ready [-p P]`. It snapshots the
+     event cursor (`/api/events?tail=1`) BEFORE the first REST condition check, then follows
+     `/api/stream?since=<cursor>` (reconnecting from the last seen id), and on each relevant event
+     **re-evaluates the condition via REST** — event payloads are never trusted as state. The
+     existing `?since=` replay closes the check/subscribe race. `Client.http`'s 10s timeout would
+     kill a stream, so cmdWait uses its own un-timed `http.Client` bounded by a
+     `context.WithTimeout` over the whole wait.
+  7. **Exit code 7 = wait timeout** (default window 10m; `--timeout` takes a Go duration or bare
+     seconds). Distinct from 4 (conflict) and 6 (server down) so a loop can branch on "condition
+     just didn't happen yet".
+  8. **Bulk `am status`/`am assign` stay client-side** — a loop of per-id PATCHes, one
+     `task.status`/`task.assign` event per task (the feed and SSE consumers keep per-task
+     semantics; no new bulk endpoint or transaction). Partial failure: one stderr line per failing
+     id, the loop continues, exit code is the FIRST failure's mapping via the new `exitCodeFor`
+     helper (extracted from `doOrFail`, now the single status→exit-code source).
+- Rationale: the conditional-UPDATE-with-subquery removes the agent's biggest race (two agents
+  `am ls --ready` then both claim the same top task) with zero new locking machinery; wait-as-client
+  keeps the server's SSE surface frozen and reuses the replay cursor that already exists for the
+  dashboard; bulk-as-loop preserves the one-event-per-mutation invariant that the feed, dashboard,
+  and `am wait` itself rely on.
+- Consequences: `am next` under heavy contention serializes on the single writer (fine at personal
+  scale); a bulk command is not atomic across ids (documented partial-failure contract instead);
+  `am wait --ready` re-checks on every in-scope event (cheap REST GET, but chatty boards cause
+  more checks); the 404 ambiguity means a typo'd `-p` slug looks like an empty board.
+- Evidence: `cmd/am/store.go` (`NextTask`); `cmd/am/server.go` (`POST /api/tasks/next`,
+  `handleNext`); `cmd/am/wait.go` (`cmdWait`, `waiter`, `readSSEFrame`, `parseWaitTimeout`);
+  `cmd/am/cli.go` (`cmdNext`, bulk `cmdStatus`/`cmdAssign`, `bulkPatch`); `cmd/am/client.go`
+  (`exitCodeFor`); `cmd/am/store_test.go` (`TestNextTask*` incl. `TestNextTaskRaceDistinctWinners`);
+  `cmd/am/server_test.go` (`TestNextEndpoint`, `TestNextEndpointProjectBody`); `cmd/am/cli_test.go`
+  (`TestCmdNextPrintsOnlyID`, `TestExitNextNoneReady`, `TestCmdStatusBulk`,
+  `TestCmdStatusBulkPartialFailure`, `TestCmdAssignBulk`); `cmd/am/wait_test.go` (10 wait tests).
+
 ## Inferred Decisions
 
 ### IADR-001: SSE chosen over WebSockets

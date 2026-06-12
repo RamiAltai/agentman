@@ -15,7 +15,10 @@ var osExit = os.Exit
 
 // Boolean (valueless) flags; everything else with a leading dash consumes the
 // next token as its value. Aliases are canonicalised in canonFlag.
-var boolFlags = map[string]bool{"json": true, "mine": true, "all": true, "comments": true, "yes": true, "log": true, "ready": true, "blocked": true}
+// Registration is global: adding "done" (for `am wait <id> --done`) makes
+// --done valueless for EVERY verb — fine today, since no verb takes a done
+// value flag.
+var boolFlags = map[string]bool{"json": true, "mine": true, "all": true, "comments": true, "yes": true, "log": true, "ready": true, "blocked": true, "done": true}
 
 type Args struct {
 	pos   []string
@@ -237,22 +240,77 @@ func cmdClaim(c *Client, a Args) {
 	}
 }
 
-func cmdStatus(c *Client, a Args) {
-	id := needID(a, "status")
-	st := a.at(1)
-	if !validStatus[st] {
-		fail(5, "status must be one of: todo doing blocked done")
+// cmdNext atomically picks and claims the highest-priority ready task
+// (FIFO within a priority). Prints only the claimed id, like cmdClaim.
+func cmdNext(c *Client, a Args) {
+	if me() == "" {
+		fail(5, "set AGENTMAN_AGENT to pick up tasks")
 	}
-	c.doOrFail("PATCH", "/api/tasks/"+id, map[string]any{"status": st})
+	var body any
+	if proj := projectFor(a); proj != "" {
+		body = map[string]any{"project": proj}
+	}
+	st, data := c.do("POST", "/api/tasks/next", body)
+	switch {
+	case st == 0:
+		fail(6, "agentman: cannot reach server (is `am serve` running?)")
+	case st >= 200 && st < 300:
+		var t Task
+		json.Unmarshal(data, &t)
+		if a.has("json") {
+			printJSON(t)
+			return
+		}
+		fmt.Println(t.ID)
+	case st == 404:
+		// Also covers a bad -p slug (the server can't tell them apart).
+		fail(3, "next: no ready task")
+	case st == 400:
+		fail(5, "next: %s", apiErr(data, "invalid request"))
+	default:
+		fail(1, "next: %s", apiErr(data, "error"))
+	}
 }
 
-func cmdAssign(c *Client, a Args) {
-	id := needID(a, "assign")
-	who := a.at(1)
-	if who == "" {
-		fail(5, "usage: am assign <id> <agent|me|->")
+// cmdStatus sets the status of one or more tasks: am status <id...> <status>.
+func cmdStatus(c *Client, a Args) {
+	if len(a.pos) < 2 || !validStatus[a.at(len(a.pos)-1)] {
+		fail(5, "usage: am status <id...> <todo|doing|blocked|done>")
 	}
-	c.doOrFail("PATCH", "/api/tasks/"+id, map[string]any{"assignee": resolveWho(who)})
+	st := a.at(len(a.pos) - 1)
+	bulkPatch(c, "status", a.pos[:len(a.pos)-1], map[string]any{"status": st})
+}
+
+// cmdAssign reassigns one or more tasks: am assign <id...> <agent|me|->.
+func cmdAssign(c *Client, a Args) {
+	if len(a.pos) < 2 {
+		fail(5, "usage: am assign <id...> <agent|me|->")
+	}
+	who := a.at(len(a.pos) - 1)
+	bulkPatch(c, "assign", a.pos[:len(a.pos)-1], map[string]any{"assignee": resolveWho(who)})
+}
+
+// bulkPatch PATCHes each id in turn — a client-side loop, so each task gets
+// its own event (the dashboard feed stays per-task). Server down aborts
+// immediately (exit 6); any other failure prints one stderr line per id and
+// CONTINUES; the final exit code is the FIRST failure's mapping (0 if none).
+func bulkPatch(c *Client, verb string, ids []string, patch map[string]any) {
+	firstFail := 0
+	for _, id := range ids {
+		st, data := c.do("PATCH", "/api/tasks/"+id, patch)
+		if st == 0 {
+			fail(6, "agentman: cannot reach server at %s (is `am serve` running?)", c.base)
+		}
+		if code := exitCodeFor(st); code != 0 {
+			fmt.Fprintf(os.Stderr, "%s: #%s %s\n", verb, id, apiErr(data, "error "+strconv.Itoa(st)))
+			if firstFail == 0 {
+				firstFail = code
+			}
+		}
+	}
+	if firstFail != 0 {
+		osExit(firstFail)
+	}
 }
 
 func cmdNote(c *Client, a Args) {

@@ -7,7 +7,8 @@ convention is loose, it's called out.
 
 - **One flat `main` package** in `cmd/am/`; modules are separated **by file, not by Go package**:
   `server.go` (HTTP), `hub.go` (SSE), `store.go` (data + domain), `client.go`/`cli.go` (CLI),
-  `db.go` (offline DB export/import/prune), `identity.go`, `version.go`, `update.go`. The web UI is in `cmd/am/web/`.
+  `wait.go` (the `am wait` SSE-consuming verb), `db.go` (offline DB export/import/prune),
+  `identity.go`, `version.go`, `update.go`. The web UI is in `cmd/am/web/`.
 - Keep that split: HTTP handling in `server.go`, all SQL in `store.go`, CLI presentation in `cli.go`.
   Do **not** put SQL in handlers or HTTP in the store.
 - There is no `internal/`/`pkg/`; because it's one package, every symbol is mutually visible —
@@ -48,8 +49,9 @@ convention is loose, it's called out.
 ## Error Handling
 
 - Store returns sentinel errors; handlers translate via `writeErr`; the CLI translates HTTP status →
-  **exit code** in `client.go doOrFail` (`0` ok · `1` generic · `3` not found · `4` conflict ·
-  `5` validation · `6` server down).
+  **exit code** via `client.go exitCodeFor` (single source, used by `doOrFail` and the bulk
+  `status`/`assign` loop): `0` ok · `1` generic · `3` not found · `4` conflict · `5` validation ·
+  `6` server down; plus `7` = `am wait` timeout (CLI-side, no HTTP status).
 - CLI: errors go to **stderr** via `fail(code, fmt, …)`; **stdout stays clean** (only ids on
   create/claim) so command substitution works.
 
@@ -80,7 +82,8 @@ convention is loose, it's called out.
 
 - `go test -race ./cmd/am/` (or `go test ./...`); table-driven tests (see `cmd/am/update_test.go`).
   Coverage spans pure logic, the store, HTTP, migrations, offline DB tooling, CLI verbs + exit codes,
-  SSE streaming/reconnect, identity, and the dashboard XSS-sink guard — 9 test files, 107 tests.
+  SSE streaming/reconnect, `am wait`, identity, and the dashboard XSS-sink guard — 10 test files,
+  130 tests.
 - **`osExit` testability var** — `cli.go` declares `var osExit = os.Exit`; `fail()` calls `osExit`
   rather than `os.Exit` directly. Tests in `cli_test.go` replace it via `captureExit(t, fn)`,
   which substitutes a panic-based stub so exit codes can be asserted without terminating the process.

@@ -162,8 +162,11 @@ Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting 
 | `am show <id> [-c]` | task detail + `depends on:` / `blocks:` lines; comments with `-c` |
 | `am new "title" [--body B] [-p P] [--priority N]` | create a task; prints the new id |
 | `am claim <id> [--steal-stale D]` | atomic: assign me + → doing (exit 4 if already taken **or** has open prereqs); `--steal-stale D` takes over a claim idle for ≥ D (exit 4 with `not stale yet` if still fresh) |
-| `am status <id> <todo\|doing\|blocked\|done>` | change status (blocked → 409 if doing/done and open prereqs) |
-| `am assign <id> <agent\|me\|->` | reassign (`-` = unassign) |
+| `am next [-p P]` | atomic pick + claim of the best ready task (priority, then FIFO); prints its id; exit 3 if nothing is ready |
+| `am wait <id> --done [--timeout D]` | block until the task is done (exit 7 on timeout; default 10m; D is a Go duration or seconds) |
+| `am wait --ready [-p P] [--timeout D]` | block until some ready task exists; prints its id |
+| `am status <id...> <todo\|doing\|blocked\|done>` | change status — several ids at once is fine (blocked → 409 if doing/done and open prereqs) |
+| `am assign <id...> <agent\|me\|->` | reassign one or more tasks (`-` = unassign) |
 | `am note <id> "text"` | add a comment (alias: `comment`) |
 | `am edit <id> [--title T] [--body B] [--priority N]` | edit fields |
 | `am drop <id>` | release: unassign + → todo |
@@ -183,7 +186,7 @@ Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting 
 `<id>` accepts a global id (`13`) or a project ref (`web-3`). `--status` accepts a comma
 list. Priority is `0` urgent … `3` low (default `2`). Durations use Go syntax (`30m`, `48h` —
 not `2d`). Add `--json` to any read to parse.
-Exit codes: `0` ok · `3` not found · `4` already claimed, blocked, or not stale yet · `5` invalid · `6` server down.
+Exit codes: `0` ok · `3` not found · `4` already claimed, blocked, or not stale yet · `5` invalid · `6` server down · `7` wait timed out.
 
 ## HTTP API
 
@@ -194,6 +197,7 @@ actor.
 GET    /api/projects                              GET    /api/tasks/{id}          (returns depends_on + blocks)
 POST   /api/projects {slug,name}                 PATCH  /api/tasks/{id} {status?,assignee?,title?,body?,priority?}
 DELETE /api/projects/{slug}                       POST   /api/tasks/{id}/claim    (409 if open prereqs; body {"steal_stale":"<dur>"} = stale takeover, 409 not_stale if fresh)
+                                                  POST   /api/tasks/next         {project?} atomic pick+claim of the best ready task (404 if none)
 POST   /api/projects/{slug}/archive              POST   /api/projects/{slug}/unarchive
 GET    /api/tasks?project=&status=&assignee=     POST   /api/tasks/{id}/comments {body}
        &ready=true|&blocked=true|&stale=<dur>    DELETE /api/tasks/{id}/comments/{cid}

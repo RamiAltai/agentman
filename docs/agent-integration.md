@@ -47,15 +47,19 @@ Set your identity once at the start of a task:
     am init <tasktype>     # e.g. `am init bugfix` → bugfix_060626_4821 (remembered for this directory)
 Then use `am` normally (`am whoami` shows it).
 
-    am ls --ready              # todo tasks with no open prereqs — start here
+    am next [-p P]             # pick up work: atomically claims the best ready task,
+                               #   prints its id (exit 3 = nothing ready) — start here
+    am wait <id> --done        # block until a task is done (exit 7 on timeout; default 10m)
+    am wait --ready [-p P]     # block until some ready task exists (prints its id)
+    am ls --ready              # todo tasks with no open prereqs (read-only view)
     am ls --status todo        # unclaimed work to pick up      am ls --mine   # my tasks
     am ls --blocked            # tasks blocked by unfinished prereqs (do not claim these)
     am ls --stale 30m          # claimed tasks with no activity for 30m (likely dead agents)
-    am claim <id>              # take a task (exit 4 = already claimed OR prereqs not done)
+    am claim <id>              # take a SPECIFIC task (exit 4 = already claimed OR prereqs not done)
     am claim <id> --steal-stale 30m   # take over a claim idle ≥30m (exit 4 = still fresh)
     am show <id> -c            # full detail + depends on/blocks + comments
     am note <id> "progress"    # leave a short comment as you work
-    am status <id> done        # todo | doing | blocked | done
+    am status <id...> done     # todo | doing | blocked | done (several ids at once is fine)
     am dep add <id> <prereq>   # add a prerequisite (same project; rejects cycles)
     am dep rm <id> <prereq>    # remove a prerequisite
     am new "title" -p <proj>   # create a task (prints its id); exits non-zero with
@@ -68,12 +72,28 @@ Then use `am` normally (`am whoami` shows it).
 
 Choose the project with `-p <slug>` (or set AGENTMAN_PROJECT). Output is terse text — add
 `--json` to parse. Silence = success. Exit codes: 0 ok · 3 not found · 4 already claimed or
-blocked by prereqs · 6 server down.
+blocked by prereqs · 6 server down · 7 wait timed out.
+
+**The work loop:** `am next` is the pickup verb — it atomically picks AND claims the
+highest-priority ready task (FIFO within a priority), so two agents calling it concurrently
+always get different tasks; there is no list-then-claim race. Exit 3 means nothing is ready —
+either stop, or block with `am wait --ready` until something becomes ready. Waiting on a
+prerequisite someone else owns? `am wait <id> --done` blocks until that task is done
+(`--timeout 5m` to bound it; exit 7 = timed out, condition not met). `am next` skips tasks
+already assigned to you — claim those explicitly with `am claim <id>`. Note the ready filter
+(`am ls --ready`, `am wait --ready`) is wider than `am next`: it includes todo tasks that are
+pre-assigned to someone, which `am next` never picks — so a `wait --ready && next` loop can
+wake on a pre-assigned task and get exit 3 from `next`. Treat exit 3 there as "loop again",
+not an error.
 
 **Dependencies:** if a task has unfinished prerequisites, claiming it fails with exit 4 and a
-message like `claim: #5 blocked — prereqs not done (#2 #3)`. Use `am ls --ready` to find tasks
-that are safe to pick up. `am ls` rows show `[blk:N]` (N open prereqs) or `[ready]` (all prereqs
-done) markers.
+message like `claim: #5 blocked — prereqs not done (#2 #3)`. `am next` only returns tasks with
+no open prereqs. `am ls` rows show `[blk:N]` (N open prereqs) or `[ready]` (all prereqs done)
+markers.
+
+**Bulk updates:** `am status` and `am assign` accept several ids — the LAST positional is the
+status/assignee: `am status 4 5 6 done`, `am assign 4 5 bob`. Failures are per-id (one stderr
+line each, e.g. `status: #5 not_found`); the rest still apply.
 
 **Recovering dead-agent tasks:** if an agent crashes after `am claim`, its task stays assigned
 with no progress. An orchestrator (or any agent) can recover it: `am ls --stale 30m` lists tasks
@@ -85,8 +105,8 @@ gap between `am note` updates, so working agents aren't robbed mid-task. The tak
 recorded as a `task.reclaimed` event naming the previous assignee, and stalled cards show a
 **⏳ stale** badge on the dashboard.
 
-Typical flow: claim (or create then claim) a task before substantial work, post brief
-`am note` updates at milestones, and `am status <id> done` when finished — so the human can
+Typical flow: pick up work with `am next` (or create then claim) before substantial work, post
+brief `am note` updates at milestones, and `am status <id> done` when finished — so the human can
 watch progress live. If `am` exits 6 (server down), ask the user to start it with `am serve`.
 ```
 

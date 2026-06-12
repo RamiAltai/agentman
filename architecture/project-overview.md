@@ -32,9 +32,10 @@ Evidence:
 
 ## Core Workflows
 
-1. **Agent task loop:** `am init <tasktype>` (once per session) → `am ls --status todo` →
-   `am claim <id>` → `am note <id> "…"` → `am status <id> done`. Evidence: `cmd/am/cli.go`,
-   `docs/agent-integration.md`.
+1. **Agent task loop:** `am init <tasktype>` (once per session) → `am next` (atomic pick+claim
+   of the best ready task; `am claim <id>` for a specific one) → `am note <id> "…"` →
+   `am status <id> done` → `am next` again (or `am wait --ready` to block until work exists).
+   Evidence: `cmd/am/cli.go`, `cmd/am/wait.go`, `docs/agent-integration.md`.
 2. **Human board management:** `am serve` → open `http://127.0.0.1:8787` → create projects/tasks,
    drag cards between status columns, comment, reassign. Evidence: `cmd/am/web/app.js`.
 3. **Live monitoring:** the dashboard subscribes to `GET /api/stream` (SSE) and reflects every
@@ -54,6 +55,11 @@ Evidence:
   `StealStaleClaim`; exactly one stealer wins; a `task.reclaimed` event records the handoff; the
   dashboard shows a ⏳ stale chip on idle claimed cards). Evidence: `cmd/am/store.go`,
   `cmd/am/cli.go`, `cmd/am/web/app.js`.
+- **Agent work loop** so agents need no list-then-claim dance: `am next` atomically picks AND
+  claims the highest-priority ready task (FIFO within a priority; same conditional-UPDATE trick,
+  `NextTask`), `am wait <id> --done` / `am wait --ready` block on the SSE stream until a task
+  finishes or work appears (exit 7 on timeout), and `am status`/`am assign` take multiple ids.
+  Evidence: `cmd/am/store.go`, `cmd/am/wait.go`, `cmd/am/cli.go`.
 - **Live activity feed** backed by an append-only `events` table (also the SSE replay cursor).
 - **Per-directory agent identity** that survives the fresh-shell-per-command model agents run in
   (`cmd/am/identity.go`).

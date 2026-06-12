@@ -118,10 +118,10 @@ In rough priority order:
 - [x] K1 `claimed_at` + `am ls --stale <dur>` + stale badge on dashboard
 - [x] K2 `am claim --steal-stale <dur>` atomic takeover + `task.reclaimed` event
 
-### Phase L — Agent work loop (M)
-- [ ] L1 `am next` — atomic pick+claim of best ready task
-- [ ] L2 `am wait` — block on task/board conditions over SSE
-- [ ] L3 Bulk `am status`/`am assign` over multiple ids
+### Phase L — Agent work loop — **DONE (2026-06-13)**
+- [x] L1 `am next` — atomic pick+claim of best ready task
+- [x] L2 `am wait` — block on task/board conditions over SSE
+- [x] L3 Bulk `am status`/`am assign` over multiple ids
 
 ### Phase M — Findability (M)
 - [ ] M1 Search: `?q=` API + `am ls --grep` + dashboard filter box

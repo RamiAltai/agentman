@@ -40,12 +40,12 @@ via `//go:embed`, so a running/old binary serves stale assets. Hard-refresh the 
 ## Running Tests
 
 ```sh
-go test -race ./cmd/am/                     # run all tests with the race detector (107 tests)
+go test -race ./cmd/am/                     # run all tests with the race detector (130 tests)
 go test ./...                               # equivalent short form
 go test -run TestUpdateAvailable -v ./cmd/am/
 ```
 
-Tests live next to the code in `cmd/am/` (9 test files):
+Tests live next to the code in `cmd/am/` (10 test files):
 
 - `update_test.go` — version-comparison logic.
 - `store_test.go` — CRUD + validation, the atomic claim race (exactly one winner), archive/unarchive
@@ -69,8 +69,10 @@ Tests live next to the code in `cmd/am/` (9 test files):
   against an `httptest` server. `captureStdout` captures os.Stdout via a pipe; `captureExit` stubs
   the `osExit` var (see "Test Seams" below) to intercept exit codes as panics. Covers: `cmdNew`
   prints only the numeric id; `cmdLs` terse output; mutations (`cmdStatus`/`cmdNote`/`cmdDrop`)
-  silent on success; exit-code mapping 3/4/5/6 (incl. `TestExitNotStale` — exit 4 with `not stale
-  yet`); `--stale`/`--steal-stale` wire encoding (`TestStaleFlagsWireFormat`); and pure
+  silent on success; exit-code mapping 3/4/5/6/7 (incl. `TestExitNotStale` — exit 4 with `not stale
+  yet`; 7, the wait timeout, is exercised in `wait_test.go`); `cmdNext` prints only the claimed id
+  and exits 3 when nothing is ready; bulk `status`/`assign` (multiple ids, partial-failure exit
+  codes); `--stale`/`--steal-stale` wire encoding (`TestStaleFlagsWireFormat`); and pure
   formatter/parse table tests.
 - `sse_test.go` — SSE streaming + reconnect (Phase E2). `TestSSEDeliversLiveEvent` opens
   `/api/stream`, creates a task, and asserts the `task.created` event arrives live.
@@ -82,6 +84,10 @@ Tests live next to the code in `cmd/am/` (9 test files):
 - `web_test.go` — dashboard XSS-sink guard (Phase E4). `TestDashboardNoXSSSinks` reads the embedded
   `web/app.js` + `web/index.html` via the `webFS` embed.FS and asserts none of `.innerHTML`/
   `.outerHTML`/`.insertAdjacentHTML`/`document.write`/`eval(` appear.
+- `wait_test.go` — `am wait` (Phase L). Already-satisfied, event-driven (`TestWaitDoneEventArrives`,
+  `TestWaitReadyOnPrereqDone`), and cross-project (`TestWaitDoneCrossProject` — `AGENTMAN_PROJECT`
+  must not scope the `--done` stream) waits; exit 7 on timeout, exit 3 not-found, exit 6 server
+  down, usage errors, and the `parseWaitTimeout` table.
 
 Behavioral dashboard JS (the modal flows, delete confirms, feed pagination) remains untested —
 see `known-risks-and-gaps.md`. New behavioral tests are welcome.

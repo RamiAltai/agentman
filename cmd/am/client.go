@@ -54,20 +54,40 @@ func (c *Client) do(method, path string, body any) (int, []byte) {
 	return resp.StatusCode, data
 }
 
+// exitCodeFor maps an HTTP status (0 = transport error) to the CLI exit-code
+// convention: 0 ok · 3 not found · 4 conflict · 5 validation · 6 server down ·
+// 1 other. Single source for doOrFail and the bulk verbs.
+func exitCodeFor(st int) int {
+	switch {
+	case st >= 200 && st < 300:
+		return 0
+	case st == 0:
+		return 6
+	case st == 404:
+		return 3
+	case st == 409:
+		return 4
+	case st == 400:
+		return 5
+	default:
+		return 1
+	}
+}
+
 // doOrFail returns the body on 2xx, otherwise prints a terse error and exits
 // with the convention: 3 not found · 4 conflict · 5 validation · 6 server down.
 func (c *Client) doOrFail(method, path string, body any) []byte {
 	st, data := c.do(method, path, body)
-	switch {
-	case st == 0:
-		fail(6, "agentman: cannot reach server at %s (is `am serve` running?)", c.base)
-	case st >= 200 && st < 300:
+	switch exitCodeFor(st) {
+	case 0:
 		return data
-	case st == 404:
+	case 6:
+		fail(6, "agentman: cannot reach server at %s (is `am serve` running?)", c.base)
+	case 3:
 		fail(3, "%s", apiErr(data, "not found"))
-	case st == 409:
+	case 4:
 		fail(4, "%s", apiErr(data, "conflict"))
-	case st == 400:
+	case 5:
 		fail(5, "%s", apiErr(data, "invalid request"))
 	default:
 		fail(1, "%s", apiErr(data, "error "+strconv.Itoa(st)))

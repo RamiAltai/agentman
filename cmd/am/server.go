@@ -38,6 +38,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/tasks", s.handleCreateTask)
 	mux.HandleFunc("GET /api/tasks/{id}", s.handleGetTask)
 	mux.HandleFunc("PATCH /api/tasks/{id}", s.handlePatchTask)
+	mux.HandleFunc("POST /api/tasks/next", s.handleNext)
 	mux.HandleFunc("POST /api/tasks/{id}/claim", s.handleClaim)
 	mux.HandleFunc("POST /api/tasks/{id}/comments", s.handleComment)
 	mux.HandleFunc("POST /api/tasks/{id}/deps", s.handleAddDep)
@@ -387,6 +388,27 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if ev != nil { // idempotent re-claim returns no event
+		s.hub.Broadcast(ev)
+	}
+	writeJSON(w, http.StatusOK, t)
+}
+
+func (s *Server) handleNext(w http.ResponseWriter, r *http.Request) {
+	agent := actorOf(r)
+	var in struct {
+		Project  string `json:"project"`
+		Assignee string `json:"assignee"`
+	}
+	_ = decode(r, &in)
+	if in.Assignee != "" {
+		agent = in.Assignee
+	}
+	t, ev, err := s.store.NextTask(in.Project, agent)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if ev != nil { // symmetry with handleClaim; NextTask always emits on success
 		s.hub.Broadcast(ev)
 	}
 	writeJSON(w, http.StatusOK, t)
