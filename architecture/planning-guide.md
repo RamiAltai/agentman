@@ -33,7 +33,7 @@ invariants (single-writer DB, atomic claims, localhost-no-auth, XSS-safe UI, tok
 
 Flag the change if it touches any of these invariants:
 - [ ] DB writer count (must stay 1 — `SetMaxOpenConns(1)`).
-- [ ] Atomic claim semantics (`store.go ClaimTask`).
+- [ ] Atomic claim semantics (`store.go ClaimTask` / `StealStaleClaim`).
 - [ ] "Event in same tx, broadcast after commit" ordering.
 - [ ] The `events.id` cursor / SSE `Last-Event-ID` contract.
 - [ ] The `127.0.0.1` bind / absence of auth.
@@ -58,9 +58,10 @@ Flag the change if it touches any of these invariants:
 
 - [ ] Schema change? A **forward-only migration runner exists and is exercised** (ADR-010) — append a
   `{version, apply}` step to `schemaMigrations` and raise `currentSchemaVersion` in `cmd/am/store.go`; do
-  **not** rely on `CREATE TABLE IF NOT EXISTS` to alter existing tables. The shipped v2 step (the
-  `ALTER TABLE projects ADD COLUMN archived_at TEXT` migration) is the template to copy. Add a migration
-  test like `TestMigrationV2AddsArchivedAt` in `cmd/am/migrate_test.go`.
+  **not** rely on `CREATE TABLE IF NOT EXISTS` to alter existing tables. The shipped v2 and v3 steps
+  (the `projects.archived_at` and `tasks.claimed_at` `ALTER TABLE` migrations) are the template to
+  copy. Add a migration test like `TestMigrationV2AddsArchivedAt` /
+  `TestMigrationV3AddsClaimedAt` in `cmd/am/migrate_test.go`.
 - [ ] New columns threaded through `schema.sql` → `store.go` structs → `CreateTask`/`PatchTask`/
   `getTaskTx` → API → dashboard?
 - [ ] Cascade/ownership rules considered (project→tasks→comments)?

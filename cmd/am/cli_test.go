@@ -3,6 +3,7 @@ package main
 import (
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
@@ -40,6 +41,34 @@ func captureStdout(t *testing.T, fn func()) string {
 	func() {
 		defer func() {
 			os.Stdout = orig
+			w.Close()
+		}()
+		fn()
+	}()
+
+	return <-outCh
+}
+
+// captureStderr mirrors captureStdout for os.Stderr (fail() writes there).
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("captureStderr: Pipe: %v", err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+
+	outCh := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(r)
+		r.Close()
+		outCh <- string(b)
+	}()
+
+	func() {
+		defer func() {
+			os.Stderr = orig
 			w.Close()
 		}()
 		fn()
@@ -183,6 +212,62 @@ func TestExitConflict(t *testing.T) {
 	})
 	if code != 4 {
 		t.Fatalf("expected exit 4 (conflict/already claimed), got %d", code)
+	}
+}
+
+func TestExitNotStale(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "staleproj")
+	id := mustCreateTask(t, ts, "staleproj", "Held Task")
+
+	// agent-a holds a fresh claim.
+	do(t, ts, http.MethodPost, "/api/tasks/"+id+"/claim", "", map[string]string{"X-Agent": "agent-a"})
+
+	// agent-b tries to steal a fresh claim → 409 not_stale → exit 4, naming the holder.
+	t.Setenv("AGENTMAN_AGENT", "agent-b")
+	c := &Client{base: ts.URL, agent: "agent-b", http: ts.Client()}
+
+	var code int
+	msg := captureStderr(t, func() {
+		code = captureExit(t, func() {
+			cmdClaim(c, parse([]string{id, "--steal-stale", "1h"}))
+		})
+	})
+	if code != 4 {
+		t.Fatalf("expected exit 4 (not stale), got %d", code)
+	}
+	if !strings.Contains(msg, "agent-a") || !strings.Contains(msg, "not stale") {
+		t.Fatalf("stderr = %q, want holder agent-a and 'not stale'", msg)
+	}
+}
+
+// TestStaleFlagsWireFormat asserts the exact wire encoding: `am ls --stale 2h`
+// sends ?stale=2h and `am claim <id> --steal-stale 2h` posts {"steal_stale":"2h"}.
+func TestStaleFlagsWireFormat(t *testing.T) {
+	var lsQuery, claimBody string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			lsQuery = r.URL.RawQuery
+			w.Write([]byte("[]"))
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		claimBody = string(b)
+		w.Write([]byte(`{"id":1}`))
+	}))
+	t.Cleanup(stub.Close)
+	t.Setenv("AGENTMAN_AGENT", "tester")
+	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+
+	captureStdout(t, func() { cmdLs(c, parse([]string{"--stale", "2h"})) })
+	if !strings.Contains(lsQuery, "stale=2h") {
+		t.Fatalf("ls query = %q, want stale=2h", lsQuery)
+	}
+
+	captureStdout(t, func() { cmdClaim(c, parse([]string{"1", "--steal-stale", "2h"})) })
+	if !strings.Contains(claimBody, `"steal_stale":"2h"`) {
+		t.Fatalf("claim body = %q, want steal_stale 2h", claimBody)
 	}
 }
 

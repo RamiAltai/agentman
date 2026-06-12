@@ -114,9 +114,9 @@ In rough priority order:
   - Tests added: `TestInputLimits`, `TestPruneEventsRejectsBadDate`, 4 prerelease cases in
     `TestUpdateAvailable`. Drag-drop revert finding withdrawn (already handled).
 
-### Phase K — Stale-claim recovery (next, M) ← highest product value
-- [ ] K1 `claimed_at` + `am ls --stale <dur>` + stale badge on dashboard
-- [ ] K2 `am claim --steal-stale <dur>` atomic takeover + `task.reclaimed` event
+### Phase K — Stale-claim recovery — **DONE (2026-06-12)**
+- [x] K1 `claimed_at` + `am ls --stale <dur>` + stale badge on dashboard
+- [x] K2 `am claim --steal-stale <dur>` atomic takeover + `task.reclaimed` event
 
 ### Phase L — Agent work loop (M)
 - [ ] L1 `am next` — atomic pick+claim of best ready task

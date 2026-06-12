@@ -71,10 +71,12 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   Routes: `GET/POST /api/projects` (`GET …?archived=true` includes archived),
   `POST /api/projects/{slug}/archive`, `POST /api/projects/{slug}/unarchive`,
   `DELETE /api/projects/{slug}` (hard-delete + cascade),
-  `GET/POST /api/tasks` (`?ready=true` / `?blocked=true` filter by prereq state),
+  `GET/POST /api/tasks` (`?ready=true` / `?blocked=true` filter by prereq state; `?stale=<dur>`
+  filters to assigned, not-done tasks with no activity for ≥ dur),
   `GET/PATCH /api/tasks/{id}` (GET returns `depends_on`/`blocks`),
   `DELETE /api/tasks/{id}` (hard-delete + cascade to comments + dep edges),
-  `POST /api/tasks/{id}/claim`, `POST /api/tasks/{id}/comments`,
+  `POST /api/tasks/{id}/claim` (body `{"steal_stale":"<dur>"}` = stale-claim takeover, 409
+  `not_stale` if still fresh), `POST /api/tasks/{id}/comments`,
   `DELETE /api/tasks/{id}/comments/{cid}`,
   `POST /api/tasks/{id}/deps` (add prerequisite edge),
   `DELETE /api/tasks/{id}/deps/{depId}` (remove prerequisite edge),
@@ -87,7 +89,8 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
 - **SSE hub** — `cmd/am/hub.go`: best-effort fan-out; buffered per-subscriber channels; a
   `project.created` event reaches all subscribers regardless of filter.
 - **Data layer** — `cmd/am/store.go`: opens SQLite with `SetMaxOpenConns(1)` (single writer),
-  WAL via DSN pragmas; all queries parameterized; atomic claim; event insertion helper.
+  WAL via DSN pragmas; all queries parameterized; atomic claim (+ the stale-claim takeover
+  `StealStaleClaim`, the same conditional-UPDATE trick); event insertion helper.
   Hard-delete methods: `DeleteTask`, `DeleteComment`, `DeleteProject` (each inserts `*.deleted`
   event in the same tx before the DELETE, then commits; cascade via FK).
 - **CLI** — `cmd/am/cli.go` + `cmd/am/client.go`: verb parsing, terse output, exit-code mapping.
@@ -101,7 +104,9 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   prereqs; `am ls --blocked` lists tasks with ≥1 open prereq. `am ls` rows show a `[blk:N]` marker
   (N open prereqs) or `[ready]` (has prereqs, all done). `am show <id>` prints `depends on:` and
   `blocks:` lines when present. Claiming a blocked task exits 4 with a message showing the open
-  prereq ids.
+  prereq ids. Stale-claim recovery: `am ls --stale <dur>` lists assigned, not-done tasks with no
+  activity for ≥ dur (Go duration syntax, e.g. `30m`, `48h`); `am claim <id> --steal-stale <dur>`
+  atomically takes over a stale claim (exit 4 with `not stale yet` if the claim is still fresh).
 - **Dashboard** — `cmd/am/web/app.js`: vanilla SPA; SSE consumer; board/modal/feed rendering.
   Includes a `⋯` "Manage projects" button in the tab bar that opens a modal (`openManageProjects`/
   `renderManageList`) listing all projects (active + archived via `GET /api/projects?archived=true`),
@@ -115,7 +120,9 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   events (no `project=` filter → `ListEvents`/`RecentEvents` exclude events whose project has a
   non-NULL `archived_at`). Task creation into an archived project is rejected at the store layer
   (`CreateTask` → `ErrProjectArchived` → HTTP 400).
-  Board cards show a **🔒 Blocked** tag (`nopen > 0`) or **✓ Ready** tag (`nprereq > 0 && nopen == 0`).
+  Board cards show a **🔒 Blocked** tag (`nopen > 0`) or **✓ Ready** tag (`nprereq > 0 && nopen == 0`),
+  and an amber **⏳ stale** chip on `doing` cards with an assignee and no activity for 30+ minutes.
+  The feed renders `task.reclaimed` (stale-claim takeover) as "X reclaimed #N from Y".
   The task modal has a **Dependencies** section: "Depends on" chips with a ✕ remove button, an
   "Add prerequisite…" dropdown of same-project tasks, and a read-only "Blocks" list. A hard-block
   409 surfaces the blocking prereq ids and reverts the UI.

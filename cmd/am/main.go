@@ -153,10 +153,10 @@ func usage() {
   am init <tasktype>                     set this session's identity (e.g. bugfix_050626_4821)
   am whoami                              print the current identity
 
-  am ls [--mine] [--status S] [-p P] [--all] [--ready] [--blocked]   list tasks (hides done)
+  am ls [--mine] [--status S] [-p P] [--all] [--ready] [--blocked] [--stale DUR]   list tasks (hides done)
   am show <id> [-c]                            task detail (+comments +deps)
   am new "title" [--body B] [-p P] [--priority N]   create, prints id
-  am claim <id>                               assign me + ->doing (atomic)
+  am claim <id> [--steal-stale DUR]           assign me + ->doing (atomic; DUR is Go syntax, e.g. 30m, 48h)
   am status <id> <todo|doing|blocked|done>    change status
   am assign <id> <agent|me|->                 reassign ("-" = unassign)
   am note <id> "text"                         add a comment

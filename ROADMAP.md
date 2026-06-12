@@ -171,5 +171,7 @@ and only matter if the network bind ever widens. (`architecture/security.md`)
 ### Suggested order
 
 Phases A, B (except the ongoing B3 process), C, D, E, F, H, and I are **complete**. **G** stays
-parked unless the access model changes. For newly proposed work (stale-claim recovery, `am next`,
-search, labels, release binaries), see `REVIEW.md` Phases J–N.
+parked unless the access model changes. For newer work, see `REVIEW.md` Phases J–N: Phase J
+(correctness & hygiene) and Phase K (stale-claim recovery — `am ls --stale`,
+`am claim --steal-stale`) have shipped; `am next`, search, labels, and release binaries remain
+proposed.

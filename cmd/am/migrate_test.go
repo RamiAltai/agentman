@@ -154,3 +154,30 @@ func TestMigrationV2AddsArchivedAt(t *testing.T) {
 		t.Fatalf("archived_at column missing after migration: %v", err)
 	}
 }
+
+func TestMigrationV3AddsClaimedAt(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "v3.db")
+	st, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	// Confirm claimed_at column exists by running a query that uses it.
+	if _, err := st.db.Exec("UPDATE tasks SET claimed_at=NULL WHERE 1=0"); err != nil {
+		t.Fatalf("claimed_at column missing after migration: %v", err)
+	}
+	// A fresh OpenStore DB ends at version 3.
+	if v, _ := readSchemaVersion(st.db); v != 3 {
+		t.Fatalf("schema_version = %d, want 3", v)
+	}
+	st.Close()
+
+	// Reopen — v3 must not double-apply (duplicate ALTER would error).
+	st2, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatalf("reopen OpenStore: %v", err)
+	}
+	defer st2.Close()
+	if v, _ := readSchemaVersion(st2.db); v != 3 {
+		t.Fatalf("schema_version after reopen = %d, want 3", v)
+	}
+}

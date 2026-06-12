@@ -12,7 +12,7 @@ lexically.
 
 | Entity | Purpose | Source |
 |--------|---------|--------|
-| `meta` | Key/value config; currently only `schema_version` (the binary migrates to `'2'`) | `schema.sql` |
+| `meta` | Key/value config; currently only `schema_version` (the binary migrates to `'3'`) | `schema.sql` |
 | `projects` | Named boards (`slug` unique, `name`, `archived_at`) | `schema.sql`, `store.go Project` |
 | `tasks` | Tickets (status, priority, assignee, dual id) | `schema.sql`, `store.go Task` |
 | `task_deps` | Prerequisite edges between tasks (many-to-many, same-project only) | `schema.sql`, `store.go DepRef` |
@@ -27,6 +27,13 @@ lexically.
 - **`tasks.status`** — `CHECK (status IN ('todo','doing','blocked','done'))`, default `todo`.
 - **`tasks.priority`** — INTEGER, `0=urgent … 3=low`, default `2`.
 - **`tasks.assignee`** — TEXT, **NULL = unclaimed** (the claim guard depends on this).
+- **`tasks.claimed_at`** — TEXT, **NULL = never claimed / dropped**; set by `ClaimTask`,
+  `StealStaleClaim`, and PATCH-assign; cleared when the assignee is removed (`am drop`).
+  Added by schema **migration v3** (`ALTER TABLE tasks ADD COLUMN claimed_at TEXT` — not in
+  `schema.sql`, same precedent as `projects.archived_at`). Staleness itself is judged from
+  `updated_at` (any activity counts), not `claimed_at`; the stale cutoff is computed in Go by
+  `staleCutoff`, which must keep the exact `strftime('%Y-%m-%dT%H:%M:%fZ')` 3-digit-fraction
+  format for the lexicographic comparison to hold.
 - **`task_deps.(task_id, depends_on_id)`** — composite PK on the pair. Both columns are FKs to
   `tasks.id` with `ON DELETE CASCADE`, so removing a task automatically removes all edges in both
   directions. A reverse index `idx_task_deps_prereq(depends_on_id)` supports the "blocks" query.
@@ -40,10 +47,11 @@ lexically.
   project is archived (`store.go ArchiveProject`) and cleared back to NULL on unarchive
   (`UnarchiveProject`). Soft-archive is reversible; default project lists hide archived rows.
 - **`events.id`** — monotonic; doubles as the `?since=` cursor and the SSE `Last-Event-ID`.
-- **`events.kind`** — one of `task.created | task.claimed | task.status | task.assign |
-  task.patched | task.deleted | task.dep_added | task.dep_removed | comment.added |
+- **`events.kind`** — one of `task.created | task.claimed | task.reclaimed | task.status |
+  task.assign | task.patched | task.deleted | task.dep_added | task.dep_removed | comment.added |
   comment.deleted | project.created | project.archived | project.unarchived | project.deleted`
-  (14 total).
+  (15 total). `task.reclaimed` is emitted by a stale-claim takeover and its data names the
+  previous assignee and the `stale_for` window.
 - **`events.data`** — compact JSON delta, e.g. `{"status":["todo","doing"]}`.
 
 ### Indexes
@@ -82,8 +90,9 @@ deleted** (append-only).
   validates same-project + no-cycle and emits a `task.dep_added` event. Removing an edge uses
   `DELETE /api/tasks/{id}/deps/{depId}` (`RemoveDep`), emitting `task.dep_removed`. Edges cascade
   on task delete (both directions).
-- **Update:** `tasks` only (status/assignee/title/body/priority); `updated_at` set explicitly in
-  each `UPDATE` (no trigger).
+- **Update:** `tasks` only (status/assignee/title/body/priority, plus `claimed_at` kept in step
+  with the assignee — set on claim/steal/assign, NULLed on unassign); `updated_at` set explicitly
+  in each `UPDATE` (no trigger).
 - **Archive (soft, projects only):** a project can be **soft-archived** — `ArchiveProject` sets
   `projects.archived_at` (and `UnarchiveProject` clears it). This is **reversible** and hides the
   project from default lists; it is **not** a hard delete (the row and its tasks/comments stay).
@@ -134,8 +143,9 @@ deleted** (append-only).
 bumps `meta.schema_version` in one transaction; steps are integer-ordered and idempotent.
 
 To add a column/table change, append a `{version, apply}` step to `schemaMigrations` and raise
-`currentSchemaVersion` (`cmd/am/store.go`, now `2`). `schemaMigrations` is **no longer empty**: its
-first real step is `{version: 2}`, which runs `ALTER TABLE projects ADD COLUMN archived_at TEXT`.
+`currentSchemaVersion` (`cmd/am/store.go`, now `3`). `schemaMigrations` is **no longer empty**: its
+first real step is `{version: 2}`, which runs `ALTER TABLE projects ADD COLUMN archived_at TEXT`,
+and Phase K added `{version: 3}`, which runs `ALTER TABLE tasks ADD COLUMN claimed_at TEXT`.
 `schema.sql` still seeds a fresh DB at version 1, so the forward-only runner is now **exercised
 end-to-end** — each step applies its change and commits the `meta.schema_version` bump in the same
 transaction (was foundation-only in Phase 0). Known limitations: forward-only (no down-migrations);
@@ -146,8 +156,8 @@ a DB at a **newer** version than the binary is accepted silently today; an unpar
 entirely new table (rather than altering an existing one), placing a `CREATE TABLE IF NOT EXISTS`
 in `schema.sql` is sufficient — `OpenStore` runs `schema.sql` on every start, so the new table
 appears in existing DBs automatically. The migration runner is only needed for `ALTER TABLE` on
-existing tables (where `IF NOT EXISTS` can't help). Example: `task_deps` was added this way;
-`currentSchemaVersion` remained at `2`.
+existing tables (where `IF NOT EXISTS` can't help). Example: `task_deps` was added this way,
+with no `schemaMigrations` step and no `currentSchemaVersion` bump.
 
 Backup/restore:
 
@@ -191,6 +201,7 @@ erDiagram
     int priority "0..3"
     text created_at
     text updated_at
+    text claimed_at "NULL = never claimed / dropped"
   }
   task_deps {
     int task_id FK "PK + cascade"

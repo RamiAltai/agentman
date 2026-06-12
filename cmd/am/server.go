@@ -215,6 +215,14 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		Ready:    q.Get("ready") == "true",
 		Blocked:  q.Get("blocked") == "true",
 	}
+	if v := q.Get("stale"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			writeErr(w, ErrValidation)
+			return
+		}
+		f.Stale = d
+	}
 	ts, err := s.store.ListTasks(f)
 	if err != nil {
 		writeErr(w, err)
@@ -355,18 +363,32 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 	}
 	agent := actorOf(r)
 	var in struct {
-		Assignee string `json:"assignee"`
+		Assignee   string `json:"assignee"`
+		StealStale string `json:"steal_stale"`
 	}
 	_ = decode(r, &in)
 	if in.Assignee != "" {
 		agent = in.Assignee
 	}
-	t, ev, err := s.store.ClaimTask(id, agent)
+	var t *Task
+	var ev *Event
+	if in.StealStale != "" {
+		d, perr := time.ParseDuration(in.StealStale)
+		if perr != nil || d <= 0 {
+			writeErr(w, ErrValidation)
+			return
+		}
+		t, ev, err = s.store.StealStaleClaim(id, agent, d)
+	} else {
+		t, ev, err = s.store.ClaimTask(id, agent)
+	}
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	s.hub.Broadcast(ev)
+	if ev != nil { // idempotent re-claim returns no event
+		s.hub.Broadcast(ev)
+	}
 	writeJSON(w, http.StatusOK, t)
 }
 
@@ -595,6 +617,11 @@ func writeErr(w http.ResponseWriter, err error) {
 	var be *BlockedError
 	if errors.As(err, &be) {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "blocked", "open_prereqs": be.OpenPrereqs})
+		return
+	}
+	var nse *NotStaleError
+	if errors.As(err, &nse) {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "not_stale", "assignee": nse.Assignee})
 		return
 	}
 	switch {

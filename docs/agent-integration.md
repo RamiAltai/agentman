@@ -50,7 +50,9 @@ Then use `am` normally (`am whoami` shows it).
     am ls --ready              # todo tasks with no open prereqs — start here
     am ls --status todo        # unclaimed work to pick up      am ls --mine   # my tasks
     am ls --blocked            # tasks blocked by unfinished prereqs (do not claim these)
+    am ls --stale 30m          # claimed tasks with no activity for 30m (likely dead agents)
     am claim <id>              # take a task (exit 4 = already claimed OR prereqs not done)
+    am claim <id> --steal-stale 30m   # take over a claim idle ≥30m (exit 4 = still fresh)
     am show <id> -c            # full detail + depends on/blocks + comments
     am note <id> "progress"    # leave a short comment as you work
     am status <id> done        # todo | doing | blocked | done
@@ -72,6 +74,16 @@ blocked by prereqs · 6 server down.
 message like `claim: #5 blocked — prereqs not done (#2 #3)`. Use `am ls --ready` to find tasks
 that are safe to pick up. `am ls` rows show `[blk:N]` (N open prereqs) or `[ready]` (all prereqs
 done) markers.
+
+**Recovering dead-agent tasks:** if an agent crashes after `am claim`, its task stays assigned
+with no progress. An orchestrator (or any agent) can recover it: `am ls --stale 30m` lists tasks
+that are assigned, not done, and have had no activity (status change, comment, edit) for 30+
+minutes; `am claim <id> --steal-stale 30m` atomically takes one over (exactly one stealer wins a
+race; a still-active claim fails with exit 4 and `not stale yet`). Durations use Go syntax
+(`30m`, `2h`, `48h` — not `2d`). Pick a window comfortably longer than your agents' normal
+gap between `am note` updates, so working agents aren't robbed mid-task. The takeover is
+recorded as a `task.reclaimed` event naming the previous assignee, and stalled cards show a
+**⏳ stale** badge on the dashboard.
 
 Typical flow: claim (or create then claim) a task before substantial work, post brief
 `am note` updates at milestones, and `am status <id> done` when finished — so the human can

@@ -112,6 +112,9 @@ The embedded web UI (no build step, no npm) is a live kanban board:
   clickable **Unblocks** list, and an **"Open task"** button (which closes the graph and opens that
   task on the board). Nodes are colored by priority; edges show whether each prerequisite is
   cleared (green solid) or still blocking (amber dashed). Pan, zoom, and reset the view freely.
+- **Stale claims:** a card in *In Progress* with an assignee and no activity for 30+ minutes
+  shows an amber **⏳ stale** chip, and a stale-claim takeover (`am claim --steal-stale`)
+  appears in the activity feed as *"X reclaimed #N from Y"*.
 - **Delete task / delete comment:** open a task modal to see a **Delete task** button (permanently
   removes the task and its comments); each comment has a **×** button to delete it individually.
   Both use an inline two-step confirm (no browser dialog).
@@ -155,10 +158,10 @@ Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting 
 
 | Command | What it does |
 |---|---|
-| `am ls [--mine] [--status S] [-p P] [--all] [--ready] [--blocked]` | list tasks (hides done; `--ready` = todo with no open prereqs; `--blocked` = ≥1 open prereq) |
+| `am ls [--mine] [--status S] [-p P] [--all] [--ready] [--blocked] [--stale D]` | list tasks (hides done; `--ready` = todo with no open prereqs; `--blocked` = ≥1 open prereq; `--stale D` = assigned, not done, no activity for D — Go duration, e.g. `30m`, `48h`) |
 | `am show <id> [-c]` | task detail + `depends on:` / `blocks:` lines; comments with `-c` |
 | `am new "title" [--body B] [-p P] [--priority N]` | create a task; prints the new id |
-| `am claim <id>` | atomic: assign me + → doing (exit 4 if already taken **or** has open prereqs) |
+| `am claim <id> [--steal-stale D]` | atomic: assign me + → doing (exit 4 if already taken **or** has open prereqs); `--steal-stale D` takes over a claim idle for ≥ D (exit 4 with `not stale yet` if still fresh) |
 | `am status <id> <todo\|doing\|blocked\|done>` | change status (blocked → 409 if doing/done and open prereqs) |
 | `am assign <id> <agent\|me\|->` | reassign (`-` = unassign) |
 | `am note <id> "text"` | add a comment (alias: `comment`) |
@@ -178,8 +181,9 @@ Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting 
 | `am version` · `am update [version]` | print version · reinstall the latest (or a given) version |
 
 `<id>` accepts a global id (`13`) or a project ref (`web-3`). `--status` accepts a comma
-list. Priority is `0` urgent … `3` low (default `2`). Add `--json` to any read to parse.
-Exit codes: `0` ok · `3` not found · `4` already claimed or blocked · `5` invalid · `6` server down.
+list. Priority is `0` urgent … `3` low (default `2`). Durations use Go syntax (`30m`, `48h` —
+not `2d`). Add `--json` to any read to parse.
+Exit codes: `0` ok · `3` not found · `4` already claimed, blocked, or not stale yet · `5` invalid · `6` server down.
 
 ## HTTP API
 
@@ -189,10 +193,10 @@ actor.
 ```
 GET    /api/projects                              GET    /api/tasks/{id}          (returns depends_on + blocks)
 POST   /api/projects {slug,name}                 PATCH  /api/tasks/{id} {status?,assignee?,title?,body?,priority?}
-DELETE /api/projects/{slug}                       POST   /api/tasks/{id}/claim    (409 if open prereqs)
+DELETE /api/projects/{slug}                       POST   /api/tasks/{id}/claim    (409 if open prereqs; body {"steal_stale":"<dur>"} = stale takeover, 409 not_stale if fresh)
 POST   /api/projects/{slug}/archive              POST   /api/projects/{slug}/unarchive
 GET    /api/tasks?project=&status=&assignee=     POST   /api/tasks/{id}/comments {body}
-       &ready=true|&blocked=true                 DELETE /api/tasks/{id}/comments/{cid}
+       &ready=true|&blocked=true|&stale=<dur>    DELETE /api/tasks/{id}/comments/{cid}
 POST   /api/tasks {project,title,...}            POST   /api/tasks/{id}/deps {depends_on:<id-or-ref>}
 DELETE /api/tasks/{id}                           DELETE /api/tasks/{id}/deps/{depId}
 GET    /api/events?since=|?tail=|?before=        GET    /api/stream  (SSE)
@@ -265,7 +269,10 @@ behind; disable that with `AGENTMAN_NO_UPDATE_CHECK=1`.
 - **Single writer.** `am serve` is the only process that touches the DB
   (`SetMaxOpenConns(1)`, WAL mode). Claims are atomic via one conditional
   `UPDATE … WHERE assignee IS NULL AND status!='done' RETURNING …`; the loser of a race
-  gets `409 already_claimed`.
+  gets `409 already_claimed`. Stale-claim takeover (`am claim <id> --steal-stale <dur>`)
+  uses the same trick with a staleness predicate (`updated_at < cutoff`), so if an agent
+  crashes after claiming, another agent can recover the task — exactly one stealer wins,
+  the rest get `409 not_stale`, and a `task.reclaimed` event records the handoff.
 - **Live updates.** Every mutation appends to an append-only `events` table in the same
   transaction, then broadcasts over SSE after commit. That table is also the durable cursor
   used to replay missed events on reconnect.

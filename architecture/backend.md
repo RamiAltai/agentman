@@ -18,11 +18,11 @@ GET   /api/projects                 handleListProjects      ?archived=true inclu
 POST  /api/projects                 handleCreateProject     {slug,name}
 POST  /api/projects/{slug}/archive    handleArchiveProject
 POST  /api/projects/{slug}/unarchive  handleUnarchiveProject
-GET   /api/tasks                    handleListTasks         ?project=&status=&assignee=&limit=&ready=true|&blocked=true  (no project ⇒ hides archived-project tasks)
+GET   /api/tasks                    handleListTasks         ?project=&status=&assignee=&limit=&ready=true|&blocked=true|&stale=<dur>  (no project ⇒ hides archived-project tasks; stale = assigned + not done + no activity for ≥ dur)
 POST  /api/tasks                    handleCreateTask        {project,title,body?,priority?,assignee?}
 GET   /api/tasks/{id}               handleGetTask           (task + comments + recent events + depends_on + blocks)
 PATCH /api/tasks/{id}               handlePatchTask         {status?,assignee?,title?,body?,priority?}  (hard-blocked if open prereqs + doing/done target)
-POST  /api/tasks/{id}/claim         handleClaim             (atomic; X-Agent = claimant; hard-blocked if open prereqs → 409 blocked)
+POST  /api/tasks/{id}/claim         handleClaim             (atomic; X-Agent = claimant; hard-blocked if open prereqs → 409 blocked; body {"steal_stale":"<dur>"} → StealStaleClaim stale takeover, 409 not_stale if still fresh)
 POST  /api/tasks/{id}/comments      handleComment           {body}
 POST  /api/tasks/{id}/deps          handleAddDep            {depends_on: <id-or-ref>}  add prerequisite edge
 DELETE /api/tasks/{id}/deps/{depId} handleRemoveDep         remove prerequisite edge
@@ -66,8 +66,8 @@ Lives in `cmd/am/store.go` (there is no separate "service" layer — the store *
 logic). Each mutating method returns `(result, *Event, error)`; the handler broadcasts the event.
 Key methods: `CreateProject`, `ListProjects(includeArchived bool)`, `ArchiveProject`,
 `UnarchiveProject`, `DeleteProject`, `ListTasks`, `GetTask`, `CreateTask`, `PatchTask`,
-`ClaimTask`, `AddComment`, `DeleteComment`, `ListEvents`, `RecentEvents`, `ListEventsBefore`,
-`DeleteTask`, `AddDep`, `RemoveDep`, `ProjectGraph`. `ArchiveProject`/`UnarchiveProject` are transactional and
+`ClaimTask`, `StealStaleClaim`, `AddComment`, `DeleteComment`, `ListEvents`, `RecentEvents`,
+`ListEventsBefore`, `DeleteTask`, `AddDep`, `RemoveDep`, `ProjectGraph`. `ArchiveProject`/`UnarchiveProject` are transactional and
 idempotent (no event when already in the target state).
 `CreateTask` checks the target project's `archived_at` before the insert and returns
 `ErrProjectArchived` if archived — creation into an archived project is rejected.
@@ -106,6 +106,19 @@ RETURNING project_id, status;
 Zero rows ⇒ loser; the code then distinguishes idempotent re-claim by the same agent (returns the
 task, no event) from `*ConflictError` (owned by someone else) and `ErrNotFound`.
 
+**Stale-claim takeover** (`StealStaleClaim`, Phase K / ADR-022) reuses the same trick with a
+staleness predicate: `UPDATE … WHERE id=? AND status!='done' AND (assignee IS NULL OR updated_at <
+cutoff) RETURNING …`, where the cutoff is computed in Go by `staleCutoff` (ISO-8601 UTC with the
+exact `strftime('%Y-%m-%dT%H:%M:%fZ')` 3-digit-fraction format, so the lexicographic TEXT
+comparison holds). Exactly one concurrent stealer wins; a still-fresh claim loses with a typed
+`*NotStaleError{Assignee}`; a `done` task → `*ConflictError`; open prerequisites hard-block like a
+normal claim; on an unclaimed task it degrades to a normal claim (plain `task.claimed` event);
+re-stealing your own claim is an idempotent no-op (no event, `updated_at` untouched). A successful
+takeover emits `task.reclaimed` with `{"assignee":[prev,new],"status":…,"stale_for":…}` in the same
+tx. Both claim paths set `tasks.claimed_at`; `am drop` (unassign) clears it. The staleness filter
+(`TaskFilter.Stale`, `?stale=<dur>` / `am ls --stale <dur>`) uses `updated_at`, not `claimed_at` —
+any activity (claim, patch, status, comment) keeps a claim fresh.
+
 ## Data Access
 
 - One `*sql.DB` with **`SetMaxOpenConns(1)`** → single writer, so writes serialize and
@@ -142,6 +155,9 @@ trusted). No per-resource authorization. See `security.md` (ADR-002/ADR-011 in `
 - Handlers map `ErrValidation` → HTTP 400.
 - Creating a task into an archived project is rejected: `CreateTask` returns `ErrProjectArchived`
   → HTTP 400 `{"error":"project_archived"}`.
+- Durations (`?stale=` query param, `steal_stale` claim-body field) are parsed with
+  `time.ParseDuration` (Go syntax — `30m`, `48h`, not `2d`); a malformed or non-positive value →
+  HTTP 400 `{"error":"invalid"}` (CLI exit 5).
 
 ## Background Jobs
 
@@ -161,18 +177,21 @@ No job queue. Long-lived goroutines only:
 ## Error Handling
 
 Sentinel errors in `store.go`: `ErrNotFound`, `ErrConflict`, `ErrValidation`, `ErrProjectArchived`,
-typed `*ConflictError{Assignee}`, and typed `*BlockedError{OpenPrereqs []int64}`. `writeErr`
+typed `*ConflictError{Assignee}`, typed `*BlockedError{OpenPrereqs []int64}`, and typed
+`*NotStaleError{Assignee}`. `writeErr`
 (`server.go`) maps them: 404 / 409 / 400, with
 `ConflictError` → `409 {"error":"already_claimed","assignee":…}`,
 `BlockedError` → `409 {"error":"blocked","open_prereqs":[…]}`,
+`NotStaleError` → `409 {"error":"not_stale","assignee":…}`,
 `ErrProjectArchived` → `400 {"error":"project_archived"}`,
 `ErrValidation` → `400`; anything else → **HTTP 500 with a generic `{"error":"internal"}` body**
 (the real error is logged server-side via `log.Printf("agentman: internal error: %v", err)` to
 stderr — it is never sent to the client). Delete handlers (`handleDeleteTask`,
 `handleDeleteComment`, `handleDeleteProject`) return `404` via `writeErr` when the target is
 missing (`ErrNotFound`). The CLI re-maps HTTP status to **exit codes** in `client.go doOrFail`
-(`3` not found · `4` conflict/blocked · `5` validation/project_archived · `6` server down · `1` other);
-a `blocked` 409 prints e.g. `claim: #3 blocked — prereqs not done (#1 #2)`.
+(`3` not found · `4` conflict/blocked/not-stale · `5` validation/project_archived · `6` server down · `1` other);
+a `blocked` 409 prints e.g. `claim: #3 blocked — prereqs not done (#1 #2)`; a `not_stale` 409
+prints e.g. `claim: #3 held by agent-a (not stale yet)`.
 
 ## Observability
 
@@ -187,22 +206,28 @@ per request after completion: `METHOD PATH STATUS LATENCY ACTOR` (actor = `X-Age
 
 ## Testing
 
-There are nine test files (run `go test -race ./cmd/am/`; 95 tests, all green):
+There are nine test files (run `go test -race ./cmd/am/`; 107 tests, all green):
 - `cmd/am/update_test.go` — version-comparison logic.
 - `cmd/am/store_test.go` — atomic-claim race (concurrent, `-race`-clean), events-cursor monotonicity,
   store CRUD + validation (`ErrValidation`), project archive/unarchive round-trip + idempotency,
   hard-delete cascade/not-found (`TestDeleteTaskCascadesComments`, `TestDeleteTaskNotFound`,
-  `TestDeleteCommentRemovesOnlyComment`, `TestDeleteProjectCascades`), and graph store:
-  `TestProjectGraph` (nodes + edges shape), `TestProjectGraphMissingProject` (ErrNotFound).
+  `TestDeleteCommentRemovesOnlyComment`, `TestDeleteProjectCascades`), graph store:
+  `TestProjectGraph` (nodes + edges shape), `TestProjectGraphMissingProject` (ErrNotFound), and
+  stale-claim recovery (Phase K): `TestStealStaleClaim`, `TestStealRaceExactlyOneWinner`
+  (concurrent stealers, exactly one winner), `TestListTasksStaleFilter`, `TestClaimSetsClaimedAt`,
+  `TestDropClearsClaimedAt`.
 - `cmd/am/server_test.go` — validation→status mapping (400/404/409), `hostGuard`, `csrfGuard`,
   `securityHeaders`, `listenAddr` loopback regression, archive/unarchive endpoints + 404,
   hard-delete HTTP endpoints (`TestDeleteTaskEndpoint`, `TestDeleteProjectEndpoint`,
   `TestDeleteCommentEndpoint`), Phase D: `TestWriteErrHidesInternalDetail` (500 returns generic
   body, not raw error), `TestRequestLoggerPassesThrough`, `TestRequestLoggerPreservesFlusher`, and
   graph endpoint: `TestProjectGraphEndpoint` (200 with correct nodes + edges),
-  `TestProjectGraphEndpoint404` (missing project → 404) (via `net/http/httptest`).
+  `TestProjectGraphEndpoint404` (missing project → 404), and Phase K: `TestListTasksStaleParam`
+  (`?stale=` filter + 400 on bad duration), `TestStealStaleEndpoint` (steal body, `not_stale` 409)
+  (via `net/http/httptest`).
 - `cmd/am/migrate_test.go` — migration runner (apply/skip/idempotent/rollback), incl. the v2 step
-  that adds `projects.archived_at`.
+  that adds `projects.archived_at` and the v3 step that adds `tasks.claimed_at`
+  (`TestMigrationV3AddsClaimedAt`).
 - `cmd/am/db_test.go` — `db export`/`import` roundtrip + file perms (0o600), backup creation + perms,
   garbage rejection, server-liveness check; `TestPruneEventsKeep`, `TestPruneEventsBefore`,
   `TestPruneEventsBeforeSameDayBoundary` (prune).
@@ -212,7 +237,9 @@ There are nine test files (run `go test -race ./cmd/am/`; 95 tests, all green):
   (`cmdStatus`/`cmdNote`/`cmdDrop`) are silent on success; and the exit-code mapping in
   `client.go doOrFail` — 3 (not found), 4 (conflict), 5 (validation/`project_archived`), 6 (server
   down). Also table-tests for `parse`/`Args` and the pure formatters
-  (`taskLine`/`statusShort`/`assignee`/`trunc`/`apiErr`).
+  (`taskLine`/`statusShort`/`assignee`/`trunc`/`apiErr`); Phase K added `TestExitNotStale`
+  (exit 4 + `not stale yet` message) and `TestStaleFlagsWireFormat` (`--stale` / `--steal-stale`
+  wire encoding).
 - `cmd/am/sse_test.go` — SSE streaming + reconnect (Phase E2). `TestSSEDeliversLiveEvent`
   subscribes to `/api/stream`, creates a task, and asserts the `task.created` event arrives live.
   `TestSSEReplayOnReconnect` reconnects with `Last-Event-ID` and asserts that events created while
@@ -232,7 +259,8 @@ rejection, idempotent add/remove, cascade on task delete, `NPrereqs`/`NOpenPrere
 `server_test.go` (HTTP add/remove dep endpoints, `?ready=`/`?blocked=` query params, 409 blocked
 response for claim and patch). The +4 graph tests (`TestProjectGraph`, `TestProjectGraphMissingProject`
 in `store_test.go`; `TestProjectGraphEndpoint`, `TestProjectGraphEndpoint404` in `server_test.go`)
-bring the total to **95 tests**.
+brought the total to **95** at the time; Phase J's hygiene tests and Phase K's 10 stale-claim
+tests (listed above) bring it to **107**.
 
 SSE streaming/reconnect, CLI verbs, exit-code mapping, and identity are now covered. The
 dashboard has a source-level XSS-sink guard but **no behavioral JS tests** — the project
@@ -246,9 +274,10 @@ deliberately adopts no JS test runner (preserves the single-binary/no-npm ethos)
 - **New task field:** add the column in `schema.sql`, the struct field in `store.go`, thread it
   through `CreateTask`/`PatchTask`/`getTaskTx`, the API, and the dashboard (`web/`).
 - **New event kind:** emit via `insertEvent(...)` and handle it in `web/app.js` `evText`/`describeText`.
-  Current kinds (14 total): `task.created`, `task.claimed`, `task.status`, `task.assign`,
-  `task.patched`, `task.deleted`, `task.dep_added`, `task.dep_removed`, `comment.added`,
-  `comment.deleted`, `project.created`, `project.archived`, `project.unarchived`, `project.deleted`.
+  Current kinds (15 total): `task.created`, `task.claimed`, `task.reclaimed`, `task.status`,
+  `task.assign`, `task.patched`, `task.deleted`, `task.dep_added`, `task.dep_removed`,
+  `comment.added`, `comment.deleted`, `project.created`, `project.archived`, `project.unarchived`,
+  `project.deleted`.
 
 ## Risks and Gaps
 
