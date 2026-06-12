@@ -55,6 +55,9 @@ Then use `am` normally (`am whoami` shows it).
     am ls --status todo        # unclaimed work to pick up      am ls --mine   # my tasks
     am ls --blocked            # tasks blocked by unfinished prereqs (do not claim these)
     am ls --stale 30m          # claimed tasks with no activity for 30m (likely dead agents)
+    am ls --grep "auth"        # search task titles + bodies (substring, case-insensitive)
+    am ls --label bug          # only tasks carrying a label (also -l bug)
+    am label <id> +bug -wip    # add/remove labels (bare `am label <id>` prints them)
     am claim <id>              # take a SPECIFIC task (exit 4 = already claimed OR prereqs not done)
     am claim <id> --steal-stale 30m   # take over a claim idle ≥30m (exit 4 = still fresh)
     am show <id> -c            # full detail + depends on/blocks + comments

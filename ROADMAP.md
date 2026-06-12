@@ -173,5 +173,6 @@ and only matter if the network bind ever widens. (`architecture/security.md`)
 Phases A, B (except the ongoing B3 process), C, D, E, F, H, and I are **complete**. **G** stays
 parked unless the access model changes. For newer work, see `REVIEW.md` Phases J–N: Phase J
 (correctness & hygiene), Phase K (stale-claim recovery — `am ls --stale`,
-`am claim --steal-stale`), and Phase L (agent work loop — `am next`, `am wait`, bulk
-`status`/`assign`) have shipped; search, labels, and release binaries remain proposed.
+`am claim --steal-stale`), Phase L (agent work loop — `am next`, `am wait`, bulk
+`status`/`assign`), and Phase M (findability — `am ls --grep`/`--label`, `am label`) have
+shipped; release binaries remain proposed.

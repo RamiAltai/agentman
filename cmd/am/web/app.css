@@ -89,6 +89,24 @@ header {
 .tab.add { color: var(--muted); padding: 5px 12px; font-size: 16px; line-height: 1; }
 
 .actions { display: flex; align-items: center; gap: 10px; flex: none; }
+.search-input {
+  background: var(--card-bg); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 8px; padding: 7px 11px; font-size: 13px; width: 160px; font-family: inherit;
+}
+.search-input:hover { border-color: var(--line-strong); }
+.search-input:focus { border-color: var(--accent); outline: none; }
+.label-filter {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: rgba(110, 168, 254, .14); color: var(--accent);
+  border: 1px solid rgba(110, 168, 254, .35); border-radius: 999px;
+  padding: 3px 9px; font-size: 12px; font-weight: 600; white-space: nowrap;
+}
+.label-filter.hidden { display: none; }
+.label-filter-x {
+  background: none; border: none; color: var(--accent); padding: 0 1px;
+  font-size: 11px; line-height: 1; cursor: pointer;
+}
+.label-filter-x:hover { color: var(--fg); }
 .btn-primary {
   background: var(--accent); color: #fff; border: none; border-radius: 8px;
   padding: 7px 13px; font-weight: 600; font-size: 13px;
@@ -363,6 +381,19 @@ select:hover, .field:hover { border-color: var(--line-strong); }
   border: 1px solid rgba(240, 136, 62, .35); border-radius: 999px;
   padding: 1px 7px; font-size: 11px; font-weight: 600;
 }
+.tag-label {
+  display: inline-flex; align-items: center; gap: 3px;
+  background: rgba(110, 168, 254, .12); color: var(--accent);
+  border: 1px solid rgba(110, 168, 254, .3); border-radius: 999px;
+  padding: 1px 7px; font-size: 11px; font-weight: 600; cursor: pointer;
+}
+.tag-label:hover { border-color: var(--accent); }
+
+/* labels row in the task modal */
+.labels-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.tag-label-modal { font-size: 12px; padding: 3px 8px; cursor: default; }
+.tag-label-modal:hover { border-color: rgba(110, 168, 254, .3); }
+.label-add { min-width: 110px; max-width: 150px; padding: 4px 8px; font-size: 12px; }
 
 /* ===================== dependency section (task modal) ===================== */
 .deps-section { margin: 10px 0 14px; }

@@ -60,6 +60,11 @@ Evidence:
   `NextTask`), `am wait <id> --done` / `am wait --ready` block on the SSE stream until a task
   finishes or work appears (exit 7 on timeout), and `am status`/`am assign` take multiple ids.
   Evidence: `cmd/am/store.go`, `cmd/am/wait.go`, `cmd/am/cli.go`.
+- **Findability** so a grown board stays navigable: substring search over task titles and bodies
+  (`am ls --grep <text>` / `GET /api/tasks?q=`; a header search box on the dashboard) and
+  lightweight free-form labels (`am label <id> +bug -wip`, `am ls --label <l>`; clickable label
+  chips + filter on the dashboard). Evidence: `cmd/am/store.go` (`likeEscape`, `normalizeLabel`),
+  `cmd/am/cli.go`, `cmd/am/web/app.js`.
 - **Live activity feed** backed by an append-only `events` table (also the SSE replay cursor).
 - **Per-directory agent identity** that survives the fresh-shell-per-command model agents run in
   (`cmd/am/identity.go`).
@@ -94,6 +99,8 @@ Evidence:
 - **Task** — a ticket. Has a global `id` (`#42`, the cheap wire ref) **and** a per-project `ref`
   (`web-3`, human-friendly). Status + priority + optional assignee.
 - **Comment** — a threaded note on a task.
+- **Label** — a lightweight free-form tag on a task (normalized lowercase; no separate catalog —
+  a label exists iff some task carries it).
 - **Event** — an append-only record of every mutation; powers the activity feed, SSE stream, and
   reconnect replay (`events.id` is the cursor / SSE `Last-Event-ID`).
 - **Agent identity** — `{tasktype}_{DDMMYY}_{4 digits}`, attached as the actor on writes.
@@ -102,7 +109,8 @@ Evidence:
 
 Inferred (Confidence: Medium–High) from `README.md` "Security" and the localhost bind:
 - **Not** a multi-tenant / authenticated / internet-facing service. No auth, binds `127.0.0.1`.
-- **Not** a heavyweight project manager (no sprints, labels, due dates, attachments today).
+- **Not** a heavyweight project manager (no sprints, due dates, or attachments today; the only
+  metadata beyond status/priority/assignee is lightweight free-form labels, added in Phase M).
 - **Not** a hosted SaaS — it's a single local binary; "back up = copy one file."
 
 ## Evidence
@@ -115,6 +123,6 @@ Inferred (Confidence: Medium–High) from `README.md` "Security" and the localho
 
 - **Intended scale.** No stated target for concurrent agents / task volume. The single-writer
   SQLite design (`SetMaxOpenConns(1)`) implies modest scale, but this is not documented.
-- **Roadmap.** Near-term gap-closing work is now tracked in `ROADMAP.md` (repo root). Longer-term
-  ideas (auth, remote access, labels/due-dates, prebuilt binaries) remain discussion-only — treat
-  those as unconfirmed.
+- **Roadmap.** Near-term gap-closing work is now tracked in `ROADMAP.md` (repo root). Labels and
+  search shipped in Phase M; longer-term ideas (auth, remote access, due dates, prebuilt binaries)
+  remain discussion-only — treat those as unconfirmed.

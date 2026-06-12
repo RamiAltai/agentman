@@ -89,8 +89,9 @@ The embedded web UI (no build step, no npm) is a live kanban board:
 - **Activity feed** you can **collapse** or **drag-resize** (it becomes an overlay drawer on
   small screens); task `#refs` in the feed are clickable.
 - **Responsive** from desktop down to mobile — columns stack and the panel overlays.
-- **Keyboard:** `n` new task · `a` toggle the activity panel · `Enter`/`Space` open a focused
-  card · `[` / `]` move a focused card between statuses · `Esc` close a dialog.
+- **Keyboard:** `n` new task · `a` toggle the activity panel · `/` focus the search box ·
+  `Enter`/`Space` open a focused card · `[` / `]` move a focused card between statuses ·
+  `Esc` close a dialog.
 - **Manage projects:** the `⋯` button in the tab bar opens a modal listing all projects.
   Active projects show an **Archive** button; archived ones show an **Unarchive** button.
   The modal also has a **Delete** button per project — permanently deletes the project and
@@ -112,6 +113,11 @@ The embedded web UI (no build step, no npm) is a live kanban board:
   clickable **Unblocks** list, and an **"Open task"** button (which closes the graph and opens that
   task on the board). Nodes are colored by priority; edges show whether each prerequisite is
   cleared (green solid) or still blocking (amber dashed). Pan, zoom, and reset the view freely.
+- **Search & labels:** a header **search box** (press `/` to focus it) filters the board by a
+  substring of any task's title *or* description (server-side via `?q=`, so the filter survives
+  live SSE reloads). Cards show up to 3 **label chips** (then a `+N` overflow chip) — click a chip
+  to filter the board by that label (a header chip with ✕ clears it). The task modal has a
+  **Labels** section: chips with ✕ remove buttons and an "Add label…" input that submits on Enter.
 - **Stale claims:** a card in *In Progress* with an assignee and no activity for 30+ minutes
   shows an amber **⏳ stale** chip, and a stale-claim takeover (`am claim --steal-stale`)
   appears in the activity feed as *"X reclaimed #N from Y"*.
@@ -158,7 +164,7 @@ Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting 
 
 | Command | What it does |
 |---|---|
-| `am ls [--mine] [--status S] [-p P] [--all] [--ready] [--blocked] [--stale D]` | list tasks (hides done; `--ready` = todo with no open prereqs; `--blocked` = ≥1 open prereq; `--stale D` = assigned, not done, no activity for D — Go duration, e.g. `30m`, `48h`) |
+| `am ls [--mine] [--status S] [-p P] [--all] [--ready] [--blocked] [--stale D] [--grep TEXT] [--label L]` | list tasks (hides done; `--ready` = todo with no open prereqs; `--blocked` = ≥1 open prereq; `--stale D` = assigned, not done, no activity for D — Go duration, e.g. `30m`, `48h`; `--grep` = substring match on title or body, ASCII-case-insensitive; `--label`/`-l` = tasks carrying that label) |
 | `am show <id> [-c]` | task detail + `depends on:` / `blocks:` lines; comments with `-c` |
 | `am new "title" [--body B] [-p P] [--priority N]` | create a task; prints the new id |
 | `am claim <id> [--steal-stale D]` | atomic: assign me + → doing (exit 4 if already taken **or** has open prereqs); `--steal-stale D` takes over a claim idle for ≥ D (exit 4 with `not stale yet` if still fresh) |
@@ -173,6 +179,7 @@ Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting 
 | `am rm <id>` | hard-delete a task (permanent; cascades its comments + dep edges); exit 3 if not found |
 | `am dep add <id> <prereq> [prereq…]` | add one or more prerequisites to a task (same project; rejects cycles) |
 | `am dep rm <id> <prereq>` | remove a prerequisite edge |
+| `am label <id> [+l …] [-l …]` | with no args: print the task's labels; `+foo` (or bare `foo`) adds, `-bar` removes. Labels are lowercased, 1–50 chars of `a-z 0-9 . _ -` |
 | `am projects [--all]` · `am project new <slug> [name]` | list (`--all` includes archived) / create projects |
 | `am project archive <slug>` · `am project unarchive <slug>` | soft-archive (hide) / restore a project |
 | `am project rm <slug> --yes` | hard-delete a project **and ALL its tasks/comments** (permanent; `--yes` required) |
@@ -201,8 +208,10 @@ DELETE /api/projects/{slug}                       POST   /api/tasks/{id}/claim  
 POST   /api/projects/{slug}/archive              POST   /api/projects/{slug}/unarchive
 GET    /api/tasks?project=&status=&assignee=     POST   /api/tasks/{id}/comments {body}
        &ready=true|&blocked=true|&stale=<dur>    DELETE /api/tasks/{id}/comments/{cid}
-POST   /api/tasks {project,title,...}            POST   /api/tasks/{id}/deps {depends_on:<id-or-ref>}
-DELETE /api/tasks/{id}                           DELETE /api/tasks/{id}/deps/{depId}
+       |&q=<text>|&label=<l>                     POST   /api/tasks/{id}/deps {depends_on:<id-or-ref>}
+POST   /api/tasks {project,title,...}            DELETE /api/tasks/{id}/deps/{depId}
+DELETE /api/tasks/{id}                           POST   /api/tasks/{id}/labels {label}
+                                                 DELETE /api/tasks/{id}/labels/{label}
 GET    /api/events?since=|?tail=|?before=        GET    /api/stream  (SSE)
 GET    /api/projects/{slug}/graph               {nodes,edges}; read-only DAG (no events)
 ```

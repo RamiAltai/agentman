@@ -123,9 +123,9 @@ In rough priority order:
 - [x] L2 `am wait` — block on task/board conditions over SSE
 - [x] L3 Bulk `am status`/`am assign` over multiple ids
 
-### Phase M — Findability (M)
-- [ ] M1 Search: `?q=` API + `am ls --grep` + dashboard filter box
-- [ ] M2 Labels: schema + CLI + API + board chips/filter
+### Phase M — Findability — **DONE (2026-06-13)**
+- [x] M1 Search: `?q=` API + `am ls --grep` + dashboard filter box
+- [x] M2 Labels: schema + CLI + API + board chips/filter
 
 ### Phase N — Distribution (M)
 - [ ] N1 Goreleaser release binaries; `am update` downloads binary

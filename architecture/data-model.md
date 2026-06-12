@@ -4,7 +4,8 @@
 
 Storage is a single **SQLite** database (default `~/.agentman/agentman.db`), WAL mode, owned by
 one writer process. Schema is in `cmd/am/schema.sql` (embedded and executed at startup by
-`store.OpenStore`). Six tables: `meta`, `projects`, `tasks`, `task_deps`, `comments`, `events`.
+`store.OpenStore`). Seven tables: `meta`, `projects`, `tasks`, `task_deps`, `task_labels`,
+`comments`, `events`.
 All timestamps are ISO-8601 UTC **TEXT** (`strftime('%Y-%m-%dT%H:%M:%fZ','now')`), so they sort
 lexically.
 
@@ -16,6 +17,7 @@ lexically.
 | `projects` | Named boards (`slug` unique, `name`, `archived_at`) | `schema.sql`, `store.go Project` |
 | `tasks` | Tickets (status, priority, assignee, dual id) | `schema.sql`, `store.go Task` |
 | `task_deps` | Prerequisite edges between tasks (many-to-many, same-project only) | `schema.sql`, `store.go DepRef` |
+| `task_labels` | Free-form tags on tasks (many-to-many, label text stored inline — no catalog) | `schema.sql`, `store.go Task.Labels` |
 | `comments` | Threaded notes on a task | `schema.sql`, `store.go Comment` |
 | `events` | Append-only mutation log = activity feed + SSE backbone + cursor | `schema.sql`, `store.go Event` |
 
@@ -43,37 +45,50 @@ lexically.
   propagates to existing DBs **without a migration-runner step and without bumping
   `currentSchemaVersion`** (no `ALTER` is needed; a new table just needs to be present in
   `schema.sql`).
+- **`task_labels.(task_id, label)`** — composite PK; `task_id` is an FK to `tasks.id` with
+  `ON DELETE CASCADE`. The label TEXT is stored inline (no separate labels catalog — a label
+  exists iff some task carries it). Labels are normalized at the boundary (`normalizeLabel`):
+  trimmed, lowercased, 1–50 bytes of `a-z 0-9 . _ -` (charset excludes `,` for safe
+  `GROUP_CONCAT` splitting and `+`/space for unambiguous CLI tokens). Adding/removing a label
+  does **not** bump the task's `updated_at` (metadata must not refresh a stale claim). Filterable
+  via `GET /api/tasks?label=<l>` (`TaskFilter.Label`); free-text search is the separate
+  `?q=<text>` (`TaskFilter.Query`) — a LIKE-with-ESCAPE substring match on title OR body,
+  ASCII-case-insensitive, which does **not** search labels or comments. Like `task_deps`, the
+  table is added via `CREATE TABLE IF NOT EXISTS` in `schema.sql` — no migration-runner step, no
+  version bump (ADR-024).
 - **`projects.archived_at`** — TEXT, **NULL = active**; an ISO-8601 UTC timestamp set when the
   project is archived (`store.go ArchiveProject`) and cleared back to NULL on unarchive
   (`UnarchiveProject`). Soft-archive is reversible; default project lists hide archived rows.
 - **`events.id`** — monotonic; doubles as the `?since=` cursor and the SSE `Last-Event-ID`.
 - **`events.kind`** — one of `task.created | task.claimed | task.reclaimed | task.status |
-  task.assign | task.patched | task.deleted | task.dep_added | task.dep_removed | comment.added |
-  comment.deleted | project.created | project.archived | project.unarchived | project.deleted`
-  (15 total). `task.reclaimed` is emitted by a stale-claim takeover and its data names the
-  previous assignee and the `stale_for` window.
+  task.assign | task.patched | task.deleted | task.dep_added | task.dep_removed | task.labeled |
+  task.unlabeled | comment.added | comment.deleted | project.created | project.archived |
+  project.unarchived | project.deleted` (17 total). `task.reclaimed` is emitted by a stale-claim
+  takeover and its data names the previous assignee and the `stale_for` window;
+  `task.labeled`/`task.unlabeled` carry `{"label": l}`.
 - **`events.data`** — compact JSON delta, e.g. `{"status":["todo","doing"]}`.
 
 ### Indexes
 
 `idx_tasks_project_status(project_id,status)`, `idx_tasks_assignee(assignee)`,
 `idx_tasks_updated(updated_at)`, `idx_task_deps_prereq(depends_on_id)`,
-`idx_comments_task(task_id,id)`, `idx_events_since(id)`.
+`idx_task_labels_label(label)`, `idx_comments_task(task_id,id)`, `idx_events_since(id)`.
 
 ## Relationships
 
 - `tasks.project_id → projects.id` — `ON DELETE CASCADE`.
 - `task_deps.task_id → tasks.id` — `ON DELETE CASCADE`.
 - `task_deps.depends_on_id → tasks.id` — `ON DELETE CASCADE`.
+- `task_labels.task_id → tasks.id` — `ON DELETE CASCADE`.
 - `comments.task_id → tasks.id` — `ON DELETE CASCADE`.
 - `events.project_id` / `events.task_id` — **denormalized, nullable, NOT foreign keys** (so events
   survive even if the referenced row is gone; e.g. `project.created` has no task). Confirmed:
   `schema.sql` defines no FK on `events`.
 
-Ownership: a project owns its tasks; a task owns its comments and its dependency edges (both
-directions cascade). Cascade deletes flow project → tasks → comments; deleting a task also removes
-all `task_deps` rows where it is either the dependent or the prerequisite. **Events are never
-deleted** (append-only).
+Ownership: a project owns its tasks; a task owns its comments, its labels, and its dependency
+edges (both directions cascade). Cascade deletes flow project → tasks → comments; deleting a task
+also removes its `task_labels` rows and all `task_deps` rows where it is either the dependent or
+the prerequisite. **Events are never deleted** (append-only).
 
 ## Sensitive Data
 
@@ -89,7 +104,10 @@ deleted** (append-only).
   same transaction. Dependency edges are created via `POST /api/tasks/{id}/deps` (`AddDep`), which
   validates same-project + no-cycle and emits a `task.dep_added` event. Removing an edge uses
   `DELETE /api/tasks/{id}/deps/{depId}` (`RemoveDep`), emitting `task.dep_removed`. Edges cascade
-  on task delete (both directions).
+  on task delete (both directions). Labels are attached via `POST /api/tasks/{id}/labels`
+  (`AddLabel`, emits `task.labeled`) and removed via `DELETE /api/tasks/{id}/labels/{label}`
+  (`RemoveLabel`, emits `task.unlabeled`); both are idempotent (no-op commits without an event)
+  and neither bumps the task's `updated_at`.
 - **Update:** `tasks` only (status/assignee/title/body/priority, plus `claimed_at` kept in step
   with the assignee — set on claim/steal/assign, NULLed on unassign); `updated_at` set explicitly
   in each `UPDATE` (no trigger).
@@ -156,8 +174,9 @@ a DB at a **newer** version than the binary is accepted silently today; an unpar
 entirely new table (rather than altering an existing one), placing a `CREATE TABLE IF NOT EXISTS`
 in `schema.sql` is sufficient — `OpenStore` runs `schema.sql` on every start, so the new table
 appears in existing DBs automatically. The migration runner is only needed for `ALTER TABLE` on
-existing tables (where `IF NOT EXISTS` can't help). Example: `task_deps` was added this way,
-with no `schemaMigrations` step and no `currentSchemaVersion` bump.
+existing tables (where `IF NOT EXISTS` can't help). Examples: `task_deps` (Phase H) and
+`task_labels` (Phase M, ADR-024) were both added this way, with no `schemaMigrations` step and
+no `currentSchemaVersion` bump.
 
 Backup/restore:
 
@@ -183,6 +202,7 @@ erDiagram
   tasks ||--o{ comments : "has"
   tasks ||--o{ task_deps : "depends on (task_id)"
   tasks ||--o{ task_deps : "is prerequisite of (depends_on_id)"
+  tasks ||--o{ task_labels : "tagged with"
   projects {
     int id PK
     text slug UK
@@ -206,6 +226,10 @@ erDiagram
   task_deps {
     int task_id FK "PK + cascade"
     int depends_on_id FK "PK + cascade"
+  }
+  task_labels {
+    int task_id FK "PK + cascade"
+    text label "PK; normalized lowercase"
   }
   comments {
     int id PK

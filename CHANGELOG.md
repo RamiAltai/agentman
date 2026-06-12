@@ -11,6 +11,44 @@ fresh `[Unreleased]` section.
 
 ### Added
 
+- **Findability (Phase M)** — search and labels, so a grown board stays navigable.
+  - **Search: `am ls --grep <text>`** (`GET /api/tasks?q=<text>`) — substring match on **title OR
+    body** via SQL `LIKE … ESCAPE '\'`; the wildcards `%`/`_` (and `\`) in the query are escaped, so
+    they match literally. Matching is **ASCII-case-insensitive** (SQLite's default LIKE; Unicode
+    folding deliberately not applied — fine at personal-board scale). Comments and label names are
+    **not** searched. A query over 500 bytes (the title cap) is `400 invalid` (CLI exit 5). The
+    dashboard header gains a **search box** (`/` focuses it, 250 ms debounce) that filters the board
+    server-side, so the filter survives SSE live reloads and can match description text. New
+    `TaskFilter.Query`; helper `likeEscape`.
+  - **Labels: `am label <id> [+add …] [-remove …]`** — free-form tags on tasks.
+    `am label <id>` alone prints the task's labels space-separated (nothing if none); `+foo` or bare
+    `foo` adds, `-bar` removes (silent success, scriptable). The verb takes **raw argv** (dispatched
+    before `parse()`, which would swallow `-bar` as a value flag); flag-like tokens are rejected
+    rather than treated as labels — `--…` is a usage error and the global value flags `-p`/`-c` are
+    refused by name with a hint (both exit 5), so e.g. `am label 12 --json` can't silently remove a
+    `json` label. Labels are normalized at the
+    boundary — trimmed, lowercased, 1–50 bytes of `a-z 0-9 . _ -` (charset excludes `,` for safe
+    `GROUP_CONCAT` splitting and `+`/space for unambiguous CLI tokens); anything else is
+    `400 invalid` → exit 5. API: `POST /api/tasks/{id}/labels {"label":…}` /
+    `DELETE /api/tasks/{id}/labels/{label}` (both `200 {"status":"ok"}`, idempotent no-ops emit no
+    event), `GET /api/tasks?label=<l>` filter, and `labels:[…]` (sorted) on task JSON —
+    `am ls --label <l>` / `-l <l>` on the CLI; `am show` prints a `labels:` line; `taskLine` is
+    deliberately unchanged (token budget). Storage: new **`task_labels`** join table (inline label
+    text, no catalog) propagated via `CREATE TABLE IF NOT EXISTS` in `schema.sql` — no migration
+    step, no version bump (the `task_deps` precedent). Adding/removing a label does **not** bump
+    `updated_at` (metadata must not refresh a stale claim). **2 new event kinds**:
+    `task.labeled` / `task.unlabeled` (total now 17), rendered in the feed as
+    *"X labeled #N +bug"*. Dashboard: board cards show up to 3 clickable label chips (click =
+    filter by that label; a header chip with ✕ clears it); the task modal gains a **Labels**
+    section (chips with ✕ remove + an Enter-to-add input). New store methods `AddLabel` /
+    `RemoveLabel`; `TaskFilter.Label`.
+  - Tests (+14, now 144): `TestListTasksQueryFilter`, `TestListTasksQueryEscapesLikeWildcards`,
+    `TestAddRemoveLabel`, `TestLabelValidation`, `TestListTasksLabelFilter`,
+    `TestAddLabelDoesNotBumpUpdatedAt`, `TestDeleteTaskCascadesLabels`,
+    `TestTaskLabelsTableExistsOnReopenedDB` (store); `TestListTasksQueryParam`,
+    `TestLabelEndpoints` (HTTP); `TestCmdLsGrepWireFormat`, `TestCmdLabelAddRemove`,
+    `TestCmdLabelPrintsLabels`, `TestCmdLabelUsage` (CLI).
+
 - **Agent work loop (Phase L)** — the verbs an agent loop needs between "what should I do?" and
   "is my prerequisite finished?".
   - **`am next [-p P]`** (`POST /api/tasks/next {"project"?}`) — atomic pick + claim of the best

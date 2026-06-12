@@ -42,6 +42,15 @@ CREATE TABLE IF NOT EXISTS task_deps (
 );
 CREATE INDEX IF NOT EXISTS idx_task_deps_prereq ON task_deps(depends_on_id);
 
+-- task_labels: free-form tags on tasks (many-to-many, label stored inline —
+-- no separate labels catalog; a label exists iff some task carries it).
+CREATE TABLE IF NOT EXISTS task_labels (
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  label   TEXT NOT NULL,
+  PRIMARY KEY (task_id, label)
+);
+CREATE INDEX IF NOT EXISTS idx_task_labels_label ON task_labels(label);
+
 -- comments: discussion thread on a task.
 CREATE TABLE IF NOT EXISTS comments (
   id         INTEGER PRIMARY KEY,
@@ -58,7 +67,7 @@ CREATE TABLE IF NOT EXISTS events (
   project_id INTEGER,
   task_id    INTEGER,
   actor      TEXT NOT NULL,
-  kind       TEXT NOT NULL,               -- task.created|claimed|reclaimed|status|assign|patched|deleted|dep_added|dep_removed|comment.added|comment.deleted|project.created|archived|unarchived|deleted
+  kind       TEXT NOT NULL,               -- task.created|claimed|reclaimed|status|assign|patched|deleted|dep_added|dep_removed|labeled|unlabeled|comment.added|comment.deleted|project.created|archived|unarchived|deleted
   data       TEXT NOT NULL DEFAULT '{}',  -- compact JSON delta, e.g. {"status":["todo","doing"]}
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );

@@ -97,7 +97,7 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 ## Testing Gaps
 
-- Coverage now spans store/server/migrate/db/cli/sse/identity/wait/web tests (10 files, 130 tests,
+- Coverage now spans store/server/migrate/db/cli/sse/identity/wait/web tests (10 files, 144 tests,
   `-race`-clean): the **atomic claim** (race, `-race`-clean), events cursor, store CRUD/validation,
   validation→status mapping, the Host/CSRF/CSP guards, project archive/unarchive (store round-trip
   + idempotency and the HTTP endpoints incl. 404), the v2 migration (adds `archived_at` +
@@ -148,10 +148,18 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   bulk `TestCmdStatusBulk`/`TestCmdStatusBulkPartialFailure`/`TestCmdAssignBulk`), and `am wait`
   end to end in `wait_test.go` (already-done, event-driven, cross-project `--done`, ready-on-prereq,
   timeout exit 7, not-found, server-down, usage, `parseWaitTimeout`).
+  Phase M added 14 findability tests: search (`TestListTasksQueryFilter`,
+  `TestListTasksQueryEscapesLikeWildcards`, `TestListTasksQueryParam`) and labels
+  (`TestAddRemoveLabel`, `TestLabelValidation`, `TestListTasksLabelFilter`,
+  `TestAddLabelDoesNotBumpUpdatedAt`, `TestDeleteTaskCascadesLabels`,
+  `TestTaskLabelsTableExistsOnReopenedDB`, `TestLabelEndpoints`), plus the CLI surface
+  (`TestCmdLsGrepWireFormat`, `TestCmdLabelAddRemove`, `TestCmdLabelPrintsLabels`,
+  `TestCmdLabelUsage`).
   **Still untested:** behavioral dashboard JS — the "Manage projects" modal, the delete confirm
   flows (task/comment/project), the feed pagination button, the dependency section UI (prereq chips,
   add-prereq dropdown, blocks list), the **graph overlay** (layout, pan/zoom, transitive highlight,
-  detail panel, live refresh), and other client-side logic — because the project deliberately
+  detail panel, live refresh), the search box and label chips/Labels section (Phase M),
+  and other client-side logic — because the project deliberately
   adopts **no JS test runner** (preserves the no-npm/single-binary ethos; ADR-018). The
   `web_test.go` sink guard mitigates XSS regressions at the source level; the dependency UI and
   the graph overlay are additional un-runner-tested JS covered by that same guard.
