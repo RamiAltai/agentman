@@ -157,8 +157,8 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 - ~~`gofmt -l` is non-empty~~ — **fixed in Phase 0** (`cmd/am/update_test.go`, `cmd/am/version.go`
   formatted; `gofmt -l cmd/am` is now empty).
-- `store.go` (~1292 lines) and `app.js` (~1696 lines) are the largest files and mix several
-  responsibilities; fine now, watch for growth.
+- `store.go` and `app.js` are the largest files and mix several responsibilities; fine now,
+  watch for growth.
 - No linter beyond `gofmt`/`go vet`; no pre-commit hooks. CI now enforces `gofmt`/`go vet`/
   `go test -race`/`govulncheck` on every push and PR, so format/vet/test drift is caught
   automatically. Pre-commit hooks are still absent (local runs remain manual).

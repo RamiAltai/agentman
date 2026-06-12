@@ -34,6 +34,10 @@ func TestUpdateAvailable(t *testing.T) {
 		{"v0.0.0-20260604000000-aaaa", "v0.0.0-20260605203447-bbbb", false}, // older pseudo
 		{"", "v0.1.0", false},
 		{"v0.2.0", "devel", false},
+		{"v0.5.0", "v0.5.0-rc1", true},      // stable beats prerelease
+		{"v0.5.0-rc1", "v0.5.0", false},     // prerelease does not beat stable
+		{"v0.5.0-rc2", "v0.5.0-rc1", true},  // newer prerelease
+		{"v0.5.0-rc1", "v0.5.0-rc1", false}, // same prerelease
 	}
 	for _, c := range cases {
 		if got := updateAvailable(c.latest, c.cur); got != c.want {

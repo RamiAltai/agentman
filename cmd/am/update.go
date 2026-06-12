@@ -141,7 +141,28 @@ func updateAvailable(latest, cur string) bool {
 	if ls != "" && cs != "" {
 		return ls > cs
 	}
+	if ls == "" && cs == "" {
+		// Neither is a pseudo-version: compare prerelease suffixes per semver —
+		// a stable tag beats any prerelease (v0.5.0 > v0.5.0-rc1), and prereleases
+		// order lexically (rc1 < rc2), which is good enough for this scheme.
+		lpre, cpre := preRelease(latest), preRelease(cur)
+		if cpre != "" && lpre == "" {
+			return true
+		}
+		if lpre != "" && cpre != "" {
+			return lpre > cpre
+		}
+	}
 	return false
+}
+
+// preRelease returns the suffix after the first '-' (e.g. "rc1" from
+// "v0.5.0-rc1"), or "" for a plain release version.
+func preRelease(v string) string {
+	if i := strings.IndexByte(v, '-'); i >= 0 {
+		return v[i+1:]
+	}
+	return ""
 }
 
 func semverParts(v string) [3]int {

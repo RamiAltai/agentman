@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -1181,5 +1182,65 @@ func TestProjectGraphMissingProject(t *testing.T) {
 	_, err := st.ProjectGraph("nonexistent")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("ProjectGraph missing slug: got %v, want ErrNotFound", err)
+	}
+}
+
+// TestInputLimits: oversized titles/bodies/comments and out-of-range priorities
+// are rejected with ErrValidation on both create and patch paths.
+func TestInputLimits(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("lim", "Limits"); err != nil {
+		t.Fatal(err)
+	}
+	longTitle := strings.Repeat("x", maxTitleLen+1)
+	longBody := strings.Repeat("x", maxBodyLen+1)
+
+	// Create rejections.
+	createCases := []struct {
+		name string
+		in   CreateTaskInput
+	}{
+		{"long title", CreateTaskInput{Project: "lim", Title: longTitle}},
+		{"long body", CreateTaskInput{Project: "lim", Title: "ok", Body: longBody}},
+		{"priority too high", CreateTaskInput{Project: "lim", Title: "ok", Priority: maxPriority + 1}},
+		{"priority negative", CreateTaskInput{Project: "lim", Title: "ok", Priority: -1}},
+	}
+	for _, c := range createCases {
+		if _, _, err := st.CreateTask(c.in); !errors.Is(err, ErrValidation) {
+			t.Errorf("CreateTask %s: err = %v, want ErrValidation", c.name, err)
+		}
+	}
+
+	// Boundary values are accepted.
+	task, _, err := st.CreateTask(CreateTaskInput{
+		Project: "lim", Title: strings.Repeat("t", maxTitleLen),
+		Body: strings.Repeat("b", maxBodyLen), Priority: maxPriority,
+	})
+	if err != nil {
+		t.Fatalf("CreateTask at limits: %v", err)
+	}
+
+	// Patch rejections. Priority arrives as float64 over JSON, so test that form.
+	patchCases := []struct {
+		name  string
+		patch map[string]any
+	}{
+		{"long title", map[string]any{"title": longTitle}},
+		{"long body", map[string]any{"body": longBody}},
+		{"priority too high", map[string]any{"priority": float64(maxPriority + 1)}},
+		{"priority negative", map[string]any{"priority": float64(-1)}},
+	}
+	for _, c := range patchCases {
+		if _, _, err := st.PatchTask(task.ID, c.patch, "alice"); !errors.Is(err, ErrValidation) {
+			t.Errorf("PatchTask %s: err = %v, want ErrValidation", c.name, err)
+		}
+	}
+
+	// Comment rejection + boundary accept.
+	if _, _, err := st.AddComment(task.ID, "alice", longBody); !errors.Is(err, ErrValidation) {
+		t.Errorf("AddComment long body: err = %v, want ErrValidation", err)
+	}
+	if _, _, err := st.AddComment(task.ID, "alice", strings.Repeat("c", maxBodyLen)); err != nil {
+		t.Errorf("AddComment at limit: %v", err)
 	}
 }

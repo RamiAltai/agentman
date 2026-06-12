@@ -300,6 +300,22 @@ func TestValidateImportCandidateRejectsGarbage(t *testing.T) {
 	}
 }
 
+// TestPruneEventsRejectsBadDate: malformed --before dates must error out
+// instead of silently string-comparing against ISO-8601 timestamps.
+func TestPruneEventsRejectsBadDate(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "bad_date.db")
+	st, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	for _, bad := range []string{"2026-13-99", "garbage", "2026-1-1", "2026/01/01"} {
+		if _, err := pruneEvents(dbPath, bad, 0); err == nil {
+			t.Errorf("pruneEvents(--before %q): expected error, got nil", bad)
+		}
+	}
+}
+
 // TestIsServerRunning: quick sanity (server is NOT running in tests).
 func TestIsServerRunning(t *testing.T) {
 	// There should be no server on a random high port

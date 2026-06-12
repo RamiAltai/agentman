@@ -481,7 +481,8 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		// JSON like every other error path — the dashboard's api() parses JSON.
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "streaming_unsupported"})
 		return
 	}
 	q := r.URL.Query()

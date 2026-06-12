@@ -11,6 +11,37 @@ fresh `[Unreleased]` section.
 
 ### Added
 
+- **Input size limits** — task titles are capped at 500 bytes; task bodies and comment bodies at
+  64 KiB; priority must be 0–3. Exceeding a limit returns `400 invalid` (CLI exit 5) instead of
+  silently inserting megabyte payloads that render into every board card and SSE event. Enforced
+  in the store (`CreateTask`, `PatchTask`, `AddComment`); boundary values accepted.
+  Test: `TestInputLimits`.
+
+### Fixed
+
+- **Dashboard `api()` no longer crashes on non-JSON responses** — a proxy error page or truncated
+  body now falls through to an `HTTP <status>` error message instead of throwing an uncaught
+  `SyntaxError` from `JSON.parse`. (`cmd/am/web/app.js`)
+- **SSE Flusher-unsupported error is now JSON** — `handleStream` returned plain text via
+  `http.Error` while every other error path returns JSON; now `{"error":"streaming_unsupported"}`.
+  (`cmd/am/server.go`)
+- **`am db prune --before` validates its date** — a malformed date (e.g. `2026-13-99`) previously
+  fed an ISO-8601 string comparison and silently pruned the wrong rows (usually none); it now
+  fails with a clear error, both before the confirmation prompt and inside `pruneEvents`.
+  Test: `TestPruneEventsRejectsBadDate`. (`cmd/am/db.go`)
+- **Event-payload marshal errors are no longer discarded** — `insertEvent` returns the
+  `json.Marshal` error instead of writing a corrupted/empty payload into the events table (the
+  durable replay cursor). (`cmd/am/store.go`)
+- **`am update` semver compare handles prereleases** — a stable tag now beats a prerelease of the
+  same triple (`v0.5.0` > `v0.5.0-rc1`); prereleases order lexically. Previously a prerelease
+  build never saw the stable release as an update. (`cmd/am/update.go`)
+- **SSE reconnect backoff is jittered** — multiple open dashboard tabs no longer reconnect in
+  lockstep. (`cmd/am/web/app.js`)
+
+## [0.5.0] - 2026-06-07
+
+### Added
+
 - **Dependency-graph overlay** — a per-project interactive visualization of the task dependency DAG.
   - **Entry:** the **"Graph"** button in the dashboard header + the **`g`** keyboard shortcut (not
     while typing). Opens a full-screen overlay (`#graphOverlay`) reusing the modal focus-trap and
