@@ -489,6 +489,12 @@ func cmdLabel(c *Client, argv []string) {
 		return
 	}
 	for _, tok := range argv[1:] {
+		if strings.HasPrefix(tok, "--") {
+			fail(5, usage)
+		}
+		if tok == "-p" || tok == "-c" {
+			fail(5, tok+" is a global flag, not a label removal; "+usage)
+		}
 		remove := strings.HasPrefix(tok, "-")
 		l := strings.TrimPrefix(strings.TrimPrefix(tok, "-"), "+")
 		if l == "" {

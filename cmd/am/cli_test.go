@@ -622,7 +622,7 @@ func TestCmdLabelAddRemove(t *testing.T) {
 
 	var code int
 	out := captureStdout(t, func() {
-		code = captureExit(t, func() { cmdLabel(c, []string{"12", "+a", "-b", "c"}) })
+		code = captureExit(t, func() { cmdLabel(c, []string{"12", "+a", "-bug", "c"}) })
 	})
 	if code != -1 {
 		t.Fatalf("cmdLabel exited %d, want normal return", code)
@@ -632,7 +632,7 @@ func TestCmdLabelAddRemove(t *testing.T) {
 	}
 	want := []call{
 		{http.MethodPost, "/api/tasks/12/labels", `{"label":"a"}`},
-		{http.MethodDelete, "/api/tasks/12/labels/b", ""},
+		{http.MethodDelete, "/api/tasks/12/labels/bug", ""},
 		{http.MethodPost, "/api/tasks/12/labels", `{"label":"c"}`},
 	}
 	if len(calls) != len(want) {
@@ -676,5 +676,19 @@ func TestCmdLabelUsage(t *testing.T) {
 	code = captureExit(t, func() { cmdLabel(c, []string{"12", "-"}) })
 	if code != 5 {
 		t.Fatalf("empty -token exit = %d, want 5", code)
+	}
+
+	// Double-dash tokens are flags, never labels → exit 5.
+	code = captureExit(t, func() { cmdLabel(c, []string{"12", "--json"}) })
+	if code != 5 {
+		t.Fatalf("--json exit = %d, want 5", code)
+	}
+
+	// Known global value flags are rejected by name with a message.
+	msg := captureStderr(t, func() {
+		code = captureExit(t, func() { cmdLabel(c, []string{"12", "-p", "web"}) })
+	})
+	if code != 5 || !strings.Contains(msg, "-p is a global flag") {
+		t.Fatalf("-p exit = %d, stderr = %q, want 5 with global flag message", code, msg)
 	}
 }
