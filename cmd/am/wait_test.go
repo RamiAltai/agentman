@@ -210,6 +210,7 @@ func TestParseWaitTimeout(t *testing.T) {
 		{"-5m", 0, true},
 		{"0", 0, true},
 		{"-3", 0, true},
+		{"9223372036854775807", 0, true}, // bare-integer seconds that overflow a Duration
 	}
 	for _, c := range cases {
 		got, err := parseWaitTimeout(c.in)

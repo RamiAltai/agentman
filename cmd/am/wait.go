@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -111,6 +112,9 @@ func parseWaitTimeout(s string) (time.Duration, error) {
 	if n, err := strconv.Atoi(s); err == nil {
 		if n <= 0 {
 			return 0, fmt.Errorf("non-positive timeout %q", s)
+		}
+		if int64(n) > math.MaxInt64/int64(time.Second) {
+			return 0, fmt.Errorf("timeout %q overflows", s)
 		}
 		return time.Duration(n) * time.Second, nil
 	}

@@ -80,7 +80,11 @@ always get different tasks; there is no list-then-claim race. Exit 3 means nothi
 either stop, or block with `am wait --ready` until something becomes ready. Waiting on a
 prerequisite someone else owns? `am wait <id> --done` blocks until that task is done
 (`--timeout 5m` to bound it; exit 7 = timed out, condition not met). `am next` skips tasks
-already assigned to you — claim those explicitly with `am claim <id>`.
+already assigned to you — claim those explicitly with `am claim <id>`. Note the ready filter
+(`am ls --ready`, `am wait --ready`) is wider than `am next`: it includes todo tasks that are
+pre-assigned to someone, which `am next` never picks — so a `wait --ready && next` loop can
+wake on a pre-assigned task and get exit 3 from `next`. Treat exit 3 there as "loop again",
+not an error.
 
 **Dependencies:** if a task has unfinished prerequisites, claiming it fails with exit 4 and a
 message like `claim: #5 blocked — prereqs not done (#2 #3)`. `am next` only returns tasks with
