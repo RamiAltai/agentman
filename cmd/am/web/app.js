@@ -4,9 +4,26 @@ const COLS = [["todo", "Todo"], ["doing", "In Progress"], ["blocked", "Blocked"]
 const STALE_MS = 30 * 60 * 1000; // a doing+assigned card with no activity this long gets a stale badge
 const STALE_FILTER = "30m";      // ?stale= duration sent when the Stale board-filter is on (matches STALE_MS)
 const ST = { todo: "var(--st-todo)", doing: "var(--st-doing)", blocked: "var(--st-blocked)", done: "var(--st-done)" };
+const ST_LABEL = { todo: "Todo", doing: "Doing", blocked: "Blocked", done: "Done" };
 const PRIO = ["#f4756b", "#f8b738", "#8b93a4", "#6e7681"]; // 0 urgent .. 3 low
 const PRIO_LABEL = ["Urgent", "High", "", ""];
+// Always-present rank token for EVERY priority level (text, not color-only). The
+// rank ("P0".."P3") plus the word make priority readable for all four levels;
+// Normal/Low used to render nothing.
+const PRIO_RANK = ["P0", "P1", "P2", "P3"];
+const PRIO_WORD = ["Urgent", "High", "Normal", "Low"];
 const PRIO_OPTS = ["0 — Urgent", "1 — High", "2 — Normal", "3 — Low"];
+// Per-kind feed glyphs (decorative; .ev-text states the event in words). These
+// carry the non-color-only meaning the design asks for.
+const EV_GLYPH = { claimed: "▸", status: "⇄", done: "✓", blocked: "⏸", comment: "💬", other: "•" };
+
+// Reduced-motion guard for JS-driven animation (the one-shot card flash). CSS
+// already disables transitions/animations under reduce; this prevents even
+// scheduling the class toggle so we never churn for nothing.
+function prefersReducedMotion() {
+  try { return window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches; }
+  catch (e) { return false; }
+}
 
 const FEED_W_KEY = "am.feedW", FEED_COLLAPSED_KEY = "am.feedCollapsed";
 const THEME_KEY = "am.theme";
@@ -58,6 +75,58 @@ function el(tag, props, ...kids) {
     n.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
   }
   return n;
+}
+
+// ---------- loading skeletons + toasts (additive, el()-only) ----------
+
+// boardSkeleton renders placeholder columns/cards into #board before the first
+// real data arrives. renderBoard() replaces it via replaceChildren().
+function boardSkeleton() {
+  const board = $("board");
+  if (!board || board.childElementCount) return; // don't clobber real content
+  board.replaceChildren();
+  for (const [key] of COLS) {
+    const col = el("div", { class: "col skeleton", "aria-hidden": "true" });
+    col.append(el("div", { class: "colhead" }, el("span", { class: "swatch", style: "background:" + ST[key] }), ""));
+    const cards = el("div", { class: "cards" });
+    for (let i = 0; i < 3; i++) {
+      cards.append(el("div", { class: "skel-card" },
+        el("div", { class: "skel-line short" }),
+        el("div", { class: "skel-line title" }),
+        el("div", { class: "skel-line" })));
+    }
+    col.append(cards);
+    board.append(col);
+  }
+}
+
+// feedSkeleton renders placeholder rows into #feedList before the first feed load.
+function feedSkeleton() {
+  const list = $("feedList");
+  if (!list || list.childElementCount) return;
+  list.replaceChildren();
+  for (let i = 0; i < 6; i++) {
+    list.append(el("li", { class: "skel-feed skeleton", "aria-hidden": "true" },
+      el("span", { class: "skel-line", style: "width:10px;height:10px;border-radius:50%" }),
+      el("span", { class: "skel-line" }),
+      el("span", { class: "skel-line short", style: "width:32px" })));
+  }
+}
+
+// showToast surfaces a transient, non-blocking message in a bottom-center
+// aria-live region (a supplement to alert(), not a replacement). Built via el().
+let toastRegion = null;
+function showToast(msg, kind) {
+  if (!toastRegion) {
+    toastRegion = el("div", { class: "toast-region", role: "status", "aria-live": "polite" });
+    document.body.append(toastRegion);
+  }
+  const close = () => { if (toast.parentNode) toast.remove(); };
+  const toast = el("div", { class: "toast" + (kind === "ok" ? " toast-ok" : "") },
+    el("span", { class: "toast-msg" }, String(msg)),
+    el("button", { class: "toast-x", "aria-label": "Dismiss", onclick: close }, "✕"));
+  toastRegion.append(toast);
+  setTimeout(close, 6000);
 }
 
 async function api(method, path, body) {
@@ -231,6 +300,26 @@ function renderBoard() {
     col.append(cards);
     board.append(col);
   }
+  applyFlash();
+}
+
+// applyFlash gives any card touched by a recent live event a single, short
+// "updated" highlight so live moves are noticed without motion spam. Reduced
+// motion suppresses it. The flashIds set is populated in onEvent and consumed
+// here on the next render; the class auto-clears so re-renders don't re-trigger.
+let flashIds = new Set();
+function applyFlash() {
+  if (!flashIds.size) return;
+  if (prefersReducedMotion()) { flashIds.clear(); return; }
+  for (const id of flashIds) {
+    const node = document.querySelector('.card[data-id="' + id + '"]');
+    if (!node) continue;
+    node.classList.remove("is-updated");
+    void node.offsetWidth; // restart the animation if it was mid-flight
+    node.classList.add("is-updated");
+    node.addEventListener("animationend", () => node.classList.remove("is-updated"), { once: true });
+  }
+  flashIds.clear();
 }
 
 function boardEmpty() {
@@ -266,31 +355,47 @@ function card(t) {
       document.querySelectorAll(".col.drag-over").forEach((x) => x.classList.remove("drag-over"));
     },
   });
-  const crow = el("div", { class: "crow" }, el("span", { class: "cid" }, "#" + t.id));
-  if (PRIO_LABEL[t.priority]) crow.append(el("span", { class: "chip-prio" }, PRIO_LABEL[t.priority]));
+  // ROW 1 (head): #id · priority rank (all levels) · status pill.
+  const pr = PRIO_RANK[t.priority] != null ? t.priority : 3;
+  const crow = el("div", { class: "crow" },
+    el("span", { class: "cid" }, "#" + t.id),
+    el("span", { class: "chip-prio p" + pr, title: "Priority: " + PRIO_WORD[pr] }, PRIO_RANK[pr]),
+    el("span", { class: "status-pill st-" + t.status }, ST_LABEL[t.status] || t.status));
   c.append(crow);
+
+  // ROW 2 (title).
   c.append(el("div", { class: "ctitle" }, t.title));
 
+  // ROW 3a (meta primary): assignee · project.
   const foot = el("div", { class: "cfoot" });
   const who = el("span", { class: "who" + (t.assignee ? "" : " unassigned") });
   if (t.assignee) who.append(el("span", { class: "avatar" }, initials(t.assignee)), el("span", { class: "name" }, t.assignee));
   else who.append("Unassigned");
   foot.append(who);
   if (selected.size !== 1) foot.append(el("span", { class: "ptag" }, t.project));
+  c.append(foot);
+
+  // ROW 3b (reserved trouble sub-row): blocked / ready / stale, BEFORE labels so
+  // critical signals never sink beneath decorative chips. Collapses when empty.
+  const trouble = el("div", { class: "ctrouble" });
+  if (t.nopen > 0) trouble.append(el("span", { class: "tag-blocked", title: t.nopen + " open prerequisite(s)" }, "🔒 Blocked " + t.nopen));
+  else if (t.nprereq > 0) trouble.append(el("span", { class: "tag-ready" }, "✓ Ready"));
+  if (t.status === "doing" && t.assignee && Date.now() - Date.parse(t.updated_at) > STALE_MS)
+    trouble.append(el("span", { class: "tag-stale", title: "no activity for 30+ min" }, "⏳ Stale"));
+  c.append(trouble);
+
+  // ROW 3c (tags): label chips · comment count.
+  const tags = el("div", { class: "ctags" });
   const labels = t.labels || [];
   for (const l of labels.slice(0, 3)) {
-    foot.append(el("span", {
+    tags.append(el("span", {
       class: "tag-label", role: "button", tabindex: "0", title: "Filter by " + l,
       onclick: (e) => { e.stopPropagation(); setLabelFilter(l); },
     }, l));
   }
-  if (labels.length > 3) foot.append(el("span", { class: "tag-label" }, "+" + (labels.length - 3)));
-  if (t.nc > 0) foot.append(el("span", { class: "cc" }, "💬 " + t.nc));
-  if (t.nopen > 0) foot.append(el("span", { class: "tag-blocked" }, "🔒 " + t.nopen));
-  else if (t.nprereq > 0) foot.append(el("span", { class: "tag-ready" }, "✓ Ready"));
-  if (t.status === "doing" && t.assignee && Date.now() - Date.parse(t.updated_at) > STALE_MS)
-    foot.append(el("span", { class: "tag-stale", title: "no activity for 30+ min" }, "⏳ stale"));
-  c.append(foot);
+  if (labels.length > 3) tags.append(el("span", { class: "tag-label" }, "+" + (labels.length - 3)));
+  if (t.nc > 0) tags.append(el("span", { class: "cc" }, "💬 " + t.nc));
+  c.append(tags);
   return c;
 }
 
@@ -1303,12 +1408,20 @@ function openEditProject(p) {
 
 function connect() {
   if (es) es.close();
+  setStatus("connecting…", "");
   es = new EventSource("/api/stream" + qstr({ since: cursor }));
   es.onopen = () => { backoff = 1000; setStatus("live", "ok"); };
   es.onmessage = (m) => { let ev; try { ev = JSON.parse(m.data); } catch (e) { return; } onEvent(ev); };
   es.onerror = () => {
     es.close();
-    setStatus("reconnecting…", "warn");
+    // Surface degraded liveness clearly: once backoff has climbed (repeated
+    // failures) or the browser reports offline, show a loud "offline" state in
+    // the reserved error channel; otherwise the transient "reconnecting…" warn.
+    if (backoff >= 8000 || (typeof navigator !== "undefined" && navigator.onLine === false)) {
+      setStatus("offline — retrying…", "err");
+    } else {
+      setStatus("reconnecting…", "warn");
+    }
     // Jitter so multiple open tabs don't reconnect in lockstep.
     setTimeout(connect, backoff + Math.random() * 250);
     backoff = Math.min(backoff * 2, 10000);
@@ -1375,14 +1488,22 @@ function onEvent(ev) {
     const depId = (ev.data || {}).depends_on;
     if (openTaskId === ev.task_id || openTaskId === depId) refreshModal();
   }
+  // Mark the touched task so the next board render flashes it once (board views
+  // only — the overview has no cards). Status moves and edits are the signals
+  // worth surfacing; deletes are handled above.
+  if (view !== "overview" && ev.task_id && /^task\./.test(ev.kind) && ev.kind !== "task.deleted") flashIds.add(ev.task_id);
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => loadBoard().catch(() => {}), 250); // debounced reconcile
   if (openTaskId && ev.task_id === openTaskId && ev.kind !== "task.deleted" && ev.kind !== "comment.deleted" && ev.kind !== "task.dep_added" && ev.kind !== "task.dep_removed") refreshModal();
 }
 
 function feedItem(ev) {
-  return el("li", { class: "ev k-" + evKind(ev) },
-    el("span", { class: "ev-dot" }),
+  const kind = evKind(ev);
+  // The glyph carries the non-color event-kind cue; it is decorative to screen
+  // readers since .ev-text already states the event in words. The k-<kind> class
+  // (kept) still colors the glyph and would color a legacy .ev-dot.
+  return el("li", { class: "ev k-" + kind },
+    el("span", { class: "ev-icon", "aria-hidden": "true" }, EV_GLYPH[kind] || EV_GLYPH.other),
     evText(ev),
     el("span", { class: "ev-time", title: fullTime(ev.created_at) }, fmtTime(ev.created_at)));
 }
@@ -1622,6 +1743,9 @@ function onKey(e) {
 
 $("newBtn").onclick = openNew;
 $("searchBox").oninput = (e) => {
+  // Reflect "is there an active text filter" immediately so the box reads as
+  // part of the filter family (shared accent), even before the debounce fires.
+  e.target.classList.toggle("has-query", !!e.target.value.trim());
   clearTimeout(searchTimer);
   searchTimer = setTimeout(() => {
     filterQ = e.target.value.trim();
@@ -1637,6 +1761,10 @@ initTheme();
 window.addEventListener("hashchange", () => { route().catch(() => {}); });
 
 (async function init() {
+  // Show loading skeletons immediately so the first paint isn't a blank board /
+  // feed; the real renders replace them via replaceChildren() on data arrival.
+  if (!document.body.classList.contains("view-overview")) boardSkeleton();
+  feedSkeleton();
   // Load projects first (the overview's "All" card and the board tabs both need
   // them), then let route() apply the view named by the URL hash. route() handles
   // its own data loads (overview vs board) and opens the stream.

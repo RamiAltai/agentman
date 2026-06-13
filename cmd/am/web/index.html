@@ -28,23 +28,34 @@
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <nav id="tabs" class="tabs" aria-label="Projects"></nav>
     <div class="actions">
-      <input id="searchBox" type="search" class="search-input" placeholder="Search… ( / )" aria-label="Search tasks">
-      <span id="labelFilterChip" class="label-filter hidden"></span>
-      <div class="filter-wrap">
-        <button id="filterBtn" class="iconbtn" aria-haspopup="true" aria-expanded="false" title="Filter tasks" aria-label="Filter tasks">Filter</button>
-        <div id="filterPanel" class="filter-panel hidden" role="dialog" aria-label="Board filters"></div>
+      <!-- Find segment: search + label chip + Filter popover -->
+      <div class="actions-seg" role="group" aria-label="Find">
+        <input id="searchBox" type="search" class="search-input" placeholder="Search… ( / )" aria-label="Search tasks">
+        <span id="labelFilterChip" class="label-filter hidden"></span>
+        <div class="filter-wrap">
+          <button id="filterBtn" class="iconbtn" aria-haspopup="true" aria-expanded="false" title="Filter tasks" aria-label="Filter tasks">Filter</button>
+          <div id="filterPanel" class="filter-panel hidden" role="dialog" aria-label="Board filters"></div>
+        </div>
       </div>
-      <button id="themeToggle" class="iconbtn ghost" title="Toggle light/dark theme" aria-label="Toggle color theme">
-        <span class="theme-toggle-icon" aria-hidden="true"></span>
-      </button>
-      <button id="graphBtn" class="iconbtn" title="Dependency graph (g)" aria-label="Open dependency graph">Graph</button>
-      <button id="newBtn" class="btn-primary" title="New task (n)">+ Task</button>
-      <span id="status" class="status" role="status" aria-live="polite">
-        <span class="pulse" aria-hidden="true"></span><span class="status-text">connecting…</span>
-      </span>
-      <button id="feedToggle" class="iconbtn" aria-controls="feed" aria-expanded="true" title="Toggle activity (a)">
-        <span class="feed-toggle-label">Activity</span>
-      </button>
+      <span class="actions-sep" aria-hidden="true"></span>
+      <!-- View segment: theme + graph -->
+      <div class="actions-seg" role="group" aria-label="View">
+        <button id="themeToggle" class="iconbtn ghost" title="Toggle light/dark theme" aria-label="Toggle color theme">
+          <span class="theme-toggle-icon" aria-hidden="true"></span>
+        </button>
+        <button id="graphBtn" class="iconbtn" title="Dependency graph (g)" aria-label="Open dependency graph">Graph</button>
+      </div>
+      <span class="actions-sep" aria-hidden="true"></span>
+      <!-- Act / status segment: new task + live status + activity toggle -->
+      <div class="actions-seg" role="group" aria-label="Actions">
+        <button id="newBtn" class="btn-primary" title="New task (n)">+ Task</button>
+        <span id="status" class="status" role="status" aria-live="polite">
+          <span class="pulse" aria-hidden="true"></span><span class="status-text">connecting…</span>
+        </span>
+        <button id="feedToggle" class="iconbtn" aria-controls="feed" aria-expanded="true" title="Toggle activity (a)">
+          <span class="feed-toggle-label">Activity</span>
+        </button>
+      </div>
     </div>
   </header>
 
