@@ -1115,6 +1115,88 @@ without evidence.
   `cmd/am/web/app.js` (`THEME_KEY`, `applyTheme`/`currentTheme`/`toggleTheme`/`initTheme`, the
   `matchMedia` follow-only-while-unset listener); `cmd/am/web_test.go` (`TestDashboardThemeAssets`).
 
+### ADR-031: Dashboard CLI↔GUI parity — filter as a popover (not a row), columns are the status axis, category lifecycle in the Manage modal, and the explicit reversal of "create is category-unaware" + "Meta is read-only"
+- Status: Active
+- Context: Seven dashboard operations still required dropping to the `am` CLI: creating a category,
+  choosing a category at project-create time, archiving/unarchiving a category, editing a project
+  (rename + vault binding), filtering the board, editing task meta, and releasing a task. The HTTP
+  API and store already supported every one of them (`POST /api/categories`,
+  `POST /api/categories/{slug}/archive|unarchive`, `category` in the create body,
+  `PATCH /api/projects/{slug}`, the `?ready/blocked/stale/assignee/meta_key` task filters, `meta` in
+  `PATCH /api/tasks/{id}`), so closing the gaps is purely a frontend job
+  (`cmd/am/web/{index.html,app.js,app.css}`): no Go, API, schema, event-kind, error-code, exit-code,
+  or CLI surface is touched, and no new keyboard shortcut is added.
+- Decision (the four notable UX choices):
+  1. **Board filters are a button + popover, not a persistent filter row.** A single **Filter**
+     button (`#filterBtn`) toggles a popover panel (`#filterPanel`) of Ready / Blocked / Stale
+     toggles + Assignee + Meta-key inputs, with a count chip + highlighted state while any filter is
+     active and a "Clear all" reset. This keeps the header compact and matches the existing
+     label-filter-chip idiom rather than spending permanent vertical space on a row of controls that
+     are usually unused. The filters fold into `loadBoard()`'s query string (state in
+     `filterReady/Blocked/Stale/Mine/MetaKey`, deliberately *not* in the shared `qstr()` used by the
+     feed/SSE), so they compose with the project/category scope, search, and label filter and survive
+     SSE-driven reloads with **no `onEvent`/`renderBoard` change**. The panel closes on outside click
+     and on Escape (returning focus to the button) but stays open while toggling so several filters
+     can be set in a row.
+  2. **Status is NOT a filter — the four board columns already are the status axis.** The server
+     supports a `?status=` lens, but exposing it in the filter set would be redundant with (and
+     could contradict) the Todo / In Progress / Blocked / Done columns the board already draws. The
+     "Mine" fill-button sets Assignee to `human` because the dashboard always sends `X-Agent: human`,
+     so "my" tasks are the human actor's.
+  3. **Category lifecycle lives in the Manage modal, not as per-card buttons on the overview.** The
+     `⋯` button is relabeled **Manage** (`openManageProjects` → `openManage`, back-compat alias kept)
+     and its modal gains a **Categories** section (`renderManageCategories`) above **Projects**, each
+     row carrying an Archive/Unarchive toggle (incl. archived via `?archived=true`). Co-locating all
+     project/category lifecycle in one place keeps the overview a clean grid of cards. For the same
+     reason the new-category creation flow is the overview's dashed **＋ New category** add-card
+     (`openNewCategory`) and there is **no inline new-category option inside the new-project picker**
+     — that would nest one creation flow inside another. There is no category-**delete** control
+     because there is no category-delete API.
+  4. **Explicit reversal of two prior "by design" decisions.** This change closes documented parity
+     gaps, so it deliberately undoes two earlier choices:
+     - **ADR-025 / Phase O kept the project-create form category-unaware** (an empty category mapped
+       to `general` server-side). The New-project modal now has a **required Category `<select>`**
+       (default = current view's category, else `general`); the create POST carries the chosen
+       category. The server-side empty→`general` mapping stays as a compatibility fallback for the
+       no-category case (and the "category list unfetchable" fallback option).
+     - **ADR-026 / Phase P kept the dashboard's Meta section read-only** ("the dashboard can display
+       but not edit meta (CLI/API-only writes for now)"). The Meta section is now **editable**: ✕ to
+       remove a pair (PATCH with an empty value deletes it), an add-row to create one. Meta editing
+       uses the raw `api()` call rather than the shared `patch()` helper, because `patch()`'s
+       success path refreshes the modal and would wipe the inline error / in-progress add inputs; the
+       SSE `task.patched` echo re-renders the section from server truth on its own.
+  - Other affordances ride proven idioms with no new decision: **project edit** (`openEditProject`)
+    is a safe **uid-keyed slug rename** + vault binding via `PATCH /api/projects/{slug}` with only
+    the changed fields (slug is NOT auto-derived here — it's an existing value the user may
+    deliberately edit); **one-click Release** (`btn-release`, shown only when there's something to
+    release) is `{assignee:"", status:"todo"}` in one PATCH — the `am drop` equivalent.
+- New error / kinds / schema: **none.** No new event kind (catalog stays **21**), no schema change
+  (`currentSchemaVersion` stays **5**), no new error or exit code, no API/CLI change. New client-side
+  module state only: `filterReady`/`filterBlocked`/`filterStale`/`filterMine`/`filterMetaKey` plus
+  per-input debounce timers (`filterMineTimer`/`filterMetaTimer`, separate from `searchTimer` so the
+  boxes don't cancel each other) and `filterOutsideClickWired`.
+- Rationale: every operation already existed on the API, so the smallest correct change is to wire
+  the existing endpoints into the existing UI idioms (popover like the label chip, Manage modal like
+  the project list, modal sections built via `el()`/`textContent`). The popover and the
+  status-axis-is-columns choices keep the header lean and avoid a redundant/contradictory control.
+  Reversing the two "by design" decisions is the whole point of a parity pass — those decisions were
+  scoped to their phases ("for now"), and the API was always ready.
+- Consequences / residuals (accepted): **`project.patched` is not in the `onEvent` `loadProjects()`
+  trigger set**, so a *remote* dashboard does not live-refresh another client's project rename in its
+  tab strip until its next reload — a pre-existing liveness pattern (the editing client refreshes via
+  the `openManage()` reload), not a regression. The behavioral JS (the modals, the filter popover,
+  meta editing, release) is verified by source reading + manual curl-driven check, not automated
+  tests — the documented no-JS-runner gap (ADR-018); `TestDashboardParityAffordances` locks the
+  affordances' presence at the Go build level, not their behavior. `TestDashboardNoXSSSinks` still
+  passes (all new DOM is `el()`/`textContent`, no `innerHTML`-family sink).
+- Evidence: `cmd/am/web/index.html` (`#filterBtn`/`#filterPanel` in `.actions`); `cmd/am/web/app.js`
+  (`openNewCategory`/`newCatCard`, the `category` create-body field, `openManage`/
+  `renderManageCategories`, `openEditProject`/`btn-edit-proj`, `renderFilterPanel`/`applyFilters`/
+  `clearFilters`/`toggleFilterPanel` + the `filter*` state, `patchMeta`/`meta-add-row`, the
+  `btn-release` handler); `cmd/am/web/app.css` (`.filter-panel`, `.cat-card-add`, `.cat-manage-list`/
+  `.cat-row`, `.btn-edit-proj`, `.meta-section`/`.meta-add-row`, `.btn-release`);
+  `cmd/am/web_test.go` (`TestDashboardParityAffordances`).
+
 ## Inferred Decisions
 
 ### IADR-001: SSE chosen over WebSockets

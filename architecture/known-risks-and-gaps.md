@@ -74,6 +74,14 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   the category-home overview, `onEvent` debounces a `loadOverview()` (250 ms) on task/project/
   category events; the debounced callback **re-checks `view === "overview"` at fire time** so it
   never writes to the now-hidden `#overview`. Harmless either way. → `frontend.md`.
+- **`project.patched` is not in the `onEvent` `loadProjects()` trigger set** (Low, deferred
+  follow-up; ADR-031). The new GUI project-edit (rename + vault binding) reloads the project strip on
+  the *editing* client (via the `openManage()` reload), but `onEvent` does not call `loadProjects()`
+  on a `project.patched` event, so a *remote* dashboard does not live-refresh another client's
+  project rename in its tab strip until its next reload / view change. This follows the existing
+  liveness pattern (the trigger set is `project.created`/`project.unarchived`/`project.archived` +
+  `category.created`/`category.archived`/`category.unarchived`) — adding `project.patched` would
+  close it. Pre-existing pattern, not a regression. → ADR-031, `frontend.md`.
 - **Identity collisions in one directory** (Low). Two agents in the same working dir share the
   per-dir identity unless one sets `AGENTMAN_AGENT`. → ADR-008.
 - **Update bootstrap** (Low). A machine must do one manual `go install …@latest` to get a binary
@@ -202,7 +210,7 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 ## Testing Gaps
 
-- Coverage now spans store/server/migrate/db/cli/sse/hub/identity/wait/web tests (11 files, 256
+- Coverage now spans store/server/migrate/db/cli/sse/hub/identity/wait/web tests (11 files, 258
   tests, `-race`-clean): the **atomic claim** (race, `-race`-clean), events cursor, store CRUD/validation,
   validation→status mapping, the Host/CSRF/CSP guards, project archive/unarchive (store round-trip
   + idempotency and the HTTP endpoints incl. 404), the v2 migration (adds `archived_at` +
@@ -317,20 +325,25 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   `TestCmdTokenNewRequiresScope`, `TestWhoamiPrintsTokenSet`, `TestClientSendsBearerNotScope`,
   `TestExitCodeForUnauthorized`, `TestDoOrFailUnauthorized`), and export/import round-trip
   (`TestExportImportWithTokens`).
-  **Still untested:** behavioral dashboard JS — the "Manage projects" modal, the delete confirm
+  **Still untested:** behavioral dashboard JS — the **Manage** modal (category + project lists), the
+  delete confirm
   flows (task/comment/project), the feed pagination button, the dependency section UI (prereq chips,
   add-prereq dropdown, blocks list), the **graph overlay** (layout, pan/zoom, transitive highlight,
   detail panel, live refresh), the search box and label chips/Labels section (Phase M), the
-  read-only modal Meta section (Phase P), the **category overview + hash routing** (overview cards,
+  editable modal Meta section (Phase P / ADR-031), the **CLI↔GUI parity affordances** (create/archive
+  category, new-project category picker, project edit, board-filter popover, meta editing, release —
+  ADR-031), the **category overview + hash routing** (overview cards,
   drill-down, breadcrumb/back, per-view stream re-open, debounced count refresh — Phase R), the
   **dark/light theme toggle** (toggle click, system-follow while unset, `am.theme` persistence —
   ADR-030), and other client-side logic — because the project deliberately
   adopts **no JS test runner** (preserves the no-npm/single-binary ethos; ADR-018). The `web_test.go`
-  source guards mitigate regressions at the source level: `TestDashboardNoXSSSinks` for XSS sinks and
+  source guards mitigate regressions at the source level: `TestDashboardNoXSSSinks` for XSS sinks,
   `TestDashboardThemeAssets` for the theme-asset wiring (the override block, the FOUC script, the
-  toggle button); the dependency UI and the graph overlay are additional un-runner-tested JS covered
-  by the same guard pattern.
-  → `backend.md`, `frontend.md`, `decision-records.md` ADR-018, ADR-021.
+  toggle button), and `TestDashboardParityAffordances` for the parity-affordance markers
+  (create/archive-category, category picker, project edit, filter popover, editable meta, release);
+  the dependency UI and the graph overlay are additional un-runner-tested JS covered by the same
+  guard pattern.
+  → `backend.md`, `frontend.md`, `decision-records.md` ADR-018, ADR-021, ADR-031.
 
 ## Documentation Gaps
 

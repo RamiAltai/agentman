@@ -117,7 +117,10 @@ Evidence:
   (`cmd/am/identity.go`).
 - **Embedded dashboard** (no build step, no npm): kanban board, drag-and-drop status changes,
   collapsible/resizable activity panel, keyboard shortcuts, a light/dark theme toggle (system-default,
-  then persisted), responsive. Evidence: `cmd/am/web/`.
+  then persisted), responsive. **CLI↔GUI parity** (ADR-031): the dashboard can also create/archive
+  categories, pick a category when creating a project, edit a project (rename + vault binding), filter
+  the board (ready/blocked/stale/assignee/meta via a header popover), edit task meta inline, and
+  release a task — all previously CLI-only. Evidence: `cmd/am/web/`.
 - **Multi-select project filter** on the dashboard: pick any number of project tabs to scope the
   board/feed at once ("All" clears the selection). Evidence: `cmd/am/web/app.js` `toggleProject`.
 - **DB export/import**: `am db export` writes a consistent snapshot (`VACUUM INTO`), and
@@ -127,14 +130,15 @@ Evidence:
   default views across all surfaces — tab bar (`ListProjects`), board (`ListTasks`), and activity
   feed (`ListEvents`/`RecentEvents`). Writing into an archived project is blocked: `CreateTask`
   returns `ErrProjectArchived` → HTTP 400 `{"error":"project_archived"}`. Archive/unarchive is
-  accessible from the CLI (`am project archive`/`unarchive`) and from a "Manage projects" modal in
-  the dashboard tab bar (`openManageProjects`). Evidence: `cmd/am/store.go`, `cmd/am/cli.go`,
+  accessible from the CLI (`am project archive`/`unarchive`) and from the "Manage" modal in
+  the dashboard tab bar (`openManage`); that modal also archives/unarchives **categories**.
+  Evidence: `cmd/am/store.go`, `cmd/am/cli.go`,
   `cmd/am/server.go`, `cmd/am/web/app.js`.
 - **Hard delete (tasks, comments, projects)**: permanent removal via `DELETE /api/tasks/{id}`,
   `DELETE /api/tasks/{id}/comments/{cid}`, and `DELETE /api/projects/{slug}` (cascade via FK:
   project → tasks → comments). CLI: `am rm <id>` (silent, exit 3 if not found);
   `am project rm <slug> --yes` (requires `--yes`; cascade). The dashboard exposes inline two-step
-  delete confirms in the task modal, per-comment, and the Manage-projects modal. Events are never
+  delete confirms in the task modal, per-comment, and the Manage modal. Events are never
   deleted — the audit log (including the `*.deleted` events) survives. Evidence: `cmd/am/store.go`
   (`DeleteTask`/`DeleteComment`/`DeleteProject`), `cmd/am/server.go`, `cmd/am/cli.go`,
   `cmd/am/web/app.js`.
