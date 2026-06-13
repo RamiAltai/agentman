@@ -205,10 +205,19 @@ identity scope.
   shows on the board views. A category board scopes its tabs (`projectsInView`), board, feed, and
   stream by `?category=` via `viewParams()`; the stream is re-opened on every view change, and the
   overview's counts refresh debounced on `task.*`/`project.*`/`category.*` events.
-  Includes a `⋯` "Manage projects" button in the tab bar that opens a modal (`openManageProjects`/
-  `renderManageList`) listing all projects (active + archived via `GET /api/projects?archived=true`),
-  with Archive/Unarchive buttons and a **Delete project** button (inline two-step confirm, calls
-  `DELETE /api/projects/{slug}`). The task modal has a **Delete task** button (inline two-step);
+  Includes a `⋯` "Manage" button in the tab bar that opens a modal (`openManage`, alias
+  `openManageProjects`) with a **Categories** section (`renderManageCategories` — every category incl.
+  archived via `GET /api/categories?archived=true`, with Archive/Unarchive toggles) and a
+  **Projects** section (`renderManageList` — all projects active + archived via
+  `GET /api/projects?archived=true`), each project row carrying an **Edit** button
+  (`openEditProject` — rename + vault binding via `PATCH /api/projects/{slug}`), Archive/Unarchive
+  buttons, and a **Delete project** button (inline two-step confirm, calls
+  `DELETE /api/projects/{slug}`). The **＋** new-project modal has a required category `<select>` and
+  POSTs `category` in the body; the overview's dashed **＋ New category** add-card POSTs
+  `/api/categories`. A header **Filter** popover (`#filterBtn`/`#filterPanel`) folds
+  ready/blocked/stale/assignee/meta_key filters into `loadBoard()`'s query string.
+  The task modal has a **Delete task** button (inline two-step) and a **Release** button (one PATCH of
+  `{assignee:"", status:"todo"}`, shown when the task is claimed or not in todo);
   each comment has a **× delete** button (inline two-step; `DELETE /api/tasks/{id}/comments/{cid}`).
   All confirms use the `el()` helper, no native `confirm()`/`prompt()`. `onEvent` handles
   `task.deleted` (remove card + close modal), `comment.deleted` (refresh modal),
@@ -225,9 +234,10 @@ identity scope.
   `category.archived`/`category.unarchived` so the archive cascade shows live.
   The task modal has a **Dependencies** section: "Depends on" chips with a ✕ remove button, an
   "Add prerequisite…" dropdown of same-project tasks, and a read-only "Blocks" list. A hard-block
-  409 surfaces the blocking prereq ids and reverts the UI. A read-only **Meta** section after
-  Labels lists the task's key=value pairs (sorted; set via CLI/API only), and `task.patched`
-  feed lines append `(meta: k1, k2)` when the event delta contains meta.
+  409 surfaces the blocking prereq ids and reverts the UI. An editable **Meta** section after
+  Labels lists the task's key=value pairs (sorted) with a ✕ to remove each and an add-row to create
+  one (`patchMeta` → `PATCH /api/tasks/{id}` `{meta:{…}}`, empty value deletes; ADR-031), and
+  `task.patched` feed lines append `(meta: k1, k2)` when the event delta contains meta.
   A **"Graph"** button in the header (and the `g` keyboard shortcut) opens a full-screen
   **dependency-graph overlay**: a layered SVG DAG of all tasks in a project, with pan/zoom,
   transitive-path highlighting on click, a right detail panel, a legend, and live refresh from SSE

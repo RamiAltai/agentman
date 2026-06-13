@@ -2,6 +2,7 @@
 
 const COLS = [["todo", "Todo"], ["doing", "In Progress"], ["blocked", "Blocked"], ["done", "Done"]];
 const STALE_MS = 30 * 60 * 1000; // a doing+assigned card with no activity this long gets a stale badge
+const STALE_FILTER = "30m";      // ?stale= duration sent when the Stale board-filter is on (matches STALE_MS)
 const ST = { todo: "var(--st-todo)", doing: "var(--st-doing)", blocked: "var(--st-blocked)", done: "var(--st-done)" };
 const PRIO = ["#f4756b", "#f8b738", "#8b93a4", "#6e7681"]; // 0 urgent .. 3 low
 const PRIO_LABEL = ["Urgent", "High", "", ""];
@@ -21,6 +22,11 @@ let cursor = 0;              // highest event id seen (SSE since=)
 let es = null, backoff = 1000, refreshTimer = null, openTaskId = null, lastFocus = null, dragId = null;
 let filterQ = "";            // search-box text filter (server-side ?q=)
 let filterLabel = "";        // active label filter (server-side ?label=)
+let filterReady = false;     // board filter: ready tasks only (server-side ?ready=true)
+let filterBlocked = false;   // board filter: blocked tasks only (server-side ?blocked=true)
+let filterStale = false;     // board filter: stale claims only (server-side ?stale=)
+let filterMine = "";         // board filter: assignee (server-side ?assignee=)
+let filterMetaKey = "";      // board filter: tasks carrying a meta key (server-side ?meta_key=)
 let searchTimer = null;      // search-box input debounce
 let feedOldest = 0;          // lowest event id currently in #feedList (0 = none loaded)
 let feedPaginated = false;   // true once the user has clicked "Load older"; trimFeed is then skipped
@@ -122,6 +128,11 @@ async function loadBoard() {
   const extra = { limit: 500 };
   if (filterQ) extra.q = filterQ;
   if (filterLabel) extra.label = filterLabel;
+  if (filterReady) extra.ready = "true";
+  if (filterBlocked) extra.blocked = "true";
+  if (filterStale) extra.stale = STALE_FILTER;
+  if (filterMine) extra.assignee = filterMine;
+  if (filterMetaKey) extra.meta_key = filterMetaKey;
   const list = await api("GET", "/api/tasks" + qstr(extra));
   tasks = new Map(list.map((t) => [t.id, t]));
   renderBoard();
@@ -160,7 +171,7 @@ function renderTabs() {
   nav.replaceChildren(tab("", "All", allOpen));
   for (const p of inView) nav.append(tab(p.slug, p.name, openCount(p.counts)));
   nav.append(el("button", { class: "tab add", onclick: openNewProject, title: "New project", "aria-label": "New project" }, "＋"));
-  nav.append(el("button", { class: "tab add", onclick: openManageProjects, title: "Manage projects", "aria-label": "Manage projects" }, "⋯"));
+  nav.append(el("button", { class: "tab add", onclick: openManage, title: "Manage", "aria-label": "Manage categories and projects" }, "⋯"));
 }
 
 function openCount(c) { c = c || {}; return (c.todo || 0) + (c.doing || 0) + (c.blocked || 0); }
@@ -402,7 +413,20 @@ function renderOverview() {
   // An "All" card opens the cross-category board.
   grid.append(allCard());
   for (const c of categories) grid.append(catCard(c));
+  grid.append(newCatCard());
   root.append(grid);
+}
+
+// newCatCard is the dashed add-card in the overview grid that opens the
+// create-category modal.
+function newCatCard() {
+  const card = el("div", {
+    class: "cat-card cat-card-add", role: "button", tabindex: "0",
+    onclick: openNewCategory,
+    onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openNewCategory(); } },
+  });
+  card.append(el("div", { class: "cat-name" }, "＋ New category"));
+  return card;
 }
 
 function allCard() {
@@ -467,6 +491,128 @@ function clearLabelFilter() {
   loadBoard().catch(() => {});
 }
 
+// ---------- board filters ----------
+//
+// The Filter button opens a popover panel of server-side board filters (Ready /
+// Blocked / Stale toggles + Assignee + Meta key). They compose with the existing
+// project/category scope, search, and label filter because loadBoard() folds them
+// all into the ?-query — so they survive SSE-driven reloads automatically.
+
+let filterMineTimer = null; // debounce for the assignee box (NOT searchTimer)
+let filterMetaTimer = null; // debounce for the meta-key box (separate so the boxes don't cancel each other)
+let filterOutsideClickWired = false;
+
+function activeFilterCount() {
+  let n = 0;
+  if (filterReady) n++;
+  if (filterBlocked) n++;
+  if (filterStale) n++;
+  if (filterMine) n++;
+  if (filterMetaKey) n++;
+  return n;
+}
+
+function filterCheck(labelText, checked, onToggle) {
+  const box = el("input", { type: "checkbox", onchange: (e) => onToggle(e.target.checked) });
+  if (checked) box.checked = true;
+  return el("label", { class: "filter-check" }, box, el("span", {}, labelText));
+}
+
+function renderFilterPanel() {
+  const panel = $("filterPanel");
+  panel.replaceChildren();
+
+  const flags = el("div", { class: "filter-section" },
+    filterCheck("Ready", filterReady, (v) => { filterReady = v; applyFilters(); }),
+    filterCheck("Blocked", filterBlocked, (v) => { filterBlocked = v; applyFilters(); }),
+    filterCheck("Stale", filterStale, (v) => { filterStale = v; applyFilters(); }));
+  panel.append(flags);
+
+  const mineBox = el("input", { class: "field", value: filterMine, placeholder: "assignee", "aria-label": "Filter by assignee" });
+  mineBox.oninput = () => {
+    clearTimeout(filterMineTimer);
+    filterMineTimer = setTimeout(() => { filterMine = mineBox.value.trim(); applyFilters(); }, 250);
+  };
+  const mineBtn = el("button", { class: "iconbtn filter-mine-btn", title: "Show tasks assigned to me", onclick: () => { filterMine = "human"; mineBox.value = "human"; applyFilters(); } }, "Mine");
+  const metaBox = el("input", { class: "field", value: filterMetaKey, placeholder: "meta key", "aria-label": "Filter by meta key" });
+  metaBox.oninput = () => {
+    clearTimeout(filterMetaTimer);
+    filterMetaTimer = setTimeout(() => { filterMetaKey = metaBox.value.trim(); applyFilters(); }, 250);
+  };
+  panel.append(el("div", { class: "filter-section" },
+    el("label", { class: "lbl" }, el("span", {}, "Assignee"), el("div", { class: "filter-mine-row" }, mineBox, mineBtn)),
+    el("label", { class: "lbl" }, el("span", {}, "Meta key"), metaBox)));
+
+  panel.append(el("div", { class: "filter-foot" },
+    el("button", { class: "iconbtn ghost filter-clear", onclick: clearFilters }, "Clear all")));
+}
+
+// applyFilters persists the panel's current state to the board without closing the
+// panel (so several toggles can be flipped in a row). renderFilterBadge keeps the
+// button's count chip in sync.
+function applyFilters() {
+  renderFilterBadge();
+  loadBoard().catch(() => {});
+}
+
+function clearFilters() {
+  filterReady = false;
+  filterBlocked = false;
+  filterStale = false;
+  filterMine = "";
+  filterMetaKey = "";
+  renderFilterPanel();
+  renderFilterBadge();
+  loadBoard().catch(() => {});
+}
+
+function renderFilterBadge() {
+  const btn = $("filterBtn");
+  if (!btn) return;
+  const n = activeFilterCount();
+  let chip = btn.querySelector(".filter-count");
+  if (n > 0) {
+    if (!chip) { chip = el("span", { class: "filter-count" }); btn.append(chip); }
+    chip.textContent = String(n);
+    btn.classList.add("has-filters");
+    btn.setAttribute("aria-pressed", "true");
+  } else {
+    if (chip) chip.remove();
+    btn.classList.remove("has-filters");
+    btn.setAttribute("aria-pressed", "false");
+  }
+}
+
+function toggleFilterPanel() {
+  const panel = $("filterPanel");
+  const btn = $("filterBtn");
+  const willOpen = panel.classList.contains("hidden");
+  panel.classList.toggle("hidden", !willOpen);
+  btn.setAttribute("aria-expanded", String(willOpen));
+  if (willOpen) {
+    renderFilterPanel();
+    const first = panel.querySelector("input, button");
+    if (first) first.focus();
+  }
+  // Register the outside-click closer once, lazily (on first open).
+  if (willOpen && !filterOutsideClickWired) {
+    filterOutsideClickWired = true;
+    document.addEventListener("click", (e) => {
+      const p = $("filterPanel");
+      if (p.classList.contains("hidden")) return;
+      if (e.target.closest(".filter-wrap")) return; // click inside the wrap (button or panel)
+      closeFilterPanel();
+    });
+  }
+}
+
+function closeFilterPanel() {
+  const panel = $("filterPanel");
+  if (panel.classList.contains("hidden")) return;
+  panel.classList.add("hidden");
+  $("filterBtn").setAttribute("aria-expanded", "false");
+}
+
 function slugify(s) {
   return s.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
 }
@@ -520,6 +666,13 @@ function patch(id, body) {
   // the status <select> / fields revert to the real state instead of the rejected value.
   return api("PATCH", "/api/tasks/" + id, body).catch((e) => { alert(e.message); refreshModal(); });
 }
+
+// patchMeta sets (or, with value==="", deletes) one meta pair. It uses the raw
+// api() rather than patch(): patch()'s alert+refreshModal on success would wipe the
+// inline error and the in-progress add inputs. The SSE task.patched echo triggers
+// refreshModal anyway, so the section re-renders from server truth on its own.
+function patchMeta(id, key, value) { return api("PATCH", "/api/tasks/" + id, { meta: { [key]: value } }); }
+function metaErrMsg(e) { return e.message === "validation" ? "meta key must be 1-50 chars of a-z 0-9 . _ - and value ≤500 chars" : e.message; }
 
 function label(text, node) { return el("label", { class: "lbl" }, el("span", {}, text), node); }
 
@@ -680,17 +833,51 @@ function renderModal(t) {
   labelsDiv.append(labelBox);
   s.append(labelsDiv, labelErr);
 
-  // ---- Meta section (read-only; pairs are set via the CLI/API) ----
+  // ---- Meta section (editable key=value pairs; mirrors the Labels section) ----
+  s.append(el("h3", {}, "Meta"));
+  const metaWrap = el("div", { class: "meta-section" });
+  const metaErr = el("div", { class: "ferr" });
   const tMeta = t.meta || {};
-  const metaKeys = Object.keys(tMeta).sort();
-  if (metaKeys.length) {
-    s.append(el("h3", {}, "Meta"));
-    for (const k of metaKeys) {
-      s.append(el("div", { class: "meta-row" },
-        el("span", { class: "meta-key" }, k),
-        el("span", { class: "meta-val" }, tMeta[k])));
-    }
+  for (const k of Object.keys(tMeta).sort()) {
+    const row = el("div", { class: "meta-row" },
+      el("span", { class: "meta-key" }, k),
+      el("span", { class: "meta-val" }, tMeta[k]));
+    const rm = el("button", { class: "dep-rm", "aria-label": "Remove meta " + k, title: "Remove" }, "✕");
+    rm.onclick = async () => {
+      rm.disabled = true;
+      metaErr.textContent = "";
+      try {
+        await patchMeta(t.id, k, ""); // empty value deletes the pair
+      } catch (e) {
+        rm.disabled = false;
+        metaErr.textContent = metaErrMsg(e);
+      }
+    };
+    row.append(rm);
+    metaWrap.append(row);
   }
+  const keyBox = el("input", { class: "field meta-key-add", placeholder: "key", "aria-label": "Meta key" });
+  const valBox = el("input", { class: "field meta-val-add", placeholder: "value", "aria-label": "Meta value" });
+  const addMeta = async () => {
+    const k = keyBox.value.trim();
+    const v = valBox.value.trim();
+    if (!k || !v) return;
+    metaErr.textContent = "";
+    try {
+      await patchMeta(t.id, k, v);
+      keyBox.value = "";
+      valBox.value = "";
+      keyBox.focus();
+    } catch (e) {
+      metaErr.textContent = metaErrMsg(e);
+    }
+  };
+  const onMetaKey = (e) => { if (e.key === "Enter") { e.preventDefault(); addMeta(); } };
+  keyBox.onkeydown = onMetaKey;
+  valBox.onkeydown = onMetaKey;
+  metaWrap.append(el("div", { class: "meta-add-row" }, keyBox, valBox,
+    el("button", { class: "btn-primary meta-add-btn", onclick: addMeta }, "Add")));
+  s.append(metaWrap, metaErr);
 
   s.append(el("h3", {}, "Comments" + (t.comments && t.comments.length ? " (" + t.comments.length + ")" : "")));
   const cl = el("div", { class: "comments" });
@@ -773,7 +960,20 @@ function renderModal(t) {
       if (sibling && sibling.classList && sibling.classList.contains("btn-cancel-del")) sibling.remove();
     }
   };
-  s.append(el("div", { class: "del-task-row" }, delBtn));
+  // One-click Release: hand the task back to the unclaimed pool (clear assignee,
+  // reset to todo). Only shown when there's something to release.
+  const relBtn = el("button", { class: "btn-release" }, "Release");
+  relBtn.onclick = async () => {
+    relBtn.disabled = true;
+    try {
+      await api("PATCH", "/api/tasks/" + t.id, { assignee: "", status: "todo" });
+    } catch (e) {
+      relBtn.disabled = false;
+      alert(e.message);
+    }
+  };
+  const showRelease = !!t.assignee || t.status !== "todo";
+  s.append(el("div", { class: "del-task-row" }, showRelease ? relBtn : null, delBtn));
 }
 
 function openNew() {
@@ -810,12 +1010,15 @@ function openNew() {
   title.focus();
 }
 
-function openNewProject() {
+// openNewCategory mirrors openNewProject (name + auto-derived slug), but POSTs to
+// /api/categories. Categories live above the project layer, so there is no scope
+// picker here.
+function openNewCategory() {
   const s = $("sheet");
   s.replaceChildren();
   s.append(el("button", { class: "x", onclick: closeModal, "aria-label": "Close" }, "✕"));
-  s.append(el("div", { class: "mhead" }, "New project"));
-  const name = el("input", { class: "mtitle field", placeholder: "Project name (e.g. Web App)", "aria-label": "Project name" });
+  s.append(el("div", { class: "mhead" }, "New category"));
+  const name = el("input", { class: "mtitle field", placeholder: "Category name (e.g. Platform)", "aria-label": "Category name" });
   const slug = el("input", { class: "field", placeholder: "slug (auto)", "aria-label": "Slug" });
   const err = el("div", { class: "ferr" });
   let slugEdited = false;
@@ -826,7 +1029,58 @@ function openNewProject() {
       const sv = slugify(slug.value || name.value);
       if (!sv) { err.textContent = "enter a name"; name.focus(); return; }
       try {
-        const p = await api("POST", "/api/projects", { slug: sv, name: name.value.trim() || sv });
+        await api("POST", "/api/categories", { slug: sv, name: name.value.trim() || sv });
+        await loadOverview();
+        closeModal();
+      } catch (e) {
+        err.textContent = e.message === "conflict" ? "a category with slug “" + sv + "” already exists" : e.message;
+      }
+    }
+  }, "Create category");
+  s.append(name, el("div", { class: "mrow" }, label("Slug", slug)), err, save);
+  openModal();
+  name.focus();
+}
+
+async function openNewProject() {
+  // The category picker needs the category list; on the board views (where the
+  // overview hasn't loaded) fetch it lazily so the <select> can be populated.
+  if (!categories.length) {
+    try { categories = await api("GET", "/api/categories"); } catch (e) { /* fall back to a single "general" option below */ }
+  }
+  const s = $("sheet");
+  s.replaceChildren();
+  s.append(el("button", { class: "x", onclick: closeModal, "aria-label": "Close" }, "✕"));
+  s.append(el("div", { class: "mhead" }, "New project"));
+  const name = el("input", { class: "mtitle field", placeholder: "Project name (e.g. Web App)", "aria-label": "Project name" });
+  const slug = el("input", { class: "field", placeholder: "slug (auto)", "aria-label": "Slug" });
+
+  // Default the picker to the current view's category, else "general" (falling back
+  // to the first known category when "general" is absent).
+  const slugs = categories.map((c) => c.slug);
+  let defaultCat = (view === "category" && activeCategory) ? activeCategory : "general";
+  if (!slugs.includes(defaultCat)) defaultCat = slugs[0] || "general";
+  const csel = el("select", { "aria-label": "Category" });
+  if (!categories.length) {
+    csel.append(el("option", { value: "general" }, "general"));
+  } else {
+    for (const c of categories) {
+      const o = el("option", { value: c.slug }, c.name || c.slug);
+      if (c.slug === defaultCat) o.setAttribute("selected", "selected");
+      csel.append(o);
+    }
+  }
+
+  const err = el("div", { class: "ferr" });
+  let slugEdited = false;
+  slug.oninput = () => { slugEdited = true; };
+  name.oninput = () => { if (!slugEdited) slug.value = slugify(name.value); };
+  const save = el("button", {
+    class: "save", onclick: async () => {
+      const sv = slugify(slug.value || name.value);
+      if (!sv) { err.textContent = "enter a name"; name.focus(); return; }
+      try {
+        const p = await api("POST", "/api/projects", { slug: sv, name: name.value.trim() || sv, category: csel.value });
         await loadProjects();
         closeModal();
         toggleProject(p.slug);
@@ -835,28 +1089,84 @@ function openNewProject() {
       }
     }
   }, "Create project");
-  s.append(name, el("div", { class: "mrow" }, label("Slug", slug)), err, save);
+  s.append(name, el("div", { class: "mrow" }, label("Slug", slug), label("Category", csel)), err, save);
   openModal();
   name.focus();
 }
 
-// ---------- manage projects modal ----------
+// ---------- manage categories + projects modal ----------
 
-async function openManageProjects() {
+async function openManage() {
   const s = $("sheet");
   s.replaceChildren();
   s.append(el("button", { class: "x", onclick: closeModal, "aria-label": "Close" }, "✕"));
-  s.append(el("div", { class: "mhead" }, "Manage projects"));
+  s.append(el("div", { class: "mhead" }, "Manage"));
   const err = el("div", { class: "ferr" });
   s.append(err);
 
+  s.append(el("h3", {}, "Categories"));
+  const catList = el("ul", { class: "cat-manage-list", "aria-label": "Categories" });
+  s.append(catList);
+
+  s.append(el("h3", {}, "Projects"));
   const list = el("ul", { class: "proj-list", "aria-label": "Projects" });
   s.append(list);
 
   openModal();
   s.focus();
 
+  await renderManageCategories(catList, err);
   await renderManageList(list, err);
+}
+
+// Back-compat alias in case anything still references the old name.
+const openManageProjects = openManage;
+
+// renderManageCategories models renderManageList: it lists every category (incl.
+// archived) with an Archive/Unarchive toggle. There is no category-delete API, so
+// no delete control is offered here.
+async function renderManageCategories(list, err) {
+  list.replaceChildren();
+  let cats;
+  try {
+    cats = await api("GET", "/api/categories?archived=true");
+  } catch (e) {
+    err.textContent = e.message;
+    return;
+  }
+  if (!cats.length) {
+    list.append(el("li", { class: "feed-empty" }, "No categories yet"));
+    return;
+  }
+  for (const c of cats) {
+    const isArchived = !!c.archived_at;
+    const row = el("li", { class: "cat-row" + (isArchived ? " archived" : "") });
+
+    const nameSpan = el("span", { class: "cat-row-name" }, c.name || c.slug);
+    const slugSpan = el("span", { class: "cat-row-slug" }, c.slug);
+    const countSpan = el("span", { class: "cat-row-count" }, openCount(c.counts) + " open");
+
+    const archBtn = el("button", {
+      class: "btn-archive" + (isArchived ? " unarchive" : ""),
+      onclick: async () => {
+        archBtn.disabled = true;
+        try {
+          await api("POST", "/api/categories/" + encodeURIComponent(c.slug) + (isArchived ? "/unarchive" : "/archive"));
+          await loadProjects();
+          if (view === "overview") await loadOverview();
+          await renderManageCategories(list, err);
+        } catch (e) {
+          err.textContent = e.message;
+          archBtn.disabled = false;
+        }
+      },
+    }, isArchived ? "Unarchive" : "Archive");
+
+    if (isArchived) row.append(nameSpan, slugSpan, el("span", { class: "badge-archived" }, "Archived"), countSpan, archBtn);
+    else row.append(nameSpan, slugSpan, countSpan, archBtn);
+
+    list.append(row);
+  }
 }
 
 async function renderManageList(list, err) {
@@ -881,6 +1191,8 @@ async function renderManageList(list, err) {
     const nameSpan = el("span", { class: "proj-row-name" }, p.name);
     const slugSpan = el("span", { class: "proj-row-slug" }, p.slug);
     const countSpan = el("span", { class: "proj-row-count" }, openTasks + " open");
+
+    const editBtn = el("button", { class: "btn-archive btn-edit-proj", onclick: () => openEditProject(p) }, "Edit");
 
     const archBtn = el("button", {
       class: "btn-archive" + (isArchived ? " unarchive" : ""),
@@ -936,11 +1248,55 @@ async function renderManageList(list, err) {
       }
     };
 
-    if (isArchived) row.append(nameSpan, slugSpan, el("span", { class: "badge-archived" }, "Archived"), countSpan, archBtn, rmBtn);
-    else row.append(nameSpan, slugSpan, countSpan, archBtn, rmBtn);
+    if (isArchived) row.append(nameSpan, slugSpan, el("span", { class: "badge-archived" }, "Archived"), countSpan, editBtn, archBtn, rmBtn);
+    else row.append(nameSpan, slugSpan, countSpan, editBtn, archBtn, rmBtn);
 
     list.append(row);
   }
+}
+
+// openEditProject edits a project's name, slug (a safe uid-keyed rename), and the
+// optional vault fields. Slug is NOT auto-derived here (it's an existing value the
+// user may deliberately rename). On a slug change we follow the selection so the
+// renamed project stays selected after the tab bar reloads.
+function openEditProject(p) {
+  const s = $("sheet");
+  s.replaceChildren();
+  s.append(el("button", { class: "x", onclick: closeModal, "aria-label": "Close" }, "✕"));
+  s.append(el("div", { class: "mhead" }, "Edit project · " + p.slug));
+  const name = el("input", { class: "mtitle field", value: p.name, placeholder: "Project name", "aria-label": "Project name" });
+  const slug = el("input", { class: "field", value: p.slug, "aria-label": "Slug" });
+  const vaultId = el("input", { class: "field", value: p.vault_project_id || "", placeholder: "vault project id (optional)", "aria-label": "Vault project id" });
+  const vaultPath = el("input", { class: "field", value: p.vault_path || "", placeholder: "vault path (optional)", "aria-label": "Vault path" });
+  const err = el("div", { class: "ferr" });
+  const save = el("button", {
+    class: "save", onclick: async () => {
+      if (!name.value.trim()) { err.textContent = "name cannot be empty"; name.focus(); return; }
+      const ns = slug.value.trim();
+      const body = {};
+      if (ns && ns !== p.slug) body.slug = ns;
+      if (name.value.trim() !== p.name) body.name = name.value.trim();
+      if (vaultId.value.trim() !== (p.vault_project_id || "")) body.vault_project_id = vaultId.value.trim();
+      if (vaultPath.value.trim() !== (p.vault_path || "")) body.vault_path = vaultPath.value.trim();
+      if (!Object.keys(body).length) { closeModal(); return; }
+      try {
+        await api("PATCH", "/api/projects/" + encodeURIComponent(p.slug), body);
+        if (body.slug && selected.has(p.slug)) { selected.delete(p.slug); selected.add(body.slug); }
+        await loadProjects();
+        openManage();
+      } catch (e) {
+        err.textContent = e.message === "conflict" ? "slug “" + ns + "” is taken"
+          : e.message === "validation" ? "check name/slug (no spaces or /)"
+          : e.message;
+      }
+    }
+  }, "Save");
+  s.append(
+    el("div", { class: "mrow" }, label("Slug", slug), label("Name", name)),
+    el("div", { class: "mrow" }, label("Vault project id", vaultId), label("Vault path", vaultPath)),
+    err, save);
+  openModal();
+  name.focus();
 }
 
 // ---------- live stream ----------
@@ -1246,7 +1602,11 @@ function initTheme() {
 // ---------- keyboard ----------
 
 function onKey(e) {
-  if (e.key === "Escape") { if (!$("modal").classList.contains("hidden")) closeModal(); return; }
+  if (e.key === "Escape") {
+    if (!$("filterPanel").classList.contains("hidden")) { closeFilterPanel(); $("filterBtn").focus(); return; }
+    if (!$("modal").classList.contains("hidden")) closeModal();
+    return;
+  }
   trapFocus(e);
   const tag = (e.target.tagName || "").toLowerCase();
   const typing = tag === "input" || tag === "textarea" || tag === "select" || e.target.isContentEditable;
@@ -1269,6 +1629,7 @@ $("searchBox").oninput = (e) => {
   }, 250);
 };
 $("modal").onclick = (e) => { if (e.target.id === "modal") closeModal(); };
+$("filterBtn").onclick = (e) => { e.stopPropagation(); toggleFilterPanel(); };
 document.addEventListener("keydown", onKey);
 initFeed();
 initTheme();

@@ -11,6 +11,74 @@ fresh `[Unreleased]` section.
 
 ### Added
 
+- **Dashboard CLI↔GUI parity** — the embedded dashboard can now do seven things that previously
+  required dropping to the `am` CLI. **Frontend-only** (`cmd/am/web/{index.html,app.js,app.css}`):
+  the HTTP API and store already supported every operation, so there is **no Go API, schema,
+  event-kind, error-code, exit-code, or CLI change** (the catalog stays **21 event kinds**,
+  `currentSchemaVersion` stays **5**, exit codes stay `0/3/4/5/6/7/8/9`).
+  - **Create a category** — the category-home overview grows a dashed **＋ New category** add-card
+    after the existing cards (`newCatCard`, Enter/Space activatable). It opens a "New category" modal
+    (name + auto-derived slug, same `slugify` behavior as New project) that POSTs `/api/categories`
+    `{slug,name}`, reloads the overview, and closes (`openNewCategory`). A slug conflict surfaces as
+    *a category with slug "<slug>" already exists*. There is no category **delete** control (no
+    category-delete API).
+  - **Pick a category when creating a project** — the **New project** modal gains a required
+    **Category** `<select>`, populated from `GET /api/categories` (fetched lazily on the board views
+    where the overview hasn't loaded it). It defaults to the current view's category on a category
+    board, else `general` (falling back to the first known category if `general` is absent), and the
+    create POST now carries `category: <selected slug>`. **This reverses the Phase O decision that
+    the create form was deliberately category-unaware** — previously a GUI-created project silently
+    defaulted to `general`. If the category list can't be fetched the select falls back to a single
+    `general` option so creation still works.
+  - **Archive / unarchive a category** — the tab-bar `⋯` button is relabeled **Manage** (handler
+    `openManageProjects` → `openManage`, with a back-compat `openManageProjects` alias). The Manage
+    modal gains a **Categories** section above **Projects** (`renderManageCategories`) listing every
+    category (incl. archived via `GET /api/categories?archived=true`) with name, slug, open-task
+    count, an **Archived** pill, and an Archive/Unarchive toggle that POSTs
+    `/api/categories/<slug>/{archive,unarchive}`, then refreshes the projects, the overview (when
+    visible), and the list in place.
+  - **Edit a project** — each project row in the Manage modal gains an **Edit** button
+    (`btn-edit-proj`) opening an "Edit project · <slug>" sub-modal (`openEditProject`) with Name,
+    Slug (an explicit, safe **uid-keyed rename** — NOT auto-derived), Vault project id, and Vault
+    path. Save PATCHes `/api/projects/<slug>` with only the changed fields (a no-op edit just closes);
+    on a slug change the selection follows the new slug. Errors surface as *slug "<slug>" is taken*
+    (conflict) or *check name/slug (no spaces or /)* (validation).
+  - **Board filters** — a single **Filter** button (`#filterBtn`) in the header opens a **popover
+    panel** (`#filterPanel`) of server-side board filters: **Ready** / **Blocked** / **Stale**
+    checkboxes (`?ready=true`, `?blocked=true`, `?stale=30m` — the `30m` matches the existing
+    `STALE_MS` stale-badge threshold), an **Assignee** text input (`?assignee=`) with a **Mine**
+    fill-button (sets it to `human`, the actor the dashboard sends), and a **Meta key** input
+    (`?meta_key=`), plus **Clear all**. They fold into `loadBoard()`'s query string, so they compose
+    with the existing project/category scope, search box, and label filter and survive SSE-driven
+    live reloads with no `onEvent`/`renderBoard` change. The button shows a count chip and a
+    highlighted state while any filter is active; the panel closes on outside click and on Escape
+    (returning focus to the button). **Status is intentionally not a filter** — the four board
+    columns are the status axis.
+  - **Edit task meta** — the task modal's **Meta** section is now editable (previously read-only):
+    each existing pair gets a ✕ remove button, and an add-row (`meta-add-row`) of **key** + **value**
+    inputs + an **Add** button creates a pair (Enter in either input also adds). Adding PATCHes
+    `/api/tasks/<id>` `{meta:{<key>:<value>}}`; removing sends an empty value (`{meta:{<key>:""}}`)
+    which deletes the pair. **This reverses the Phase P decision that the dashboard could display but
+    not edit meta.** A validation error now names both the key and the value cases: *meta key must be
+    1-50 chars of a-z 0-9 . _ - and value ≤500 chars*. Meta editing uses the raw `api()` call (not the
+    shared `patch()` helper) so an inline error / in-progress input isn't wiped on success — the SSE
+    `task.patched` echo re-renders the section from server truth.
+  - **One-click Release** — the task modal's delete row gains a **Release** button (`btn-release`,
+    shown only when the task has an assignee or isn't in `todo`) that PATCHes `/api/tasks/<id>`
+    `{assignee:"", status:"todo"}` in one call — the `am drop` equivalent, returning the task to the
+    unclaimed pool. Delete is pushed to the right edge of the row.
+  - `app.js` 2023 → 2384 lines, `app.css` 729 → 782 lines, `index.html` 87 → 91 lines.
+  - Tests (+1, now 258): `cmd/am/web_test.go` — `TestDashboardParityAffordances` reads the embedded
+    `app.js`/`index.html`/`app.css` and asserts every parity affordance's marker is present
+    (`openNewCategory`, `newCatCard`, `category: csel.value`, `renderManageCategories`,
+    `/api/categories?archived=true`, `openEditProject`, `btn-edit-proj`, `vault_project_id`,
+    `#filterBtn`/`#filterPanel`, `filterReady`/`filterBlocked`/`filterStale`/`filterMetaKey`,
+    `renderFilterPanel`, `patchMeta`, `meta-add-row`, `btn-release`, and the `.filter-panel`/
+    `.meta-add-row`/`.btn-release`/`.cat-card-add`/`.cat-row` CSS classes) — the source-level
+    no-JS-runner pattern of `TestDashboardNoXSSSinks`/`TestDashboardThemeAssets`.
+  - → ADR-031, `frontend.md`, `docs/reference.md`, `README.md`, `project-overview.md`,
+    `system-map.md`, `engineering-conventions.md`, `contribution-guide.md`, `known-risks-and-gaps.md`.
+
 - **Dashboard dark/light theme toggle** — the embedded dashboard, previously dark-only, now ships a
   light theme alongside the dark default and a header control to switch between them. Frontend-only
   (`cmd/am/web/`): no Go API, schema, event-kind, error-code, or CLI change.

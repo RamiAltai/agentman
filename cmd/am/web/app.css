@@ -193,6 +193,29 @@ header {
 .iconbtn.ghost:hover { background: var(--card-bg); }
 .theme-toggle-icon { font-size: 14px; line-height: 1; }
 
+/* ---------- board filters (popover) ---------- */
+.filter-wrap { position: relative; display: inline-flex; }
+.iconbtn.has-filters { color: var(--accent); border-color: var(--accent); background: var(--accent-weak); }
+.filter-count {
+  background: var(--accent); color: var(--on-accent); border-radius: 999px;
+  font-size: 11px; font-weight: 700; line-height: 1; padding: 2px 6px; min-width: 16px; text-align: center;
+}
+.filter-panel {
+  position: absolute; top: calc(100% + 8px); right: 0; z-index: 70;
+  width: 260px; background: var(--surface); border: 1px solid var(--line-strong);
+  border-radius: 10px; box-shadow: var(--shadow); padding: 14px;
+  display: flex; flex-direction: column; gap: 14px;
+}
+.filter-panel.hidden { display: none; }
+.filter-section { display: flex; flex-direction: column; gap: 9px; }
+.filter-check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--fg); cursor: pointer; }
+.filter-check input { width: auto; min-width: 0; margin: 0; }
+.filter-mine-row { display: flex; gap: 6px; align-items: stretch; }
+.filter-mine-row .field { flex: 1; min-width: 0; }
+.filter-mine-btn { flex: none; padding: 7px 11px; }
+.filter-foot { display: flex; justify-content: flex-end; border-top: 1px solid var(--line); padding-top: 12px; }
+.filter-clear { color: var(--muted); }
+
 .status { font-size: 12px; color: var(--faint); display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
 .status .pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
 .status.ok { color: var(--ok); }
@@ -285,6 +308,9 @@ body.view-overview #tabs { display: none; }
 .cat-card:hover { background: var(--card-hover); border-color: var(--line-strong); }
 .cat-card:active { transform: translateY(1px); }
 .cat-card-all { border-style: dashed; }
+.cat-card-add { border-style: dashed; align-items: center; justify-content: center; color: var(--muted); min-height: 96px; }
+.cat-card-add:hover { color: var(--accent); border-color: var(--accent); }
+.cat-card-add .cat-name { color: inherit; }
 .cat-name { font-size: 15px; font-weight: 600; color: var(--fg); }
 .cat-sub { font-size: 12px; color: var(--faint); }
 .count-chips { display: flex; gap: 10px; flex-wrap: wrap; }
@@ -443,6 +469,19 @@ select:hover, .field:hover { border-color: var(--line-strong); }
 .btn-archive:hover { color: var(--fg); border-color: var(--line-strong); }
 .btn-archive.unarchive { color: var(--accent); border-color: var(--accent); background: var(--accent-weak); }
 .btn-archive.unarchive:hover { filter: brightness(1.1); }
+.btn-edit-proj { color: var(--muted); }
+
+/* manage-categories list (mirrors .proj-list / .proj-row) */
+.cat-manage-list { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.cat-row {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--card-bg); border: 1px solid var(--line);
+  border-radius: 9px; padding: 10px 13px;
+}
+.cat-row.archived { opacity: .65; }
+.cat-row-name { font-weight: 600; font-size: 14px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cat-row-slug { color: var(--faint); font-size: 11px; font-family: ui-monospace, monospace; flex: none; }
+.cat-row-count { color: var(--muted); font-size: 12px; flex: none; }
 
 /* ===================== delete / danger controls ===================== */
 
@@ -469,6 +508,14 @@ select:hover, .field:hover { border-color: var(--line-strong); }
   border-radius: 8px; padding: 6px 11px; font-size: 12px;
 }
 .btn-cancel-del:hover { border-color: var(--line-strong); color: var(--fg); }
+
+/* Release button in the task modal (pushes Delete to the right edge of the row) */
+.btn-release {
+  margin-right: auto; background: transparent; border: 1px solid var(--line); color: var(--muted);
+  border-radius: 8px; padding: 6px 13px; font-size: 12px;
+  transition: color .12s, border-color .12s, background .12s;
+}
+.btn-release:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-weak); }
 
 /* Per-project delete button in the manage-projects list */
 .btn-danger-proj {
@@ -512,10 +559,16 @@ select:hover, .field:hover { border-color: var(--line-strong); }
 .tag-label-modal:hover { border-color: var(--tag-label-border); }
 .label-add { min-width: 110px; max-width: 150px; padding: 4px 8px; font-size: 12px; }
 
-/* meta rows in the task modal (read-only key=value pairs) */
+/* editable meta key=value pairs in the task modal (mirrors the Labels section) */
+.meta-section { display: flex; flex-direction: column; gap: 4px; }
 .meta-row { display: flex; gap: 8px; align-items: baseline; font-size: 12px; margin-bottom: 4px; }
 .meta-key { color: var(--muted); font-weight: 600; min-width: 90px; }
-.meta-val { color: var(--faint); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+.meta-val { color: var(--faint); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; flex: 1; }
+.meta-row .dep-rm { margin-left: auto; flex: none; }
+.meta-add-row { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+.meta-key-add { min-width: 0; flex: 1; max-width: 140px; padding: 5px 9px; font-size: 12px; }
+.meta-val-add { min-width: 0; flex: 1; padding: 5px 9px; font-size: 12px; }
+.meta-add-btn { flex: none; padding: 6px 12px; }
 
 /* ===================== dependency section (task modal) ===================== */
 .deps-section { margin: 10px 0 14px; }
