@@ -6,6 +6,12 @@ const STALE_FILTER = "30m";      // ?stale= duration sent when the Stale board-f
 const ST = { todo: "var(--st-todo)", doing: "var(--st-doing)", blocked: "var(--st-blocked)", done: "var(--st-done)" };
 const ST_LABEL = { todo: "Todo", doing: "Doing", blocked: "Blocked", done: "Done" };
 const PRIO = ["#f4756b", "#f8b738", "#8b93a4", "#6e7681"]; // 0 urgent .. 3 low
+// Themed priority colors (mirror the --prio-N CSS custom properties, which carry
+// AA-clearing light/dark values). Use these — not the raw PRIO[] hex — anywhere a
+// priority color is painted as text/border (e.g. the graph nodes, detail chip, and
+// legend), so the color adapts per theme. var() resolves in both inline style and
+// SVG presentation attributes (same as ST[]/var(--st-*)).
+const PRIO_VAR = ["var(--prio-0)", "var(--prio-1)", "var(--prio-2)", "var(--prio-3)"];
 const PRIO_LABEL = ["Urgent", "High", "", ""];
 // Always-present rank token for EVERY priority level (text, not color-only). The
 // rank ("P0".."P3") plus the word make priority readable for all four levels;
@@ -2118,7 +2124,7 @@ function renderGraph() {
     const pos = positions.get(n.id);
     if (!pos) continue;
 
-    const prioColor = PRIO[n.priority] || PRIO[3];
+    const prioColor = PRIO_VAR[n.priority] || PRIO_VAR[3];
     const statusColor = ST[n.status] || "var(--faint)";
     const isDone = n.status === "done";
     const isBlocked = n.nopen > 0;
@@ -2294,7 +2300,7 @@ function renderGraphDetail(node, edges, nodesById) {
   const d = $("graphDetail");
   d.replaceChildren();
 
-  const prioColor = PRIO[node.priority] || PRIO[3];
+  const prioColor = PRIO_VAR[node.priority] || PRIO_VAR[3];
   const statusColor = ST[node.status] || "var(--faint)";
 
   const head = el("div", { class: "gd-head" });
@@ -2303,7 +2309,11 @@ function renderGraphDetail(node, edges, nodesById) {
   d.append(head);
 
   const chips = el("div", { class: "gd-chips" });
-  chips.append(el("span", { class: "gd-chip", style: "background:" + statusColor + "22;color:" + statusColor }, node.status));
+  // statusColor is a var(--st-*) reference, so the old hex-alpha trick
+  // ("…22") produced an invalid value and the soft fill never painted. Mix
+  // the resolved color with transparent to get a real ~14% soft background.
+  chips.append(el("span", { class: "gd-chip",
+    style: "background:color-mix(in srgb, " + statusColor + " 14%, transparent);color:" + statusColor }, node.status));
   chips.append(el("span", { class: "gd-chip", style: "border-color:" + prioColor + ";color:" + prioColor },
     PRIO_LABEL[node.priority] || ("P" + node.priority)));
   if (node.assignee) chips.append(el("span", { class: "gd-chip gd-assignee" }, node.assignee));
@@ -2431,10 +2441,10 @@ function buildGraphLegend() {
   leg.replaceChildren();
 
   const items = [
-    { color: PRIO[0], label: "Urgent" },
-    { color: PRIO[1], label: "High" },
-    { color: PRIO[2], label: "Normal" },
-    { color: PRIO[3], label: "Low" },
+    { color: PRIO_VAR[0], label: "Urgent" },
+    { color: PRIO_VAR[1], label: "High" },
+    { color: PRIO_VAR[2], label: "Normal" },
+    { color: PRIO_VAR[3], label: "Low" },
     { color: "var(--st-done)", label: "Cleared edge", isLine: true },
     { color: "var(--warn)", label: "Blocking edge", isLine: true, dashed: true },
     { color: "var(--st-done)", label: "Done task", isDot: true },
