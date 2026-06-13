@@ -310,10 +310,14 @@ var schemaMigrations = []migration{
 	}},
 	// v5: tasks.created_by — who created the task, for the Phase Q proposals
 	// carve-out (a scoped agent may comment on its OWN proposal tickets).
-	// Backfill is best-effort from the durable event log: the first
-	// task.created event's actor is the creator. Tasks whose events were
-	// pruned (`am db prune`) stay NULL — they simply never match the
-	// own-proposal comment rule, which is the safe direction.
+	// Backfill is best-effort from the durable event log: the LATEST
+	// task.created event's actor is the creator — latest, not first, because
+	// tasks.id is a reusable rowid (no AUTOINCREMENT) and DeleteTask leaves a
+	// deleted task's events behind, so an id's oldest creation event may
+	// belong to a deleted predecessor; the newest one is always the current
+	// incarnation's. Tasks whose events were pruned (`am db prune`) stay
+	// NULL — they simply never match the own-proposal comment rule, which is
+	// the safe direction.
 	{version: 5, apply: func(tx *sql.Tx) error {
 		if _, err := tx.Exec("ALTER TABLE tasks ADD COLUMN created_by TEXT"); err != nil {
 			return err
@@ -321,7 +325,7 @@ var schemaMigrations = []migration{
 		_, err := tx.Exec(`UPDATE tasks SET created_by=(
 		       SELECT e.actor FROM events e
 		       WHERE e.task_id=tasks.id AND e.kind='task.created'
-		       ORDER BY e.id LIMIT 1)
+		       ORDER BY e.id DESC LIMIT 1)
 		     WHERE created_by IS NULL`)
 		return err
 	}},

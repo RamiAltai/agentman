@@ -1054,15 +1054,42 @@ func (s *Server) checkComment(r *http.Request, sc Scope, taskID int64) error {
 	return denyScope(r, sc)
 }
 
+// isProposals reports whether slug currently designates the carve-out
+// project: the slug must match AND the project's actual category must be the
+// designated one. Slugs are globally unique, so a same-named project in
+// another category is NOT the carve-out — without the category check a
+// scoped agent could squat the slug inside its own scope and capture every
+// other agent's proposals. A missing project still counts (ErrNotFound
+// passes through as true): the gate stays open and the store 404s, keeping
+// the carve-out inert rather than special-cased. Every site that consults
+// the carve-out goes through here or checks the (category, project) pair
+// directly (checkTaskRead, checkComment) — the five sites must agree.
+func (s *Server) isProposals(slug string) (bool, error) {
+	if slug != s.proposals.Project {
+		return false, nil
+	}
+	cat, err := s.store.projectCategory(slug)
+	if errors.Is(err, ErrNotFound) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return cat == s.proposals.Category, nil
+}
+
 // checkCreate gates task creation: the target project must be in scope, OR be
-// the proposals project (the carve-out works from any scope). The proposals
-// branch is slug-only — if the project does not exist the store 404s, leaving
-// the carve-out inert rather than special-cased.
+// the proposals project (the carve-out works from any scope). A category
+// mismatch on the designated slug falls through to the normal scope rules;
+// if the project does not exist the store 404s, leaving the carve-out inert
+// rather than special-cased.
 func (s *Server) checkCreate(r *http.Request, sc Scope, projectSlug string) error {
 	if sc.IsZero() {
 		return nil
 	}
-	if projectSlug == s.proposals.Project {
+	if ok, err := s.isProposals(projectSlug); err != nil {
+		return err
+	} else if ok {
 		return nil
 	}
 	if sc.Project != "" {
@@ -1082,12 +1109,15 @@ func (s *Server) checkCreate(r *http.Request, sc Scope, projectSlug string) erro
 }
 
 // checkProjectRead gates project-level reads (graph): in scope or the
-// proposals project.
+// proposals project (the (category, project) pair — a same-slug project in
+// another category falls through to the normal rules).
 func (s *Server) checkProjectRead(r *http.Request, sc Scope, slug string) error {
 	if sc.IsZero() {
 		return nil
 	}
-	if slug == s.proposals.Project {
+	if ok, err := s.isProposals(slug); err != nil {
+		return err
+	} else if ok {
 		return nil
 	}
 	return s.checkProjectMut(r, sc, slug)
@@ -1121,7 +1151,9 @@ func (s *Server) checkProjectMut(r *http.Request, sc Scope, slug string) error {
 // (ErrOutOfScope); absent ones are filled in from the scope (silent
 // narrowing, so an unfiltered `am ls` just shows the agent its world).
 // allowProposals additionally accepts an explicit ?project=<proposals>
-// (reads); next passes false — a scoped agent never picks up proposal work.
+// (reads, the pair-checked carve-out); next passes false — the carve-out
+// does not extend to next (an agent whose scope already covers the
+// proposals project still picks them via plain in-scope matching).
 func (s *Server) narrowScope(r *http.Request, sc Scope, proj, cat string, allowProposals bool) (string, string, error) {
 	if sc.IsZero() {
 		return proj, cat, nil
@@ -1130,8 +1162,14 @@ func (s *Server) narrowScope(r *http.Request, sc Scope, proj, cat string, allowP
 		return "", "", denyScope(r, sc)
 	}
 	if proj != "" {
-		if allowProposals && proj == s.proposals.Project {
-			return proj, cat, nil
+		if allowProposals {
+			ok, err := s.isProposals(proj)
+			if err != nil {
+				return "", "", err
+			}
+			if ok {
+				return proj, cat, nil
+			}
 		}
 		if sc.Project != "" {
 			if proj != sc.Project {

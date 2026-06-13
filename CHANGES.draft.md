@@ -23,11 +23,16 @@ R5 (scope tokens) is what upgrades it.
 
 - `currentSchemaVersion` 4 → 5. schema.sql untouched (frozen v1 baseline).
 - v5: `ALTER TABLE tasks ADD COLUMN created_by TEXT`, then a best-effort
-  backfill: `created_by` = the actor of the task's first `task.created`
-  event. Tasks whose events were pruned stay NULL — they simply never match
-  the own-proposal comment rule (the safe direction).
-- `created_by` is set on every new task from the request actor
-  (`actorOr(in.Actor)`, so "anon" when no `X-Agent`).
+  backfill: `created_by` = the actor of the task's LATEST `task.created`
+  event (latest, not first: tasks.id is a reusable SQLite rowid and a
+  deleted task's events survive, so an id's oldest creation event may belong
+  to a deleted predecessor — the newest always belongs to the current
+  incarnation). Tasks whose events were pruned stay NULL — they simply never
+  match the own-proposal comment rule (the safe direction).
+- `created_by` is set on every new task from the request actor: the server
+  passes `actorOf(r)`, which defaults to "human" when no `X-Agent` header is
+  present; the store-level `actorOr` fallback "anon" is only reachable for
+  direct store callers that pass an empty actor.
 - Forward-only, idempotent, version bump in the same tx (house pattern).
   db.go's import ceiling tracks `currentSchemaVersion` automatically; a v5
   snapshot now imports, a v6 one is refused.
@@ -74,7 +79,9 @@ R5 (scope tokens) is what upgrades it.
   call, i.e. INSIDE the atomic pick+claim: a scoped agent can never be
   handed an out-of-scope task, even racing unscoped callers. Explicit
   out-of-scope `project`/`category` in the body → 403; absent ones are
-  injected from the scope. Proposals are NOT pickable via next.
+  injected from the scope. The proposals carve-out does not extend to next
+  (an agent whose scope covers the proposals project still picks them via
+  plain in-scope matching).
 - `GET /api/tasks` — silent narrowing: explicit `?project=`/`?category=`
   that contradicts the scope → 403 (loud); missing filters are filled from
   the scope (an unfiltered list shows only the agent's world);
@@ -101,9 +108,17 @@ R5 (scope tokens) is what upgrades it.
   `meta/proposals`. Flag beats env. Both segments required — a bare
   category is rejected at startup (`fail(1)`) because it would widen the
   carve-out to a whole category.
-- Designation is by slug pair, no existence check: if the project does not
-  exist, scoped creates into it pass the gate and 404 in the store — the
-  carve-out is inert, never an error or a hole.
+- The carve-out matches the (category, project) PAIR everywhere it is
+  consulted (create, comment, task read, project read, list narrowing): a
+  project that merely shares the designated slug but lives in another
+  category gets no special treatment and falls through to the normal scope
+  rules. Slugs are globally unique, so without the category check a scoped
+  agent could squat the slug inside its own category and capture other
+  scopes' proposals (fixed in review round 1; `isProposals` in server.go is
+  the single helper for the slug-keyed sites).
+- No existence check: if the designated project does not exist, scoped
+  creates into it pass the gate and 404 in the store — the carve-out is
+  inert, never an error or a hole.
 - `NewServer` defaults to `{meta, proposals}` so embedded/test servers
   behave like production.
 
@@ -148,10 +163,12 @@ R5 (scope tokens) is what upgrades it.
 3. **Denials are log-only** — no `scope.denied` event kind.
 4. **tasks.created_by via migration v5** with best-effort events backfill;
    pruned-events tasks stay NULL and never match the own-proposal rule.
-5. **Proposals designated by slug pair** (`--proposals` / env), default
-   meta/proposals; inert when missing; not pickable by `am next`; comments
-   restricted to the proposal's creator (plus anyone whose scope covers it
-   and the unscoped human).
+5. **Proposals designated by (category, project) pair** (`--proposals` /
+   env), default meta/proposals; enforced as the pair at every check site (a
+   same-slug project in another category is not the carve-out); inert when
+   missing; the carve-out does not extend to `am next`; comments restricted
+   to the proposal's creator (plus anyone whose scope covers it and the
+   unscoped human).
 6. **Identity file JSON-when-scoped** with plain-text legacy = unscoped.
 7. **One resolution point** — `scopeOf(r)`; Phase S swaps the source there.
 8. **Category endpoints 403 for scoped agents; project create allowed for
@@ -198,7 +215,9 @@ R5 (scope tokens) is what upgrades it.
 
 - `cmd/am/migrate_test.go` — `TestMigrationV5Fresh` (column + version 5),
   `TestMigrationV5ExistingDB` (hand-built v4 DB → backfill from
-  task.created event; pruned-events task stays NULL; idempotent reopen);
+  task.created event; pruned-events task stays NULL; a reused rowid
+  backfills from the LATEST creation event, not a deleted predecessor's;
+  idempotent reopen);
   `TestMigrationV4Fresh`/`TestMigrationV4ExistingDB` un-hardcoded to
   `currentSchemaVersion` (TestOpenStoreRejectsNewerSchema already used
   `currentSchemaVersion+1`).
@@ -215,7 +234,11 @@ R5 (scope tokens) is what upgrades it.
   `TestScopeNextEnforcement` (acceptance 3), `TestScopeStealStale`
   (acceptance 4), `TestScopeProposalsCarveOut` +
   `TestScopeProposalsConfigurable` + `TestScopeProposalsMissingProjectInert`
-  (acceptance 8), `TestScopeMutationSweep` (every mutating verb, 403
+  (acceptance 8), `TestScopeProposalsWrongCategoryNoCarveOut` (designated
+  slug in a non-designated category: create/explicit-list/graph all 403 via
+  the normal rules; in-scope agent unaffected) + `TestScopeProposalsSquat`
+  (work-scoped agent creates work/proposals; another scope's create into the
+  slug is 403, not captured), `TestScopeMutationSweep` (every mutating verb, 403
   out-of-scope vs success in-scope), `TestScopeProjectScopedAgent`,
   `TestScopeReads` (named 403 / narrowing / proposals / graph),
   `TestScopeHeaderValidation` (400s + unknown-slug scope),

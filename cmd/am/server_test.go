@@ -1904,6 +1904,78 @@ func TestScopeProposalsMissingProjectInert(t *testing.T) {
 	}
 }
 
+// The carve-out is the (category, project) PAIR: a project that merely shares
+// the designated slug but lives in another category gets no special
+// treatment — create, explicit list filters, and graph reads all fall through
+// to the normal scope rules.
+func TestScopeProposalsWrongCategoryNoCarveOut(t *testing.T) {
+	ts := newTestServer(t)
+	scopedBoard(t, ts)
+	// "proposals" exists, but under work — NOT the designated meta/proposals.
+	r := do(t, ts, http.MethodPost, "/api/projects",
+		`{"slug":"proposals","category":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	if r.StatusCode != http.StatusCreated {
+		t.Fatalf("create work/proposals = %d, want 201", r.StatusCode)
+	}
+
+	// Out-of-scope create: 403, not the carve-out's 201.
+	rc := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"proposals","title":"smuggled"}`, scoped("agent-p", "personal"))
+	rc.Body.Close()
+	if rc.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped create into work/proposals = %d, want 403", rc.StatusCode)
+	}
+
+	// Explicit list filter falls through to the normal rules → loud 403.
+	rl := do(t, ts, http.MethodGet, "/api/tasks?project=proposals", "", scoped("agent-p", "personal"))
+	rl.Body.Close()
+	if rl.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped list of work/proposals = %d, want 403", rl.StatusCode)
+	}
+
+	// Graph read: same fall-through.
+	rg := do(t, ts, http.MethodGet, "/api/projects/proposals/graph", "", scoped("agent-p", "personal"))
+	rg.Body.Close()
+	if rg.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped graph of work/proposals = %d, want 403", rg.StatusCode)
+	}
+
+	// The normal rules still apply: the agent whose scope covers it creates fine.
+	rw := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"proposals","title":"plain in-scope task"}`, scoped("agent-w", "work"))
+	rw.Body.Close()
+	if rw.StatusCode != http.StatusCreated {
+		t.Fatalf("work-scoped create into work/proposals = %d, want 201", rw.StatusCode)
+	}
+}
+
+// A scoped agent must not be able to SQUAT the designated slug: creating
+// "proposals" inside its own category (legal — project creation in one's own
+// category is allowed) must not capture other scopes' proposals.
+func TestScopeProposalsSquat(t *testing.T) {
+	ts := newTestServer(t)
+	scopedBoard(t, ts) // meta/proposals does not exist yet
+
+	// The work-scoped agent squats the slug inside its own category.
+	r := do(t, ts, http.MethodPost, "/api/projects",
+		`{"slug":"proposals","category":"work"}`, scoped("agent-w", "work"))
+	r.Body.Close()
+	if r.StatusCode != http.StatusCreated {
+		t.Fatalf("work-scoped create of work/proposals = %d, want 201", r.StatusCode)
+	}
+
+	// Another scope's create into "proposals" is NOT the carve-out — the pair
+	// does not match, so the normal scope rules deny it. No captured task.
+	rp := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"proposals","title":"my proposal"}`, scoped("agent-p", "personal"))
+	rp.Body.Close()
+	if rp.StatusCode != http.StatusForbidden {
+		t.Fatalf("personal-scoped create into squatted proposals = %d, want 403", rp.StatusCode)
+	}
+}
+
 // Every task-mutating verb: out-of-scope → 403, in-scope → success.
 func TestScopeMutationSweep(t *testing.T) {
 	ts := newTestServer(t)

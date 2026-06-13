@@ -404,6 +404,43 @@ func TestMigrationV5ExistingDB(t *testing.T) {
 	       FROM tasks t WHERE t.title='with-event'`); err != nil {
 		t.Fatalf("insert event: %v", err)
 	}
+	// Rowid-reuse case: tasks.id has no AUTOINCREMENT, so deleting the max-id
+	// task frees its id for the next insert, while the deleted task's events
+	// survive (DeleteTask removes only the tasks row). The backfill must pick
+	// the LATEST task.created event — the current incarnation's creator
+	// ('bob'), not the deleted predecessor's ('alice').
+	if _, err := db.Exec(`INSERT INTO tasks(project_id,ref,title)
+	       SELECT id, (SELECT COALESCE(MAX(ref),0)+1 FROM tasks), 'old-incarnation' FROM projects WHERE slug='web'`); err != nil {
+		t.Fatalf("insert old incarnation: %v", err)
+	}
+	var oldID int64
+	if err := db.QueryRow("SELECT id FROM tasks WHERE title='old-incarnation'").Scan(&oldID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO events(project_id,task_id,actor,kind,data)
+	       SELECT t.project_id, t.id, 'alice', 'task.created', '{}'
+	       FROM tasks t WHERE t.title='old-incarnation'`); err != nil {
+		t.Fatalf("insert old event: %v", err)
+	}
+	if _, err := db.Exec("DELETE FROM tasks WHERE id=?", oldID); err != nil {
+		t.Fatalf("delete old incarnation: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO tasks(project_id,ref,title)
+	       SELECT id, (SELECT COALESCE(MAX(ref),0)+1 FROM tasks), 'reused' FROM projects WHERE slug='web'`); err != nil {
+		t.Fatalf("insert reused task: %v", err)
+	}
+	var reusedID int64
+	if err := db.QueryRow("SELECT id FROM tasks WHERE title='reused'").Scan(&reusedID); err != nil {
+		t.Fatal(err)
+	}
+	if reusedID != oldID {
+		t.Fatalf("new task id = %d, want reused %d (rowid-reuse setup assumption broken)", reusedID, oldID)
+	}
+	if _, err := db.Exec(`INSERT INTO events(project_id,task_id,actor,kind,data)
+	       SELECT t.project_id, t.id, 'bob', 'task.created', '{}'
+	       FROM tasks t WHERE t.title='reused'`); err != nil {
+		t.Fatalf("insert reused event: %v", err)
+	}
 	db.Close()
 
 	// OpenStore runs migration v5: column added, backfill applied.
@@ -427,6 +464,14 @@ func TestMigrationV5ExistingDB(t *testing.T) {
 	}
 	if creator.Valid {
 		t.Fatalf("created_by for pruned-events task = %q, want NULL", creator.String)
+	}
+	// The reused id backfills from the LATEST creation event, not the deleted
+	// predecessor's.
+	if err := st.db.QueryRow("SELECT created_by FROM tasks WHERE title='reused'").Scan(&creator); err != nil {
+		t.Fatal(err)
+	}
+	if !creator.Valid || creator.String != "bob" {
+		t.Fatalf("created_by for reused-id task = %v, want bob (not the deleted predecessor's alice)", creator)
 	}
 	st.Close()
 
