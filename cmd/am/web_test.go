@@ -47,3 +47,29 @@ func TestDashboardNoXSSSinks(t *testing.T) {
 		}
 	}
 }
+
+// TestDashboardThemeAssets locks in the dark/light theme wiring at the Go build
+// level (same no-JS-runner rationale as TestDashboardNoXSSSinks): the CSS must
+// ship the light-theme override block, and index.html must carry both the inline
+// FOUC-guard script and the toggle button.
+func TestDashboardThemeAssets(t *testing.T) {
+	css, err := webFS.ReadFile("web/app.css")
+	if err != nil {
+		t.Fatalf("ReadFile app.css: %v", err)
+	}
+	if !strings.Contains(string(css), `:root[data-theme="light"]`) {
+		t.Error("app.css missing light-theme override block")
+	}
+
+	html, err := webFS.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatalf("ReadFile index.html: %v", err)
+	}
+	hs := string(html)
+	if !strings.Contains(hs, `localStorage.getItem("am.theme")`) {
+		t.Error("index.html missing inline theme-init script")
+	}
+	if !strings.Contains(hs, `id="themeToggle"`) {
+		t.Error("index.html missing #themeToggle button")
+	}
+}
