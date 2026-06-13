@@ -116,22 +116,23 @@ Evidence:
 - **Per-directory agent identity** that survives the fresh-shell-per-command model agents run in
   (`cmd/am/identity.go`).
 - **Embedded dashboard** (no build step, no npm): kanban board, drag-and-drop status changes,
-  collapsible/resizable activity panel, keyboard shortcuts, a light/dark theme toggle (system-default,
-  then persisted), responsive. **CLI↔GUI parity** (ADR-031): the dashboard can also create/archive
+  a collapsible left-rail nav, a collapsible/resizable activity panel, keyboard shortcuts, a
+  light/dark theme toggle (system-default, then persisted), responsive. **CLI↔GUI parity** (ADR-031): the dashboard can also create/archive
   categories, pick a category when creating a project, edit a project (rename + vault binding), filter
   the board (ready/blocked/stale/assignee/meta via a header popover), edit task meta inline, and
   release a task — all previously CLI-only. Evidence: `cmd/am/web/`.
-- **Multi-select project filter** on the dashboard: pick any number of project tabs to scope the
-  board/feed at once ("All" clears the selection). Evidence: `cmd/am/web/app.js` `toggleProject`.
+- **Left-rail navigation** on the dashboard: a collapsible rail (Overview, All tasks, a
+  category→project tree with open-counts, "New project"/"Manage" actions) selects a single project
+  to scope the board/feed ("All tasks" clears it). Evidence: `cmd/am/web/app.js` `renderRail`/`goProject`.
 - **DB export/import**: `am db export` writes a consistent snapshot (`VACUUM INTO`), and
   `am db import` restores a validated candidate (integrity/FK checks, refuses while a server is
   running, backs up the existing DB first). Evidence: `cmd/am/db.go`.
 - **Project archive/hide**: reversible soft-archive (`archived_at`) that hides a project from
-  default views across all surfaces — tab bar (`ListProjects`), board (`ListTasks`), and activity
-  feed (`ListEvents`/`RecentEvents`). Writing into an archived project is blocked: `CreateTask`
+  default views across all surfaces — rail project tree (`ListProjects`), board (`ListTasks`), and
+  activity feed (`ListEvents`/`RecentEvents`). Writing into an archived project is blocked: `CreateTask`
   returns `ErrProjectArchived` → HTTP 400 `{"error":"project_archived"}`. Archive/unarchive is
-  accessible from the CLI (`am project archive`/`unarchive`) and from the "Manage" modal in
-  the dashboard tab bar (`openManage`); that modal also archives/unarchives **categories**.
+  accessible from the CLI (`am project archive`/`unarchive`) and from the dashboard's "Manage"
+  modal (`openManage`, a left-rail action); that modal also archives/unarchives **categories**.
   Evidence: `cmd/am/store.go`, `cmd/am/cli.go`,
   `cmd/am/server.go`, `cmd/am/web/app.js`.
 - **Hard delete (tasks, comments, projects)**: permanent removal via `DELETE /api/tasks/{id}`,
@@ -187,11 +188,5 @@ Inferred (Confidence: Medium–High) from `README.md` "Security" and the localho
 
 - **Intended scale.** No stated target for concurrent agents / task volume. The single-writer
   SQLite design (`SetMaxOpenConns(1)`) implies modest scale, but this is not documented.
-- **Roadmap.** Near-term gap-closing work is tracked in `ROADMAP.md` (repo root). Labels and search
-  shipped in Phase M; the agentic_brain foundation (categories, stable IDs, vault binding) in Phase O,
-  task metadata in Phase P, scoped agent identity & enforcement in Phase Q, the category dashboard +
-  scoped feed in Phase R, and **scope tokens in Phase S** — the final phase. **With Phase S the entire
-  agentic_brain integration train (O+P+Q+R+S) is complete: every MUST+SHOULD requirement R1–R8 is
-  shipped.** Only NICE-to-have items remain unbuilt (webhook with egress filter, copyable `vault_path`
-  in the dashboard, scoped `am db export -c`) along with longer-term ideas (full auth, remote access,
-  due dates, prebuilt binaries) — treat those as unconfirmed.
+- **Roadmap.** Open and future work is tracked in `ROADMAP.md` (repo root); shipped history lives
+  in git.

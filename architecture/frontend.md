@@ -1,7 +1,7 @@
 # Frontend Architecture
 
 There **is** a frontend: a small single-page dashboard in `cmd/am/web/`
-(`index.html` 91 lines, `app.css` 782 lines, `app.js` 2384 lines), embedded into the binary via
+(`index.html` 123 lines, `app.css` 1140 lines, `app.js` 2706 lines), embedded into the binary via
 `//go:embed web` (`cmd/am/server.go`) and served at `/`. It is the human-facing view; agents do
 not use it.
 
@@ -25,11 +25,12 @@ mapper (called on load and on `hashchange`):
 
 `navigate(hash)` sets `location.hash` (or calls `route()` directly when the hash is unchanged);
 `applyView(next, cat)` updates the `view`/`activeCategory` module state, toggles
-`body.view-overview`, sets the breadcrumb, loads the right data (overview cards vs. board), and
-**re-opens the SSE stream with the new scope**. Within a board view, project tabs are still
-**multi-select** — several projects can be active at once, and the "All" tab clears the within-view
-selection (`toggleProject`); a view change resets that selection. Opening/closing the modal and the
-graph overlay is not part of the hash route.
+`body.view-overview`, sets the scope title (`setBreadcrumb`), re-renders the rail, loads the right
+data (overview cards vs. board), and **re-opens the SSE stream with the new scope**. A view change
+**resets** the within-view project selection (`selected`); the rail navigates to a single project via
+`goProject`, which stashes the slug in `pendingProject` so `applyView` re-selects it after clearing
+(see Left-rail navigation). Opening/closing the modal and the graph overlay is not part of the hash
+route.
 
 ## Pages and Components
 
@@ -47,20 +48,25 @@ All built imperatively in `app.js` (no component framework):
   `role="button"`/`tabindex=0`) opens the create-category modal on click or Enter/Space
   (`openNewCategory`). The overview keeps **one global, unfiltered** recent-activity feed (the
   existing `#feed` aside) — not
-  per-card mini-feeds. `body.view-overview` (set by `applyView`) is what hides the project tabs and
-  `#board` and shows `#overview`.
-- **Header breadcrumb / back** — `setBreadcrumb`: fills the header `#breadcrumb` element on the
-  board views with a **"← Categories"** back button (`navigate("#/")`) plus the current view's name
-  (the category's `name` for `#/cat/<slug>`, "All" for `#/all`). Hidden on the overview
-  (`body.view-overview .breadcrumb { display:none }`), which is the root.
-- **Header / tabs** — `renderTabs`, `tab()`: project tabs with open-count badges + an "All" tab + a
-  "＋" new-project button + a "⋯" **Manage** button (after the ＋; title "Manage", aria-label
-  "Manage categories and projects"). In a **category board**
-  the tabs render only that category's projects (`projectsInView` filters `projects` by
-  `p.category === activeCategory`) and the "All" tab spans the category's projects; in the `#/all`
-  view it spans every project. Clicking "⋯" calls
-  `openManage` (the former `openManageProjects`, kept as a back-compat alias), which opens the reused
-  `#sheet` modal (same focus-trap / Esc-to-close infrastructure as the task modal) with two sections:
+  per-card mini-feeds. `body.view-overview` (set by `applyView`) is what hides `#board` and shows
+  `#overview`.
+- **Left-rail navigation** — `renderRail`, `railItem`, `goProject`: a collapsible left rail
+  (`<aside id="rail">`) is the primary navigation; it **replaces the old header project-tab strip
+  and the "← Categories" back button**. `renderRail` rebuilds `#railNav` from `categories` +
+  `projects` + the current view/selection on every change. It lays out, in order: **Overview**
+  (`#/`), **All tasks** (`#/all`, with a total open-count), then one **category section** per
+  category (`.rail-section`: a clickable category label `.rail-cat` opening `#/cat/<slug>`, with its
+  projects nested beneath as `.rail-project` rows carrying a status dot + open-count); uncategorized
+  projects collect under a synthetic non-clickable **"Other"** header (`.rail-section-label`).
+  After a divider come two **rail actions** (`.rail-action`): **＋ New project** (`openNewProject`)
+  and **⋯ Manage** (`openManage`). Each `railItem` is a `<button>` with `aria-pressed`/`aria-current`
+  reflecting the active scope. Clicking a project calls `goProject(p)`, which selects **only** that
+  project: if already in the project's category/All view it swaps `selected` in place and reloads;
+  otherwise it stashes the slug in `pendingProject` and navigates to the project's category board,
+  where `applyView` re-selects it. `toggleProject` is retained only as a vestigial helper.
+  Clicking **⋯ Manage** calls `openManage` (the former `openManageProjects`, kept as a back-compat
+  alias), which opens the reused `#sheet` modal (same focus-trap / Esc-to-close infrastructure as the
+  task modal) with two sections:
   - **Categories** (`renderManageCategories`) — fetches every category including archived ones via
     `GET /api/categories?archived=true` and builds a `.cat-manage-list` of `.cat-row`s (mirroring the
     project list, `el()` only): each row shows name, slug, open-task count, an **Archived** pill when
@@ -73,9 +79,9 @@ All built imperatively in `app.js` (no component framework):
     `innerHTML`): active projects show **Edit** + **Archive**; archived ones show an **Archived**
     badge + **Edit** + **Unarchive** (plus the two-step **Delete** below). The archive buttons call
     `POST /api/projects/{slug}/archive|unarchive` via `api()`, then refresh the list. If the
-    just-archived project was selected, the tab bar and board reload automatically. The **Edit**
+    just-archived project was selected, the rail and board reload automatically. The **Edit**
     button (`btn-edit-proj`) opens the per-project edit sub-modal (`openEditProject`, see below).
-- **Search + label filter (header)** — a `#searchBox` input in the header `.actions` filters the
+- **Search + label filter (header)** — a `#searchBox` input in the top bar's Find segment filters the
   board **server-side** (`?q=` on `GET /api/tasks` — substring match over title *and* body, which
   the client couldn't do since the list payload has no body). Input is **debounced 250 ms**
   (`searchTimer`) before `loadBoard()` re-fetches; the **`/`** keyboard shortcut focuses the box.
@@ -83,7 +89,16 @@ All built imperatively in `app.js` (no component framework):
   *not* in the shared `qstr()` used by the feed/SSE), the debounced SSE board reload keeps the
   filter across live refreshes. An active label filter shows a **`#labelFilterChip`** chip next to
   the search box (`setLabelFilter`) with a **✕** clear button (`clearLabelFilter`).
-- **Board filters (header popover)** — a single **Filter** button (`#filterBtn`, in `.actions`)
+- **Lean top bar** — the header is `<header>` inside `.appcol`, holding (left→right) a mobile-only
+  hamburger (`#railOpen`), the scope **title** (`#breadcrumb`, an `<h1>`; see below), and the
+  `.actions` cluster of three segments: a **Find** segment (`.actions-seg` "Find": the `#searchBox`,
+  the `#labelFilterChip`, and the **Filter** popover), the **+ Task** primary button (`#newBtn`,
+  `.btn-primary` gradient), an `.actions-sep` hairline, then a **utility cluster** (`.actions-seg
+  .actions-util` "View": **Graph** `#graphBtn`, the **theme toggle** `#themeToggle`, the **Activity**
+  toggle `#feedToggle`, and the live-status dot `#status`). `#breadcrumb` is just the scope label now
+  (`setBreadcrumb` sets it — Overview / All tasks / a category name / the single selected project);
+  navigation lives in the rail, so there is **no back button**.
+- **Board filters (header popover)** — a single **Filter** button (`#filterBtn`, in the Find segment)
   toggles a popover panel (`#filterPanel`, `role="dialog"`) of server-side board filters
   (`renderFilterPanel`): **Ready** / **Blocked** / **Stale** checkboxes (→ `?ready=true`,
   `?blocked=true`, `?stale=30m` — `STALE_FILTER`, matching the `STALE_MS` stale-badge threshold), an
@@ -98,19 +113,33 @@ All built imperatively in `app.js` (no component framework):
   in sync. The panel closes on **outside click** (a lazily-wired `document` click listener,
   `filterOutsideClickWired`) and on **Escape** (which returns focus to the button); status is
   **intentionally not a filter** — the four board columns are the status axis.
-- **Board** — `renderBoard`, `card(t)`: four status columns (`COLS`), priority via card left-border
-  + chip, avatar initials, project tag (shown when `selected.size !== 1`, i.e. only when the board
-  isn't already scoped to a single project), comment count. Cards now also show a dependency tag in
-  the card footer: **🔒 Blocked** (`.tag-blocked`, shown when `t.nopen > 0`) or **✓ Ready**
-  (`.tag-ready`, shown when `t.nprereq > 0 && t.nopen === 0`). These are derived from server-side
-  counts (`nprereq`/`nopen` on the task object); there is no stored "ready" status field. A card in
-  `doing` with an assignee and no activity for 30+ minutes (`Date.now() - Date.parse(t.updated_at)
-  > STALE_MS`, `STALE_MS = 30 * 60 * 1000`) additionally shows an amber **⏳ stale** chip
-  (`.tag-stale`) — purely client-side, computed at render time from `updated_at`. Cards also show
-  the task's **label chips** (`.tag-label`) in the footer — at most 3, then a **`+N`** overflow
-  chip; clicking a label chip calls `setLabelFilter(l)` to filter the whole board by that label
-  (the chips are `role="button"`/`tabindex=0` and stop click propagation so the card doesn't open).
-- **Activity feed** — `feedItem`, `evText`, `evKind`: color-coded events with clickable `#refs`.
+- **Board** — `renderBoard`, `card(t)`: four status columns (`COLS`, `.col[data-status=<status>]`).
+  Status is the dominant axis: the column header is **status-tinted**, the **Blocked column** carries
+  a subtle warm tint (`.col[data-status="blocked"]`), and each card's **left edge is status-colored**
+  (`.col[data-status=…] .card { border-left-color }`) — priority no longer drives the edge. A card is
+  three rhythmic rows:
+  - **Row 1 (head)** — `#id`, an **always-present priority rank chip** for all four levels
+    (`.chip-prio.p0..p3`, **solid/filled** via `--prio-N` background + `--chip-prio-ink` text;
+    `PRIO_RANK` = `P0..P3`, `PRIO_WORD` titles), and a labeled **status pill** (`.status-pill.st-…`:
+    a dot + the status word over a soft fill — the redundant, non-color-only status cue).
+  - **Row 2** — the title (`.ctitle`, line-clamped).
+  - **Row 3** — three sub-rows in fixed order: `.cfoot` (assignee avatar + name · project `.ptag`,
+    shown only when `selected.size !== 1`); a **reserved trouble sub-row** `.ctrouble` rendered
+    *before* labels so critical signals never sink beneath decorative chips — **🔒 Blocked N**
+    (`.tag-blocked`, when `t.nopen > 0`) or **✓ Ready** (`.tag-ready`, when `t.nprereq > 0`), plus an
+    amber **⏳ Stale** chip (`.tag-stale`) for a `doing`+assigned card idle 30+ min
+    (`Date.now() - Date.parse(t.updated_at) > STALE_MS`, `STALE_MS = 30 * 60 * 1000`, purely
+    client-side); and `.ctags` (label chips `.tag-label`, at most 3 then a **`+N`** overflow, then
+    the comment count). Clicking a label chip calls `setLabelFilter(l)` (the chips are
+    `role="button"`/`tabindex=0` and stop click propagation so the card doesn't open). Both `.ctrouble`
+    and `.ctags` collapse via `:empty { display:none }`. Blocked/Ready are derived from server counts
+    (`nprereq`/`nopen`); there is no stored "ready" status. A reconciled card gets a one-shot
+    `.is-updated` flash (`applyFlash`/`flashIds`, suppressed under reduced motion).
+- **Activity feed** — `feedItem`, `evText`, `evKind`: a 3-column grid (`.ev`: glyph · text · time)
+  of **typed events**. Each event kind gets a **glyph + the event stated in words**: `feedItem` adds
+  an `.ev-icon` cell from `EV_GLYPH` (`claimed ▸`, `status ⇄`, `done ✓`, `blocked ⏸`, `comment 💬`,
+  `other •`; decorative/`aria-hidden`, the meaning is in `.ev-text`) and the `.k-<kind>` class colors
+  the glyph. Events carry clickable `#refs`.
   Event kinds include the project lifecycle: `project.created`, `project.archived`,
   `project.unarchived` (render via `evText`/`describeText`; `evKind` colors them as generic "other"),
   the category lifecycle: `category.created`, `category.archived`, `category.unarchived` —
@@ -232,8 +261,10 @@ All built imperatively in `app.js` (no component framework):
 Module-level mutable variables in `app.js` (no store/framework):
 `view` (`"overview"` | `"all"` | `"category"`, Phase R — the current top-level view, driven by the
 URL hash), `activeCategory` (category slug when `view === "category"`), `categories`
-(`CategoryStat[]` for the overview — counts + active_agents), `overviewTimer` (debounce handle for
-the live overview count refresh),
+(`CategoryStat[]` for the overview — counts + active_agents; the rail tree reads it too),
+`overviewTimer` (debounce for the live overview count refresh), `railTimer` (debounce for the live
+rail open-count refresh, `refreshRailCounts` re-fetching projects + categories), `pendingProject`
+(a project slug stashed by `goProject` to auto-select after the next `applyView`),
 `projects` (array), `selected` (`Set<slug>` of active project filters within the current view,
 empty=all), `tasks`
 (`Map<id,task>`), `cursor` (highest seen `events.id` for SSE `since=`), `es` (EventSource),
@@ -250,7 +281,12 @@ once). Graph overlay state:
 `graphOpen` (bool), `graphSlug` (slug of the project currently shown), `graphData`
 (`{nodes, edges}` from the last fetch), `graphViewState` / `graphInitialView` (current and
 reset-target `viewBox`), `graphSelectedId` (currently highlighted node id), `graphDragState`,
-`graphRefreshTimer`, `graphLastFocus`, `graphPanZoomInstalled`. Reconciliation is **snapshot-based**:
+`graphRefreshTimer`, `graphLastFocus`, `graphPanZoomInstalled`. **Persisted UI prefs** live in
+`localStorage` (via `lsGet`/`lsSet`): `RAIL_COLLAPSED_KEY` (`am.railCollapsed`, the desktop rail
+collapse state — `setRailCollapsed` toggles `body.rail-collapsed`; on mobile the rail is off-canvas
+and `toggleRail`/`openMobileRail`/`closeMobileRail` slide it via `body.rail-open` behind
+`#railBackdrop`), `FEED_W_KEY`/`FEED_COLLAPSED_KEY` (activity drawer), and `THEME_KEY` (`am.theme`).
+Reconciliation is **snapshot-based**:
 on each SSE event the feed updates immediately and a **debounced (250 ms) full `loadBoard()`**
 re-fetches and re-renders (`onEvent`). The graph overlay uses its own debounced re-fetch
 (`graphRefreshTimer`) when `graphMaybeRefresh` fires. Simple and correct over clever diffing.
@@ -273,36 +309,48 @@ re-fetches and re-renders (`onEvent`). The graph overlay uses its own debounced 
   `onEvent` keeps the global feed live and, on any `task.*`/`project.*`/`category.*` event,
   **debounce-refreshes (250 ms) the category cards** via `loadOverview()` — the debounced callback
   re-checks `view === "overview"` at fire time so navigating away before it elapses never writes to
-  the now-hidden `#overview`. `onEvent` also reloads the project strip on `category.created` (in
-  addition to the existing `project.created`/`project.unarchived`/`category.archived`/
-  `category.unarchived`) so a new category appears live. `onEvent` handles the three delete kinds:
+  the now-hidden `#overview`. `onEvent` rebuilds the **rail** (`loadProjects()` → `renderRail()`) on
+  `category.created` (in addition to `project.created`/`project.unarchived`/`category.archived`/
+  `category.unarchived`) so a new category/project appears live, and keeps the rail's open-counts
+  live on the board views via `refreshRailCounts` (a debounced projects+categories re-fetch on any
+  `task.*`/`project.*`/`category.*` event). `onEvent` handles the three delete kinds:
   `task.deleted` removes the card from `tasks` map and closes the modal if it was open;
-  `comment.deleted` refreshes the open modal; `project.deleted` drops the slug from `selected` and
-  reloads the board/feed; `category.archived`/`category.unarchived` (like `project.created` and
-  `project.unarchived`) trigger `loadProjects()` so the project strip reflects the archive
-  cascade live. For `task.dep_added` and `task.dep_removed`, `onEvent` refreshes the
+  `comment.deleted` refreshes the open modal; `project.deleted` drops the slug from `selected`,
+  re-renders the rail, and reloads the board/feed; `category.archived`/`category.unarchived` (like
+  `project.created` and `project.unarchived`) trigger `loadProjects()` so the rail reflects the
+  archive cascade live. For `task.dep_added` and `task.dep_removed`, `onEvent` refreshes the
   open modal if either the task or the referenced prereq is currently open (so both sides of the
   edge see the update), then triggers the debounced board reload.
 - Same-origin only; no CORS, no auth token (the API is unauthenticated).
 
 ## Styling and Design System
 
-`app.css` defines a **CSS-variable design system** (`:root` tokens): background/surface levels,
-`--line`, text `--fg`/`--muted`/`--faint`, `--accent`, status colors (`--st-todo/doing/blocked/
-done`), radii, `--feed-w`, `--header-h`, plus **component color tokens** (backdrops, tag pill
-backgrounds/borders, the status pulse ring, the `--on-accent` on-accent text, the scrollbar-hover
-color, the graph legend background, the danger-confirm wash) that were factored out of inline
-literals so a single override block can re-theme them. Thin custom scrollbars. Status and priority
-each have a consistent color language across board, cards, and feed.
+`app.css` opens with a **token-based CSS custom-property design system** (`:root`). Tokens cover:
+surface/line levels (`--bg`/`--surface`/`--surface-2`/`--col-bg`/`--card-bg`/`--card-hover`/`--line`/
+`--line-strong`), text (`--fg`/`--muted`/`--faint`), and a **bold, vivid violet brand**: `--accent`
+is violet (`#7d5cff` dark / `#6a40e0` light); all accent **text** uses `--accent-strong`
+(`#b9a8ff` / `#5a31c8`) for WCAG-AA contrast; the **+ Task** primary is the `--accent-btn` gradient;
+and a faint radial violet **`--app-glow`** sits behind the app background. Status tokens
+(`--st-todo/doing/blocked/done`, their `*-soft` pill fills, and `--st-blocked-col` column tint) and
+**priority** tokens (`--prio-0..3`, mirroring the JS `PRIO`/`PRIO_VAR` palette, painted as solid chip
+fills with `--chip-prio-ink` for the text) each carry a consistent, AA-clearing language across board,
+cards, feed, and graph in both themes. The system also defines reusable **scales** — type (`--fs-*`,
+`--lh-*`), spacing (`--sp-1..8`, 4 px base), radii (`--r-xs..xl`, `--r-pill`), elevation (`--elev-*`,
+`--shadow`), motion (`--dur-*`, `--ease`) — layout tokens (`--feed-w`, `--header-h`, `--col-min`,
+`--rail-w`/`--rail-bg`), and **component color tokens** (backdrops, tag pill backgrounds/borders, the
+status pulse ring, `--on-accent`, the scrollbar-hover color, the graph legend background, the
+danger-confirm wash) factored out of inline literals so the light override block can re-theme them.
+Thin custom scrollbars throughout.
 
 **Theming — dark default + light override.** The dashboard supports a **dark (default) and a light
 theme**, selected by a single `data-theme` attribute on `<html>`. Dark is the bare `:root`; light is
 **one `:root[data-theme="light"]{…}` block** that re-defines the color tokens — so an unknown or
 absent `data-theme` renders dark, and dark keeps the exact prior literal values (no visual change in
-dark mode). The `color-scheme` meta is `content="dark light"` so native form controls/scrollbars
-render correctly in both. A header **`#themeToggle`** ghost icon button (in `.actions`, before the
-Graph button, styled `.theme-toggle-icon`) flips the theme and shows the theme you'd switch TO (`☀`
-in dark, `☾` in light; `aria-label`/`title`/`aria-pressed` track the action; **no keyboard
+dark mode — only the violet token *values* changed in this redesign, not the mechanism). The
+`color-scheme` meta is `content="dark light"` so native form controls/scrollbars render correctly in
+both. A **`#themeToggle`** ghost icon button in the header's **utility cluster** (between Graph and
+the Activity toggle, styled `.theme-toggle-icon`) flips the theme and shows the theme you'd switch TO
+(`☀` in dark, `☾` in light; `aria-label`/`title`/`aria-pressed` track the action; **no keyboard
 shortcut**). Theme selection is **default-to-system-then-persist** (ADR-030): an inline `<head>`
 script in `index.html` sets `data-theme` from `localStorage["am.theme"]` (else `prefers-color-scheme`,
 else `"dark"`) **before the stylesheet loads** (no flash); `app.js` (`THEME_KEY`, `applyTheme`/
@@ -311,27 +359,38 @@ else `"dark"`) **before the stylesheet loads** (no flash); `app.js` (`THEME_KEY`
 `"light"`/`"dark"` to `localStorage["am.theme"]`. Both the inline script and `app.js` degrade
 gracefully when `localStorage`/`matchMedia` are unavailable.
 
-The board uses `justify-content: safe center` on `#board` so columns are centered on wide/ultrawide
-screens. The `safe` keyword falls back to `flex-start` when columns overflow their container, so
-horizontal scrolling on narrow screens never clips the leftmost column. New CSS classes support the
-Manage modal: `.proj-list`, `.proj-row`, `.badge-archived`, `.btn-archive` (and
-`.btn-archive.unarchive`), the per-project `.btn-edit-proj`, and the Categories section's
-`.cat-manage-list` / `.cat-row` (mirroring the project list). The board-filter popover uses
-`.filter-wrap` / `.filter-panel` / `.filter-section` / `.filter-check` / `.filter-mine-row` /
-`.filter-mine-btn` / `.filter-foot` / `.filter-clear`, plus `.iconbtn.has-filters` + `.filter-count`
-on the button. The task modal's **Release** button is `.btn-release` (`margin-right:auto` pushes
-Delete to the row's right edge). The Phase R category overview adds `.cat-grid`, `.cat-card`
-(`.cat-card-all` for the dashed "All" card, `.cat-card-add` for the dashed "＋ New category"
-add-card), `.cat-name`/`.cat-sub`, `.count-chips`/`.count-chip`
-(with a color `.swatch`), and `.active-agents`/`.active-agent-avatar`/`.no-agents`/`.more-agents`;
-the header breadcrumb uses `.breadcrumb`/`.crumb-back`/`.crumb-current`. `#overview` is hidden by
-default and shown via `body.view-overview #overview` (which also hides `#board` and `#tabs`). The card chips use `.tag-blocked` / `.tag-ready` / `.tag-stale`
-(amber pill for the ⏳ stale badge). The modal's editable Meta section uses `.meta-section` /
-`.meta-row` / `.meta-key` / `.meta-val` (tones match `.dep-status`; monospace value) plus the
-`.meta-add-row` / `.meta-key-add` / `.meta-val-add` / `.meta-add-btn` add-row (the per-row ✕ reuses
-`.dep-rm`). The graph overlay is styled via `.graph-overlay`, `.graph-shell`,
-`.graph-header`, `.graph-body`, `.graph-svg`, `.graph-detail`, `.graph-legend`, and assorted
-`.gnode-*` / `.gedge-*` / `.gd-*` classes for nodes, edges, and the detail panel.
+**Layout shell.** The page is `body > .shell > (aside#rail, .appcol > (header, main))`: `.shell` is
+the horizontal split between the fixed-width rail and the flexible content column. `#modal`,
+`#graphOverlay`, and `#railBackdrop` sit outside `.shell` as body-level overlays. The board uses
+`justify-content: safe center` on `#board` so columns center on wide/ultrawide screens while `safe`
+falls back to `flex-start` (so narrow-screen horizontal scrolling never clips the first column).
+
+**Class inventory.** The **rail** uses `.rail-head`/`.brand`/`.rail-toggle`, `.rail-nav`,
+`.rail-item` (`.active`, plus `.rail-cat`/`.rail-section`/`.rail-section-label`/`.rail-project`/
+`.rail-dot`/`.rail-count`/`.rail-glyph`/`.rail-empty`/`.rail-divider`/`.rail-action`); collapse via
+`body.rail-collapsed`, off-canvas via `body.rail-open` + `#railBackdrop`. The header actions use
+`.actions` / `.actions-seg` (`.actions-util`) / `.actions-sep`; the scope title is `.breadcrumb`
+(now a plain label — the dead `.crumb-back`/`.crumb-current` are gone). Cards use `.crow` + the solid
+`.chip-prio.p0..p3`, the labeled `.status-pill.st-…`, `.cfoot`/`.who`/`.ptag`, the reserved
+`.ctrouble` sub-row (`.tag-blocked`/`.tag-ready`/`.tag-stale`), and `.ctags` (`.tag-label`); the
+feed uses the 3-col `.ev` grid + `.ev-icon`/`.ev-text`/`.ev-time` (kind-colored via `.k-<kind>`).
+**Loading skeletons** (`.skeleton`/`.skel-card`/`.skel-line`/`.skel-feed`, shimmer; static under
+reduced motion) and **non-blocking toasts** (`.toast-region`/`.toast`/`.toast-ok`/`.toast-x`,
+`showToast`) are additive, `el()`-only. The Manage modal: `.proj-list`/`.proj-row`,
+`.badge-archived`, `.btn-archive` (`.unarchive`), the per-project `.btn-edit-proj`, and the
+Categories `.cat-manage-list`/`.cat-row`. The board-filter popover: `.filter-wrap` / `.filter-panel`
+/ `.filter-section` / `.filter-check` / `.filter-mine-row` / `.filter-mine-btn` / `.filter-foot` /
+`.filter-clear`, plus `.iconbtn.has-filters` + `.filter-count`. The modal's **Release** button is
+`.btn-release` (`margin-right:auto` pushes Delete to the row's right edge). The category overview adds
+`.cat-grid`, `.cat-card` (`.cat-card-all` dashed "All" card, `.cat-card-add` dashed "＋ New category"
+add-card), `.cat-name`/`.cat-sub`, `.count-chips`/`.count-chip` (with a color `.swatch`), and
+`.active-agents`/`.active-agent-avatar`/`.no-agents`/`.more-agents`. `#overview` is hidden by default
+and shown via `body.view-overview #overview` (which also hides `#board`; `#tabs` is a hidden stub).
+The modal's editable Meta section uses `.meta-section` / `.meta-row` / `.meta-key` / `.meta-val`
+(monospace value) plus the `.meta-add-row` / `.meta-key-add` / `.meta-val-add` / `.meta-add-btn`
+add-row (the per-row ✕ reuses `.dep-rm`). The graph overlay is styled via `.graph-overlay`,
+`.graph-shell`, `.graph-header`, `.graph-body`, `.graph-svg`, `.graph-detail`, `.graph-legend`, and
+assorted `.gnode-*` / `.gedge-*` / `.gd-*` classes for nodes, edges, and the detail panel.
 
 ## Forms
 
@@ -345,7 +404,9 @@ explicit field (NOT auto-derived) and Save sends only the changed fields.
 
 - **Empty states** — `boardEmpty()` (no projects / no tasks, with a CTA), `.empty-col` per empty
   column, "No comments yet" / "No activity yet".
-- **Connection state** — `setStatus()` shows `live` (green pulse) / `reconnecting…` / `connecting…`.
+- **Connection state** — `setStatus()` (the `#status` dot) shows `live` (green pulse) /
+  `connecting…` / `reconnecting…` (warn) / `offline — retrying…` (a loud, non-pulsing red `.status.err`
+  once backoff climbs or `navigator.onLine === false`).
 - **Loading** — minimal; localhost fetches are instant. No spinners.
 - **Done column** capped at 50 rendered cards (`+N more`); feed capped at ~200 nodes (`trimFeed`) —
   cap is skipped once the user has paginated (`feedPaginated = true`) to preserve loaded history.
@@ -353,14 +414,22 @@ explicit field (NOT auto-derived) and Save sends only the changed fields.
 ## Accessibility
 
 Deliberately addressed in this codebase (see `decision-records.md` IADR / UX history):
-- Skip link (`index.html`), global `:focus-visible` ring, `prefers-reduced-motion` reset.
-- Modal: `role="dialog"`, `aria-modal`, dynamic `aria-label`, a **focus trap** (`trapFocus`) and
-  **focus restore** to the trigger (`lastFocus`).
+- Skip link (`index.html`), global `:focus-visible` ring, `prefers-reduced-motion` reset (CSS kills
+  transitions/animations; `prefersReducedMotion()` also skips scheduling the JS card-flash).
+- Modal **and** graph overlay: `role="dialog"`, `aria-modal`, dynamic `aria-label`, a **focus trap**
+  (`trapFocus`) and **focus restore** to the trigger (`lastFocus` / `graphLastFocus`); `Esc` closes.
 - Cards are `role="button"`, `tabindex=0`, openable with Enter/Space; status moves via `[` / `]`.
+- Status uses a redundant, non-color-only cue (the labeled `.status-pill` word + dot); priority shows
+  the `P0..P3` rank text on every card; feed events carry a glyph **and** the event in words.
+- Rail items are `<button>`s with `aria-pressed`/`aria-current` reflecting the active scope (the old
+  tabs' `aria-pressed` model carried over); the rail is `<aside role="navigation">`, the toggle tracks
+  `aria-expanded`, and `#status` is an `aria-live` region. Non-blocking **toasts** (`showToast`) and
+  loading **skeletons** are `aria-live`/`aria-hidden` respectively.
 - Keyboard shortcuts (`onKey`): `n` new task, `a` toggle activity, `g` toggle graph overlay
-  (open/close), `/` focus the search box, `Esc` close. The graph detail panel's "Open task" closes the overlay, then opens the
-  task modal on the board (so the modal isn't hidden behind the overlay).
-- `aria-pressed` on tabs, `aria-expanded` on the activity toggle, labels on all fields.
+  (open/close), `/` focus the search box, `Esc` close (filter panel → modal → mobile rail, in order).
+  The graph detail panel's "Open task" closes the overlay, then opens the task modal on the board (so
+  the modal isn't hidden behind the overlay).
+- `aria-expanded` on the activity toggle, labels on all fields.
 - Drawer resize handle is a `role="separator"` with arrow-key support.
 
 ## Testing
@@ -389,9 +458,9 @@ of them fails `go test` before it ships.
 edit), the board-filter popover, the editable Meta section, the Release button, the delete confirm flows
 (task/comment/project), the feed pagination button, the dependency section (prereq chips, add-prereq
 dropdown, blocks list), the graph overlay (layout, pan/zoom, transitive highlight, detail panel,
-live refresh), the **category overview + hash routing** (overview cards, drill-down, breadcrumb/back,
-per-view stream re-open, live count refresh — Phase R), multi-select filter logic, and SSE
-reconciliation paths — is not automatically tested. The **server** surface those views ride on is
+live refresh), the **left-rail navigation + hash routing** (rail tree, drill-down, `goProject`
+single-select, collapse/off-canvas, per-view stream re-open, live count refresh), the category
+overview cards, and SSE reconciliation paths — is not automatically tested. The **server** surface those views ride on is
 covered by Go tests (the `?category=` feed/stream filtering and the augmented `/api/categories`
 payload — `server_test.go`, `sse_test.go`, `hub_test.go`, `store_test.go`); the **rendering** relies
 on preview/smoke + the XSS-sink guard. XSS safety of all these surfaces is guarded by
@@ -404,7 +473,8 @@ verification. (Gap; see `known-risks-and-gaps.md`.)
   after editing (`go build -o am ./cmd/am`) — assets are embedded, so a running server serves the
   old UI until restarted.
 - New card field → extend `card()` + `renderModal()`. New event type → `evKind`/`evText`/
-  `describeText`. New board affordance → `renderBoard()`/`moveTask()`. Graph overlay changes →
+  `describeText` (+ an `EV_GLYPH` entry for the feed glyph). New board affordance →
+  `renderBoard()`/`moveTask()`. New rail entry → `renderRail()`/`railItem()`. Graph overlay changes →
   `computeGraphLayout`, `renderGraph`, `renderGraphDetail`; SVG elements via `svg()` helper.
 - New **top-level view** → add a hash case to `route()` and a branch in `applyView`; new
   scope-aware data call → route it through `viewParams()` so `?project=`/`?category=` stay
@@ -415,7 +485,7 @@ verification. (Gap; see `known-risks-and-gaps.md`.)
 - **Native HTML5 drag-and-drop doesn't fire on touch** → mobile relies on the status dropdown /
   `[ ]` keys (documented fallback in code comments).
 - **Full board re-render per event batch** (debounced) — fine at small scale, O(n) at large scale.
-- Single 2384-line `app.js`, no module split, no minification. Behavioral JS logic is not
+- Single 2706-line `app.js`, no module split, no minification. Behavioral JS logic is not
   automatically tested (deliberate no-JS-runner decision); XSS-sink safety is enforced by the
   `TestDashboardNoXSSSinks` Go guard. The delete confirm flows, feed pagination, dependency UI,
   and the graph overlay are still untested at the behavioral level.

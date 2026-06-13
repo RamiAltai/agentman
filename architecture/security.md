@@ -1,7 +1,7 @@
 # Security Architecture
 
 > The single most important fact: **there is no authentication, and authorization is loopback-only.**
-> Access control is *entirely* the `127.0.0.1` bind. Scope tokens (Phase S) confine a token-following
+> Access control is *entirely* the `127.0.0.1` bind. Scope tokens confine a token-following
 > agent server-side but are **not** auth against arbitrary local processes — any change that widens
 > the bind, or adds remote access, must still add real auth first. Deliberate decisions
 > (`decision-records.md` ADR-002, ADR-029).
@@ -12,7 +12,7 @@
 all requests. The `X-Agent` header (`server.go actorOf`) is an **actor label for attribution, not a
 credential** — any caller may claim any identity, including `"human"` (the dashboard's value).
 
-The `X-Agent-Scope` header (Phase Q) and the Phase S **bearer token** (`Authorization: Bearer <tok>`)
+The `X-Agent-Scope` header and the **bearer token** (`Authorization: Bearer <tok>`)
 are both about *scope confinement*, not authentication — there is no user to authenticate. A token
 **does** let the server derive a scope it can trust against a *config-following* agent (the token is
 server-minted and bound to a scope; the agent cannot forge a token for another scope), but it is not
@@ -26,17 +26,17 @@ Anyone who can reach the port can act unscoped (read/mutate everything) by simpl
 and no scope header.
 
 **The scope boundary, in three layers:**
-- **Phase Q — `X-Agent-Scope` (client-asserted).** An agent may carry an `X-Agent-Scope` header
+- **`X-Agent-Scope` (client-asserted).** An agent may carry an `X-Agent-Scope` header
   (`category[/project]`), enforced on every mutation and on named reads — out-of-scope →
   `403 {"error":"out_of_scope"}` (CLI exit 8). Client-asserted: any caller can send any scope or omit
   it. Accident prevention, not a boundary against crafted HTTP.
-- **Phase S — bearer tokens (server-derived).** `am token new --scope <cat[/proj]>` mints a
+- **Bearer tokens (server-derived).** `am token new --scope <cat[/proj]>` mints a
   scope-bound token (the human does this); the agent's CLI then sends it as `Authorization: Bearer`
   on every request. **A bearer token's scope WINS over any `X-Agent-Scope` header** — the server
   resolves the token to its bound scope and ignores the header (the CLI drops the header entirely when
   a token is set). The token is **server-minted and bound to a scope**, so a config-following agent
-  that holds only its own token **cannot forge a token for another scope**: this is what upgrades
-  Phase Q's "any header" caveat to "a server-minted, scope-bound, revocable credential". An invalid or
+  that holds only its own token **cannot forge a token for another scope** — a server-minted,
+  scope-bound, revocable credential. An invalid or
   revoked token → `401 {"error":"unauthorized"}` (CLI **exit 9**) on ANY endpoint — `scopeOf` surfaces
   it, never a silent fallthrough to unscoped, so a bad credential hard-fails (distinct from exit 8's
   per-id scope-skip).
@@ -58,24 +58,23 @@ and no scope header.
 - **Cleartext on loopback.** Tokens travel in cleartext over `127.0.0.1` (no TLS); acceptable because
   the bind never leaves loopback. A token is not a network-facing secret.
 
-**Residual honesty note (the precise boundary).** Phase S is **loopback-only and has no users**: a
-process that can read an identity file (`~/.agentman/agents/*`) holds that token and can act as that
-scope. The boundary Phase S provides is narrow and precise — *a config-following agent that cannot
-forge another scope's token is confined to its own scope.* It is **not** protection against an
-attacker with arbitrary filesystem read, and it is **not** authentication. This upgrades Phase Q's
-caveat but does **not** fully close R4's accident-prevention framing. The full remote/multi-user
-auth+TLS work (Phase G) stays parked. `scopeOf(r)` in `server.go` remains the single reader of request
-scope (now a `*Server` method so it can resolve tokens) — token-vs-header precedence lives there
+**Residual honesty note (the precise boundary).** The token model is **loopback-only and has no
+users**: a process that can read an identity file (`~/.agentman/agents/*`) holds that token and can
+act as that scope. The boundary it provides is narrow and precise — *a config-following agent that
+cannot forge another scope's token is confined to its own scope.* It is **not** protection against an
+attacker with arbitrary filesystem read, and it is **not** authentication; full remote/multi-user
+auth+TLS is out of scope. `scopeOf(r)` in `server.go` is the single reader of request
+scope (a `*Server` method so it can resolve tokens) — token-vs-header precedence lives there
 alone, no handler touches it.
 
-**Known coverage gaps in Phase Q (deliberate):**
+**Known coverage gaps (deliberate):**
 - `GET /api/events` and `GET /api/stream` are **not** narrowed by `X-Agent-Scope` — a scoped agent
-  can still read the global activity feed. Phase R added an *unscoped* `?category=` lens for the
+  can still read the global activity feed. An *unscoped* `?category=` lens serves the
   human dashboard's category drill-down (a query-param choice, not an identity scope); the agent
   `am wait` stream stays unscoped by design.
 - `GET /api/projects` and `GET /api/categories` list endpoints are **not** narrowed — board
-  metadata (slugs/names) is visible to any scope; task *data* is the enforcement point (Phase R
-  kept `/api/categories` unscoped on purpose — it serves the unscoped human dashboard).
+  metadata (slugs/names) is visible to any scope; task *data* is the enforcement point
+  (`/api/categories` is unscoped on purpose — it serves the unscoped human dashboard).
 - An explicit unknown `?project=` for a scoped agent returns 403 (not 404/empty) — the server
   cannot prove it in-scope, so it fails loud (mild existence ambiguity, accepted).
 
@@ -90,11 +89,11 @@ alone, no handler touches it.
 ## Sensitive Assets
 
 - The **SQLite DB** (`~/.agentman/agentman.db`) — contains all board content; no encryption at rest.
-  Since Phase S it also holds the `tokens` table, but only the **sha256 hash** of each token, never
+  It also holds the `tokens` table, but only the **sha256 hash** of each token, never
   the plaintext — a stolen DB row cannot be replayed (the server compares `hash(presented_plaintext)`).
 - **Task/comment bodies** — may hold internal plans, repo names, or secrets an agent pasted.
 - **Agent identity files** (`~/.agentman/agents/*`) — carry the agent label and scope (non-secret),
-  **plus, since Phase S, the agent's plaintext bearer token** (the optional `token` field). The token
+  **plus the agent's plaintext bearer token** (the optional `token` field). The token
   is a scope-bound credential: a process that can read the file can act as that scope. Treat the file
   as scope-sensitive (loopback-only mitigates; see the Authorization honesty note).
 - No passwords or API keys are stored. The only credential at rest is the bearer **token hash**
@@ -123,7 +122,7 @@ alone, no handler touches it.
 
 - **Dashboard is XSS-safe by construction:** `web/app.js` builds DOM via `el()` using `textContent`
   / text nodes and **never `innerHTML`** — a task titled `<img src=x onerror=…>` renders as literal
-  text. (Confirmed; this was explicitly verified during development.)
+  text.
 - API returns `application/json` via `encoding/json` (auto-escaped).
 - The **CLI prints server text verbatim** to the terminal — fine for terminals, but a consumer that
   renders CLI output as HTML would need to encode it (not a current concern).
@@ -132,7 +131,7 @@ alone, no handler touches it.
 
 No secrets in the repo. `.gitignore` excludes the binary and `*.db*`. Identity uses `math/rand` for
 a non-security-sensitive suffix (`identity.go`) — acceptable since it's a label, not a credential.
-**Bearer tokens (Phase S)** are the one runtime secret: the plaintext (`amt_` + 32 hex, 16 bytes of
+**Bearer tokens** are the one runtime secret: the plaintext (`amt_` + 32 hex, 16 bytes of
 `crypto/rand`) is generated and shown **once** at mint, then only ever stored as a sha256 hash in the
 DB. It is never logged (the convention bans logging tokens), never returned by `am token ls`/`whoami`,
 and the CLI keeps stdout clean (the plaintext is the first stdout line at mint so capture works; the
@@ -149,17 +148,19 @@ hint goes to stderr). The plaintext at rest lives only in the per-directory iden
 ## Attack Surface
 
 - **HTTP API on loopback** — full read/write, unauthenticated.
-- **Browser-driven attacks even on loopback:** historically, with no auth and no CSRF/`Host` guard, a
-  malicious website could issue writes to `127.0.0.1:8787` (CSRF) or read via DNS rebinding — and
+- **Browser-driven attacks even on loopback:** with no auth, a malicious website would otherwise
+  issue writes to `127.0.0.1:8787` (CSRF) or read via DNS rebinding — and
   because agents *act on* tasks, a poisoned task is an **injection vector into the agent fleet**.
-  **As of Phase 0 (ADR-011) this is mitigated** by the Host allowlist (`hostGuard`) and the
-  write-CSRF guard (`csrfGuard`). It is not eliminated: a local non-browser process (no `Origin`/
-  `Sec-Fetch-Site`) is still trusted, and reads are not CSRF-gated.
+  Mitigated by the Host allowlist (`hostGuard`) and the
+  write-CSRF guard (`csrfGuard`) (ADR-011). It is not eliminated: a local non-browser process (no
+  `Origin`/`Sec-Fetch-Site`) is still trusted, and reads are not CSRF-gated.
 - **`am update`** shells out `go install <fixed module>@<version>` via `os/exec` (`update.go`);
   the version comes from a local CLI arg, the module path is a constant → low risk (no shell string
   interpolation; args passed as a slice).
 - **Startup update check** fetches a **fixed** `proxy.golang.org` URL → not SSRF-prone.
-- ~~**500 responses leak raw error strings**~~ — **fixed (Phase D1)**. `writeErr`'s default branch now logs the real error server-side (`log.Printf("agentman: internal error: %v", err)` to stderr) and returns a generic `{"error":"internal"}` body. Internal detail is no longer sent to clients.
+- **500 responses return a generic body.** `writeErr`'s default branch logs the real error
+  server-side (`log.Printf("agentman: internal error: %v", err)` to stderr) and returns
+  `{"error":"internal"}` — internal detail is never sent to clients.
 - **`am db export`/`am db import`** (`cmd/am/db.go`) are **CLI-only and add no HTTP route or network
   surface**. Export reads the DB read-only and `VACUUM INTO` a snapshot; import replaces the local DB
   file. See *Local DB Snapshot & Restore* below for the file-handling and liveness controls.
@@ -182,10 +183,10 @@ the server. Their security-relevant properties:
   importing". This avoids replacing a live WAL DB out from under a running process and corrupting it.
 - **Candidate validation.** Before replacing anything, import runs `PRAGMA integrity_check` /
   `foreign_key_check`, requires the five core tables (the v1 baseline set — later tables, the
-  Phase-S `tokens` table included, are recreated by `schema.sql`/migrations on open, so old snapshots
+  `tokens` table included, are recreated by `schema.sql`/migrations on open, so old snapshots
   stay importable), and rejects a `schema_version` newer than `currentSchemaVersion` — so a garbage
   or future-schema file is refused, not imported. `OpenStore` applies the same version ceiling at open
-  time (Phase O), so an older binary refuses a too-new DB instead of operating on it.
+  time, so an older binary refuses a too-new DB instead of operating on it.
 - **Token hashes ride the snapshot.** `VACUUM INTO` is a whole-file snapshot, so a `tokens` table
   is exported with everything else — acceptable because only non-replayable sha256 hashes are stored
   (the server compares `hash(presented_plaintext)`); no scrubbing is performed (ADR-029).
@@ -194,21 +195,21 @@ the server. Their security-relevant properties:
 
 - Loopback-only bind (the primary control).
 - **Host-header allowlist** (`server.go hostGuard`) — rejects any Host except `127.0.0.1`/`localhost`/
-  `::1`; mitigates DNS rebinding. (Added Phase 0, ADR-011.)
+  `::1`; mitigates DNS rebinding. (ADR-011.)
 - **Write-CSRF guard** (`server.go csrfGuard`) — blocks cross-origin browser writes via
   `Sec-Fetch-Site`/`Origin` while allowing the header-less CLI and the same-origin dashboard;
-  mitigates malicious-website drive-by writes. (Added Phase 0, ADR-011.)
+  mitigates malicious-website drive-by writes. (ADR-011.)
 - **`X-Content-Type-Options: nosniff` + a dashboard-safe CSP** (`server.go securityHeaders`).
 - **Atomic claim** prevents double-claim/race (`store.go ClaimTask` / `StealStaleClaim` /
   `NextTask`, conditional `UPDATE … RETURNING`).
 - XSS-safe DOM rendering; parameterized SQL; request body size cap.
 - The **`events` table is a de-facto audit log** (actor, kind, timestamp, delta) — but the actor is
   spoofable since `X-Agent` is unauthenticated, so it's attribution, not non-repudiation.
-- **Scope confinement** (`X-Agent-Scope`, Phase Q; **scope tokens, Phase S**) — the server rejects
+- **Scope confinement** (`X-Agent-Scope` header + **scope tokens**) — the server rejects
   out-of-scope mutations and named reads with `403 out_of_scope` and logs each denial
   (`agentman: out_of_scope: …`). A control for **accidental** cross-scope action by a config-following
-  agent. Phase S adds a **server-minted, scope-bound bearer token** (`Authorization: Bearer`): its
-  scope wins over the header, mint requires an unscoped caller, and an invalid/revoked token →
+  agent. A **server-minted, scope-bound bearer token** (`Authorization: Bearer`) has its
+  scope win over the header, mint requires an unscoped caller, and an invalid/revoked token →
   `401 unauthorized` (CLI exit 9). This confines a *token-following* agent that cannot forge another
   scope's token — but it is **not** auth against an arbitrary local process (loopback-only; a
   filesystem read of the identity file = token possession). Denials are log-only — no event kind, and
@@ -216,28 +217,26 @@ the server. Their security-relevant properties:
 
 ## Security Gaps
 
+(Current gaps only. Resolved items live in git history.)
+
 1. No authentication; authorization is **loopback-scoped** (by design, but blocks any non-loopback
-   use). Phase S scope tokens confine a token-following agent server-side but are not auth against an
+   use). Scope tokens confine a token-following agent server-side but are not auth against an
    arbitrary local process.
-2. ~~No CSRF / DNS-rebinding guard~~ — **mitigated in Phase 0** by the Host allowlist + write-CSRF
-   guard (ADR-011). Residual: these are not auth, so any *local* process can still call the API.
-3. No TLS — Phase S bearer tokens travel in **cleartext** over the `127.0.0.1` loop. Acceptable only
+2. No TLS — bearer tokens travel in **cleartext** over the `127.0.0.1` loop. Acceptable only
    because the bind never leaves loopback; a token is not a network-facing secret. (Would be sniffable
    the moment the bind widened — another reason remote access is an auth+TLS project, not a bolt-on.)
-4. No rate limiting / brute-force protection (token lookup is also not constant-time — a non-issue at
+3. No rate limiting / brute-force protection (token lookup is also not constant-time — a non-issue at
    loopback scale, infeasible to make constant-time over a DB lookup).
-5. ~~500s expose internal error text~~ — **fixed (Phase D1)**; 500s return `{"error":"internal"}`; detail only in server-side logs.
-6. ~~No dependency vulnerability scanning~~ — **added (Phase F)**; `govulncheck ./...` runs in CI. Residual: no Dependabot.
-7. Audit actor is spoofable (no identity verification).
-8. **Scope confinement is token-backed but loopback-only** (Phase Q + Phase S). `X-Agent-Scope` alone
-   is client-asserted (forgeable/omittable). **Phase S scope tokens** make the scope server-derived
+4. Audit actor is spoofable (no identity verification).
+5. **Scope confinement is token-backed but loopback-only.** `X-Agent-Scope` alone
+   is client-asserted (forgeable/omittable). **Scope tokens** make the scope server-derived
    for a *token-following* agent — a server-minted, scope-bound token whose scope wins over the header,
    minted only by an unscoped caller, so a confined agent cannot forge another scope's token (bad
    token → `401`/exit 9). **Residual**: still not auth against an arbitrary local process — a process
    that reads the identity file holds the token (loopback-only; see the Authorization honesty note).
    Residual reads: `/api/events`, `/api/stream`, `GET /api/projects`, `GET /api/categories` are not
-   narrowed by scope (Phase R added an unscoped `?category=` lens for the human dashboard, not an
-   identity scope) — see Authorization above.
+   narrowed by scope (an unscoped `?category=` lens serves the human dashboard, not an identity
+   scope) — see Authorization above.
 
 ## Secure Implementation Checklist
 
@@ -246,9 +245,9 @@ Before merging a change, confirm:
       sanctioned exception is the escaped-literal `VACUUM INTO` path in `exportDB` — don't add more.
 - [ ] Any new dashboard rendering uses `el()`/`textContent`, never `innerHTML`/`insertAdjacentHTML`.
 - [ ] The server still binds `127.0.0.1` **unless** you also added authentication.
-- [ ] New endpoints validate inputs and map errors via `writeErr` (no raw 500 text for expected cases; the `default` branch now returns a generic `{"error":"internal"}` body and logs detail server-side).
+- [ ] New endpoints validate inputs and map errors via `writeErr` (no raw 500 text for expected cases; the `default` branch returns a generic `{"error":"internal"}` body and logs detail server-side).
 - [ ] No secrets added to the repo, logs, or query strings. **Never log or `ls`/`whoami`-print a
-      bearer token plaintext** (Phase S); store only its sha256 hash, show the plaintext once at mint.
+      bearer token plaintext**; store only its sha256 hash, show the plaintext once at mint.
 - [ ] If you added remote access: auth + CSRF/`Host` guard + TLS are all present, not just one.
 - [ ] Any new local file written from a DB path (snapshots, backups) is created `0o600` / `0o700`,
       and a DB-replacing op writes only to the configured DB path and guards against a live server.
