@@ -365,7 +365,7 @@ async function applyView(next, cat) {
       await loadFeed();
     }
   } catch (e) {
-    setStatus("error", "warn");
+    setStatus("error: " + e.message, "warn");
   }
   connect(); // re-open the stream with the new scope (?category= or unfiltered)
 }
@@ -974,7 +974,12 @@ function onEvent(ev) {
   if (view === "overview") {
     if (/^(task|project|category)\./.test(ev.kind)) {
       clearTimeout(overviewTimer);
-      overviewTimer = setTimeout(() => loadOverview().catch(() => {}), 250);
+      // Re-check the view at fire time: navigating away before the debounce
+      // elapses must not write to the now-hidden #overview element.
+      overviewTimer = setTimeout(() => {
+        if (view !== "overview") return;
+        loadOverview().catch(() => {});
+      }, 250);
     }
     return;
   }
