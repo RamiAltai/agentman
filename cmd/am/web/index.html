@@ -23,59 +23,80 @@
 <body>
   <a class="skip-link" href="#board">Skip to board</a>
 
-  <header>
-    <span class="brand">agent<span class="brand-accent">man</span></span>
-    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
-    <nav id="tabs" class="tabs" aria-label="Projects"></nav>
-    <div class="actions">
-      <!-- Find segment: search + label chip + Filter popover -->
-      <div class="actions-seg" role="group" aria-label="Find">
-        <input id="searchBox" type="search" class="search-input" placeholder="Search… ( / )" aria-label="Search tasks">
-        <span id="labelFilterChip" class="label-filter hidden"></span>
-        <div class="filter-wrap">
-          <button id="filterBtn" class="iconbtn" aria-haspopup="true" aria-expanded="false" title="Filter tasks" aria-label="Filter tasks">Filter</button>
-          <div id="filterPanel" class="filter-panel hidden" role="dialog" aria-label="Board filters"></div>
-        </div>
-      </div>
-      <span class="actions-sep" aria-hidden="true"></span>
-      <!-- View segment: theme + graph -->
-      <div class="actions-seg" role="group" aria-label="View">
-        <button id="themeToggle" class="iconbtn ghost" title="Toggle light/dark theme" aria-label="Toggle color theme">
-          <span class="theme-toggle-icon" aria-hidden="true"></span>
-        </button>
-        <button id="graphBtn" class="iconbtn" title="Dependency graph (g)" aria-label="Open dependency graph">Graph</button>
-      </div>
-      <span class="actions-sep" aria-hidden="true"></span>
-      <!-- Act / status segment: new task + live status + activity toggle -->
-      <div class="actions-seg" role="group" aria-label="Actions">
-        <button id="newBtn" class="btn-primary" title="New task (n)">+ Task</button>
-        <span id="status" class="status" role="status" aria-live="polite">
-          <span class="pulse" aria-hidden="true"></span><span class="status-text">connecting…</span>
-        </span>
-        <button id="feedToggle" class="iconbtn" aria-controls="feed" aria-expanded="true" title="Toggle activity (a)">
-          <span class="feed-toggle-label">Activity</span>
+  <div class="shell">
+    <!-- Left rail: primary navigation. The brand + collapse toggle are static;
+         renderRail() fills #railNav (Overview, All tasks, category→project tree,
+         + New project, Manage). #tabs is kept as a hidden, harmless stub so any
+         residual renderTabs() reference can't throw. -->
+    <aside id="rail" role="navigation" aria-label="Projects">
+      <div class="rail-head">
+        <span class="brand">agent<span class="brand-accent">man</span></span>
+        <button id="railToggle" class="rail-toggle" aria-label="Toggle navigation" aria-expanded="true" title="Collapse navigation">
+          <span class="rail-toggle-icon" aria-hidden="true">⟨</span>
         </button>
       </div>
-    </div>
-  </header>
-
-  <main>
-    <section id="overview" aria-label="Category overview"></section>
-    <section id="board" aria-label="Task board"></section>
-
-    <div id="feedResize" role="separator" aria-orientation="vertical"
-         aria-label="Resize activity panel" tabindex="0"></div>
-
-    <aside id="feed" aria-label="Activity feed">
-      <div class="feed-head">
-        <h2>Activity</h2>
-        <button id="feedClose" class="iconbtn ghost" aria-label="Collapse activity panel" title="Collapse">⟩⟩</button>
-      </div>
-      <ul id="feedList"></ul>
+      <nav id="railNav" class="rail-nav" aria-label="Projects navigation"></nav>
     </aside>
 
-    <div id="feedBackdrop"></div>
-  </main>
+    <div class="appcol">
+      <header>
+        <button id="railOpen" class="rail-open-btn iconbtn ghost" aria-label="Open navigation" title="Open navigation">☰</button>
+        <h1 id="breadcrumb" class="breadcrumb" aria-label="Current scope"></h1>
+        <div class="actions">
+          <!-- Find segment: search + label chip + Filter popover -->
+          <div class="actions-seg" role="group" aria-label="Find">
+            <input id="searchBox" type="search" class="search-input" placeholder="Search… ( / )" aria-label="Search tasks">
+            <span id="labelFilterChip" class="label-filter hidden"></span>
+            <div class="filter-wrap">
+              <button id="filterBtn" class="iconbtn" aria-haspopup="true" aria-expanded="false" title="Filter tasks" aria-label="Filter tasks">Filter</button>
+              <div id="filterPanel" class="filter-panel hidden" role="dialog" aria-label="Board filters"></div>
+            </div>
+          </div>
+          <!-- Primary action: new task -->
+          <button id="newBtn" class="btn-primary" title="New task (n)">+ Task</button>
+          <span class="actions-sep" aria-hidden="true"></span>
+          <!-- Utility cluster: graph · theme · activity · live status -->
+          <div class="actions-seg actions-util" role="group" aria-label="View">
+            <button id="graphBtn" class="iconbtn" title="Dependency graph (g)" aria-label="Open dependency graph">Graph</button>
+            <button id="themeToggle" class="iconbtn ghost" title="Toggle light/dark theme" aria-label="Toggle color theme">
+              <span class="theme-toggle-icon" aria-hidden="true"></span>
+            </button>
+            <button id="feedToggle" class="iconbtn" aria-controls="feed" aria-expanded="true" title="Toggle activity (a)">
+              <span class="feed-toggle-label">Activity</span>
+            </button>
+            <span id="status" class="status" role="status" aria-live="polite">
+              <span class="pulse" aria-hidden="true"></span><span class="status-text">connecting…</span>
+            </span>
+          </div>
+        </div>
+      </header>
+
+      <main>
+        <section id="overview" aria-label="Category overview"></section>
+        <section id="board" aria-label="Task board"></section>
+
+        <div id="feedResize" role="separator" aria-orientation="vertical"
+             aria-label="Resize activity panel" tabindex="0"></div>
+
+        <aside id="feed" aria-label="Activity feed">
+          <div class="feed-head">
+            <h2>Activity</h2>
+            <button id="feedClose" class="iconbtn ghost" aria-label="Collapse activity panel" title="Collapse">⟩⟩</button>
+          </div>
+          <ul id="feedList"></ul>
+        </aside>
+
+        <div id="feedBackdrop"></div>
+      </main>
+    </div>
+  </div>
+
+  <!-- Hidden, harmless stub: renderTabs() was replaced by renderRail(), but any
+       residual $("tabs") reference must still resolve to an element, not null. -->
+  <nav id="tabs" hidden aria-hidden="true"></nav>
+
+  <!-- Off-canvas backdrop for the mobile rail (mirrors #feedBackdrop). -->
+  <div id="railBackdrop"></div>
 
   <div id="modal" class="hidden" role="dialog" aria-modal="true" aria-label="Task details">
     <div class="sheet" id="sheet" tabindex="-1"></div>

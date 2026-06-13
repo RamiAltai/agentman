@@ -32,6 +32,7 @@ function prefersReducedMotion() {
 }
 
 const FEED_W_KEY = "am.feedW", FEED_COLLAPSED_KEY = "am.feedCollapsed";
+const RAIL_COLLAPSED_KEY = "am.railCollapsed";
 const THEME_KEY = "am.theme";
 
 let projects = [];
@@ -40,6 +41,8 @@ let view = "overview";       // "overview" (category home) | "all" (cross-catego
 let activeCategory = "";     // category slug when view==="category"
 let categories = [];         // CategoryStat[] for the overview (counts + active_agents)
 let overviewTimer = null;    // debounce for live overview count refresh
+let railTimer = null;        // debounce for live rail count refresh (projects + categories)
+let pendingProject = "";     // a project slug to auto-select after the next applyView() (see goProject)
 let tasks = new Map();       // id -> task (terse)
 let cursor = 0;              // highest event id seen (SSE since=)
 let es = null, backoff = 1000, refreshTimer = null, openTaskId = null, lastFocus = null, dragId = null;
@@ -192,7 +195,15 @@ function setStatus(text, cls) {
 
 async function loadProjects() {
   projects = await api("GET", "/api/projects");
-  renderTabs();
+  renderRail();
+}
+
+// loadCategories fetches the category list used by the rail tree. loadOverview()
+// also sets `categories` (with active_agents), but the board views never call it,
+// so init() loads them once up front and live events refresh them on a debounce.
+async function loadCategories() {
+  categories = await api("GET", "/api/categories");
+  renderRail();
 }
 
 async function loadBoard() {
@@ -237,29 +248,101 @@ async function loadFeed() {
   }
 }
 
-function renderTabs() {
-  const nav = $("tabs");
-  const inView = projectsInView();
-  const allOpen = inView.reduce((n, p) => n + openCount(p.counts), 0);
-  // In a category board the "All" tab spans that category's projects; in the
-  // "all" view it spans every project.
-  nav.replaceChildren(tab("", "All", allOpen));
-  for (const p of inView) nav.append(tab(p.slug, p.name, openCount(p.counts)));
-  nav.append(el("button", { class: "tab add", onclick: openNewProject, title: "New project", "aria-label": "New project" }, "＋"));
-  nav.append(el("button", { class: "tab add", onclick: openManage, title: "Manage", "aria-label": "Manage categories and projects" }, "⋯"));
-}
-
 function openCount(c) { c = c || {}; return (c.todo || 0) + (c.doing || 0) + (c.blocked || 0); }
 
-function tab(slug, label, open) {
-  const active = slug === "" ? selected.size === 0 : selected.has(slug);
-  const b = el("button", {
-    class: "tab" + (active ? " active" : ""),
-    "aria-pressed": String(active),
-    onclick: () => toggleProject(slug),
-  }, label);
-  if (open) b.append(el("span", { class: "badge" }, String(open)));
-  return b;
+// ---------- left rail (primary navigation) ----------
+//
+// renderRail() rebuilds #railNav from `categories` + `projects` + current nav
+// state every time the view/selection/data changes. The rail replaces the old
+// header tab strip: it carries Overview, All tasks, a category→project tree with
+// open-counts, and the create/manage actions. Built entirely with el().
+
+// railItem builds one navigable row (Overview / All tasks / project / action).
+// glyph is a decorative marker node (or null); count is an open-count badge value.
+function railItem(opts) {
+  const item = el("button", {
+    class: "rail-item" + (opts.cls ? " " + opts.cls : "") + (opts.active ? " active" : ""),
+    "aria-pressed": opts.active ? "true" : null,
+    "aria-current": opts.active ? "true" : null,
+    onclick: opts.onclick,
+    title: opts.title || null,
+  });
+  if (opts.glyph != null) item.append(el("span", { class: "rail-glyph", "aria-hidden": "true" }, opts.glyph));
+  if (opts.dot) item.append(el("span", { class: "rail-dot", "aria-hidden": "true" }));
+  item.append(el("span", { class: "rail-label" }, opts.label));
+  if (opts.count) item.append(el("span", { class: "rail-count" }, String(opts.count)));
+  return item;
+}
+
+function renderRail() {
+  const nav = $("railNav");
+  if (!nav) return;
+  nav.replaceChildren();
+
+  // Top-level destinations.
+  nav.append(railItem({
+    label: "Overview", glyph: "◳", active: view === "overview",
+    onclick: () => { navigate("#/"); closeMobileRail(); },
+  }));
+  const allOpen = projects.reduce((n, p) => n + openCount(p.counts), 0);
+  nav.append(railItem({
+    label: "All tasks", glyph: "▤", count: allOpen,
+    active: view === "all" && selected.size === 0,
+    onclick: () => { navigate("#/all"); closeMobileRail(); },
+  }));
+
+  // Category sections, each with its nested project rows. Uncategorized projects
+  // (a category slug not in `categories`) collect under a synthetic "Other" group
+  // so every project is reachable from the rail.
+  const known = new Set(categories.map((c) => c.slug));
+  const sections = categories.map((c) => ({ slug: c.slug, name: c.name || c.slug, counts: c.counts }));
+  const orphans = projects.filter((p) => !known.has(p.category));
+  if (orphans.length) sections.push({ slug: "", name: "Other", counts: null, orphan: true });
+
+  for (const sec of sections) {
+    const secEl = el("div", { class: "rail-section" });
+    const catActive = view === "category" && activeCategory === sec.slug && selected.size === 0;
+    const catProjects = sec.orphan ? orphans : projects.filter((p) => p.category === sec.slug);
+    const catOpen = sec.counts ? openCount(sec.counts) : catProjects.reduce((n, p) => n + openCount(p.counts), 0);
+
+    // A category label row is itself a destination (opens the category board);
+    // the synthetic "Other" group is a non-clickable header.
+    if (sec.orphan) {
+      const lbl = el("div", { class: "rail-section-label" }, el("span", { class: "rail-cat-name" }, sec.name));
+      if (catOpen) lbl.append(el("span", { class: "rail-count" }, String(catOpen)));
+      secEl.append(lbl);
+    } else {
+      const lbl = el("button", {
+        class: "rail-item rail-cat" + (catActive ? " active" : ""),
+        "aria-current": catActive ? "true" : null,
+        onclick: () => { navigate("#/cat/" + encodeURIComponent(sec.slug)); closeMobileRail(); },
+        title: "Open " + sec.name,
+      },
+        el("span", { class: "rail-glyph", "aria-hidden": "true" }, "▦"),
+        el("span", { class: "rail-label rail-cat-name" }, sec.name));
+      if (catOpen) lbl.append(el("span", { class: "rail-count" }, String(catOpen)));
+      secEl.append(lbl);
+    }
+
+    if (!catProjects.length) {
+      secEl.append(el("div", { class: "rail-empty" }, "No projects"));
+    } else {
+      for (const p of catProjects) {
+        secEl.append(railItem({
+          cls: "rail-project", label: p.name, dot: true, count: openCount(p.counts),
+          active: selected.has(p.slug),
+          onclick: () => { goProject(p); closeMobileRail(); },
+          title: p.name,
+        }));
+      }
+    }
+    nav.append(secEl);
+  }
+
+  // Footer actions.
+  nav.append(el("div", { class: "rail-divider", "aria-hidden": "true" }));
+  nav.append(railItem({ cls: "rail-action", label: "New project", glyph: "＋", onclick: () => { openNewProject(); closeMobileRail(); } }));
+  nav.append(railItem({ cls: "rail-action", label: "Manage", glyph: "⋯", onclick: () => { openManage(); closeMobileRail(); } }));
 }
 
 function renderBoard() {
@@ -437,15 +520,36 @@ function moveTask(id, status) {
 
 // ---------- project switching ----------
 
+// goProject navigates to a project's category board and selects ONLY that project.
+// applyView() clears `selected` on a view change, so we stash the slug in the
+// module-scoped `pendingProject` and have applyView() re-select it after clearing.
+// If we're already in the target category view, switch the selection in place.
+async function goProject(p) {
+  const targetHash = p.category ? "#/cat/" + encodeURIComponent(p.category) : "#/all";
+  const sameView = (p.category && view === "category" && activeCategory === p.category) ||
+                   (!p.category && view === "all");
+  if (sameView) {
+    selected = new Set([p.slug]);
+    renderRail();
+    try { await loadBoard(); await loadFeed(); } catch (e) { setStatus("error", "warn"); }
+    connect();
+    return;
+  }
+  pendingProject = p.slug;
+  navigate(targetHash);
+}
+
+// toggleProject toggles a single project in/out of `selected` within the current
+// view (kept for any residual callers; the rail uses goProject for single-select).
 async function toggleProject(slug) {
   if (slug === "") {
     selected.clear();            // "All" clears selection
   } else if (selected.has(slug)) {
-    selected.delete(slug);       // clicking an active tab deselects it
+    selected.delete(slug);       // clicking an active row deselects it
   } else {
-    selected.add(slug);          // clicking an inactive tab adds it
+    selected.add(slug);          // clicking an inactive row adds it
   }
-  renderTabs();
+  renderRail();
   try { await loadBoard(); await loadFeed(); } catch (e) { setStatus("error", "warn"); }
   connect();
 }
@@ -476,14 +580,17 @@ async function applyView(next, cat) {
   view = next;
   activeCategory = cat;
   selected.clear(); // a view change resets the within-view project selection
+  // goProject() stashes a slug here so a rail project-click lands on the project's
+  // category board with that project pre-selected (applyView always clears first).
+  if (pendingProject) { selected.add(pendingProject); pendingProject = ""; }
   document.body.classList.toggle("view-overview", view === "overview");
   setBreadcrumb();
+  renderRail(); // keep the rail's active highlight in sync in every view
   try {
     if (view === "overview") {
       await loadOverview();
       await loadFeed(); // one global, unfiltered recent-activity feed on the overview
     } else {
-      renderTabs();
       await loadBoard();
       await loadFeed();
     }
@@ -493,19 +600,24 @@ async function applyView(next, cat) {
   connect(); // re-open the stream with the new scope (?category= or unfiltered)
 }
 
-// setBreadcrumb fills the header back/breadcrumb element for the current view.
+// setBreadcrumb fills the lean top-bar TITLE (#breadcrumb) with the current scope
+// name. Navigation lives in the rail now, so this is just the scope label:
+// "Overview" / "All tasks" / a category name / the single selected project's name.
 function setBreadcrumb() {
   const bc = $("breadcrumb");
   if (!bc) return;
-  bc.replaceChildren();
-  if (view === "overview") return; // overview is the root; no back element
-  bc.append(el("button", { class: "crumb-back", onclick: () => navigate("#/"), title: "Back to categories" }, "← Categories"));
-  if (view === "category" && activeCategory) {
+  let title = "Overview";
+  if (selected.size === 1) {
+    const slug = [...selected][0];
+    const p = projects.find((x) => x.slug === slug);
+    title = (p && p.name) || slug;
+  } else if (view === "category" && activeCategory) {
     const c = categories.find((x) => x.slug === activeCategory);
-    bc.append(el("span", { class: "crumb-current" }, (c && c.name) || activeCategory));
+    title = (c && c.name) || activeCategory;
   } else if (view === "all") {
-    bc.append(el("span", { class: "crumb-current" }, "All"));
+    title = "All tasks";
   }
+  bc.textContent = title;
 }
 
 // ---------- overview (category home) ----------
@@ -514,6 +626,7 @@ async function loadOverview() {
   categories = await api("GET", "/api/categories");
   renderOverview();
   setBreadcrumb(); // category names are now known
+  renderRail();    // category names + counts are now known
 }
 
 function renderOverview() {
@@ -1463,7 +1576,7 @@ function onEvent(ev) {
     const archivedSlug = (ev.data || {}).slug;
     if (selected.has(archivedSlug)) {
       selected.delete(archivedSlug);
-      renderTabs();
+      renderRail();
       loadBoard().catch(() => {});
       loadFeed().catch(() => {});
       connect();
@@ -1483,7 +1596,7 @@ function onEvent(ev) {
     const deletedSlug = (ev.data || {}).slug;
     if (selected.has(deletedSlug)) {
       selected.delete(deletedSlug);
-      renderTabs();
+      renderRail();
       connect();
     }
     loadProjects().catch(() => {});
@@ -1500,7 +1613,29 @@ function onEvent(ev) {
   if (view !== "overview" && ev.task_id && /^task\./.test(ev.kind) && ev.kind !== "task.deleted") flashIds.add(ev.task_id);
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => loadBoard().catch(() => {}), 250); // debounced reconcile
+  // Keep the rail's open-counts live on the board views: task moves change a
+  // project's (and its category's) open count. Refresh both on the same debounce
+  // cadence as the board reconcile, but lightly — one projects+categories fetch.
+  if (/^(task|project|category)\./.test(ev.kind)) refreshRailCounts();
   if (openTaskId && ev.task_id === openTaskId && ev.kind !== "task.deleted" && ev.kind !== "comment.deleted" && ev.kind !== "task.dep_added" && ev.kind !== "task.dep_removed") refreshModal();
+}
+
+// refreshRailCounts re-fetches projects + categories (their open-counts) and
+// re-renders the rail, debounced so a burst of live events causes one refresh.
+function refreshRailCounts() {
+  clearTimeout(railTimer);
+  railTimer = setTimeout(async () => {
+    if (view === "overview") return; // the overview path already refreshes via loadOverview()
+    try {
+      const [ps, cs] = await Promise.all([
+        api("GET", "/api/projects"),
+        api("GET", "/api/categories"),
+      ]);
+      projects = ps;
+      categories = cs;
+      renderRail();
+    } catch (e) { /* ignore — next event retries */ }
+  }, 300);
 }
 
 function feedItem(ev) {
@@ -1691,6 +1826,47 @@ function initFeed() {
   });
 }
 
+// ---------- left rail: collapse (desktop) + off-canvas (mobile) ----------
+//
+// Two behaviors share #railToggle, switched by viewport width (the CSS rail
+// breakpoint is 820px). On desktop the toggle collapses the rail to zero width
+// (persisted in am.railCollapsed, mirroring the feed). On mobile the rail is
+// off-canvas; the toggle (and the header hamburger #railOpen) slide it in/out
+// via body.rail-open, with #railBackdrop closing it.
+
+const RAIL_MOBILE_MAX = 820; // keep in sync with the @media breakpoint in app.css
+function railIsMobile() { return window.innerWidth <= RAIL_MOBILE_MAX; }
+
+function setRailCollapsed(collapsed) {
+  document.body.classList.toggle("rail-collapsed", collapsed);
+  lsSet(RAIL_COLLAPSED_KEY, collapsed ? "1" : "0");
+  const t = $("railToggle");
+  if (t) t.setAttribute("aria-expanded", String(!collapsed));
+}
+
+function openMobileRail() { document.body.classList.add("rail-open"); }
+function closeMobileRail() { document.body.classList.remove("rail-open"); }
+
+function toggleRail() {
+  if (railIsMobile()) {
+    document.body.classList.toggle("rail-open");
+  } else {
+    setRailCollapsed(!document.body.classList.contains("rail-collapsed"));
+  }
+}
+
+function initRail() {
+  // Restore the desktop collapse preference (default: expanded). On mobile the
+  // rail starts off-canvas regardless; the class only affects desktop width.
+  setRailCollapsed(lsGet(RAIL_COLLAPSED_KEY) === "1");
+  const toggle = $("railToggle");
+  if (toggle) toggle.onclick = toggleRail;
+  const opener = $("railOpen");
+  if (opener) opener.onclick = () => { if (railIsMobile()) openMobileRail(); else setRailCollapsed(false); };
+  const backdrop = $("railBackdrop");
+  if (backdrop) backdrop.onclick = closeMobileRail;
+}
+
 // ---------- light/dark theme ----------
 // The inline <head> script sets data-theme before paint (FOUC guard); these only
 // react to clicks and live system changes. The toggle shows the theme you'd switch
@@ -1731,7 +1907,8 @@ function initTheme() {
 function onKey(e) {
   if (e.key === "Escape") {
     if (!$("filterPanel").classList.contains("hidden")) { closeFilterPanel(); $("filterBtn").focus(); return; }
-    if (!$("modal").classList.contains("hidden")) closeModal();
+    if (!$("modal").classList.contains("hidden")) { closeModal(); return; }
+    if (document.body.classList.contains("rail-open")) { closeMobileRail(); return; }
     return;
   }
   trapFocus(e);
@@ -1762,6 +1939,7 @@ $("modal").onclick = (e) => { if (e.target.id === "modal") closeModal(); };
 $("filterBtn").onclick = (e) => { e.stopPropagation(); toggleFilterPanel(); };
 document.addEventListener("keydown", onKey);
 initFeed();
+initRail();
 initTheme();
 
 window.addEventListener("hashchange", () => { route().catch(() => {}); });
@@ -1771,10 +1949,16 @@ window.addEventListener("hashchange", () => { route().catch(() => {}); });
   // feed; the real renders replace them via replaceChildren() on data arrival.
   if (!document.body.classList.contains("view-overview")) boardSkeleton();
   feedSkeleton();
-  // Load projects first (the overview's "All" card and the board tabs both need
-  // them), then let route() apply the view named by the URL hash. route() handles
-  // its own data loads (overview vs board) and opens the stream.
-  try { await loadProjects(); } catch (e) { setStatus("error: " + e.message, "warn"); }
+  // Load projects + categories first so the rail can render its full tree in any
+  // view (the board views never call loadOverview, which is the other place that
+  // populates `categories`). route() then applies the URL-hash view and opens the
+  // stream; it handles its own board/overview data loads.
+  try {
+    await Promise.all([
+      loadProjects(),
+      loadCategories().catch(() => {}), // rail still works project-only if this fails
+    ]);
+  } catch (e) { setStatus("error: " + e.message, "warn"); }
   route().catch((e) => setStatus("error: " + e.message, "warn"));
 })();
 

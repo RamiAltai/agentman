@@ -107,6 +107,8 @@
   --feed-w: 320px;
   --header-h: 52px;
   --col-min: 288px;
+  --rail-w: 248px;
+  --rail-bg: #12151b;         /* a hair darker than --surface so the rail reads as chrome */
 
   /* ---- component tokens (light theme overrides these below) ---- */
   --scrollbar-thumb-hover: #4b5566;
@@ -200,6 +202,7 @@
   --tag-label-border: rgba(106, 64, 224, .32);
   --dep-open-border: rgba(185, 119, 10, .45);
   --legend-bg: rgba(255, 255, 255, .92);
+  --rail-bg: #f0f1f4;         /* a hair darker than --surface (white) so the rail reads as chrome */
 }
 
 * { box-sizing: border-box; }
@@ -234,39 +237,129 @@ body {
 button { font: inherit; cursor: pointer; color: var(--fg); }
 button:disabled { opacity: .5; cursor: default; }
 
+/* ===================== shell (rail + content column) =====================
+   body is a column (skip-link + .shell). .shell is the horizontal split:
+   the fixed-width rail and a flexible content column (.appcol = header + main).
+   #modal / #graphOverlay / #railBackdrop stay outside .shell as body-level
+   overlays so positioning isn't affected by the flex layout. */
+.shell { flex: 1; display: flex; min-height: 0; }
+.appcol { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+/* ===================== left rail ===================== */
+#rail {
+  flex: none; width: var(--rail-w);
+  display: flex; flex-direction: column; min-height: 0;
+  background: var(--rail-bg); border-right: 1px solid var(--line);
+  transition: width var(--dur-base) var(--ease);
+  overflow: hidden;
+}
+.rail-head {
+  display: flex; align-items: center; gap: var(--sp-3);
+  height: var(--header-h); padding: 0 var(--sp-5); flex: none;
+  border-bottom: 1px solid var(--line);
+}
+.brand { font-weight: 700; font-size: var(--fs-md); letter-spacing: .2px; flex: none; white-space: nowrap; }
+.brand-accent { color: var(--accent-strong); }
+.rail-toggle {
+  margin-left: auto; flex: none; width: 28px; height: 28px;
+  background: transparent; border: 1px solid transparent; color: var(--muted);
+  border-radius: var(--r-sm); display: inline-flex; align-items: center; justify-content: center;
+  font-size: var(--fs-md); line-height: 1;
+  transition: background var(--dur-fast), color var(--dur-fast), border-color var(--dur-fast);
+}
+.rail-toggle:hover { background: var(--card-bg); color: var(--fg); border-color: var(--line-strong); }
+
+.rail-nav {
+  flex: 1; min-height: 0; overflow-y: auto;
+  padding: var(--sp-4) var(--sp-4) var(--sp-6);
+  display: flex; flex-direction: column; gap: 2px;
+}
+/* A rail entry: Overview / All tasks / project row / + New project / Manage. */
+.rail-item {
+  display: flex; align-items: center; gap: var(--sp-3);
+  width: 100%; text-align: left; position: relative;
+  background: transparent; border: 1px solid transparent; color: var(--muted);
+  border-radius: var(--r-sm); padding: 7px 10px; font-size: var(--fs-base);
+  white-space: nowrap;
+  transition: background var(--dur-fast), color var(--dur-fast);
+}
+.rail-item:hover { background: var(--card-bg); color: var(--fg); }
+.rail-item .rail-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.rail-item.active {
+  background: var(--accent-weak); color: var(--accent-strong); font-weight: 600;
+}
+/* Left accent bar on the active item. */
+.rail-item.active::before {
+  content: ""; position: absolute; left: 0; top: 6px; bottom: 6px; width: 3px;
+  border-radius: 0 var(--r-xs) var(--r-xs) 0; background: var(--accent);
+}
+.rail-item .rail-glyph { flex: none; width: 16px; text-align: center; color: var(--faint); font-size: var(--fs-sm); }
+.rail-item.active .rail-glyph { color: var(--accent-strong); }
+/* Count pill — muted, tabular. */
+.rail-count {
+  flex: none; background: var(--line); color: var(--muted); border-radius: var(--r-pill);
+  padding: 0 7px; font-size: var(--fs-xs); font-variant-numeric: tabular-nums;
+  min-width: 18px; text-align: center; line-height: 18px;
+}
+.rail-item.active .rail-count { background: var(--accent-weak); color: var(--accent-strong); }
+
+/* Category section: a label row, then its project rows nested beneath. The
+   category label is itself a destination (.rail-cat button); it reads as a small
+   section header — compact, uppercase-ish weight — distinct from project rows. */
+.rail-section { display: flex; flex-direction: column; gap: 1px; margin-top: var(--sp-3); }
+.rail-cat {
+  padding: 5px 10px; font-size: var(--fs-xs); font-weight: 700;
+  letter-spacing: .4px; color: var(--faint); text-transform: uppercase;
+}
+.rail-cat .rail-glyph { font-size: var(--fs-xs); }
+.rail-cat .rail-count { text-transform: none; letter-spacing: 0; }
+.rail-cat:hover { color: var(--fg); }
+.rail-cat.active { color: var(--accent-strong); }
+/* Non-clickable "Other" header for uncategorized projects. */
+.rail-section-label {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: 5px 10px 3px; font-size: var(--fs-xs); font-weight: 700;
+  text-transform: uppercase; letter-spacing: .5px; color: var(--faint);
+}
+.rail-section-label .rail-cat-name {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rail-section-label .rail-count { text-transform: none; letter-spacing: 0; font-weight: 600; }
+/* Project rows nest one step in from their category label. */
+.rail-section .rail-item.rail-project { padding-left: 22px; font-size: var(--fs-sm); }
+.rail-section .rail-item.rail-project .rail-dot {
+  flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--faint);
+}
+.rail-section .rail-item.rail-project.active .rail-dot { background: var(--accent); }
+.rail-empty { padding: 4px 10px 4px 22px; font-size: var(--fs-xs); color: var(--faint); }
+
+/* Divider + footer actions (+ New project, Manage). */
+.rail-divider { height: 1px; background: var(--line); margin: var(--sp-4) 6px; flex: none; }
+.rail-item.rail-action { color: var(--muted); }
+.rail-item.rail-action .rail-glyph { color: var(--accent-strong); }
+
+/* The header hamburger only shows when the rail is off-canvas (mobile). */
+.rail-open-btn { display: none; flex: none; padding: 6px 10px; }
+
+/* Collapsed (desktop): the rail shrinks to nothing and slides out. The header
+   hamburger surfaces so the rail can be reopened. */
+body.rail-collapsed #rail { width: 0; border-right: none; }
+body.rail-collapsed .rail-open-btn { display: inline-flex; }
+
 /* ===================== header ===================== */
 header {
   display: flex; align-items: center; gap: var(--sp-5);
   height: var(--header-h); padding: 0 var(--sp-6); flex: none;
   background: var(--surface); border-bottom: 1px solid var(--line);
 }
-.brand { font-weight: 700; font-size: var(--fs-md); letter-spacing: .2px; flex: none; }
-.brand-accent { color: var(--accent-strong); }
 
-.tabs {
-  display: flex; gap: var(--sp-2); align-items: center;
-  flex: 1; min-width: 0; overflow-x: auto; padding: 7px 0;
-  scrollbar-width: none;
-}
-.tabs::-webkit-scrollbar { display: none; }
-.tab {
-  flex: none; display: inline-flex; align-items: center; gap: 7px;
-  background: var(--card-bg); color: var(--muted); border: 1px solid var(--line);
-  border-radius: var(--r-pill); padding: 5px 13px; font-size: var(--fs-base); white-space: nowrap;
-  transition: background var(--dur-fast), color var(--dur-fast), border-color var(--dur-fast);
-}
-.tab:hover { color: var(--fg); border-color: var(--line-strong); }
-.tab.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
-.tab .badge {
-  background: var(--line); color: var(--muted); border-radius: var(--r-pill);
-  padding: 0 7px; font-size: var(--fs-xs); font-variant-numeric: tabular-nums; min-width: 18px; text-align: center;
-}
-.tab.active .badge { background: var(--tab-active-badge-bg); color: var(--on-accent); }
-.tab.add { color: var(--muted); padding: 5px 12px; font-size: var(--fs-md); line-height: 1; }
+/* #tabs is now a hidden stub (rail replaces the header tab strip). */
+#tabs { display: none; }
 
-/* Actions cluster groups into Find / View / Act segments. The optional
-   .actions-sep is a hairline divider built via el() between segments. */
-.actions { display: flex; align-items: center; gap: var(--sp-4); flex: none; }
+/* Actions cluster: Find segment · + Task · utility cluster. The optional
+   .actions-sep is a hairline divider between the primary action and the
+   utility cluster. The actions sit at the right edge of the lean header. */
+.actions { display: flex; align-items: center; gap: var(--sp-4); flex: none; margin-left: auto; }
 .actions-seg { display: flex; align-items: center; gap: var(--sp-4); }
 .actions-sep { width: 1px; height: 22px; background: var(--line); flex: none; }
 .search-input {
@@ -498,15 +591,15 @@ body.view-overview #tabs { display: none; }
 .no-agents { font-size: var(--fs-xs); color: var(--faint); }
 .more-agents { font-size: var(--fs-xs); color: var(--faint); }
 
-/* ---------- header breadcrumb / back ---------- */
-.breadcrumb { display: flex; align-items: center; gap: 10px; flex: none; }
-body.view-overview .breadcrumb { display: none; }
-.crumb-back {
-  background: var(--card-bg); border: 1px solid var(--line); color: var(--muted);
-  border-radius: 8px; padding: 5px 12px; font-size: 12.5px; cursor: pointer;
+/* ---------- header scope title ---------- */
+/* #breadcrumb is now the lean top-bar TITLE (an <h1>): the current scope name
+   (Overview / All tasks / category / selected project). The rail handles
+   navigation, so there is no back affordance here. */
+.breadcrumb {
+  margin: 0; flex: none; min-width: 0;
+  font-size: var(--fs-md); font-weight: 600; color: var(--fg);
+  letter-spacing: .1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.crumb-back:hover { color: var(--fg); border-color: var(--line-strong); }
-.crumb-current { font-size: 13px; font-weight: 600; color: var(--fg); }
 .more-note { color: var(--faint); font-size: 11px; text-align: center; padding: 4px; }
 
 .board-empty { margin: auto; text-align: center; color: var(--muted); max-width: 340px; padding: 32px; }
@@ -789,6 +882,30 @@ select:hover, .field:hover { border-color: var(--line-strong); }
 .dep-block-row { display: flex; align-items: center; gap: 6px; font-size: 12px; }
 
 /* ===================== responsive ===================== */
+#railBackdrop { display: none; }
+
+/* Rail goes off-canvas a touch earlier than the board switches to vertical, so the
+   board gets the rail's width back as soon as space is tight. It slides in when body
+   has .rail-open, with #railBackdrop behind it (mirrors the feed pattern). The
+   desktop .rail-collapsed width:0 rule is overridden here so the slide is
+   transform-driven and the rail keeps its full width while sliding. */
+@media (max-width: 820px) {
+  #rail {
+    position: fixed; top: 0; left: 0; bottom: 0; width: var(--rail-w); max-width: 84vw;
+    z-index: 65; transform: translateX(-100%); box-shadow: var(--shadow);
+    border-right: 1px solid var(--line);
+    transition: transform var(--dur-base) var(--ease);
+  }
+  body.rail-collapsed #rail { width: var(--rail-w); border-right: 1px solid var(--line); }
+  body.rail-open #rail { transform: none; }
+  /* The hamburger is the rail entry point on mobile regardless of collapse state. */
+  .rail-open-btn, body.rail-collapsed .rail-open-btn { display: inline-flex; }
+  #railBackdrop {
+    display: none; position: fixed; inset: 0; z-index: 60; background: var(--backdrop-feed);
+  }
+  body.rail-open #railBackdrop { display: block; }
+}
+
 @media (max-width: 720px) {
   header { gap: 8px; padding: 0 10px; }
   #board { flex-direction: column; overflow-x: hidden; overflow-y: auto; justify-content: flex-start; }
