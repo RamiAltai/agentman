@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -145,6 +147,29 @@ func TestRunMigrationsRollbackLeavesPriorVersion(t *testing.T) {
 	}
 	if v, _ := readSchemaVersion(st.db); v != currentSchemaVersion {
 		t.Fatalf("schema_version after failed migration = %d, want %d (rolled back)", v, currentSchemaVersion)
+	}
+}
+
+func TestOpenStoreRejectsNewerSchema(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "newer.db")
+	st, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	// Simulate a DB migrated by a newer am.
+	if _, err := st.db.Exec("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?)",
+		strconv.Itoa(currentSchemaVersion+1)); err != nil {
+		t.Fatalf("bump schema_version: %v", err)
+	}
+	st.Close()
+
+	_, err = OpenStore(dbPath)
+	if err == nil {
+		t.Fatal("OpenStore on newer-schema DB: want error, got nil")
+	}
+	want := fmt.Sprintf("schema_version %d is newer than supported %d", currentSchemaVersion+1, currentSchemaVersion)
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("error = %q, want it to mention %q", err, want)
 	}
 }
 

@@ -123,6 +123,15 @@ R3 (vault binding), R8 (migration) of `agentman_requirements.md`.
   rejected.
 - `exportDB` unchanged (VACUUM INTO snapshots everything, categories included).
 
+## Behavior changes
+
+- `OpenStore` now refuses to open a DB whose recorded `schema_version` is newer
+  than the binary supports ("database schema_version N is newer than supported
+  M — upgrade am"): `am serve` and every CLI command error out cleanly against
+  a too-new DB instead of misbehaving (e.g. an older binary inserting projects
+  the newer schema's queries would silently hide). Same ceiling
+  `validateImportCandidate` already applies to import snapshots.
+
 ## Decisions (ADR-grade)
 
 1. **Stable-ID format `amc_`/`amp_` + 16 lowercase hex** (8 bytes crypto/rand,
@@ -171,7 +180,9 @@ R3 (vault binding), R8 (migration) of `agentman_requirements.md`.
   `TestMigrationV4ExistingDB` (hand-built v3 DB → v4: both projects in
   general, distinct `amp_` uids, task ids/refs/claimed_at/labels untouched,
   reopen keeps uids / no double-apply); `TestMigrationV3AddsClaimedAt` updated
-  to assert `currentSchemaVersion` instead of literal 3; new `uidRe` helper.
+  to assert `currentSchemaVersion` instead of literal 3; new `uidRe` helper;
+  `TestOpenStoreRejectsNewerSchema` (bump meta.schema_version past current,
+  reopen → error naming both versions).
 - `cmd/am/store_test.go`: `TestCreateCategory`, `TestArchiveUnarchiveCategory`,
   `TestCreateProjectWithCategory`, `TestPatchProject`,
   `TestCategoryArchiveCascade`, `TestListTasksCategoryFilterComposes`,

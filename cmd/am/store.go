@@ -153,6 +153,16 @@ func OpenStore(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
+	// Refuse a DB written by a newer am: migrations only run forward, so an
+	// older binary would otherwise operate on (and corrupt) too-new data.
+	// Mirrors the ceiling validateImportCandidate applies to import snapshots.
+	if v, err := readSchemaVersion(db); err != nil {
+		db.Close()
+		return nil, err
+	} else if v > currentSchemaVersion {
+		db.Close()
+		return nil, fmt.Errorf("database schema_version %d is newer than supported %d — upgrade am", v, currentSchemaVersion)
+	}
 	if err := runMigrations(db, currentSchemaVersion, schemaMigrations); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate schema: %w", err)
