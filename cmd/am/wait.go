@@ -16,8 +16,8 @@ import (
 
 // cmdWait blocks until a board condition is met, watching the SSE stream:
 //
-//	am wait <id> --done [--timeout D]      until the task's status is done
-//	am wait --ready [-p P] [--timeout D]   until some ready task exists
+//	am wait <id> --done [--timeout D]                            until the task's status is done
+//	am wait --ready [-p P] [-c CAT] [--meta KEY] [--timeout D]   until some ready task exists in scope
 //
 // Exactly these two conditions. Exit 0 when met (--done prints nothing;
 // --ready prints one ready task id; --json prints the satisfying task JSON);
@@ -27,8 +27,10 @@ import (
 // are never trusted as state.
 func cmdWait(c *Client, a Args) {
 	waitDone, waitReady, id := a.has("done"), a.has("ready"), a.at(0)
-	if waitDone == waitReady || (waitDone && id == "") || (waitReady && id != "") {
-		fail(1, "usage: am wait <id> --done | am wait --ready [-p P]  [--timeout D]")
+	metaKey := metaKeyArg(a, "wait") // >1 key or key=value → exit 5
+	if waitDone == waitReady || (waitDone && id == "") || (waitReady && id != "") ||
+		(waitDone && metaKey != "") { // --meta scopes --ready only
+		fail(1, "usage: am wait <id> --done | am wait --ready [-p P] [-c CAT] [--meta KEY]  [--timeout D]")
 	}
 
 	timeout := 10 * time.Minute
@@ -44,8 +46,9 @@ func cmdWait(c *Client, a Args) {
 
 	// Client.http has a 10s Timeout that would kill a long SSE read; the wait
 	// uses its own un-timed http.Client and is bounded by ctx instead.
-	w := &waiter{base: c.base, agent: c.agent, hc: &http.Client{}, ctx: ctx}
+	w := &waiter{base: c.base, agent: c.agent, scope: c.scope, hc: &http.Client{}, ctx: ctx}
 	project := projectFor(a)
+	category := categoryFor(a) // scopes --ready only; ignored under --done like -p
 
 	// Cursor BEFORE the first condition check, so an event landing between
 	// check and subscribe is replayed via ?since= (no check/subscribe race).
@@ -58,7 +61,7 @@ func cmdWait(c *Client, a Args) {
 			taskID = t.ID
 			return t, met
 		}
-		return w.checkReady(project)
+		return w.checkReady(project, category, metaKey)
 	}
 	if t, met := check(); met {
 		waitPrint(a, t, waitReady)
@@ -70,6 +73,10 @@ func cmdWait(c *Client, a Args) {
 		// Project-scope the stream only for --ready: under --done the watched
 		// task may live in a different project than AGENTMAN_PROJECT, and a
 		// scoped stream would drop its events (the waiter would never re-check).
+		// A category scope deliberately does NOT narrow the stream — /api/stream
+		// has no ?category= yet (Phase R); the unscoped stream just triggers the
+		// REST re-check, which IS category-scoped (the ADR-023 pattern: event
+		// payloads are never trusted as state).
 		if waitReady && project != "" {
 			qs.Set("project", project)
 		}
@@ -144,6 +151,7 @@ func waitPrint(a Args, t *Task, ready bool) {
 type waiter struct {
 	base  string
 	agent string
+	scope string // sent as X-Agent-Scope; scopes the REST re-checks, never the stream
 	hc    *http.Client
 	ctx   context.Context
 }
@@ -167,6 +175,9 @@ func (w *waiter) request(path string) *http.Response {
 	}
 	if w.agent != "" {
 		req.Header.Set("X-Agent", w.agent)
+	}
+	if w.scope != "" {
+		req.Header.Set("X-Agent-Scope", w.scope)
 	}
 	resp, err := w.hc.Do(req)
 	if err != nil {
@@ -197,6 +208,8 @@ func (w *waiter) checkDone(id string) (*Task, bool) {
 	switch {
 	case st == 404:
 		fail(3, "wait: #%s not found", id)
+	case st == 403:
+		fail(8, "wait: #%s %s", id, apiErr(data, "out of scope"))
 	case st < 200 || st >= 300:
 		fail(1, "wait: %s", apiErr(data, "error "+strconv.Itoa(st)))
 	}
@@ -205,13 +218,24 @@ func (w *waiter) checkDone(id string) (*Task, bool) {
 	return &t, t.Status == "done"
 }
 
-// checkReady re-evaluates the --ready condition via REST.
-func (w *waiter) checkReady(project string) (*Task, bool) {
+// checkReady re-evaluates the --ready condition via REST. Like the category
+// scope, --meta narrows only this re-check, never the SSE stream (ADR-023:
+// event payloads are triggers, not state).
+func (w *waiter) checkReady(project, category, metaKey string) (*Task, bool) {
 	qs := url.Values{"ready": {"true"}, "limit": {"1"}}
 	if project != "" {
 		qs.Set("project", project)
 	}
+	if category != "" {
+		qs.Set("category", category)
+	}
+	if metaKey != "" {
+		qs.Set("meta_key", metaKey)
+	}
 	st, data := w.get("/api/tasks?" + qs.Encode())
+	if st == 403 { // explicit -p/-c outside the agent's scope
+		fail(8, "wait: %s", apiErr(data, "out of scope"))
+	}
 	if st < 200 || st >= 300 {
 		fail(1, "wait: %s", apiErr(data, "error "+strconv.Itoa(st)))
 	}

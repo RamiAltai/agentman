@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -690,5 +691,557 @@ func TestCmdLabelUsage(t *testing.T) {
 	})
 	if code != 5 || !strings.Contains(msg, "-p is a global flag") {
 		t.Fatalf("-p exit = %d, stderr = %q, want 5 with global flag message", code, msg)
+	}
+}
+
+// ---------- Phase O: category CLI ----------
+
+func TestCmdCategoryVerbs(t *testing.T) {
+	ts := newTestServer(t)
+	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+
+	// am category new prints only the slug.
+	out := captureStdout(t, func() {
+		cmdCategory(c, parse([]string{"new", "work", "Work"}))
+	})
+	if strings.TrimSpace(out) != "work" {
+		t.Fatalf("category new stdout = %q, want work", out)
+	}
+
+	// am categories --json includes the uid.
+	out = captureStdout(t, func() {
+		cmdCategories(c, parse([]string{"--json"}))
+	})
+	if !strings.Contains(out, `"uid":"amc_`) {
+		t.Fatalf("categories --json = %q, want amc_ uid", out)
+	}
+
+	// archive/unarchive are silent successes.
+	out = captureStdout(t, func() {
+		cmdCategory(c, parse([]string{"archive", "work"}))
+	})
+	if strings.TrimSpace(out) != "" {
+		t.Fatalf("category archive stdout = %q, want empty", out)
+	}
+	out = captureStdout(t, func() {
+		cmdCategory(c, parse([]string{"unarchive", "work"}))
+	})
+	if strings.TrimSpace(out) != "" {
+		t.Fatalf("category unarchive stdout = %q, want empty", out)
+	}
+
+	// Usage errors exit 1.
+	code := captureExit(t, func() { cmdCategory(c, parse([]string{"new"})) })
+	if code != 1 {
+		t.Fatalf("category new (no slug) exit = %d, want 1", code)
+	}
+	code = captureExit(t, func() { cmdCategory(c, parse([]string{"bogus"})) })
+	if code != 1 {
+		t.Fatalf("category bogus exit = %d, want 1", code)
+	}
+}
+
+func TestCmdProjectNewRequiresCategory(t *testing.T) {
+	ts := newTestServer(t)
+	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+
+	// Without -c and without AGENTMAN_CATEGORY → exit 5.
+	t.Setenv("AGENTMAN_CATEGORY", "")
+	var code int
+	msg := captureStderr(t, func() {
+		code = captureExit(t, func() {
+			cmdProject(c, parse([]string{"new", "pslug"}))
+		})
+	})
+	if code != 5 {
+		t.Fatalf("project new without category exit = %d, want 5", code)
+	}
+	if !strings.Contains(msg, "AGENTMAN_CATEGORY") {
+		t.Fatalf("stderr = %q, want hint about AGENTMAN_CATEGORY", msg)
+	}
+
+	// With AGENTMAN_CATEGORY set it succeeds and prints the slug.
+	t.Setenv("AGENTMAN_CATEGORY", "general")
+	out := captureStdout(t, func() {
+		cmdProject(c, parse([]string{"new", "pslug"}))
+	})
+	if strings.TrimSpace(out) != "pslug" {
+		t.Fatalf("project new stdout = %q, want pslug", out)
+	}
+
+	// With an explicit -c flag.
+	mustCreateCategory(t, ts, "work")
+	out = captureStdout(t, func() {
+		cmdProject(c, parse([]string{"new", "wproj", "-c", "work"}))
+	})
+	if strings.TrimSpace(out) != "wproj" {
+		t.Fatalf("project new -c stdout = %q, want wproj", out)
+	}
+}
+
+func TestCmdProjectEdit(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+
+	// Silent success for rename + vault binding.
+	out := captureStdout(t, func() {
+		cmdProject(c, parse([]string{"edit", "web", "--slug", "frontend", "--vault-id", "p_7", "--vault-path", "/v/x"}))
+	})
+	if strings.TrimSpace(out) != "" {
+		t.Fatalf("project edit stdout = %q, want empty", out)
+	}
+	resp := do(t, ts, http.MethodGet, "/api/projects", "", nil)
+	defer resp.Body.Close()
+	var ps []Project
+	if err := json.NewDecoder(resp.Body).Decode(&ps); err != nil {
+		t.Fatalf("decode projects: %v", err)
+	}
+	if len(ps) != 1 || ps[0].Slug != "frontend" || ps[0].VaultProjectID != "p_7" || ps[0].VaultPath != "/v/x" {
+		t.Fatalf("project after edit = %+v", ps)
+	}
+
+	// Clearing a vault field with an explicit empty value works (ok-form flags).
+	captureStdout(t, func() {
+		cmdProject(c, parse([]string{"edit", "frontend", "--vault-path="}))
+	})
+	resp2 := do(t, ts, http.MethodGet, "/api/projects", "", nil)
+	defer resp2.Body.Close()
+	ps = nil
+	json.NewDecoder(resp2.Body).Decode(&ps)
+	if ps[0].VaultPath != "" {
+		t.Fatalf("vault_path after clear = %q, want empty", ps[0].VaultPath)
+	}
+
+	// Nothing to change → exit 1.
+	code := captureExit(t, func() { cmdProject(c, parse([]string{"edit", "frontend"})) })
+	if code != 1 {
+		t.Fatalf("project edit (no flags) exit = %d, want 1", code)
+	}
+}
+
+func TestCmdLsCategoryWireFormat(t *testing.T) {
+	var lsQuery string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		lsQuery = r.URL.RawQuery
+		w.Write([]byte("[]"))
+	}))
+	t.Cleanup(stub.Close)
+	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+
+	captureStdout(t, func() { cmdLs(c, parse([]string{"-c", "work"})) })
+	if !strings.Contains(lsQuery, "category=work") {
+		t.Fatalf("ls query = %q, want category=work (short -c)", lsQuery)
+	}
+
+	// AGENTMAN_CATEGORY is the fallback; --all suppresses the scope.
+	t.Setenv("AGENTMAN_CATEGORY", "personal")
+	captureStdout(t, func() { cmdLs(c, parse([]string{})) })
+	if !strings.Contains(lsQuery, "category=personal") {
+		t.Fatalf("ls query = %q, want category=personal from env", lsQuery)
+	}
+	captureStdout(t, func() { cmdLs(c, parse([]string{"--all"})) })
+	if strings.Contains(lsQuery, "category=") {
+		t.Fatalf("ls --all query = %q, want no category scope", lsQuery)
+	}
+}
+
+func TestCmdNextCategory(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateCategory(t, ts, "work")
+	t.Setenv("AGENTMAN_AGENT", "tester")
+	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+
+	// No ready task in the category → exit 3.
+	code := captureExit(t, func() {
+		cmdNext(c, parse([]string{"-c", "work"}))
+	})
+	if code != 3 {
+		t.Fatalf("next -c work (none ready) exit = %d, want 3", code)
+	}
+
+	// Bogus category slug → also exit 3 (the server can't tell them apart).
+	code = captureExit(t, func() {
+		cmdNext(c, parse([]string{"-c", "bogus"}))
+	})
+	if code != 3 {
+		t.Fatalf("next -c bogus exit = %d, want 3", code)
+	}
+
+	// A ready task in scope is picked and its id printed.
+	r := do(t, ts, http.MethodPost, "/api/projects", `{"slug":"wproj","category":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	want := mustCreateTask(t, ts, "wproj", "Pick Me")
+	out := captureStdout(t, func() {
+		cmdNext(c, parse([]string{"-c", "work"}))
+	})
+	if strings.TrimSpace(out) != want {
+		t.Fatalf("next -c work stdout = %q, want %q", out, want)
+	}
+}
+
+// Regression: `am show <id> -c` still means --comments after -c became the
+// global category flag (main.go rewrites the token for show only).
+func TestCmdShowDashCStillPrintsComments(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "showproj")
+	id := mustCreateTask(t, ts, "showproj", "Has Comment")
+	r := do(t, ts, http.MethodPost, "/api/tasks/"+id+"/comments", `{"body":"the comment body"}`,
+		map[string]string{"Content-Type": "application/json", "X-Agent": "alice"})
+	r.Body.Close()
+
+	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	out := captureStdout(t, func() {
+		cmdShow(c, parse(rewriteShowComments([]string{id, "-c"})))
+	})
+	if !strings.Contains(out, "the comment body") {
+		t.Fatalf("show -c output missing comment:\n%s", out)
+	}
+}
+
+func TestRewriteShowComments(t *testing.T) {
+	got := rewriteShowComments([]string{"12", "-c", "--json"})
+	if got[0] != "12" || got[1] != "--comments" || got[2] != "--json" {
+		t.Fatalf("rewriteShowComments = %v", got)
+	}
+}
+
+// ---------- Phase P: --meta flag tests ----------
+
+func TestParseMultiFlag(t *testing.T) {
+	// Repeated --meta collects every occurrence, in order, including the = form.
+	a := parse([]string{"--meta", "a=1", "--meta=b=2", "--meta", "c=3"})
+	got := a.all("meta")
+	if len(got) != 3 || got[0] != "a=1" || got[1] != "b=2" || got[2] != "c=3" {
+		t.Fatalf("all(meta) = %v, want [a=1 b=2 c=3]", got)
+	}
+	if a.flag("meta") != "" {
+		t.Fatalf("flag(meta) = %q, want empty (meta is multi, not single)", a.flag("meta"))
+	}
+	// Single-value flags are still last-wins.
+	a = parse([]string{"--body", "first", "--body", "second"})
+	if a.flag("body") != "second" {
+		t.Fatalf("repeated --body = %q, want last-wins second", a.flag("body"))
+	}
+	// No --meta → empty slice.
+	if got := parse([]string{"x"}).all("meta"); len(got) != 0 {
+		t.Fatalf("all(meta) with no flags = %v, want empty", got)
+	}
+}
+
+func TestCmdNewMetaWireFormat(t *testing.T) {
+	var posts int
+	var body string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		posts++
+		b, _ := io.ReadAll(r.Body)
+		body = string(b)
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte(`{"id":1}`))
+	}))
+	t.Cleanup(stub.Close)
+	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+
+	captureStdout(t, func() {
+		cmdNew(c, parse([]string{"title", "-p", "web", "--meta", "a=1", "--meta", "b=2"}))
+	})
+	if posts != 1 {
+		t.Fatalf("POST count = %d, want 1 (all meta in one request)", posts)
+	}
+	var sent struct {
+		Meta map[string]string `json:"meta"`
+	}
+	if err := json.Unmarshal([]byte(body), &sent); err != nil {
+		t.Fatalf("unmarshal body %q: %v", body, err)
+	}
+	if len(sent.Meta) != 2 || sent.Meta["a"] != "1" || sent.Meta["b"] != "2" {
+		t.Fatalf("body meta = %v, want {a:1 b:2}", sent.Meta)
+	}
+
+	// Missing '=' and empty value are usage errors (exit 5) — before any request.
+	posts = 0
+	code := captureExit(t, func() {
+		captureStderr(t, func() { cmdNew(c, parse([]string{"t", "-p", "web", "--meta", "bare"})) })
+	})
+	if code != 5 || posts != 0 {
+		t.Fatalf("--meta bare exit = %d posts = %d, want 5 and 0", code, posts)
+	}
+	code = captureExit(t, func() {
+		captureStderr(t, func() { cmdNew(c, parse([]string{"t", "-p", "web", "--meta", "k="})) })
+	})
+	if code != 5 || posts != 0 {
+		t.Fatalf("--meta k= on new exit = %d posts = %d, want 5 and 0", code, posts)
+	}
+}
+
+func TestCmdEditMetaSinglePatch(t *testing.T) {
+	var patches int
+	var body string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPatch {
+			patches++
+			b, _ := io.ReadAll(r.Body)
+			body = string(b)
+		}
+		w.Write([]byte(`{"id":1}`))
+	}))
+	t.Cleanup(stub.Close)
+	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+
+	// Two sets and one removal — the dispatcher's atomic auto+packet flip —
+	// must ride in exactly ONE PATCH.
+	cmdEdit(c, parse([]string{"1", "--meta", "auto=packet-8", "--meta", "stage=review", "--meta", "old="}))
+	if patches != 1 {
+		t.Fatalf("PATCH count = %d, want 1", patches)
+	}
+	var sent struct {
+		Meta map[string]string `json:"meta"`
+	}
+	if err := json.Unmarshal([]byte(body), &sent); err != nil {
+		t.Fatalf("unmarshal body %q: %v", body, err)
+	}
+	if len(sent.Meta) != 3 || sent.Meta["auto"] != "packet-8" ||
+		sent.Meta["stage"] != "review" || sent.Meta["old"] != "" {
+		t.Fatalf("patch meta = %v, want auto/stage set and old:\"\" removal", sent.Meta)
+	}
+
+	// Values may contain '=' — split happens at the FIRST one.
+	cmdEdit(c, parse([]string{"1", "--meta", "expr=a=b"}))
+	if !strings.Contains(body, `"expr":"a=b"`) {
+		t.Fatalf("body = %q, want expr=a=b (split at first =)", body)
+	}
+
+	// --meta alone is a change; no flags at all still errors.
+	code := captureExit(t, func() {
+		captureStderr(t, func() { cmdEdit(c, parse([]string{"1"})) })
+	})
+	if code != 1 {
+		t.Fatalf("edit with nothing exit = %d, want 1", code)
+	}
+}
+
+func TestCmdNextMetaWireFormat(t *testing.T) {
+	var body string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		b, _ := io.ReadAll(r.Body)
+		body = string(b)
+		w.Write([]byte(`{"id":7}`))
+	}))
+	t.Cleanup(stub.Close)
+	t.Setenv("AGENTMAN_AGENT", "tester")
+	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+
+	out := captureStdout(t, func() { cmdNext(c, parse([]string{"--meta", "auto"})) })
+	if !strings.Contains(body, `"meta_key":"auto"`) {
+		t.Fatalf("next body = %q, want meta_key auto", body)
+	}
+	if strings.TrimSpace(out) != "7" {
+		t.Fatalf("next stdout = %q, want 7", out)
+	}
+
+	// key=value and repeated keys are usage errors for the filter form.
+	code := captureExit(t, func() {
+		captureStderr(t, func() { cmdNext(c, parse([]string{"--meta", "auto=1"})) })
+	})
+	if code != 5 {
+		t.Fatalf("next --meta k=v exit = %d, want 5", code)
+	}
+	code = captureExit(t, func() {
+		captureStderr(t, func() { cmdNext(c, parse([]string{"--meta", "a", "--meta", "b"})) })
+	})
+	if code != 5 {
+		t.Fatalf("next with two --meta exit = %d, want 5", code)
+	}
+}
+
+func TestCmdLsMetaWireFormat(t *testing.T) {
+	var lsQuery string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		lsQuery = r.URL.RawQuery
+		w.Write([]byte("[]"))
+	}))
+	t.Cleanup(stub.Close)
+	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+
+	captureStdout(t, func() { cmdLs(c, parse([]string{"--meta", "auto"})) })
+	if !strings.Contains(lsQuery, "meta_key=auto") {
+		t.Fatalf("ls query = %q, want meta_key=auto", lsQuery)
+	}
+
+	code := captureExit(t, func() {
+		captureStderr(t, func() { cmdLs(c, parse([]string{"--meta", "auto=1"})) })
+	})
+	if code != 5 {
+		t.Fatalf("ls --meta k=v exit = %d, want 5", code)
+	}
+	code = captureExit(t, func() {
+		captureStderr(t, func() { cmdLs(c, parse([]string{"--meta", "a", "--meta", "b"})) })
+	})
+	if code != 5 {
+		t.Fatalf("ls with two --meta exit = %d, want 5", code)
+	}
+}
+
+func TestCmdShowPrintsMeta(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+	r := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"web","title":"carrier","meta":{"owner":"alice","auto":"packet-7"}}`,
+		map[string]string{"Content-Type": "application/json"})
+	var tk Task
+	if err := json.NewDecoder(r.Body).Decode(&tk); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	r.Body.Close()
+
+	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	out := captureStdout(t, func() {
+		cmdShow(c, parse([]string{strconv.FormatInt(tk.ID, 10)}))
+	})
+	// One line, keys sorted.
+	if !strings.Contains(out, "meta: auto=packet-7 owner=alice") {
+		t.Fatalf("show output missing sorted meta line:\n%s", out)
+	}
+
+	// No meta → no meta line.
+	plain := mustCreateTask(t, ts, "web", "plain")
+	out = captureStdout(t, func() { cmdShow(c, parse([]string{plain})) })
+	if strings.Contains(out, "meta:") {
+		t.Fatalf("show printed a meta line for a task without meta:\n%s", out)
+	}
+}
+
+// ---------- Phase Q: out-of-scope exit code 8 ----------
+
+func TestExitCodeForOutOfScope(t *testing.T) {
+	if got := exitCodeFor(403); got != 8 {
+		t.Fatalf("exitCodeFor(403) = %d, want 8", got)
+	}
+}
+
+func TestCmdClaimOutOfScopeExit8(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"error":"out_of_scope"}`))
+	}))
+	t.Cleanup(stub.Close)
+	t.Setenv("AGENTMAN_AGENT", "tester")
+	c := &Client{base: stub.URL, agent: "tester", scope: "personal", http: stub.Client()}
+
+	var code int
+	msg := captureStderr(t, func() {
+		code = captureExit(t, func() {
+			cmdClaim(c, parse([]string{"7"}))
+		})
+	})
+	if code != 8 {
+		t.Fatalf("claim 403 exit = %d, want 8", code)
+	}
+	if !strings.Contains(msg, "out of scope") || !strings.Contains(msg, "#7") {
+		t.Fatalf("stderr = %q, want '#7 ... out of scope'", msg)
+	}
+}
+
+func TestCmdNextOutOfScopeExit8(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"error":"out_of_scope"}`))
+	}))
+	t.Cleanup(stub.Close)
+	t.Setenv("AGENTMAN_AGENT", "tester")
+	c := &Client{base: stub.URL, agent: "tester", scope: "personal", http: stub.Client()}
+
+	var code int
+	msg := captureStderr(t, func() {
+		code = captureExit(t, func() {
+			cmdNext(c, parse([]string{"-c", "work"}))
+		})
+	})
+	if code != 8 {
+		t.Fatalf("next 403 exit = %d, want 8", code)
+	}
+	if !strings.Contains(msg, "out_of_scope") {
+		t.Fatalf("stderr = %q, want out_of_scope", msg)
+	}
+}
+
+// Client.do attaches X-Agent-Scope only when a scope is set.
+func TestClientSendsScopeHeader(t *testing.T) {
+	var got string
+	var calls int
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		got = r.Header.Get("X-Agent-Scope")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("[]"))
+	}))
+	t.Cleanup(stub.Close)
+
+	c := &Client{base: stub.URL, agent: "tester", scope: "work/api", http: stub.Client()}
+	captureStdout(t, func() { cmdLs(c, parse([]string{})) })
+	if got != "work/api" {
+		t.Fatalf("X-Agent-Scope = %q, want work/api", got)
+	}
+	c = &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	captureStdout(t, func() { cmdLs(c, parse([]string{})) })
+	if calls != 2 || got != "" {
+		t.Fatalf("unscoped X-Agent-Scope = %q, want absent", got)
+	}
+}
+
+// Bulk status against an enforcing server: the out-of-scope id gets its own
+// stderr line, the rest succeed, exit = first failure's code (8). When a 404
+// comes first, the 3 wins (first-failure ordering).
+func TestCmdStatusBulkOutOfScope(t *testing.T) {
+	ts := newTestServer(t)
+	workID, personalID := scopedBoard(t, ts)
+	personal2 := mustCreateTask(t, ts, "pproj", "second personal")
+
+	c := &Client{base: ts.URL, agent: "agent-p", scope: "personal", http: ts.Client()}
+
+	var code int
+	msg := captureStderr(t, func() {
+		code = captureExit(t, func() {
+			cmdStatus(c, parse([]string{personalID, workID, personal2, "done"}))
+		})
+	})
+	if code != 8 {
+		t.Fatalf("bulk status exit = %d, want 8 (first failure out_of_scope)", code)
+	}
+	if !strings.Contains(msg, "#"+workID) || !strings.Contains(msg, "out_of_scope") {
+		t.Fatalf("stderr = %q, want a line naming #%s out_of_scope", msg, workID)
+	}
+	// The in-scope ids were patched despite the failure in the middle.
+	for _, id := range []string{personalID, personal2} {
+		r := do(t, ts, http.MethodGet, "/api/tasks/"+id, "", nil)
+		var tk Task
+		if err := json.NewDecoder(r.Body).Decode(&tk); err != nil {
+			t.Fatalf("decode task: %v", err)
+		}
+		r.Body.Close()
+		if tk.Status != "done" {
+			t.Fatalf("task #%s status = %q, want done (loop continues past 403)", id, tk.Status)
+		}
+	}
+
+	// 404 before 403: exit code = 3 (first failure), both lines on stderr.
+	msg = captureStderr(t, func() {
+		code = captureExit(t, func() {
+			cmdStatus(c, parse([]string{"99999", workID, "todo"}))
+		})
+	})
+	if code != 3 {
+		t.Fatalf("bulk status (404 first) exit = %d, want 3", code)
+	}
+	if !strings.Contains(msg, "#99999") || !strings.Contains(msg, "#"+workID) {
+		t.Fatalf("stderr = %q, want lines for #99999 and #%s", msg, workID)
 	}
 }

@@ -7,11 +7,25 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 
 -- projects: named boards that group tasks.
+-- NOTE: this CREATE TABLE is the frozen v1 baseline — category_id, uid, and the
+-- vault binding columns are added by migration v4 (see store.go), never here.
 CREATE TABLE IF NOT EXISTS projects (
   id         INTEGER PRIMARY KEY,
   slug       TEXT NOT NULL UNIQUE,        -- short handle agents pass (token-cheap)
   name       TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+-- categories: the layer above projects (instance → category → project → task).
+-- projects.category_id is added by migration v4, not here — the projects CREATE
+-- TABLE above is the frozen v1 baseline that old snapshots are validated against.
+CREATE TABLE IF NOT EXISTS categories (
+  id          INTEGER PRIMARY KEY,
+  uid         TEXT NOT NULL UNIQUE,   -- stable id, amc_<16 hex>, never changes
+  slug        TEXT NOT NULL UNIQUE,   -- lowercase handle
+  name        TEXT NOT NULL,
+  created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  archived_at TEXT
 );
 
 -- tasks: the tickets.
@@ -51,6 +65,17 @@ CREATE TABLE IF NOT EXISTS task_labels (
 );
 CREATE INDEX IF NOT EXISTS idx_task_labels_label ON task_labels(label);
 
+-- task_meta: key→value pairs on tasks (values are opaque; key PRESENCE is the
+-- filterable unit). Like task_labels there is no separate catalog — a key
+-- exists iff some task carries it.
+CREATE TABLE IF NOT EXISTS task_meta (
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  key     TEXT NOT NULL,
+  value   TEXT NOT NULL,
+  PRIMARY KEY (task_id, key)
+);
+CREATE INDEX IF NOT EXISTS idx_task_meta_key ON task_meta(key);
+
 -- comments: discussion thread on a task.
 CREATE TABLE IF NOT EXISTS comments (
   id         INTEGER PRIMARY KEY,
@@ -67,7 +92,7 @@ CREATE TABLE IF NOT EXISTS events (
   project_id INTEGER,
   task_id    INTEGER,
   actor      TEXT NOT NULL,
-  kind       TEXT NOT NULL,               -- task.created|claimed|reclaimed|status|assign|patched|deleted|dep_added|dep_removed|labeled|unlabeled|comment.added|comment.deleted|project.created|archived|unarchived|deleted
+  kind       TEXT NOT NULL,               -- task.created|claimed|reclaimed|status|assign|patched|deleted|dep_added|dep_removed|labeled|unlabeled|comment.added|comment.deleted|project.created|archived|unarchived|patched|deleted|category.created|archived|unarchived
   data       TEXT NOT NULL DEFAULT '{}',  -- compact JSON delta, e.g. {"status":["todo","doing"]}
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );

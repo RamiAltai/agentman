@@ -194,7 +194,10 @@ func validateImportCandidate(srcPath string) error {
 		return errors.New("foreign key violations found")
 	}
 
-	// required tables
+	// required tables — deliberately the v1 baseline set, NOT the current
+	// schema: later tables (task_deps, task_labels, categories) are created by
+	// schema.sql/migrations on the next OpenStore, so pre-migration snapshots
+	// stay importable. Do not add new tables here.
 	required := map[string]bool{
 		"projects": false,
 		"tasks":    false,

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -20,14 +21,21 @@ var osExit = os.Exit
 // value flag.
 var boolFlags = map[string]bool{"json": true, "mine": true, "all": true, "comments": true, "yes": true, "log": true, "ready": true, "blocked": true, "done": true}
 
+// Repeatable value flags: every occurrence is collected (in order) into
+// Args.multi instead of last-wins Args.flags. A flag is multi OR single,
+// never both, and (like boolFlags) registration is global across verbs.
+var multiFlags = map[string]bool{"meta": true}
+
 type Args struct {
 	pos   []string
 	flags map[string]string
 	bools map[string]bool
+	multi map[string][]string
 }
 
-func (a Args) flag(k string) string { return a.flags[k] }
-func (a Args) has(k string) bool    { return a.bools[k] }
+func (a Args) flag(k string) string  { return a.flags[k] }
+func (a Args) has(k string) bool     { return a.bools[k] }
+func (a Args) all(k string) []string { return a.multi[k] }
 func (a Args) at(i int) string {
 	if i < len(a.pos) {
 		return a.pos[i]
@@ -38,17 +46,29 @@ func (a Args) at(i int) string {
 // parse splits argv into positionals, value flags, and boolean flags in any
 // order, so `am new "title" --body x` and `am new --body x "title"` both work.
 func parse(argv []string) Args {
-	a := Args{flags: map[string]string{}, bools: map[string]bool{}}
+	a := Args{flags: map[string]string{}, bools: map[string]bool{}, multi: map[string][]string{}}
 	for i := 0; i < len(argv); i++ {
 		s := argv[i]
 		if len(s) > 1 && s[0] == '-' && s != "-" {
 			key := canonFlag(strings.TrimLeft(s, "-"))
 			if eq := strings.IndexByte(key, '='); eq >= 0 {
-				a.flags[canonFlag(key[:eq])] = key[eq+1:]
+				k := canonFlag(key[:eq])
+				if multiFlags[k] {
+					a.multi[k] = append(a.multi[k], key[eq+1:])
+					continue
+				}
+				a.flags[k] = key[eq+1:]
 				continue
 			}
 			if boolFlags[key] {
 				a.bools[key] = true
+				continue
+			}
+			if multiFlags[key] {
+				if i+1 < len(argv) {
+					a.multi[key] = append(a.multi[key], argv[i+1])
+					i++
+				}
 				continue
 			}
 			if i+1 < len(argv) {
@@ -62,6 +82,42 @@ func parse(argv []string) Args {
 	return a
 }
 
+// parseMetaFlags folds repeated --meta key=value tokens into one map for a
+// single JSON body (the structural atomicity guarantee: one request, one
+// event). Tokens split at the FIRST '=' — values may themselves contain '='.
+// allowEmpty permits `--meta k=` (edit's remove-the-key form); create rejects it.
+func parseMetaFlags(a Args, allowEmpty bool) map[string]any {
+	m := map[string]any{}
+	for _, tok := range a.all("meta") {
+		eq := strings.IndexByte(tok, '=')
+		if eq < 0 {
+			fail(5, "--meta requires key=value")
+		}
+		k, v := tok[:eq], tok[eq+1:]
+		if v == "" && !allowEmpty {
+			fail(5, "--meta %s= is empty (only `am edit` removes keys this way)", k)
+		}
+		m[k] = v
+	}
+	return m
+}
+
+// metaKeyArg extracts the single --meta KEY for the filter verbs (ls/next/
+// wait), where meta scoping is by key presence only.
+func metaKeyArg(a Args, verb string) string {
+	m := a.all("meta")
+	if len(m) == 0 {
+		return ""
+	}
+	if len(m) > 1 {
+		fail(5, "%s: one --meta key only", verb)
+	}
+	if strings.ContainsRune(m[0], '=') {
+		fail(5, "%s --meta takes a key, not key=value", verb)
+	}
+	return m[0]
+}
+
 func canonFlag(k string) string {
 	switch k {
 	case "p":
@@ -69,7 +125,9 @@ func canonFlag(k string) string {
 	case "s":
 		return "status"
 	case "c":
-		return "comments"
+		// -c is the category flag everywhere; main.go rewrites -c → --comments
+		// for `am show` only, preserving the documented `am show <id> -c`.
+		return "category"
 	case "a":
 		return "assign"
 	case "l":
@@ -89,6 +147,14 @@ func projectFor(a Args) string {
 	return os.Getenv("AGENTMAN_PROJECT")
 }
 
+// categoryFor resolves the active category: -c/--category, else AGENTMAN_CATEGORY.
+func categoryFor(a Args) string {
+	if c := a.flag("category"); c != "" {
+		return c
+	}
+	return os.Getenv("AGENTMAN_CATEGORY")
+}
+
 // ---------- verbs ----------
 
 func cmdLs(c *Client, a Args) {
@@ -96,6 +162,9 @@ func cmdLs(c *Client, a Args) {
 	proj := projectFor(a)
 	if proj != "" && !a.has("all") {
 		qs.Set("project", proj)
+	}
+	if cat := categoryFor(a); cat != "" && !a.has("all") {
+		qs.Set("category", cat)
 	}
 	switch {
 	case a.flag("status") != "":
@@ -123,6 +192,9 @@ func cmdLs(c *Client, a Args) {
 	}
 	if v := a.flag("label"); v != "" {
 		qs.Set("label", v) // server validates/normalizes
+	}
+	if k := metaKeyArg(a, "ls"); k != "" {
+		qs.Set("meta_key", k) // server validates/normalizes
 	}
 	qs.Set("limit", "50")
 
@@ -159,6 +231,18 @@ func cmdShow(c *Client, a Args) {
 	if len(t.Labels) > 0 {
 		fmt.Println("labels: " + strings.Join(t.Labels, " "))
 	}
+	if len(t.Meta) > 0 {
+		keys := make([]string, 0, len(t.Meta))
+		for k := range t.Meta {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		parts := make([]string, len(keys))
+		for i, k := range keys {
+			parts[i] = k + "=" + t.Meta[k]
+		}
+		fmt.Println("meta: " + strings.Join(parts, " "))
+	}
 	fmt.Printf("created %s · %d comment%s\n", shortTime(t.CreatedAt), t.NComments, plural(t.NComments))
 	if len(t.DependsOn) > 0 {
 		parts := make([]string, len(t.DependsOn))
@@ -184,7 +268,7 @@ func cmdShow(c *Client, a Args) {
 func cmdNew(c *Client, a Args) {
 	title := a.at(0)
 	if strings.TrimSpace(title) == "" {
-		fail(5, "usage: am new \"title\" [--body ..] [-p project] [--priority N]")
+		fail(5, "usage: am new \"title\" [--body ..] [-p project] [--priority N] [--meta k=v]...")
 	}
 	proj := projectFor(a)
 	if proj == "" {
@@ -199,6 +283,9 @@ func cmdNew(c *Client, a Args) {
 	}
 	if v := a.flag("assign"); v != "" {
 		body["assignee"] = resolveWho(v)
+	}
+	if m := parseMetaFlags(a, false); len(m) > 0 {
+		body["meta"] = m
 	}
 	data := c.doOrFail("POST", "/api/tasks", body)
 	var t Task
@@ -246,6 +333,8 @@ func cmdClaim(c *Client, a Args) {
 		fail(4, "claim: #%s held by %s", id, e.Assignee)
 	case st == 400:
 		fail(5, "claim: %s", apiErr(data, "invalid request"))
+	case st == 403:
+		fail(8, "claim: #%s out of scope", id)
 	default:
 		fail(1, "claim: %s", apiErr(data, "error"))
 	}
@@ -257,9 +346,19 @@ func cmdNext(c *Client, a Args) {
 	if me() == "" {
 		fail(5, "set AGENTMAN_AGENT to pick up tasks")
 	}
-	var body any
+	scope := map[string]any{}
 	if proj := projectFor(a); proj != "" {
-		body = map[string]any{"project": proj}
+		scope["project"] = proj
+	}
+	if cat := categoryFor(a); cat != "" {
+		scope["category"] = cat
+	}
+	if k := metaKeyArg(a, "next"); k != "" {
+		scope["meta_key"] = k
+	}
+	var body any
+	if len(scope) > 0 {
+		body = scope
 	}
 	st, data := c.do("POST", "/api/tasks/next", body)
 	switch {
@@ -274,10 +373,14 @@ func cmdNext(c *Client, a Args) {
 		}
 		fmt.Println(t.ID)
 	case st == 404:
-		// Also covers a bad -p slug (the server can't tell them apart).
+		// Also covers a bad -p/-c slug (the server can't tell them apart).
 		fail(3, "next: no ready task")
 	case st == 400:
 		fail(5, "next: %s", apiErr(data, "invalid request"))
+	case st == 403:
+		// An explicit -p/-c outside the agent's scope (the unfiltered form
+		// never 403s — the server narrows it silently).
+		fail(8, "next: %s", apiErr(data, "out of scope"))
 	default:
 		fail(1, "next: %s", apiErr(data, "error"))
 	}
@@ -345,8 +448,13 @@ func cmdEdit(c *Client, a Args) {
 	if v := a.flag("priority"); v != "" {
 		patch["priority"] = atoiOr(v, 2)
 	}
+	// All repeated --meta flags ride in this ONE PATCH (one tx, one event);
+	// `--meta k=` removes the key.
+	if m := parseMetaFlags(a, true); len(m) > 0 {
+		patch["meta"] = m
+	}
 	if len(patch) == 0 {
-		fail(1, "edit: nothing to change (use --title/--body/--priority)")
+		fail(1, "edit: nothing to change (use --title/--body/--priority/--meta)")
 	}
 	c.doOrFail("PATCH", "/api/tasks/"+id, patch)
 }
@@ -388,17 +496,44 @@ func cmdProject(c *Client, a Args) {
 	switch a.at(0) {
 	case "new":
 		if a.at(1) == "" {
-			fail(1, "usage: am project new <slug> [name]")
+			fail(1, "usage: am project new <slug> [name] -c <category>")
+		}
+		cat := categoryFor(a)
+		if cat == "" {
+			fail(5, "no category: pass -c <slug> or set AGENTMAN_CATEGORY")
 		}
 		slug := a.at(1)
 		name := slug
 		if a.at(2) != "" {
 			name = a.at(2)
 		}
-		data := c.doOrFail("POST", "/api/projects", map[string]any{"slug": slug, "name": name})
+		data := c.doOrFail("POST", "/api/projects", map[string]any{"slug": slug, "name": name, "category": cat})
 		var p Project
 		json.Unmarshal(data, &p)
 		fmt.Println(p.Slug)
+	case "edit":
+		slug := a.at(1)
+		if slug == "" {
+			fail(1, "usage: am project edit <slug> [--slug NEW] [--name N] [--vault-id X] [--vault-path Y]")
+		}
+		patch := map[string]any{}
+		if v := a.flag("slug"); v != "" {
+			patch["slug"] = v
+		}
+		if v := a.flag("name"); v != "" {
+			patch["name"] = v
+		}
+		// ok-form so empty values clear the vault binding (cmdEdit --body precedent).
+		if v, ok := a.flags["vault-id"]; ok {
+			patch["vault_project_id"] = v
+		}
+		if v, ok := a.flags["vault-path"]; ok {
+			patch["vault_path"] = v
+		}
+		if len(patch) == 0 {
+			fail(1, "project edit: nothing to change (use --slug/--name/--vault-id/--vault-path)")
+		}
+		c.doOrFail("PATCH", "/api/projects/"+slug, patch)
 	case "archive":
 		if a.at(1) == "" {
 			fail(1, "usage: am project archive <slug>")
@@ -419,7 +554,58 @@ func cmdProject(c *Client, a Args) {
 		}
 		c.doOrFail("DELETE", "/api/projects/"+slug, nil)
 	default:
-		fail(1, "usage: am project <new|archive|unarchive|rm> ...")
+		fail(1, "usage: am project <new|edit|archive|unarchive|rm> ...")
+	}
+}
+
+func cmdCategories(c *Client, a Args) {
+	path := "/api/categories"
+	if a.has("all") {
+		path += "?archived=true"
+	}
+	data := c.doOrFail("GET", path, nil)
+	var cs []Category
+	json.Unmarshal(data, &cs)
+	if a.has("json") {
+		printJSON(cs)
+		return
+	}
+	for _, cat := range cs {
+		archived := ""
+		if cat.ArchivedAt != "" {
+			archived = " (archived)"
+		}
+		fmt.Printf("%-10s %-20s%s\n", cat.Slug, trunc(cat.Name, 20), archived)
+	}
+}
+
+func cmdCategory(c *Client, a Args) {
+	switch a.at(0) {
+	case "new":
+		if a.at(1) == "" {
+			fail(1, "usage: am category new <slug> [name]")
+		}
+		slug := a.at(1)
+		name := slug
+		if a.at(2) != "" {
+			name = a.at(2)
+		}
+		data := c.doOrFail("POST", "/api/categories", map[string]any{"slug": slug, "name": name})
+		var cat Category
+		json.Unmarshal(data, &cat)
+		fmt.Println(cat.Slug)
+	case "archive":
+		if a.at(1) == "" {
+			fail(1, "usage: am category archive <slug>")
+		}
+		c.doOrFail("POST", "/api/categories/"+a.at(1)+"/archive", nil)
+	case "unarchive":
+		if a.at(1) == "" {
+			fail(1, "usage: am category unarchive <slug>")
+		}
+		c.doOrFail("POST", "/api/categories/"+a.at(1)+"/unarchive", nil)
+	default:
+		fail(1, "usage: am category <new|archive|unarchive> ...")
 	}
 }
 

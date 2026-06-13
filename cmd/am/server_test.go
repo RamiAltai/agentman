@@ -1139,3 +1139,1235 @@ func TestLabelEndpoints(t *testing.T) {
 		t.Fatalf("labeled=%d unlabeled=%d, want 1 and 1 (idempotent dup adds no event)", labeled, unlabeled)
 	}
 }
+
+// ---------- Phase O: categories over HTTP ----------
+
+func mustCreateCategory(t *testing.T, ts *httptest.Server, slug string) {
+	t.Helper()
+	resp := do(t, ts, http.MethodPost, "/api/categories",
+		`{"slug":"`+slug+`","name":"`+slug+`"}`,
+		map[string]string{"Content-Type": "application/json"})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create category %q = %d, want 201", slug, resp.StatusCode)
+	}
+}
+
+func TestCategoryEndpoints(t *testing.T) {
+	ts := newTestServer(t)
+
+	// POST → 201 with uid.
+	r := do(t, ts, http.MethodPost, "/api/categories", `{"slug":"work","name":"Work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/categories = %d, want 201", r.StatusCode)
+	}
+	var cat Category
+	if err := json.NewDecoder(r.Body).Decode(&cat); err != nil {
+		t.Fatalf("decode category: %v", err)
+	}
+	if !strings.HasPrefix(cat.UID, "amc_") || len(cat.UID) != 20 {
+		t.Fatalf("category uid = %q, want amc_<16 hex>", cat.UID)
+	}
+
+	// Duplicate → 409; invalid slug → 400.
+	rd := do(t, ts, http.MethodPost, "/api/categories", `{"slug":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	rd.Body.Close()
+	if rd.StatusCode != http.StatusConflict {
+		t.Fatalf("dup category = %d, want 409", rd.StatusCode)
+	}
+	rb := do(t, ts, http.MethodPost, "/api/categories", `{"slug":"has space"}`,
+		map[string]string{"Content-Type": "application/json"})
+	rb.Body.Close()
+	if rb.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid category = %d, want 400", rb.StatusCode)
+	}
+
+	// GET default list: general (seeded) + work.
+	rg := do(t, ts, http.MethodGet, "/api/categories", "", nil)
+	defer rg.Body.Close()
+	var cs []Category
+	if err := json.NewDecoder(rg.Body).Decode(&cs); err != nil {
+		t.Fatalf("decode categories: %v", err)
+	}
+	if len(cs) != 2 || cs[0].Slug != "general" || cs[1].Slug != "work" {
+		t.Fatalf("GET /api/categories = %+v, want [general work]", cs)
+	}
+
+	// Archive → hidden by default, shown with ?archived=true.
+	ra := do(t, ts, http.MethodPost, "/api/categories/work/archive", "", nil)
+	ra.Body.Close()
+	if ra.StatusCode != http.StatusOK {
+		t.Fatalf("archive category = %d, want 200", ra.StatusCode)
+	}
+	rg2 := do(t, ts, http.MethodGet, "/api/categories", "", nil)
+	cs = nil
+	json.NewDecoder(rg2.Body).Decode(&cs)
+	rg2.Body.Close()
+	if len(cs) != 1 || cs[0].Slug != "general" {
+		t.Fatalf("default list after archive = %+v, want [general]", cs)
+	}
+	rg3 := do(t, ts, http.MethodGet, "/api/categories?archived=true", "", nil)
+	cs = nil
+	json.NewDecoder(rg3.Body).Decode(&cs)
+	rg3.Body.Close()
+	if len(cs) != 2 {
+		t.Fatalf("?archived=true list = %+v, want 2", cs)
+	}
+
+	// Unarchive restores; unknown slug → 404.
+	ru := do(t, ts, http.MethodPost, "/api/categories/work/unarchive", "", nil)
+	ru.Body.Close()
+	if ru.StatusCode != http.StatusOK {
+		t.Fatalf("unarchive category = %d, want 200", ru.StatusCode)
+	}
+	rn := do(t, ts, http.MethodPost, "/api/categories/nosuch/archive", "", nil)
+	rn.Body.Close()
+	if rn.StatusCode != http.StatusNotFound {
+		t.Fatalf("archive nosuch = %d, want 404", rn.StatusCode)
+	}
+}
+
+func TestProjectPayloadAndCategoryFilter(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateCategory(t, ts, "work")
+
+	// POST /api/projects with category; payload carries uid/category.
+	r := do(t, ts, http.MethodPost, "/api/projects",
+		`{"slug":"pentest","name":"Pentest","category":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusCreated {
+		t.Fatalf("POST project with category = %d, want 201", r.StatusCode)
+	}
+	var p Project
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		t.Fatalf("decode project: %v", err)
+	}
+	if p.Category != "work" || !strings.HasPrefix(p.UID, "amp_") || len(p.UID) != 20 {
+		t.Fatalf("project payload = %+v, want category work + amp_ uid", p)
+	}
+
+	// Dashboard compatibility: POST without category defaults to general.
+	mustCreateProject(t, ts, "misc")
+	rg := do(t, ts, http.MethodGet, "/api/projects?category=general", "", nil)
+	defer rg.Body.Close()
+	var ps []Project
+	if err := json.NewDecoder(rg.Body).Decode(&ps); err != nil {
+		t.Fatalf("decode projects: %v", err)
+	}
+	if len(ps) != 1 || ps[0].Slug != "misc" || ps[0].Category != "general" {
+		t.Fatalf("?category=general = %+v, want only misc", ps)
+	}
+	rw := do(t, ts, http.MethodGet, "/api/projects?category=work", "", nil)
+	defer rw.Body.Close()
+	ps = nil
+	json.NewDecoder(rw.Body).Decode(&ps)
+	if len(ps) != 1 || ps[0].Slug != "pentest" {
+		t.Fatalf("?category=work = %+v, want only pentest", ps)
+	}
+
+	// Archived category → 400 category_archived.
+	ra := do(t, ts, http.MethodPost, "/api/categories/work/archive", "", nil)
+	ra.Body.Close()
+	rc := do(t, ts, http.MethodPost, "/api/projects",
+		`{"slug":"another","category":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	defer rc.Body.Close()
+	if rc.StatusCode != http.StatusBadRequest {
+		t.Fatalf("create project in archived category = %d, want 400", rc.StatusCode)
+	}
+	var body map[string]string
+	json.NewDecoder(rc.Body).Decode(&body)
+	if body["error"] != "category_archived" {
+		t.Fatalf("error body = %v, want category_archived", body)
+	}
+	// Unknown category on create → 404.
+	rn := do(t, ts, http.MethodPost, "/api/projects",
+		`{"slug":"zzz","category":"nosuch"}`,
+		map[string]string{"Content-Type": "application/json"})
+	rn.Body.Close()
+	if rn.StatusCode != http.StatusNotFound {
+		t.Fatalf("create project unknown category = %d, want 404", rn.StatusCode)
+	}
+}
+
+func TestListTasksCategoryParam(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateCategory(t, ts, "work")
+	r := do(t, ts, http.MethodPost, "/api/projects", `{"slug":"wproj","category":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	mustCreateProject(t, ts, "gproj")
+	wID := mustCreateTask(t, ts, "wproj", "work task")
+	mustCreateTask(t, ts, "gproj", "general task")
+
+	rg := do(t, ts, http.MethodGet, "/api/tasks?category=work", "", nil)
+	defer rg.Body.Close()
+	var tasks []Task
+	if err := json.NewDecoder(rg.Body).Decode(&tasks); err != nil {
+		t.Fatalf("decode tasks: %v", err)
+	}
+	if len(tasks) != 1 || strconv.FormatInt(tasks[0].ID, 10) != wID {
+		t.Fatalf("?category=work = %+v, want only %s", tasks, wID)
+	}
+
+	// Composes with status=.
+	rs := do(t, ts, http.MethodGet, "/api/tasks?category=work&status=done", "", nil)
+	defer rs.Body.Close()
+	tasks = nil
+	json.NewDecoder(rs.Body).Decode(&tasks)
+	if len(tasks) != 0 {
+		t.Fatalf("?category=work&status=done = %+v, want empty", tasks)
+	}
+}
+
+func TestNextEndpointCategoryBody(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateCategory(t, ts, "work")
+	r := do(t, ts, http.MethodPost, "/api/projects", `{"slug":"wproj","category":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	mustCreateProject(t, ts, "gproj")
+	// The general task is more urgent — a category-scoped next must skip it.
+	rg := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"gproj","title":"urgent general","priority":0}`,
+		map[string]string{"Content-Type": "application/json"})
+	rg.Body.Close()
+	wID := mustCreateTask(t, ts, "wproj", "work pick")
+
+	rn := do(t, ts, http.MethodPost, "/api/tasks/next", `{"category":"work"}`,
+		map[string]string{"X-Agent": "agent-a", "Content-Type": "application/json"})
+	defer rn.Body.Close()
+	if rn.StatusCode != http.StatusOK {
+		t.Fatalf("category next = %d, want 200", rn.StatusCode)
+	}
+	var tk Task
+	if err := json.NewDecoder(rn.Body).Decode(&tk); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	if strconv.FormatInt(tk.ID, 10) != wID {
+		t.Fatalf("category next picked #%d, want #%s", tk.ID, wID)
+	}
+
+	// project+category compose; a mismatched pair finds nothing → 404.
+	rm := do(t, ts, http.MethodPost, "/api/tasks/next", `{"project":"gproj","category":"work"}`,
+		map[string]string{"X-Agent": "agent-b", "Content-Type": "application/json"})
+	rm.Body.Close()
+	if rm.StatusCode != http.StatusNotFound {
+		t.Fatalf("mismatched project+category next = %d, want 404", rm.StatusCode)
+	}
+	rc := do(t, ts, http.MethodPost, "/api/tasks/next", `{"project":"gproj","category":"general"}`,
+		map[string]string{"X-Agent": "agent-b", "Content-Type": "application/json"})
+	defer rc.Body.Close()
+	if rc.StatusCode != http.StatusOK {
+		t.Fatalf("matched project+category next = %d, want 200", rc.StatusCode)
+	}
+}
+
+func TestPatchProjectEndpoint(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+	mustCreateProject(t, ts, "api")
+
+	// Happy path: rename + vault binding in one PATCH.
+	r := do(t, ts, http.MethodPatch, "/api/projects/web",
+		`{"slug":"frontend","vault_project_id":"p_9","vault_path":"/v/f"}`,
+		map[string]string{"Content-Type": "application/json"})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH project = %d, want 200", r.StatusCode)
+	}
+	var p Project
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		t.Fatalf("decode project: %v", err)
+	}
+	if p.Slug != "frontend" || p.VaultProjectID != "p_9" || p.VaultPath != "/v/f" {
+		t.Fatalf("patched project = %+v", p)
+	}
+
+	// Old slug 404s; rename onto existing → 409; invalid slug → 400.
+	r404 := do(t, ts, http.MethodPatch, "/api/projects/web", `{"name":"x"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r404.Body.Close()
+	if r404.StatusCode != http.StatusNotFound {
+		t.Fatalf("PATCH old slug = %d, want 404", r404.StatusCode)
+	}
+	r409 := do(t, ts, http.MethodPatch, "/api/projects/frontend", `{"slug":"api"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r409.Body.Close()
+	if r409.StatusCode != http.StatusConflict {
+		t.Fatalf("PATCH dup slug = %d, want 409", r409.StatusCode)
+	}
+	r400 := do(t, ts, http.MethodPatch, "/api/projects/frontend", `{"slug":"has space"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r400.Body.Close()
+	if r400.StatusCode != http.StatusBadRequest {
+		t.Fatalf("PATCH invalid slug = %d, want 400", r400.StatusCode)
+	}
+}
+
+func TestCreateTaskArchivedCategory400(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateCategory(t, ts, "work")
+	r := do(t, ts, http.MethodPost, "/api/projects", `{"slug":"wproj","category":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	ra := do(t, ts, http.MethodPost, "/api/categories/work/archive", "", nil)
+	ra.Body.Close()
+
+	rc := do(t, ts, http.MethodPost, "/api/tasks", `{"project":"wproj","title":"nope"}`,
+		map[string]string{"Content-Type": "application/json"})
+	defer rc.Body.Close()
+	if rc.StatusCode != http.StatusBadRequest {
+		t.Fatalf("create task in archived category = %d, want 400", rc.StatusCode)
+	}
+	var body map[string]string
+	json.NewDecoder(rc.Body).Decode(&body)
+	if body["error"] != "category_archived" {
+		t.Fatalf("error body = %v, want category_archived", body)
+	}
+}
+
+// ---------- Phase P: task meta over HTTP ----------
+
+func TestCreateTaskWithMeta(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+
+	r := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"web","title":"carrier","meta":{"Auto":"packet-7","owner":"alice"}}`,
+		map[string]string{"X-Agent": "agent-a", "Content-Type": "application/json"})
+	if r.StatusCode != http.StatusCreated {
+		r.Body.Close()
+		t.Fatalf("POST with meta = %d, want 201", r.StatusCode)
+	}
+	var tk Task
+	if err := json.NewDecoder(r.Body).Decode(&tk); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	r.Body.Close()
+
+	// GET returns the normalized pairs.
+	r = do(t, ts, http.MethodGet, "/api/tasks/"+strconv.FormatInt(tk.ID, 10), "", nil)
+	var got Task
+	if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	r.Body.Close()
+	if len(got.Meta) != 2 || got.Meta["auto"] != "packet-7" || got.Meta["owner"] != "alice" {
+		t.Fatalf("meta = %v, want auto=packet-7 owner=alice", got.Meta)
+	}
+
+	// The task.created event data carries the meta.
+	r = do(t, ts, http.MethodGet, "/api/events?since=0", "", nil)
+	var feed struct {
+		Events []Event `json:"events"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&feed); err != nil {
+		t.Fatalf("decode events: %v", err)
+	}
+	r.Body.Close()
+	var found bool
+	for _, ev := range feed.Events {
+		if ev.Kind == "task.created" && strings.Contains(string(ev.Data), `"auto":"packet-7"`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("no task.created event carrying the meta")
+	}
+
+	// Bad key → 400.
+	r = do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"web","title":"bad","meta":{"no spaces":"x"}}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	if r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad meta key create = %d, want 400", r.StatusCode)
+	}
+}
+
+func TestPatchTaskMetaEndpoint(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+	id := mustCreateTask(t, ts, "web", "patch me")
+
+	// PATCH two keys → 200, ONE task.patched event with both.
+	r := do(t, ts, http.MethodPatch, "/api/tasks/"+id, `{"meta":{"auto":"x","owner":"alice"}}`,
+		map[string]string{"X-Agent": "agent-a", "Content-Type": "application/json"})
+	r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH meta = %d, want 200", r.StatusCode)
+	}
+
+	// Removal via empty value.
+	r = do(t, ts, http.MethodPatch, "/api/tasks/"+id, `{"meta":{"owner":""}}`,
+		map[string]string{"X-Agent": "agent-a", "Content-Type": "application/json"})
+	r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH meta removal = %d, want 200", r.StatusCode)
+	}
+	r = do(t, ts, http.MethodGet, "/api/tasks/"+id, "", nil)
+	var tk Task
+	if err := json.NewDecoder(r.Body).Decode(&tk); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	r.Body.Close()
+	if len(tk.Meta) != 1 || tk.Meta["auto"] != "x" {
+		t.Fatalf("meta after removal = %v, want only auto=x", tk.Meta)
+	}
+
+	// Bad key → 400.
+	r = do(t, ts, http.MethodPatch, "/api/tasks/"+id, `{"meta":{"k=v":"x"}}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	if r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad meta key patch = %d, want 400", r.StatusCode)
+	}
+
+	// Exactly two task.patched events (set + removal), the first carrying both keys.
+	r = do(t, ts, http.MethodGet, "/api/events?since=0", "", nil)
+	var feed struct {
+		Events []Event `json:"events"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&feed); err != nil {
+		t.Fatalf("decode events: %v", err)
+	}
+	r.Body.Close()
+	var patched []Event
+	for _, ev := range feed.Events {
+		if ev.Kind == "task.patched" {
+			patched = append(patched, ev)
+		}
+	}
+	if len(patched) != 2 {
+		t.Fatalf("task.patched events = %d, want 2", len(patched))
+	}
+	if !strings.Contains(string(patched[0].Data), `"auto":[null,"x"]`) ||
+		!strings.Contains(string(patched[0].Data), `"owner":[null,"alice"]`) {
+		t.Fatalf("first patch delta = %s, want both keys in one event", patched[0].Data)
+	}
+	if !strings.Contains(string(patched[1].Data), `"owner":["alice",null]`) {
+		t.Fatalf("removal delta = %s, want owner [alice,null]", patched[1].Data)
+	}
+}
+
+func TestNextEndpointMetaBody(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+	// The plain task is more urgent — a meta-scoped next must skip it.
+	r := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"web","title":"urgent plain","priority":0}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	rc := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"web","title":"carrier","meta":{"auto":"1"}}`,
+		map[string]string{"Content-Type": "application/json"})
+	var carrier Task
+	if err := json.NewDecoder(rc.Body).Decode(&carrier); err != nil {
+		t.Fatalf("decode carrier: %v", err)
+	}
+	rc.Body.Close()
+
+	rn := do(t, ts, http.MethodPost, "/api/tasks/next", `{"meta_key":"auto"}`,
+		map[string]string{"X-Agent": "agent-a", "Content-Type": "application/json"})
+	if rn.StatusCode != http.StatusOK {
+		rn.Body.Close()
+		t.Fatalf("meta next = %d, want 200", rn.StatusCode)
+	}
+	var tk Task
+	if err := json.NewDecoder(rn.Body).Decode(&tk); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	rn.Body.Close()
+	if tk.ID != carrier.ID {
+		t.Fatalf("meta next picked #%d, want carrier #%d", tk.ID, carrier.ID)
+	}
+
+	// No carriers left → 404 (the plain ready task never counts).
+	rn = do(t, ts, http.MethodPost, "/api/tasks/next", `{"meta_key":"auto"}`,
+		map[string]string{"X-Agent": "agent-b", "Content-Type": "application/json"})
+	rn.Body.Close()
+	if rn.StatusCode != http.StatusNotFound {
+		t.Fatalf("exhausted meta next = %d, want 404", rn.StatusCode)
+	}
+
+	// Bad key → 400.
+	rn = do(t, ts, http.MethodPost, "/api/tasks/next", `{"meta_key":"no spaces"}`,
+		map[string]string{"X-Agent": "agent-c", "Content-Type": "application/json"})
+	rn.Body.Close()
+	if rn.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad meta key next = %d, want 400", rn.StatusCode)
+	}
+}
+
+func TestListTasksMetaKeyParam(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+	mustCreateTask(t, ts, "web", "plain")
+	r := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"web","title":"carrier","meta":{"auto":"1"}}`,
+		map[string]string{"Content-Type": "application/json"})
+	var carrier Task
+	if err := json.NewDecoder(r.Body).Decode(&carrier); err != nil {
+		t.Fatalf("decode carrier: %v", err)
+	}
+	r.Body.Close()
+
+	// ?meta_key=auto&ready=true — this IS the query `am wait --ready --meta`
+	// re-checks against; presence-only, composed with ready.
+	r = do(t, ts, http.MethodGet, "/api/tasks?meta_key=auto&ready=true", "", nil)
+	var tasks []Task
+	if err := json.NewDecoder(r.Body).Decode(&tasks); err != nil {
+		t.Fatalf("decode tasks: %v", err)
+	}
+	r.Body.Close()
+	if len(tasks) != 1 || tasks[0].ID != carrier.ID {
+		t.Fatalf("?meta_key=auto&ready=true = %+v, want only the carrier", tasks)
+	}
+	if tasks[0].Meta["auto"] != "1" {
+		t.Fatalf("list meta = %v, want auto=1 stitched in", tasks[0].Meta)
+	}
+
+	// Bad key → 400.
+	r = do(t, ts, http.MethodGet, "/api/tasks?meta_key=no%20spaces", "", nil)
+	r.Body.Close()
+	if r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad meta_key = %d, want 400", r.StatusCode)
+	}
+}
+
+// ---------- Phase Q: scoped agent enforcement ----------
+
+// scopedBoard seeds two categories (work, personal) with one project each
+// (wproj, pproj) and one task each, returning the two task ids.
+func scopedBoard(t *testing.T, ts *httptest.Server) (workID, personalID string) {
+	t.Helper()
+	mustCreateCategory(t, ts, "work")
+	mustCreateCategory(t, ts, "personal")
+	for _, pair := range [][2]string{{"wproj", "work"}, {"pproj", "personal"}} {
+		r := do(t, ts, http.MethodPost, "/api/projects",
+			`{"slug":"`+pair[0]+`","category":"`+pair[1]+`"}`,
+			map[string]string{"Content-Type": "application/json"})
+		r.Body.Close()
+		if r.StatusCode != http.StatusCreated {
+			t.Fatalf("create project %s = %d, want 201", pair[0], r.StatusCode)
+		}
+	}
+	return mustCreateTask(t, ts, "wproj", "work task"), mustCreateTask(t, ts, "pproj", "personal task")
+}
+
+// mustCreateProposals adds the default carve-out pair (meta/proposals).
+func mustCreateProposals(t *testing.T, ts *httptest.Server) {
+	t.Helper()
+	mustCreateCategory(t, ts, "meta")
+	r := do(t, ts, http.MethodPost, "/api/projects",
+		`{"slug":"proposals","category":"meta"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	if r.StatusCode != http.StatusCreated {
+		t.Fatalf("create proposals project = %d, want 201", r.StatusCode)
+	}
+}
+
+// scoped builds the request headers for a scoped agent.
+func scoped(agent, scope string) map[string]string {
+	return map[string]string{"X-Agent": agent, "X-Agent-Scope": scope, "Content-Type": "application/json"}
+}
+
+// Acceptance 2: claim outside the scope → 403 out_of_scope; inside → 200;
+// the unscoped human still claims everything.
+func TestScopeClaimEnforcement(t *testing.T) {
+	ts := newTestServer(t)
+	workID, personalID := scopedBoard(t, ts)
+
+	r := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", "", scoped("agent-p", "personal"))
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped claim of work task = %d, want 403", r.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		t.Fatalf("decode 403 body: %v", err)
+	}
+	if body["error"] != "out_of_scope" {
+		t.Fatalf("403 body = %v, want out_of_scope", body)
+	}
+
+	r2 := do(t, ts, http.MethodPost, "/api/tasks/"+personalID+"/claim", "", scoped("agent-p", "personal"))
+	r2.Body.Close()
+	if r2.StatusCode != http.StatusOK {
+		t.Fatalf("scoped claim of personal task = %d, want 200", r2.StatusCode)
+	}
+
+	// Unscoped regression: no header claims the work task fine.
+	r3 := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", "",
+		map[string]string{"X-Agent": "human-helper"})
+	r3.Body.Close()
+	if r3.StatusCode != http.StatusOK {
+		t.Fatalf("unscoped claim of work task = %d, want 200", r3.StatusCode)
+	}
+}
+
+// Acceptance 3: next under a scope never returns out-of-scope work, even when
+// it is more urgent; explicit out-of-scope filters are loud 403s; explicit
+// in-scope filters compose.
+func TestScopeNextEnforcement(t *testing.T) {
+	ts := newTestServer(t)
+	scopedBoard(t, ts) // wproj/pproj tasks at default p2
+
+	// A more urgent ready task in work that an unscoped next would pick.
+	r := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"wproj","title":"urgent work","priority":0}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+
+	rn := do(t, ts, http.MethodPost, "/api/tasks/next", "", scoped("agent-p", "personal"))
+	defer rn.Body.Close()
+	if rn.StatusCode != http.StatusOK {
+		t.Fatalf("scoped next = %d, want 200", rn.StatusCode)
+	}
+	var tk Task
+	if err := json.NewDecoder(rn.Body).Decode(&tk); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	if tk.Project != "pproj" {
+		t.Fatalf("scoped next picked project %q, want pproj", tk.Project)
+	}
+
+	// Scope drained → 404, even though work still has ready tasks.
+	rd := do(t, ts, http.MethodPost, "/api/tasks/next", "", scoped("agent-p", "personal"))
+	rd.Body.Close()
+	if rd.StatusCode != http.StatusNotFound {
+		t.Fatalf("drained scoped next = %d, want 404", rd.StatusCode)
+	}
+
+	// Explicit out-of-scope category → loud 403.
+	rc := do(t, ts, http.MethodPost, "/api/tasks/next", `{"category":"work"}`, scoped("agent-p", "personal"))
+	rc.Body.Close()
+	if rc.StatusCode != http.StatusForbidden {
+		t.Fatalf("next category=work under personal scope = %d, want 403", rc.StatusCode)
+	}
+
+	// Explicit in-scope project composes.
+	want := mustCreateTask(t, ts, "pproj", "more personal")
+	rp := do(t, ts, http.MethodPost, "/api/tasks/next", `{"project":"pproj"}`, scoped("agent-p", "personal"))
+	defer rp.Body.Close()
+	if rp.StatusCode != http.StatusOK {
+		t.Fatalf("next project=pproj under personal scope = %d, want 200", rp.StatusCode)
+	}
+	tk = Task{}
+	if err := json.NewDecoder(rp.Body).Decode(&tk); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	if strconv.FormatInt(tk.ID, 10) != want {
+		t.Fatalf("scoped project next picked #%d, want #%s", tk.ID, want)
+	}
+}
+
+// Acceptance 4: steal_stale is scope-checked exactly like a claim.
+func TestScopeStealStale(t *testing.T) {
+	ts, store := newTestServerWithStore(t)
+	workID, _ := scopedBoard(t, ts)
+
+	r := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", "",
+		map[string]string{"X-Agent": "agent-gone"})
+	r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("setup claim = %d, want 200", r.StatusCode)
+	}
+	n, _ := strconv.ParseInt(workID, 10, 64)
+	backdateTask(t, store, n)
+
+	rs := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim",
+		`{"steal_stale":"1h"}`, scoped("agent-p", "personal"))
+	rs.Body.Close()
+	if rs.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped steal of out-of-scope stale task = %d, want 403", rs.StatusCode)
+	}
+
+	rw := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim",
+		`{"steal_stale":"1h"}`, scoped("agent-w", "work"))
+	defer rw.Body.Close()
+	if rw.StatusCode != http.StatusOK {
+		t.Fatalf("in-scope steal of stale task = %d, want 200", rw.StatusCode)
+	}
+	var stolen Task
+	if err := json.NewDecoder(rw.Body).Decode(&stolen); err != nil {
+		t.Fatalf("decode stolen task: %v", err)
+	}
+	if stolen.Assignee != "agent-w" {
+		t.Fatalf("assignee after in-scope steal = %q, want agent-w", stolen.Assignee)
+	}
+}
+
+// Acceptance 8: the proposals carve-out — any scope may create tasks (and
+// comment on its OWN tasks) in the designated project; everything else
+// out-of-scope still 403s.
+func TestScopeProposalsCarveOut(t *testing.T) {
+	ts := newTestServer(t)
+	scopedBoard(t, ts)
+	mustCreateProposals(t, ts)
+
+	// Scoped create in the carve-out → 201.
+	r := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"proposals","title":"add tool X","meta":{"proposal":"vault/p1.md"}}`,
+		scoped("agent-p", "personal"))
+	if r.StatusCode != http.StatusCreated {
+		r.Body.Close()
+		t.Fatalf("scoped create in proposals = %d, want 201", r.StatusCode)
+	}
+	var prop Task
+	if err := json.NewDecoder(r.Body).Decode(&prop); err != nil {
+		t.Fatalf("decode proposal: %v", err)
+	}
+	r.Body.Close()
+	propID := strconv.FormatInt(prop.ID, 10)
+
+	// Out-of-scope create anywhere else → 403.
+	rw := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"wproj","title":"sneaky"}`, scoped("agent-p", "personal"))
+	rw.Body.Close()
+	if rw.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped create in wproj = %d, want 403", rw.StatusCode)
+	}
+
+	// Commenting on one's OWN proposal → 201; on someone else's → 403.
+	rc := do(t, ts, http.MethodPost, "/api/tasks/"+propID+"/comments",
+		`{"body":"follow-up"}`, scoped("agent-p", "personal"))
+	rc.Body.Close()
+	if rc.StatusCode != http.StatusCreated {
+		t.Fatalf("comment on own proposal = %d, want 201", rc.StatusCode)
+	}
+	ro := do(t, ts, http.MethodPost, "/api/tasks/"+propID+"/comments",
+		`{"body":"drive-by"}`, scoped("agent-q", "work"))
+	ro.Body.Close()
+	if ro.StatusCode != http.StatusForbidden {
+		t.Fatalf("comment on another agent's proposal = %d, want 403", ro.StatusCode)
+	}
+}
+
+func TestScopeProposalsConfigurable(t *testing.T) {
+	store := openTestStore(t)
+	srv := NewServer(store)
+	srv.proposals = Scope{Category: "ops", Project: "inbox"}
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	mustCreateCategory(t, ts, "ops")
+	mustCreateCategory(t, ts, "personal")
+	for _, pair := range [][2]string{{"inbox", "ops"}, {"pproj", "personal"}} {
+		r := do(t, ts, http.MethodPost, "/api/projects",
+			`{"slug":"`+pair[0]+`","category":"`+pair[1]+`"}`,
+			map[string]string{"Content-Type": "application/json"})
+		r.Body.Close()
+		if r.StatusCode != http.StatusCreated {
+			t.Fatalf("create project %s = %d, want 201", pair[0], r.StatusCode)
+		}
+	}
+
+	// The custom carve-out works from any scope…
+	r := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"inbox","title":"proposal"}`, scoped("agent-p", "personal"))
+	r.Body.Close()
+	if r.StatusCode != http.StatusCreated {
+		t.Fatalf("scoped create in custom proposals = %d, want 201", r.StatusCode)
+	}
+	// …and the default name is no longer special on this server.
+	mustCreateCategory(t, ts, "meta")
+	rp := do(t, ts, http.MethodPost, "/api/projects",
+		`{"slug":"proposals","category":"meta"}`,
+		map[string]string{"Content-Type": "application/json"})
+	rp.Body.Close()
+	rd := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"proposals","title":"not special here"}`, scoped("agent-p", "personal"))
+	rd.Body.Close()
+	if rd.StatusCode != http.StatusForbidden {
+		t.Fatalf("create in non-designated proposals = %d, want 403", rd.StatusCode)
+	}
+}
+
+func TestScopeProposalsMissingProjectInert(t *testing.T) {
+	ts := newTestServer(t)
+	scopedBoard(t, ts) // no meta/proposals pair exists
+
+	// The carve-out passes the scope gate by slug, then the store 404s — a
+	// missing designated project never becomes a hole or a special error.
+	r := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"proposals","title":"goes nowhere"}`, scoped("agent-p", "personal"))
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusNotFound {
+		t.Fatalf("create in missing proposals project = %d, want 404", r.StatusCode)
+	}
+}
+
+// The carve-out is the (category, project) PAIR: a project that merely shares
+// the designated slug but lives in another category gets no special
+// treatment — create, explicit list filters, and graph reads all fall through
+// to the normal scope rules.
+func TestScopeProposalsWrongCategoryNoCarveOut(t *testing.T) {
+	ts := newTestServer(t)
+	scopedBoard(t, ts)
+	// "proposals" exists, but under work — NOT the designated meta/proposals.
+	r := do(t, ts, http.MethodPost, "/api/projects",
+		`{"slug":"proposals","category":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	if r.StatusCode != http.StatusCreated {
+		t.Fatalf("create work/proposals = %d, want 201", r.StatusCode)
+	}
+
+	// Out-of-scope create: 403, not the carve-out's 201.
+	rc := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"proposals","title":"smuggled"}`, scoped("agent-p", "personal"))
+	rc.Body.Close()
+	if rc.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped create into work/proposals = %d, want 403", rc.StatusCode)
+	}
+
+	// Explicit list filter falls through to the normal rules → loud 403.
+	rl := do(t, ts, http.MethodGet, "/api/tasks?project=proposals", "", scoped("agent-p", "personal"))
+	rl.Body.Close()
+	if rl.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped list of work/proposals = %d, want 403", rl.StatusCode)
+	}
+
+	// Graph read: same fall-through.
+	rg := do(t, ts, http.MethodGet, "/api/projects/proposals/graph", "", scoped("agent-p", "personal"))
+	rg.Body.Close()
+	if rg.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped graph of work/proposals = %d, want 403", rg.StatusCode)
+	}
+
+	// The normal rules still apply: the agent whose scope covers it creates fine.
+	rw := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"proposals","title":"plain in-scope task"}`, scoped("agent-w", "work"))
+	rw.Body.Close()
+	if rw.StatusCode != http.StatusCreated {
+		t.Fatalf("work-scoped create into work/proposals = %d, want 201", rw.StatusCode)
+	}
+}
+
+// A scoped agent must not be able to SQUAT the designated slug: creating
+// "proposals" inside its own category (legal — project creation in one's own
+// category is allowed) must not capture other scopes' proposals.
+func TestScopeProposalsSquat(t *testing.T) {
+	ts := newTestServer(t)
+	scopedBoard(t, ts) // meta/proposals does not exist yet
+
+	// The work-scoped agent squats the slug inside its own category.
+	r := do(t, ts, http.MethodPost, "/api/projects",
+		`{"slug":"proposals","category":"work"}`, scoped("agent-w", "work"))
+	r.Body.Close()
+	if r.StatusCode != http.StatusCreated {
+		t.Fatalf("work-scoped create of work/proposals = %d, want 201", r.StatusCode)
+	}
+
+	// Another scope's create into "proposals" is NOT the carve-out — the pair
+	// does not match, so the normal scope rules deny it. No captured task.
+	rp := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"proposals","title":"my proposal"}`, scoped("agent-p", "personal"))
+	rp.Body.Close()
+	if rp.StatusCode != http.StatusForbidden {
+		t.Fatalf("personal-scoped create into squatted proposals = %d, want 403", rp.StatusCode)
+	}
+}
+
+// Every task-mutating verb: out-of-scope → 403, in-scope → success.
+func TestScopeMutationSweep(t *testing.T) {
+	ts := newTestServer(t)
+	workID, personalID := scopedBoard(t, ts)
+	workID2 := mustCreateTask(t, ts, "wproj", "work prereq")
+	personalID2 := mustCreateTask(t, ts, "pproj", "personal prereq")
+
+	// Seed a comment on each board's task (unscoped) for the delete-comment leg.
+	commentID := func(taskID string) string {
+		r := do(t, ts, http.MethodPost, "/api/tasks/"+taskID+"/comments",
+			`{"body":"seed"}`, map[string]string{"Content-Type": "application/json"})
+		defer r.Body.Close()
+		if r.StatusCode != http.StatusCreated {
+			t.Fatalf("seed comment = %d, want 201", r.StatusCode)
+		}
+		var cm Comment
+		if err := json.NewDecoder(r.Body).Decode(&cm); err != nil {
+			t.Fatalf("decode comment: %v", err)
+		}
+		return strconv.FormatInt(cm.ID, 10)
+	}
+	workCID, personalCID := commentID(workID), commentID(personalID)
+	// Seed a dep on each side (unscoped) for the dep-remove leg.
+	for _, pair := range [][2]string{{workID, workID2}, {personalID, personalID2}} {
+		r := do(t, ts, http.MethodPost, "/api/tasks/"+pair[0]+"/deps",
+			`{"depends_on":`+pair[1]+`}`, map[string]string{"Content-Type": "application/json"})
+		r.Body.Close()
+		if r.StatusCode != http.StatusOK {
+			t.Fatalf("seed dep = %d, want 200", r.StatusCode)
+		}
+	}
+	// Seed a label on each side for the label-remove leg.
+	for _, id := range []string{workID, personalID} {
+		r := do(t, ts, http.MethodPost, "/api/tasks/"+id+"/labels",
+			`{"label":"seed"}`, map[string]string{"Content-Type": "application/json"})
+		r.Body.Close()
+	}
+
+	hdr := scoped("agent-p", "personal")
+	sweep := []struct {
+		name         string
+		method       string
+		outPath      string // against the work board: must 403
+		inPath       string // against the personal board: must succeed
+		body         string
+		wantInStatus int
+	}{
+		// dep rm runs first: the seeded prereq would otherwise hard-block the
+		// in-scope status→doing leg (409 blocked).
+		{"dep rm", http.MethodDelete, "/api/tasks/" + workID + "/deps/" + workID2, "/api/tasks/" + personalID + "/deps/" + personalID2, "", http.StatusOK},
+		{"patch status", http.MethodPatch, "/api/tasks/" + workID, "/api/tasks/" + personalID, `{"status":"doing"}`, http.StatusOK},
+		{"patch assignee", http.MethodPatch, "/api/tasks/" + workID, "/api/tasks/" + personalID, `{"assignee":"agent-p"}`, http.StatusOK},
+		{"comment", http.MethodPost, "/api/tasks/" + workID + "/comments", "/api/tasks/" + personalID + "/comments", `{"body":"hi"}`, http.StatusCreated},
+		{"label add", http.MethodPost, "/api/tasks/" + workID + "/labels", "/api/tasks/" + personalID + "/labels", `{"label":"bug"}`, http.StatusOK},
+		{"label rm", http.MethodDelete, "/api/tasks/" + workID + "/labels/seed", "/api/tasks/" + personalID + "/labels/seed", "", http.StatusOK},
+		{"dep add", http.MethodPost, "/api/tasks/" + workID + "/deps", "/api/tasks/" + personalID + "/deps", `{"depends_on":` + personalID2 + `}`, http.StatusOK},
+		{"comment delete", http.MethodDelete, "/api/tasks/" + workID + "/comments/" + workCID, "/api/tasks/" + personalID + "/comments/" + personalCID, "", http.StatusOK},
+		{"task delete", http.MethodDelete, "/api/tasks/" + workID, "/api/tasks/" + personalID2, "", http.StatusOK},
+	}
+	for _, c := range sweep {
+		r := do(t, ts, c.method, c.outPath, c.body, hdr)
+		r.Body.Close()
+		if r.StatusCode != http.StatusForbidden {
+			t.Fatalf("%s out-of-scope = %d, want 403", c.name, r.StatusCode)
+		}
+		// Sanity: the 403 left the work task untouched (still todo/unassigned)
+		// is implied by later legs succeeding against it unscoped elsewhere.
+		ri := do(t, ts, c.method, c.inPath, c.body, hdr)
+		ri.Body.Close()
+		if ri.StatusCode != c.wantInStatus {
+			t.Fatalf("%s in-scope = %d, want %d", c.name, ri.StatusCode, c.wantInStatus)
+		}
+	}
+}
+
+// A project-scoped identity (work/api) is tighter than its category.
+func TestScopeProjectScopedAgent(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateCategory(t, ts, "work")
+	for _, slug := range []string{"api", "web"} {
+		r := do(t, ts, http.MethodPost, "/api/projects",
+			`{"slug":"`+slug+`","category":"work"}`,
+			map[string]string{"Content-Type": "application/json"})
+		r.Body.Close()
+		if r.StatusCode != http.StatusCreated {
+			t.Fatalf("create project %s = %d, want 201", slug, r.StatusCode)
+		}
+	}
+	webID := mustCreateTask(t, ts, "web", "web task")
+	apiID := mustCreateTask(t, ts, "api", "api task")
+
+	hdr := scoped("agent-a", "work/api")
+	r := do(t, ts, http.MethodPost, "/api/tasks/"+webID+"/claim", "", hdr)
+	r.Body.Close()
+	if r.StatusCode != http.StatusForbidden {
+		t.Fatalf("project-scoped claim of sibling project task = %d, want 403", r.StatusCode)
+	}
+	r2 := do(t, ts, http.MethodPost, "/api/tasks/"+apiID+"/claim", "", hdr)
+	r2.Body.Close()
+	if r2.StatusCode != http.StatusOK {
+		t.Fatalf("project-scoped claim of own task = %d, want 200", r2.StatusCode)
+	}
+	// Creation follows the same line.
+	rc := do(t, ts, http.MethodPost, "/api/tasks", `{"project":"web","title":"x"}`, hdr)
+	rc.Body.Close()
+	if rc.StatusCode != http.StatusForbidden {
+		t.Fatalf("project-scoped create in sibling project = %d, want 403", rc.StatusCode)
+	}
+	ri := do(t, ts, http.MethodPost, "/api/tasks", `{"project":"api","title":"y"}`, hdr)
+	ri.Body.Close()
+	if ri.StatusCode != http.StatusCreated {
+		t.Fatalf("project-scoped create in own project = %d, want 201", ri.StatusCode)
+	}
+}
+
+// Reads policy: loud 403 on named out-of-scope reads, silent narrowing on
+// unfiltered lists, proposals readable by all.
+func TestScopeReads(t *testing.T) {
+	ts := newTestServer(t)
+	workID, personalID := scopedBoard(t, ts)
+	mustCreateProposals(t, ts)
+	propID := mustCreateTask(t, ts, "proposals", "someone's proposal")
+
+	hdr := scoped("agent-p", "personal")
+
+	// Named single-task reads.
+	for _, c := range []struct {
+		id   string
+		want int
+	}{{workID, http.StatusForbidden}, {personalID, http.StatusOK}, {propID, http.StatusOK}} {
+		r := do(t, ts, http.MethodGet, "/api/tasks/"+c.id, "", hdr)
+		r.Body.Close()
+		if r.StatusCode != c.want {
+			t.Fatalf("GET task %s scoped = %d, want %d", c.id, r.StatusCode, c.want)
+		}
+	}
+
+	// Unfiltered list silently narrows to the scope.
+	r := do(t, ts, http.MethodGet, "/api/tasks", "", hdr)
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("scoped unfiltered list = %d, want 200", r.StatusCode)
+	}
+	var tasks []Task
+	if err := json.NewDecoder(r.Body).Decode(&tasks); err != nil {
+		t.Fatalf("decode tasks: %v", err)
+	}
+	if len(tasks) != 1 || strconv.FormatInt(tasks[0].ID, 10) != personalID {
+		t.Fatalf("scoped unfiltered list = %+v, want only the personal task", tasks)
+	}
+
+	// Explicit out-of-scope category → loud 403.
+	rc := do(t, ts, http.MethodGet, "/api/tasks?category=work", "", hdr)
+	rc.Body.Close()
+	if rc.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped ?category=work = %d, want 403", rc.StatusCode)
+	}
+
+	// Explicit proposals project → readable.
+	rp := do(t, ts, http.MethodGet, "/api/tasks?project=proposals", "", hdr)
+	defer rp.Body.Close()
+	if rp.StatusCode != http.StatusOK {
+		t.Fatalf("scoped ?project=proposals = %d, want 200", rp.StatusCode)
+	}
+	tasks = nil
+	if err := json.NewDecoder(rp.Body).Decode(&tasks); err != nil {
+		t.Fatalf("decode proposals tasks: %v", err)
+	}
+	if len(tasks) != 1 || strconv.FormatInt(tasks[0].ID, 10) != propID {
+		t.Fatalf("?project=proposals = %+v, want the proposal task", tasks)
+	}
+
+	// Graph: out-of-scope project 403, in-scope and proposals 200.
+	for _, c := range []struct {
+		slug string
+		want int
+	}{{"wproj", http.StatusForbidden}, {"pproj", http.StatusOK}, {"proposals", http.StatusOK}} {
+		rg := do(t, ts, http.MethodGet, "/api/projects/"+c.slug+"/graph", "", hdr)
+		rg.Body.Close()
+		if rg.StatusCode != c.want {
+			t.Fatalf("GET graph %s scoped = %d, want %d", c.slug, rg.StatusCode, c.want)
+		}
+	}
+}
+
+func TestScopeHeaderValidation(t *testing.T) {
+	ts := newTestServer(t)
+	_, personalID := scopedBoard(t, ts)
+
+	// Malformed scopes → 400 on reads and mutations alike.
+	for _, bad := range []string{"a/b/c", "has space", "/", "work/"} {
+		hdr := map[string]string{"X-Agent": "agent-x", "X-Agent-Scope": bad, "Content-Type": "application/json"}
+		r := do(t, ts, http.MethodGet, "/api/tasks", "", hdr)
+		r.Body.Close()
+		if r.StatusCode != http.StatusBadRequest {
+			t.Fatalf("list with scope %q = %d, want 400", bad, r.StatusCode)
+		}
+		rm := do(t, ts, http.MethodPatch, "/api/tasks/"+personalID, `{"status":"doing"}`, hdr)
+		rm.Body.Close()
+		if rm.StatusCode != http.StatusBadRequest {
+			t.Fatalf("patch with scope %q = %d, want 400", bad, rm.StatusCode)
+		}
+	}
+
+	// A well-formed but unknown scope: mutations 403, unfiltered list empty.
+	hdr := scoped("agent-x", "nosuchcat")
+	rm := do(t, ts, http.MethodPatch, "/api/tasks/"+personalID, `{"status":"doing"}`, hdr)
+	rm.Body.Close()
+	if rm.StatusCode != http.StatusForbidden {
+		t.Fatalf("patch with unknown scope = %d, want 403", rm.StatusCode)
+	}
+	r := do(t, ts, http.MethodGet, "/api/tasks", "", hdr)
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("list with unknown scope = %d, want 200", r.StatusCode)
+	}
+	var tasks []Task
+	if err := json.NewDecoder(r.Body).Decode(&tasks); err != nil {
+		t.Fatalf("decode tasks: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("list with unknown scope = %+v, want empty", tasks)
+	}
+}
+
+// Project/category management under a scope: the category layer is sealed;
+// projects are manageable inside one's own category only.
+func TestScopeProjectCategoryEndpoints(t *testing.T) {
+	ts := newTestServer(t)
+	scopedBoard(t, ts)
+	hdr := scoped("agent-p", "personal")
+
+	// Category endpoints: any scope → 403.
+	for _, c := range []struct{ method, path, body string }{
+		{http.MethodPost, "/api/categories", `{"slug":"newcat"}`},
+		{http.MethodPost, "/api/categories/work/archive", ""},
+		{http.MethodPost, "/api/categories/work/unarchive", ""},
+	} {
+		r := do(t, ts, c.method, c.path, c.body, hdr)
+		r.Body.Close()
+		if r.StatusCode != http.StatusForbidden {
+			t.Fatalf("scoped %s %s = %d, want 403", c.method, c.path, r.StatusCode)
+		}
+	}
+
+	// Project create: allowed in the agent's own category, 403 elsewhere,
+	// and 403 entirely for a project-scoped agent.
+	r := do(t, ts, http.MethodPost, "/api/projects", `{"slug":"pside","category":"personal"}`, hdr)
+	r.Body.Close()
+	if r.StatusCode != http.StatusCreated {
+		t.Fatalf("scoped project create in own category = %d, want 201", r.StatusCode)
+	}
+	r2 := do(t, ts, http.MethodPost, "/api/projects", `{"slug":"wside","category":"work"}`, hdr)
+	r2.Body.Close()
+	if r2.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped project create in other category = %d, want 403", r2.StatusCode)
+	}
+	r3 := do(t, ts, http.MethodPost, "/api/projects", `{"slug":"pside2","category":"personal"}`,
+		scoped("agent-pp", "personal/pproj"))
+	r3.Body.Close()
+	if r3.StatusCode != http.StatusForbidden {
+		t.Fatalf("project-scoped project create = %d, want 403", r3.StatusCode)
+	}
+
+	// Project mutations: in-scope OK, out-of-scope 403.
+	rp := do(t, ts, http.MethodPatch, "/api/projects/pproj", `{"name":"Mine"}`, hdr)
+	rp.Body.Close()
+	if rp.StatusCode != http.StatusOK {
+		t.Fatalf("scoped patch of own project = %d, want 200", rp.StatusCode)
+	}
+	rw := do(t, ts, http.MethodPatch, "/api/projects/wproj", `{"name":"Theirs"}`, hdr)
+	rw.Body.Close()
+	if rw.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped patch of other project = %d, want 403", rw.StatusCode)
+	}
+	ra := do(t, ts, http.MethodPost, "/api/projects/pside/archive", "", hdr)
+	ra.Body.Close()
+	if ra.StatusCode != http.StatusOK {
+		t.Fatalf("scoped archive of own project = %d, want 200", ra.StatusCode)
+	}
+	ru := do(t, ts, http.MethodPost, "/api/projects/pside/unarchive", "", hdr)
+	ru.Body.Close()
+	if ru.StatusCode != http.StatusOK {
+		t.Fatalf("scoped unarchive of own project = %d, want 200", ru.StatusCode)
+	}
+	rd := do(t, ts, http.MethodDelete, "/api/projects/wproj", "", hdr)
+	rd.Body.Close()
+	if rd.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped delete of other project = %d, want 403", rd.StatusCode)
+	}
+	rdo := do(t, ts, http.MethodDelete, "/api/projects/pside", "", hdr)
+	rdo.Body.Close()
+	if rdo.StatusCode != http.StatusOK {
+		t.Fatalf("scoped delete of own project = %d, want 200", rdo.StatusCode)
+	}
+}
+
+// mustCreateProjectIn creates a project under an explicit category (the default
+// mustCreateProject lands in "general").
+func mustCreateProjectIn(t *testing.T, ts *httptest.Server, slug, category string) {
+	t.Helper()
+	resp := do(t, ts, http.MethodPost, "/api/projects",
+		`{"slug":"`+slug+`","name":"`+slug+`","category":"`+category+`"}`,
+		map[string]string{"Content-Type": "application/json"})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create project %q in %q = %d, want 201", slug, category, resp.StatusCode)
+	}
+}
+
+// eventKinds decodes the events array from an /api/events response body.
+func eventKinds(t *testing.T, resp *http.Response) []Event {
+	t.Helper()
+	defer resp.Body.Close()
+	var out struct {
+		Events []Event `json:"events"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode events: %v", err)
+	}
+	return out.Events
+}
+
+// TestEventsCategoryFilter verifies ?category= scopes the feed to one category's
+// project events, excluding category-level (NULL-project) events and other
+// categories' events, across the tail/before/since access modes.
+func TestEventsCategoryFilter(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateCategory(t, ts, "acat")
+	mustCreateCategory(t, ts, "bcat")
+	mustCreateProjectIn(t, ts, "aproj", "acat")
+	mustCreateProjectIn(t, ts, "bproj", "bcat")
+	aTask := mustCreateTask(t, ts, "aproj", "A task")
+	mustCreateTask(t, ts, "bproj", "B task")
+
+	// Default (?since=0): only acat's project events; no category.* and no bproj.
+	got := eventKinds(t, do(t, ts, http.MethodGet, "/api/events?category=acat", "", nil))
+	if len(got) == 0 {
+		t.Fatalf("?category=acat returned no events")
+	}
+	aTaskID, _ := strconv.ParseInt(aTask, 10, 64)
+	for _, e := range got {
+		if strings.HasPrefix(e.Kind, "category.") {
+			t.Fatalf("category-level event leaked into ?category=acat: %+v", e)
+		}
+		if e.TaskID != 0 && e.TaskID != aTaskID {
+			t.Fatalf("foreign-task event leaked into ?category=acat: %+v", e)
+		}
+	}
+	// Exactly the project.created for aproj and task.created for aTask.
+	wantKinds := map[string]bool{"project.created": false, "task.created": false}
+	for _, e := range got {
+		if _, ok := wantKinds[e.Kind]; ok {
+			wantKinds[e.Kind] = true
+		}
+	}
+	for k, seen := range wantKinds {
+		if !seen {
+			t.Fatalf("?category=acat missing expected %s event (got %d events)", k, len(got))
+		}
+	}
+
+	// ?tail= (newest-first bootstrap) honors the filter too.
+	tail := eventKinds(t, do(t, ts, http.MethodGet, "/api/events?category=acat&tail=50", "", nil))
+	for _, e := range tail {
+		if strings.HasPrefix(e.Kind, "category.") {
+			t.Fatalf("?tail with category leaked category-level event: %+v", e)
+		}
+		if e.ProjectID == 0 {
+			t.Fatalf("?tail with category leaked NULL-project event: %+v", e)
+		}
+	}
+
+	// ?before= (older-page) honors the filter.
+	maxID := int64(0)
+	for _, e := range got {
+		if e.ID > maxID {
+			maxID = e.ID
+		}
+	}
+	before := eventKinds(t, do(t, ts, http.MethodGet,
+		"/api/events?category=acat&before="+strconv.FormatInt(maxID+1, 10), "", nil))
+	for _, e := range before {
+		if e.ProjectID == 0 {
+			t.Fatalf("?before with category leaked NULL-project event: %+v", e)
+		}
+	}
+
+	// Unknown category → ErrNotFound surfaces as 404 (the categoryID sentinel).
+	rn := do(t, ts, http.MethodGet, "/api/events?category=nope", "", nil)
+	rn.Body.Close()
+	if rn.StatusCode != http.StatusNotFound {
+		t.Fatalf("?category=nope = %d, want 404", rn.StatusCode)
+	}
+}

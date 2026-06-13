@@ -15,6 +15,7 @@ import (
 type Client struct {
 	base  string
 	agent string
+	scope string // "cat" or "cat/proj"; empty = unscoped
 	http  *http.Client
 }
 
@@ -23,6 +24,7 @@ func NewClient() *Client {
 	return &Client{
 		base:  strings.TrimRight(base, "/"),
 		agent: resolveAgent(),
+		scope: resolveScope(),
 		http:  &http.Client{Timeout: 10 * time.Second},
 	}
 }
@@ -45,6 +47,9 @@ func (c *Client) do(method, path string, body any) (int, []byte) {
 	if c.agent != "" {
 		req.Header.Set("X-Agent", c.agent)
 	}
+	if c.scope != "" {
+		req.Header.Set("X-Agent-Scope", c.scope)
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return 0, nil
@@ -56,7 +61,7 @@ func (c *Client) do(method, path string, body any) (int, []byte) {
 
 // exitCodeFor maps an HTTP status (0 = transport error) to the CLI exit-code
 // convention: 0 ok · 3 not found · 4 conflict · 5 validation · 6 server down ·
-// 1 other. Single source for doOrFail and the bulk verbs.
+// 8 out of scope · 1 other. Single source for doOrFail and the bulk verbs.
 func exitCodeFor(st int) int {
 	switch {
 	case st >= 200 && st < 300:
@@ -69,13 +74,16 @@ func exitCodeFor(st int) int {
 		return 4
 	case st == 400:
 		return 5
+	case st == 403:
+		return 8
 	default:
 		return 1
 	}
 }
 
 // doOrFail returns the body on 2xx, otherwise prints a terse error and exits
-// with the convention: 3 not found · 4 conflict · 5 validation · 6 server down.
+// with the convention: 3 not found · 4 conflict · 5 validation · 6 server down ·
+// 8 out of scope.
 func (c *Client) doOrFail(method, path string, body any) []byte {
 	st, data := c.do(method, path, body)
 	switch exitCodeFor(st) {
@@ -89,6 +97,8 @@ func (c *Client) doOrFail(method, path string, body any) []byte {
 		fail(4, "%s", apiErr(data, "conflict"))
 	case 5:
 		fail(5, "%s", apiErr(data, "invalid request"))
+	case 8:
+		fail(8, "%s", apiErr(data, "out of scope"))
 	default:
 		fail(1, "%s", apiErr(data, "error "+strconv.Itoa(st)))
 	}

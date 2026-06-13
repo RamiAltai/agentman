@@ -8,12 +8,38 @@
 
 **None.** `am serve` binds `127.0.0.1` (`cmd/am/main.go`, `Addr: "127.0.0.1:" + port`) and accepts
 all requests. The `X-Agent` header (`server.go actorOf`) is an **actor label for attribution, not a
-credential** — any caller may claim any identity, including `"human"` (the dashboard's value).
+credential** — any caller may claim any identity, including `"human"` (the dashboard's value). The
+`X-Agent-Scope` header (Phase Q, `server.go scopeOf`) is the same kind of **client-asserted label**,
+not a credential — see Authorization below.
 
 ## Authorization
 
-**None.** There are no roles, ownership checks, or per-resource permissions. Anyone who can reach
-the port can read and mutate every project/task/comment.
+**None that is a security control.** There are no roles, credentials, or authenticated
+per-resource permissions. Anyone who can reach the port can read and mutate every
+project/task/comment by sending the right headers.
+
+**Scope confinement (Phase Q) is accident prevention, not authorization.** An agent may carry an
+**`X-Agent-Scope`** header (`category[/project]`), which the server enforces on every mutation and
+on named reads — out-of-scope → `403 {"error":"out_of_scope"}` (CLI exit 8). This keeps an agent
+that *follows its config* inside its slice of the board (a category, or one project). But like
+`X-Agent`, the scope header is **client-asserted and unauthenticated**: any caller can send any
+scope, or omit it entirely to act unscoped. It is therefore **not a security boundary against
+crafted HTTP** — it is fleet-coordination hygiene. The honest framing (mirrored from the
+requirements): scope confinement stops an agent from *accidentally* clobbering another's work; it
+does **not** stop a malicious local process. **Phase S (scope tokens) is the upgrade path** that
+turns the asserted scope into a verified credential. `scopeOf(r)` in `server.go` is the single
+reader of the header, so Phase S swaps the scope's source there without touching handlers.
+
+**Known coverage gaps in Phase Q (deliberate):**
+- `GET /api/events` and `GET /api/stream` are **not** narrowed by `X-Agent-Scope` — a scoped agent
+  can still read the global activity feed. Phase R added an *unscoped* `?category=` lens for the
+  human dashboard's category drill-down (a query-param choice, not an identity scope); the agent
+  `am wait` stream stays unscoped by design.
+- `GET /api/projects` and `GET /api/categories` list endpoints are **not** narrowed — board
+  metadata (slugs/names) is visible to any scope; task *data* is the enforcement point (Phase R
+  kept `/api/categories` unscoped on purpose — it serves the unscoped human dashboard).
+- An explicit unknown `?project=` for a scoped agent returns 403 (not 404/empty) — the server
+  cannot prove it in-scope, so it fails loud (mild existence ambiguity, accepted).
 
 ## Trust Boundaries
 
@@ -44,7 +70,9 @@ the port can read and mutate every project/task/comment.
 - The `?q=` search input is parameterized like everything else, run through `likeEscape` (so
   `%`/`_`/`\` can't act as LIKE wildcards) and capped at 500 bytes (→ 400); labels are validated by
   `normalizeLabel` against a strict charset (`^[a-z0-9._-]+$`, 1–50 bytes) before any SQL
-  (`cmd/am/store.go`).
+  (`cmd/am/store.go`). Meta keys (incl. the `?meta_key=` filter input) go through
+  `normalizeMetaKey` against the same charset; meta values are opaque but capped at 500 bytes and
+  always bound as parameters.
 
 ## Output Encoding
 
@@ -104,8 +132,11 @@ the server. Their security-relevant properties:
   `AGENTMAN_URL` (`/api/projects`) via `isServerRunning` and aborts with "stop `am serve` before
   importing". This avoids replacing a live WAL DB out from under a running process and corrupting it.
 - **Candidate validation.** Before replacing anything, import runs `PRAGMA integrity_check` /
-  `foreign_key_check`, requires the five core tables, and rejects a `schema_version` newer than
-  `currentSchemaVersion` — so a garbage or future-schema file is refused, not imported.
+  `foreign_key_check`, requires the five core tables (the v1 baseline set — later tables are
+  recreated by migrations on open, so old snapshots stay importable), and rejects a
+  `schema_version` newer than `currentSchemaVersion` — so a garbage or future-schema file is
+  refused, not imported. `OpenStore` applies the same version ceiling at open time (Phase O), so
+  an older binary refuses a too-new DB instead of operating on it.
 
 ## Existing Controls
 
@@ -121,6 +152,10 @@ the server. Their security-relevant properties:
 - XSS-safe DOM rendering; parameterized SQL; request body size cap.
 - The **`events` table is a de-facto audit log** (actor, kind, timestamp, delta) — but the actor is
   spoofable since `X-Agent` is unauthenticated, so it's attribution, not non-repudiation.
+- **Scope confinement** (`X-Agent-Scope`, Phase Q) — the server rejects out-of-scope mutations and
+  named reads with `403 out_of_scope` and logs each denial (`agentman: out_of_scope: …`). A control
+  for **accidental** cross-scope action by a config-following agent, **not** auth (the header is
+  client-asserted; Phase S scope tokens upgrade it). Denials are log-only — no event kind.
 
 ## Security Gaps
 
@@ -132,6 +167,11 @@ the server. Their security-relevant properties:
 5. ~~500s expose internal error text~~ — **fixed (Phase D1)**; 500s return `{"error":"internal"}`; detail only in server-side logs.
 6. ~~No dependency vulnerability scanning~~ — **added (Phase F)**; `govulncheck ./...` runs in CI. Residual: no Dependabot.
 7. Audit actor is spoofable (no identity verification).
+8. **Scope is client-asserted** (Phase Q) — `X-Agent-Scope` confines a config-following agent but
+   is not a boundary against crafted HTTP (any caller can forge or omit it). Phase S scope tokens
+   are the fix. Residual reads: `/api/events`, `/api/stream`, `GET /api/projects`,
+   `GET /api/categories` are not narrowed by `X-Agent-Scope` (Phase R added an unscoped
+   `?category=` lens for the human dashboard, not an identity scope) — see Authorization above.
 
 ## Secure Implementation Checklist
 

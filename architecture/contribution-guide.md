@@ -40,12 +40,12 @@ via `//go:embed`, so a running/old binary serves stale assets. Hard-refresh the 
 ## Running Tests
 
 ```sh
-go test -race ./cmd/am/                     # run all tests with the race detector (144 tests)
+go test -race ./cmd/am/                     # run all tests with the race detector (239 tests)
 go test ./...                               # equivalent short form
 go test -run TestUpdateAvailable -v ./cmd/am/
 ```
 
-Tests live next to the code in `cmd/am/` (10 test files):
+Tests live next to the code in `cmd/am/` (11 test files):
 
 - `update_test.go` — version-comparison logic.
 - `store_test.go` — CRUD + validation, the atomic claim race (exactly one winner), archive/unarchive
@@ -55,19 +55,45 @@ Tests live next to the code in `cmd/am/` (10 test files):
   `TestStealRaceExactlyOneWinner` — exactly one concurrent stealer wins, `TestListTasksStaleFilter`,
   `TestClaimSetsClaimedAt`, `TestDropClearsClaimedAt`), and findability (Phase M): the `?q=` search
   filter incl. LIKE-wildcard escaping, and labels (add/remove idempotency, validation, `?label=`
-  filter, delete cascade, no `updated_at` bump, fresh-table existence).
+  filter, delete cascade, no `updated_at` bump, fresh-table existence); and categories (Phase O):
+  create/archive/unarchive, project-in-category creation, `PatchProject`, the archived-category
+  cascade, the composing `?category=` task filter, category-scoped `NextTask`, and task creation
+  into an archived category rejected; and task metadata (Phase P): meta CRUD + validation (incl.
+  duplicate-after-normalization rejection), one-event atomic multi-key patches, no-op patches
+  emit no event, meta-only patches don't bump `updated_at`, the meta-filtered `NextTask` (incl.
+  the distinct-winners race), the `MetaKey` list filter, list rows returning meta, delete
+  cascade, and fresh-table existence on reopen; and scope (Phase Q): `taskScope`/`projectCategory`
+  + `created_by` default (`TestTaskScopeAndProjectCategory`) and the scoped+meta `NextTask` race
+  (`TestNextTaskRaceScopedCategoryMeta`); and category stats (Phase R): `TestListCategoriesCounts`
+  (`ListCategoriesWithStats` — non-archived-only counts, recently-active non-human agents).
 - `server_test.go` — HTTP status mapping (404 / 400 / lost-claim 409), the Host/CSRF guards and
   security headers, the archive/unarchive endpoints, HTTP 400 on task creation into an archived
   project (`TestCreateTaskIntoArchivedProject400`), `TestWriteErrHidesInternalDetail` (500 returns
   generic body), `TestRequestLoggerPassesThrough`, `TestRequestLoggerPreservesFlusher`, the
   `?stale=` filter (`TestListTasksStaleParam`), the steal-stale claim body
   (`TestStealStaleEndpoint`), the `?q=` search param incl. 400 on over-long input
-  (`TestListTasksQueryParam`), and the label endpoints (`TestLabelEndpoints`).
+  (`TestListTasksQueryParam`), the label endpoints (`TestLabelEndpoints`), and the Phase O
+  surfaces (`TestCategoryEndpoints`, `TestProjectPayloadAndCategoryFilter`,
+  `TestListTasksCategoryParam`, `TestNextEndpointCategoryBody`, `TestPatchProjectEndpoint`,
+  `TestCreateTaskArchivedCategory400`), the Phase P meta surfaces (`TestCreateTaskWithMeta`,
+  `TestPatchTaskMetaEndpoint`, `TestNextEndpointMetaBody`, `TestListTasksMetaKeyParam`), and the
+  Phase Q scope sweep (`TestScopeClaimEnforcement`, `TestScopeNextEnforcement`,
+  `TestScopeStealStale`, the proposals carve-out cases `TestScopeProposalsCarveOut`/`…Configurable`/
+  `…MissingProjectInert`/`…WrongCategoryNoCarveOut`/`…Squat`, `TestScopeMutationSweep`,
+  `TestScopeProjectScopedAgent`, `TestScopeReads`, `TestScopeHeaderValidation`,
+  `TestScopeProjectCategoryEndpoints`), and the Phase R `?category=` feed filter
+  (`TestEventsCategoryFilter` — one category's task events only, excludes `category.*` and the
+  other category, all of `?since=`/`?tail=`/`?before=`, unknown category → 404).
 - `migrate_test.go` — the forward-only migration runner (apply + version bump, skip ≤ current,
-  idempotency, rollback) and the v2 `archived_at` / v3 `claimed_at` columns.
+  idempotency, rollback), the v2 `archived_at` / v3 `claimed_at` columns, the v4
+  category/stable-ID/vault migration (`TestMigrationV4Fresh`, `TestMigrationV4ExistingDB`), the v5
+  `created_by` migration (`TestMigrationV5Fresh`, `TestMigrationV5ExistingDB` — latest-event
+  backfill, pruned→NULL, reused-rowid case, idempotent reopen), and the open-time version ceiling
+  (`TestOpenStoreRejectsNewerSchema`).
 - `db_test.go` — `am db` export/import (roundtrip + perms, backup creation, garbage rejection,
-  server-liveness probe), and prune (`TestPruneEventsKeep`, `TestPruneEventsBefore`,
-  `TestPruneEventsBeforeSameDayBoundary`).
+  server-liveness probe), prune (`TestPruneEventsKeep`, `TestPruneEventsBefore`,
+  `TestPruneEventsBeforeSameDayBoundary`), and Phase O (`TestExportContainsCategories`,
+  `TestImportPreCategorySnapshot`, `TestImportRejectsNewerSchema`).
 - `cli_test.go` — CLI command-path + exit-code tests (Phase E1). Constructs a `Client` directly
   against an `httptest` server. `captureStdout` captures os.Stdout via a pipe; `captureExit` stubs
   the `osExit` var (see "Test Seams" below) to intercept exit codes as panics. Covers: `cmdNew`
@@ -77,22 +103,46 @@ Tests live next to the code in `cmd/am/` (10 test files):
   and exits 3 when nothing is ready; bulk `status`/`assign` (multiple ids, partial-failure exit
   codes); `--stale`/`--steal-stale` wire encoding (`TestStaleFlagsWireFormat`); `--grep`/`--label`
   wire encoding (`TestCmdLsGrepWireFormat`) and the `am label` verb (`TestCmdLabelAddRemove`,
-  `TestCmdLabelPrintsLabels`, `TestCmdLabelUsage` — incl. rejection of flag-like tokens); and pure
+  `TestCmdLabelPrintsLabels`, `TestCmdLabelUsage` — incl. rejection of flag-like tokens); the
+  Phase O category verbs (`TestCmdCategoryVerbs`, `TestCmdProjectNewRequiresCategory`,
+  `TestCmdProjectEdit`, `TestCmdLsCategoryWireFormat`, `TestCmdNextCategory`, and the
+  `am show -c` alias-rewrite regression `TestCmdShowDashCStillPrintsComments` /
+  `TestRewriteShowComments`); the Phase P `--meta` surface (`TestParseMultiFlag` — the repeatable
+  `multiFlags` parser, `TestCmdNewMetaWireFormat`, `TestCmdEditMetaSinglePatch` — repeated flags
+  fold into one PATCH, `TestCmdNextMetaWireFormat`, `TestCmdLsMetaWireFormat`,
+  `TestCmdShowPrintsMeta`); the Phase Q exit-8 surface (`TestExitCodeForOutOfScope`,
+  `TestCmdClaimOutOfScopeExit8`, `TestCmdNextOutOfScopeExit8`, `TestClientSendsScopeHeader`,
+  `TestCmdStatusBulkOutOfScope` — per-id 403 line + continue, 404-before-403 → exit 3); and pure
   formatter/parse table tests.
 - `sse_test.go` — SSE streaming + reconnect (Phase E2). `TestSSEDeliversLiveEvent` opens
   `/api/stream`, creates a task, and asserts the `task.created` event arrives live.
   `TestSSEReplayOnReconnect` reconnects with `Last-Event-ID` and verifies gap-replay with
-  dedupe (every replayed id strictly greater than the resume cursor).
+  dedupe (every replayed id strictly greater than the resume cursor). Phase R added
+  `TestSSECategoryScopedStream` (category-scoped delivery + the `project.created` carve-out) and
+  `TestSSECategoryReconnectReplay` (a category-scoped reconnect replays only that category's gap).
+- `hub_test.go` — direct hub fan-out unit tests (Phase R): `TestHubCategoryScopedBroadcast`
+  (in-category delivered, out-of-category + category-level NULL-project dropped, `project.created`
+  delivered regardless), `TestHubProjectScopedBroadcast`, `TestHubUnscopedBroadcast`,
+  `TestHubBroadcastNilNoPanic`.
 - `identity_test.go` — identity (Phase E3). `cmdInit`→`resolveAgent` roundtrip, `AGENTMAN_AGENT`
   env override wins, `sanitizeType` table, `newIdentity` format. Uses the `AGENTMAN_AGENT_FILE` env
-  seam so the real `~/.agentman` is never written.
+  seam so the real `~/.agentman` is never written. Phase Q added scoped-identity tests
+  (`TestInitScopedWritesJSON`, `TestInitScopedCategoryProject`, `TestInitProjectRequiresCategory`,
+  `TestLegacyPlainIdentityUnscoped`, `TestScopeEnvOverride`, `TestWhoamiPrintsScope`,
+  `TestParseScope`).
 - `web_test.go` — dashboard XSS-sink guard (Phase E4). `TestDashboardNoXSSSinks` reads the embedded
   `web/app.js` + `web/index.html` via the `webFS` embed.FS and asserts none of `.innerHTML`/
   `.outerHTML`/`.insertAdjacentHTML`/`document.write`/`eval(` appear.
 - `wait_test.go` — `am wait` (Phase L). Already-satisfied, event-driven (`TestWaitDoneEventArrives`,
   `TestWaitReadyOnPrereqDone`), and cross-project (`TestWaitDoneCrossProject` — `AGENTMAN_PROJECT`
   must not scope the `--done` stream) waits; exit 7 on timeout, exit 3 not-found, exit 6 server
-  down, usage errors, and the `parseWaitTimeout` table.
+  down, usage errors, and the `parseWaitTimeout` table. Phase O added the category-scoped
+  `--ready` waits (`TestWaitReadyCategoryScoped`, `TestWaitReadyCategoryEnv`,
+  `TestWaitReadyCategoryTimeout`); Phase P added the meta-scoped `--ready` waits
+  (`TestWaitReadyMetaNoHotSpin`, `TestWaitReadyMetaReleasedByCreate`,
+  `TestWaitReadyMetaReleasedByPrereqDone`, `TestWaitMetaUsageErrors`); Phase Q added the scoped
+  `--ready` waits (`TestWaitReadyScopedTimeout`, `TestWaitReadyScopedReleased`,
+  `TestWaitReadyExplicitOutOfScopeExit8`).
 
 Behavioral dashboard JS (the modal flows, delete confirms, feed pagination) remains untested —
 see `known-risks-and-gaps.md`. New behavioral tests are welcome.

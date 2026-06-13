@@ -19,17 +19,49 @@ convention is loose, it's called out.
 - HTTP handlers: `handleX` (e.g. `handleClaim`). Routes registered in `Server.Handler()`.
 - Store methods: exported PascalCase domain verbs (`CreateTask`, `ClaimTask`, `ListEvents`).
 - CLI verb implementations: `cmdX` (`cmdClaim`, `cmdNew`); dispatched in `main.go`.
-- Sentinel errors: `ErrNotFound`, `ErrConflict`, `ErrValidation`, `ErrProjectArchived` (→ HTTP 400 `project_archived`); typed `*ConflictError{Assignee}`; typed `*BlockedError{OpenPrereqs []int64}` (→ HTTP 409 `{"error":"blocked","open_prereqs":[…]}`); typed `*NotStaleError{Assignee}` (→ HTTP 409 `{"error":"not_stale","assignee":…}`).
+- Short flags canonicalize in `canonFlag` (`cli.go`): `-p` → project, `-c` → **category**, `-s` →
+  status, `-a` → assign, `-l` → label. One carve-out: `am show <id> -c` keeps meaning
+  `--comments` — `main.go` rewrites `-c → --comments` for the `show` verb only
+  (`rewriteShowComments`, before `parse()`).
+- **Repeatable value flags** register in the `multiFlags` map (`cli.go`, like `boolFlags` —
+  registration is global across verbs); every occurrence is collected in order into `Args.multi`
+  and read with `a.all(k)`. A flag is multi OR single (last-wins `Args.flags`), never both.
+  Prefer repetition over comma-splitting one value when values are opaque (may contain commas).
+  `--meta` is the first multi flag; it has no short alias.
+- Sentinel errors: `ErrNotFound`, `ErrConflict`, `ErrValidation`, `ErrProjectArchived` (→ HTTP 400 `project_archived`), `ErrCategoryArchived` (→ HTTP 400 `category_archived`), `ErrOutOfScope` (→ HTTP 403 `out_of_scope` → CLI exit 8); typed `*ConflictError{Assignee}`; typed `*BlockedError{OpenPrereqs []int64}` (→ HTTP 409 `{"error":"blocked","open_prereqs":[…]}`); typed `*NotStaleError{Assignee}` (→ HTTP 409 `{"error":"not_stale","assignee":…}`).
 - Event kinds: dotted `noun.verb` strings — `task.created`, `task.claimed`, `task.reclaimed`,
   `task.status`, `task.assign`, `task.patched`, `task.deleted`, `task.dep_added`,
   `task.dep_removed`, `task.labeled`, `task.unlabeled`, `comment.added`, `comment.deleted`,
-  `project.created`, `project.archived`, `project.unarchived`, `project.deleted` (17 total).
-- Env vars: `AGENTMAN_*` (`AGENTMAN_URL/PROJECT/AGENT/AGENT_FILE/DB/PORT/NO_UPDATE_CHECK/LOG`).
+  `project.created`, `project.archived`, `project.unarchived`, `project.patched`,
+  `project.deleted`, `category.created`, `category.archived`, `category.unarchived` (21 total).
+- Stable IDs: `newUID(prefix)` — prefix + 16 lowercase hex chars from `crypto/rand`; `amc_` for
+  categories, `amp_` for projects. Immutable after creation; insert paths retry on a uid UNIQUE
+  collision via `isUniqueErr`.
+- Env vars: `AGENTMAN_*` (`AGENTMAN_URL/PROJECT/CATEGORY/SCOPE/AGENT/AGENT_FILE/DB/PORT/PROPOSALS/NO_UPDATE_CHECK/LOG`).
+
+## Scope Enforcement (Phase Q)
+
+- **One scope-resolution point.** `scopeOf(r)` in `server.go` is the **sole** reader of the
+  `X-Agent-Scope` header (`category[/project]`, parsed by `parseScope`). Every handler that mutates
+  or names a resource calls it and then a `check*`/`narrowScope` helper; no handler reads the header
+  directly. This is the deliberate swap-point for Phase S scope tokens — change the source inside
+  `scopeOf`, touch no handler. The zero `Scope` (absent header) is unscoped and passes every check.
+- **Client-asserted, not a boundary.** Like `X-Agent`, the scope is accident prevention for an
+  agent following its config, **not** a security control against crafted HTTP (`security.md`).
+- **Denials are log-only.** `denyScope` logs `agentman: out_of_scope: actor=<id> scope=<scope>
+  <METHOD> <PATH>` and returns `ErrOutOfScope`. **No `scope.denied` event kind** — never feed
+  denials into the SSE stream (noise + a partial-information leak). The event catalog stays at 21.
+- **Checks run outside the store tx**, sound only because `task→project` and `project→category` are
+  immutable; if a move feature ships, move the checks in-tx (see the `PatchTask`/`PatchProject`
+  scope-note comments).
+- **Proposals carve-out matches the (category, project) pair** (`isProposals`) — slugs are globally
+  unique, so the pair check blocks a slug-squat; a missing project leaves the carve-out inert.
 
 ## API Conventions
 
 - JSON in/out; write via `writeJSON`, errors via `writeErr` (`{"error": "..."}`).
-- Status codes: `200/201` success, `400` validation, `404` not found, `409` conflict
+- Status codes: `200/201` success, `400` validation, `403` out of scope
+  (`{"error":"out_of_scope"}`, Phase Q), `404` not found, `409` conflict
   (`{"error":"already_claimed","assignee":…}` for lost claims), `500` otherwise.
 - Writes read the actor from the **`X-Agent`** header (`actorOf`, default `"human"`).
 - **List endpoints return a terse projection** (no body/comments); the full object is only on
@@ -42,6 +74,11 @@ convention is loose, it's called out.
 - **Always parameterize** (`?`); never concatenate caller input into SQL.
 - A mutation and its `events` row must be in **one `*sql.Tx`**; **broadcast only after commit**
   (`hub.Broadcast(ev)` in the handler, not the store).
+- **The SSE hub stays DB-free.** `hub.Broadcast` is a pure in-memory check — any per-subscriber
+  scope must be resolved into a plain value/set **once at Subscribe time**, not looked up per event.
+  Phase R's `?category=` stream follows this: the handler resolves the category's project-id set
+  (`ProjectIDsInCategory`) into the `subFilter` before subscribing, so `Broadcast` only does a map
+  membership test (accepting a small post-open staleness window over re-querying per event).
 - Timestamps via SQL `strftime('%Y-%m-%dT%H:%M:%fZ','now')` (UTC ISO-8601 TEXT); set `updated_at`
   explicitly in every `UPDATE`.
 - Represent SQL NULLs with the `nullStr`/`nullable`/`nullableID` helpers.
@@ -51,14 +88,20 @@ convention is loose, it's called out.
 - Store returns sentinel errors; handlers translate via `writeErr`; the CLI translates HTTP status →
   **exit code** via `client.go exitCodeFor` (single source, used by `doOrFail` and the bulk
   `status`/`assign` loop): `0` ok · `1` generic · `3` not found · `4` conflict · `5` validation ·
-  `6` server down; plus `7` = `am wait` timeout (CLI-side, no HTTP status).
+  `6` server down · `8` out of scope (any 403); plus `7` = `am wait` timeout (CLI-side, no HTTP
+  status). Full catalog: `0/3/4/5/6/7/8`.
 - CLI: errors go to **stderr** via `fail(code, fmt, …)`; **stdout stays clean** (only ids on
   create/claim) so command substitution works.
 
 ## Validation
 
 - Status: `validStatus` map + SQL `CHECK`. Reject empty title/slug/body with `ErrValidation`.
-- `PatchTask` applies only known keys (`status/assignee/title/body/priority`) and ignores the rest.
+- `PatchTask` applies only known keys (`status/assignee/title/body/priority/meta`) and ignores
+  the rest.
+- Meta keys are normalized at the boundary (`normalizeMetaKey` — label rules: trim + lowercase,
+  1–50 chars of `a-z 0-9 . _ -`); values are opaque, 1–500 bytes (`maxTitleLen`; empty = remove,
+  PATCH only). Two raw keys normalizing to the same key in one request → `ErrValidation`
+  (deterministic all-or-nothing requests).
 
 ## Logging
 
@@ -71,19 +114,23 @@ convention is loose, it's called out.
 
 ## Configuration
 
-- Flags on `am serve`: `--port`, `--db`, `--log`. Everything else is env (`AGENTMAN_*`) with
-  sensible defaults (`defaultDBPath` → `~/.agentman/agentman.db`, port `8787`). Flags override
-  env where both exist. Add new config as an `AGENTMAN_*` env var and/or a flag, default-off /
-  backward-compatible.
-- Env vars: `AGENTMAN_URL`, `AGENTMAN_PROJECT`, `AGENTMAN_AGENT`, `AGENTMAN_AGENT_FILE`,
-  `AGENTMAN_DB`, `AGENTMAN_PORT`, `AGENTMAN_NO_UPDATE_CHECK`, `AGENTMAN_LOG`.
+- Flags on `am serve`: `--port`, `--db`, `--log`, `--proposals CAT/PROJ` (the scope carve-out
+  project, default `meta/proposals`; flag beats `AGENTMAN_PROPOSALS`; both segments required or
+  startup `fail(1)`). Everything else is env (`AGENTMAN_*`) with sensible defaults (`defaultDBPath`
+  → `~/.agentman/agentman.db`, port `8787`). Flags override env where both exist. Add new config as
+  an `AGENTMAN_*` env var and/or a flag, default-off / backward-compatible.
+- Env vars: `AGENTMAN_URL`, `AGENTMAN_PROJECT`, `AGENTMAN_CATEGORY` (default category scope for
+  `ls`/`next`/`wait --ready`/`project new`), `AGENTMAN_SCOPE` (overrides the identity file's scope —
+  the `X-Agent-Scope` value; non-empty only, composes per-field with `AGENTMAN_AGENT`),
+  `AGENTMAN_AGENT`, `AGENTMAN_AGENT_FILE`, `AGENTMAN_DB`, `AGENTMAN_PORT`, `AGENTMAN_PROPOSALS`
+  (serve: the carve-out project), `AGENTMAN_NO_UPDATE_CHECK`, `AGENTMAN_LOG`.
 
 ## Testing
 
 - `go test -race ./cmd/am/` (or `go test ./...`); table-driven tests (see `cmd/am/update_test.go`).
   Coverage spans pure logic, the store, HTTP, migrations, offline DB tooling, CLI verbs + exit codes,
-  SSE streaming/reconnect, `am wait`, identity, and the dashboard XSS-sink guard — 10 test files,
-  144 tests.
+  scope enforcement, SSE streaming/reconnect (incl. category-scoped) + direct hub fan-out unit
+  tests, `am wait`, identity, and the dashboard XSS-sink guard — 11 test files, 239 tests.
 - **`osExit` testability var** — `cli.go` declares `var osExit = os.Exit`; `fail()` calls `osExit`
   rather than `os.Exit` directly. Tests in `cli_test.go` replace it via `captureExit(t, fn)`,
   which substitutes a panic-based stub so exit codes can be asserted without terminating the process.

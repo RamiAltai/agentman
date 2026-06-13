@@ -131,6 +131,96 @@ In rough priority order:
 - [ ] N1 Goreleaser release binaries; `am update` downloads binary
 - [ ] N2 Server-side auto-prune (`--retain`) replacing manual-only compaction
 
+### Phase O — agentic_brain foundation — **DONE (2026-06-13)**
+
+First phase of the agentic_brain integration train (see `agentman_requirements.md`, outside
+this repo): categories, stable IDs, vault binding, migration v4. Satisfies requirements
+**R1 + R2 + R3 + R8**.
+
+- [x] O1 Category layer (R1) — `categories` table, `am categories`/`am category new|archive|
+  unarchive`, `-c` + `AGENTMAN_CATEGORY` on `ls`/`next`/`wait --ready`, `?category=` filters,
+  archived-category cascade (`400 category_archived` on writes)
+- [x] O2 Stable IDs (R2) — immutable `amc_`/`amp_` uids on categories/projects (crypto/rand,
+  16 hex); slugs renameable via `am project edit --slug` without breaking the correlation key
+- [x] O3 Vault binding (R3) — `vault_project_id`/`vault_path` on projects;
+  `am project edit --vault-id/--vault-path` + `PATCH /api/projects/{slug}`
+- [x] O4 Migration v4 (R8) — seeds default category `general`, attaches existing projects,
+  backfills uids; zero data loss (task ids/refs/`claimed_at`/labels untouched); pre-v4 snapshots
+  stay importable; `OpenStore` now rejects a too-new `schema_version`
+  - 4 new event kinds (`category.created/archived/unarchived`, `project.patched`; total 21);
+    +30 tests (now 174). → ADR-025, `CHANGELOG.md`.
+  - Next in the train: **Phase P** task metadata (shipped, see below), **Phase Q** scoping
+    enforcement (identity scope, exit 8, proposal-inbox carve-out, R4), **Phase R** category
+    dashboard + scoped feed (R6), **Phase S** scope tokens (R5).
+
+### Phase P — Task metadata — **DONE (2026-06-13)**
+
+Second phase of the agentic_brain train: free-form `key=value` pairs on tasks with key-presence
+filters across the listing and pickup verbs. Satisfies requirement **R7**.
+
+- [x] P1 `task_meta` table + `meta` on create/patch/get/list — keys normalized like labels,
+  values opaque ≤ 500 bytes; empty value removes on edit (rejected at create); duplicate keys
+  after normalization rejected on both paths; meta-only patches don't bump `updated_at`;
+  no migration step (`CREATE TABLE IF NOT EXISTS`, schema version stays 4)
+- [x] P2 presence filters — `?meta_key=` on `GET /api/tasks`, `"meta_key"` in
+  `POST /api/tasks/next`, `--meta KEY` on `am ls`/`am next`/`am wait --ready`; `NextTask`
+  refactored to take a `NextFilter` struct (Phase Q extension point); the next/wait predicates
+  are textually identical so a released wait is always pickable
+- [x] P3 CLI repeatable `--meta k=v` (new `multiFlags` parser registry) on `am new`/`am edit`
+  (all flags fold into one request); `am show` `meta:` line; dashboard modal Meta section +
+  `(meta: …)` feed suffix on `task.patched`
+  - No new event kinds (catalog stays 21), no new error/exit codes; +25 tests (now 199).
+    → ADR-026, `CHANGELOG.md`.
+  - Next in the train: **Phase Q** scoping enforcement (shipped, see below), **Phase R** category
+    dashboard + scoped feed (R6), **Phase S** scope tokens (R5).
+
+### Phase Q — Scoped agent identity & enforcement — **DONE (2026-06-13)**
+
+Third phase of the agentic_brain train: confine an agent to a category (or one project) and enforce
+it server-side. Satisfies requirement **R4**.
+
+- [x] Q1 Scope identity — `am init <tasktype> -c CAT [-p PROJ]` (JSON identity file; legacy
+  plain-text = unscoped, re-init after upgrade), `AGENTMAN_SCOPE` override, `am whoami` scope line;
+  the CLI sends `X-Agent-Scope` on every request
+- [x] Q2 Server enforcement — `scopeOf(r)` (sole reader, the Phase S swap point) + per-verb
+  `check*`/`narrowScope`; out of scope → `403 out_of_scope` → **new CLI exit code 8**; reads policy
+  loud-named / silent-unfiltered / proposals-readable; `am next` scope merged inside the atomic
+  pick+claim; category endpoints 403 for any scope, project-create only for a category-scoped agent
+  in its own category
+- [x] Q3 Proposals carve-out — `am serve --proposals` / `AGENTMAN_PROPOSALS` (default
+  `meta/proposals`), keyed by the (category, project) pair (slug-squat-proof), inert when missing,
+  not extended to `am next`; own-proposal comments via `tasks.created_by` (migration **v5**,
+  best-effort backfill from the latest `task.created` event)
+  - Denials log-only (no new event kind; catalog stays 21); `X-Agent-Scope` is client-asserted
+    (accident prevention, not auth — Phase S scope tokens upgrade it); +32 tests (now 231).
+    → ADR-027, `CHANGELOG.md`.
+  - Next in the train: **Phase R** category dashboard + scoped feed (R6, shipped below), **Phase S**
+    scope tokens (R5).
+
+### Phase R — Category dashboard + scoped feed — **DONE (2026-06-13)**
+
+Fourth phase of the agentic_brain train: a human view organized by category, plus a category lens on
+the event feed/stream. Satisfies requirement **R6**.
+
+- [x] R1 Category-home dashboard — overview cards per category (task counts + recently-active
+  agents from the augmented `GET /api/categories` `CategoryStat`), an "All" card, and drill-down
+  into a single category's board; **hash routing** (`#/`, `#/all`, `#/cat/<slug>`) so views are
+  linkable and the browser back button works, with a "← Categories" breadcrumb
+- [x] R2 Scoped feed/stream — `?category=<slug>` on `GET /api/events` (all of `?since=`/`?tail=`/
+  `?before=`; unknown → 404) and `GET /api/stream` (live + gap-replay; unknown ignored silently),
+  scoping to the category's projects' events and **excluding** instance-wide category-level
+  (NULL-project) events; the hub resolves the category's project-id set once at Subscribe
+  (`ProjectIDsInCategory`/`subFilter`) so `Broadcast` stays in-memory, preserving the
+  `project.created` carve-out
+  - No new event kinds (catalog stays 21), no new error/exit codes, no schema change
+    (`currentSchemaVersion` stays 5); the dashboard is **unscoped** (category view is a query-param
+    lens, not an `X-Agent-Scope` identity scope); `am wait`'s stream left deliberately unscoped.
+    +8 tests (now 239). → ADR-028, `frontend.md`, `backend.md`, `data-model.md`, `system-map.md`,
+    `README.md`, `known-risks-and-gaps.md`, `CHANGELOG.md`.
+  - **The integration-blocking set (O + P + Q) plus the human dashboard is now DONE.** Only the
+    train's **Phase S** (scope tokens, SHOULD, R5) and the NICE-to-have items (Phase N release
+    binaries / auto-prune, and the "Later / if demand appears" list) remain.
+
 ### Later / if demand appears
 - Due dates + `--due-before` filter; webhooks on event kinds (Slack/CI triggers);
   MCP server mode (`am mcp` exposing the board as MCP tools — natural fit for the

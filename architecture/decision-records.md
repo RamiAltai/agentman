@@ -93,9 +93,11 @@ without evidence.
   `schema.sql`. Each step applies its change **and** bumps `meta.schema_version` in one tx;
   integer-ordered; no new dependency. `schemaMigrations` is **empty at v1** (foundation only).
 - Rationale: enables additive schema evolution + import version checks without a migration library.
-- Consequences: forward-only (no down-migrations); a DB at a **newer** version than the binary is
-  currently accepted silently (to be gated by the Phase 1 import check / a future `cur>target`
-  guard); an unparseable `schema_version` defaults to 1, so migration steps must stay idempotent.
+- Consequences: forward-only (no down-migrations); a DB at a **newer** version than the binary was
+  originally accepted silently — **closed in Phase O** (ADR-025): `OpenStore` now refuses to open a
+  DB whose recorded `schema_version` exceeds `currentSchemaVersion`, the same ceiling
+  `validateImportCandidate` applies to import snapshots; an unparseable `schema_version` defaults
+  to 1, so migration steps must stay idempotent.
 - Evidence: `cmd/am/store.go` (`runMigrations`/`readSchemaVersion`/`schemaMigrations`, `OpenStore`);
   `cmd/am/migrate_test.go`.
 
@@ -615,6 +617,364 @@ without evidence.
   (`handleAddLabel`, `handleRemoveLabel`, `?q=`/`?label=` in `handleListTasks`); `cmd/am/cli.go`
   (`cmdLabel`, `--grep`/`--label` in `cmdLs`); `cmd/am/web/app.js` (search box, label chips +
   filter, modal Labels section); tests listed in the Phase M CHANGELOG entry.
+
+### ADR-025: Category layer + stable IDs + vault binding — `amc_`/`amp_` crypto/rand uids, nullable FK with app-enforced NOT NULL, globally-unique slugs, `-c` flag with a `show` carve-out, open-time version ceiling (Phase O)
+- Status: Active
+- Context: The agentic_brain integration (requirements R1/R2/R3/R8) needs a **category** layer
+  above projects (one instance, one DB, agents scoped down later), **stable IDs** the vault can
+  bind to across slug renames, **vault binding metadata** on projects, and a migration that
+  carries every existing DB forward with zero data loss. This is Phase O ("Foundation") of that
+  train; scoping enforcement (Phase Q), the category dashboard (Phase R), and scope tokens
+  (Phase S) build on it, with task metadata (Phase P) in parallel.
+- Decision:
+  1. **Stable-ID format: `amc_`/`amp_` + 16 lowercase hex** (`newUID` — 8 bytes of `crypto/rand`,
+     stdlib only; no ULID dependency). Immutable after creation; survives slug renames; the
+     vault's canonical correlation key. A bare `p_` prefix was avoided because the vault's own
+     project IDs use that namespace and sit next to these in the same binding fields. Insert
+     paths retry up to 3 attempts on a uid UNIQUE collision (`isUniqueErr`); the v4 migration
+     backfill assigns per-row without retry (collision odds ~2⁻⁶⁴).
+  2. **`projects.category_id` is nullable in SQL — NOT NULL by app invariant.** A deliberate
+     deviation from the requirement's "NOT NULL FK": SQLite's `ALTER TABLE ADD COLUMN` cannot add
+     a NOT NULL column without a constant default, which is wrong for an FK. The invariant is
+     enforced in the app instead: `CreateProject` always sets it, the v4 migration backfills all
+     NULLs to `general`, and nothing can clear it (`category_id` is not patchable). UNIQUE is
+     likewise not allowed in `ADD COLUMN`, hence the `idx_projects_uid` unique index for
+     `projects.uid`.
+  3. **Project slugs stay globally unique** (no per-category namespacing). Task refs like `web-3`
+     and `AGENTMAN_PROJECT` keep working unchanged, and `am new` needs no `-c` — a slug names
+     exactly one project across the instance, so a project fully determines its category.
+  4. **`-c` becomes the global category flag** (`canonFlag c → category`; env fallback
+     `AGENTMAN_CATEGORY`) — with one carve-out: `am show <id> -c` is the documented comments
+     toggle, so `main.go` rewrites `-c → --comments` for the `show` verb only
+     (`rewriteShowComments`, run before `parse()`). Chosen over a per-verb alias table to keep
+     `canonFlag` simple.
+  5. **Archived-category cascade mirrors the archived-project rules.** Default views
+     (`GET /api/projects`, unscoped `GET /api/tasks`, the unscoped event feed) require both
+     `p.archived_at IS NULL` AND `c.archived_at IS NULL`; an explicit `?category=` drops the
+     category-archived condition so the scope stays inspectable (hidden, not blocked-from-read);
+     `next` excludes archived categories unconditionally; writes are blocked — task/project
+     creation under an archived category → `ErrCategoryArchived` →
+     `400 {"error":"category_archived"}` → CLI exit 5 (**no new exit codes**).
+  6. **Dashboard default-category compatibility:** `POST /api/projects` with an empty category
+     maps to `general` server-side rather than 400, so the existing dashboard (and any script
+     posting `{slug,name}`) keeps working without a UI change. The v4 migration seeds `general`
+     **unconditionally**, so fresh installs have it too.
+  7. **`am wait --ready -c` streams unscoped:** `/api/stream` has no `?category=` yet (Phase R);
+     the unscoped stream just triggers the category-scoped REST re-check (the ADR-023 pattern —
+     event payloads are never trusted as state). Slightly chattier (re-checks on out-of-scope
+     events) but correct.
+  8. **Open-time schema-version ceiling:** `OpenStore` refuses a DB whose recorded
+     `schema_version` is newer than `currentSchemaVersion` ("database schema_version N is newer
+     than supported M — upgrade am") — migrations only run forward, so an older binary would
+     otherwise operate on (and corrupt or silently hide) too-new data. Mirrors the ceiling
+     `validateImportCandidate` already applies to import snapshots (closes the ADR-010 residual).
+  9. **Old snapshots stay importable by design:** `validateImportCandidate`'s required-table set
+     is pinned to the **v1 baseline** (no `categories`/`task_deps`/`task_labels`) — later tables
+     are created by `schema.sql`/migrations on the next `OpenStore`, so pre-v4 snapshots import
+     and migrate cleanly.
+- New event kinds: `category.created` / `category.archived` / `category.unarchived` (these carry
+  **no `project_id`**, so they reach unscoped SSE subscribers only and need explicit feed-render
+  cases — the default branch would print a literal "null" ref) and `project.patched` (compact
+  delta, modeled on task patches). Catalog 17 → **21**.
+- Rationale: one instance with a category layer beats one-instance-per-domain (single dashboard,
+  scoped agents later); crypto/rand hex keeps the stdlib-only invariant; the nullable-FK deviation
+  is the only way to ship the column through SQLite's ALTER TABLE while the app preserves the
+  semantic invariant; global slug uniqueness protects every existing ref and env contract; the
+  show-verb rewrite preserves a documented CLI surface at near-zero complexity.
+- Consequences: category moves are unsupported (`category_id` not patchable — revisit when
+  needed); the `-c` rewrite means `show` can never grow a category filter under that letter;
+  category events are invisible to project-scoped SSE subscribers until Phase R; `am project new`
+  is no longer zero-config (requires `-c` or `AGENTMAN_CATEGORY`, though `general` always
+  exists).
+- Evidence: `cmd/am/store.go` (migration v4, `newUID`, `isUniqueErr`, `CreateCategory`,
+  `ListCategories`, `ArchiveCategory`/`UnarchiveCategory`, `CreateProject`, `PatchProject`,
+  `getProjectTx`, `TaskFilter.Category`, `NextTask`, the cascade WHERE clauses, the `OpenStore`
+  ceiling); `cmd/am/schema.sql` (`categories` table; projects CREATE TABLE frozen as the v1
+  baseline); `cmd/am/server.go` (category routes, `PATCH /api/projects/{slug}`,
+  `ErrCategoryArchived` → 400); `cmd/am/cli.go` (`canonFlag`, `categoryFor`, `cmdCategories`,
+  `cmdCategory`, `project new`/`edit`); `cmd/am/main.go` (`rewriteShowComments`);
+  `cmd/am/wait.go` (category-scoped `checkReady`); `cmd/am/db.go` (v1-baseline comment);
+  `cmd/am/web/app.js` (category feed cases, project-strip reload); the 30 Phase O tests listed
+  in the CHANGELOG entry.
+
+### ADR-026: Task metadata — `task_meta` join table, key-presence filters, repeatable-flag CLI parser, empty-value removal, delta reuse with no new event kinds, `NextFilter` refactor (Phase P)
+- Status: Active
+- Context: The agentic_brain integration (requirement R7) needs free-form `key=value` pairs on
+  tasks — e.g. marking a task `auto=true` so an autonomous worker loop can wait for and pick up
+  exactly the tasks meant for it — with the pair settable at create and edit time and the key
+  filterable across `am ls`, `am next`, and `am wait --ready`. This is Phase P of the train ADR-025
+  opened; scoping enforcement (Phase Q) builds on the same filter plumbing.
+- Decision:
+  1. **`task_meta` join table, not a JSON column** — `task_meta(task_id, key, value)` with
+     composite PK `(task_id, key)`, `ON DELETE CASCADE`, and index `idx_task_meta_key`. Like
+     `task_labels` there is no separate catalog — a key exists iff some task carries it. A JSON
+     column would make the presence filter a string-scan instead of an indexed `EXISTS`. Shipped
+     via `CREATE TABLE IF NOT EXISTS` in `schema.sql` — **no migration step, no version bump**
+     (`currentSchemaVersion` stays 4; the `task_labels`/`task_deps` precedent; old DBs heal on
+     reopen, guarded by `TestTaskMetaTableExistsOnReopenedDB`).
+  2. **Repeatable-flag parser registry** (`multiFlags` + `Args.multi` + `a.all(k)`) rather than
+     comma-splitting one flag value — meta values are opaque and may contain commas; repetition is
+     the unambiguous CLI shape. A flag is multi OR single (last-wins), never both; `--meta` is the
+     first multi flag, is NOT in `boolFlags`, and has no short alias. Tokens split at the FIRST
+     `=`, so values may themselves contain `=`.
+  3. **Empty value removes on edit, `ErrValidation` on create** — PATCH needs a removal verb
+     inside one atomic body (`--meta k=` / `"k":""`); create has nothing to remove, so an empty
+     value there is a 400. Absent-key removal is a silent no-op.
+  4. **Keys normalized like labels, values opaque ≤ `maxTitleLen`** — `normalizeMetaKey` reuses
+     `labelRe`/`maxLabelLen` (trim, lowercase, 1–50 chars of `a-z 0-9 . _ -`): keys are
+     filter/index material, and the charset excludes `=`/space/`,`, keeping CLI tokens and any
+     future concat safe. Values render on cards/SSE payloads so they get the 500-byte title cap,
+     but are otherwise uninterpreted.
+  5. **Duplicate keys after normalization are rejected** (create AND patch) — two raw keys
+     collapsing to one normalized key (`{"Auto":"a","auto":"b"}`) would make the winner
+     map-iteration-nondeterministic and record a just-written value as "old" in the delta;
+     instead `400 validation` with `duplicate meta key after normalization: "auto"`. Keeps
+     requests deterministic and all-or-nothing. **No new error codes, no new exit codes.**
+  6. **Reuse `task.created`/`task.patched` instead of new event kinds** — the catalog stays at
+     **21**. `task.created` data gains `"meta": {k: v}`; `task.patched` gains a `"meta"`
+     sub-object in the existing delta shape (`{"meta": {"k": [old, new]}}`, `null` = absent), so
+     old/new are preserved for audit. One event per PATCH regardless of key count; `applyMetaTx`
+     walks keys in sorted order so payloads and failure points are deterministic, and any error
+     aborts the caller's tx (multi-key atomicity).
+  7. **Meta-only patches do NOT bump `updated_at`** — meta is metadata like labels; refreshing
+     the activity timestamp would keep a stale claim alive (`--steal-stale` judges staleness from
+     `updated_at` — the ADR-022/ADR-024 `AddLabel`/dep-edge precedent). Mixed field+meta patches
+     still bump. Guarded by `TestMetaOnlyPatchDoesNotBumpUpdatedAt`.
+  8. **Meta in `ListTasks`/`GetTask` but not `getTaskTx`** (labels parity) — the terse tx-internal
+     read stays cheap, so PATCH/claim responses omit meta like they omit labels. The list stitch
+     is **one follow-up SELECT, not `GROUP_CONCAT`** — values may contain the separator, so the
+     labels concat trick is unsafe; one extra parameterized query per list call is the safe shape.
+  9. **`NextTask(project, category, agent)` → `NextTask(f NextFilter, agent)`** with
+     `NextFilter{Project, Category, MetaKey}` — a fourth string parameter would be unreadable and
+     Phase Q adds more scope dimensions; extending the struct beats widening the signature again.
+  10. **Same-predicate next/wait invariant** — the NextTask meta predicate is textually identical
+      to ListTasks' `MetaKey` predicate (enforced by comment at both sites): a task that releases
+      `am wait --ready --meta K` must be pickable by `am next --meta K`, so a worker loop can't
+      hot-spin on a wait that `next` then refuses. `--meta` on `wait --ready` narrows only the
+      REST re-check, never the SSE stream (ADR-023: event payloads are triggers, not state).
+- Rationale: every piece rides proven machinery — the `EXISTS` filter builder, the
+  `CREATE TABLE IF NOT EXISTS` no-migration path, the delta-event shape, the conditional-UPDATE
+  pickup — so the change surface is small; presence-only filtering keeps the predicate cheap and
+  indexed while values stay free-form; rejecting normalization collisions buys determinism for
+  the price of one map lookup.
+- Consequences: values are not filterable (presence only — a value-match filter would be a new
+  decision); list responses grow by the tasks' meta payloads (values ≤ 500 bytes each); the list
+  stitch adds one bind variable per returned row (bounded by the list `limit`); the dashboard can
+  display but not edit meta (CLI/API-only writes for now).
+- Evidence: `cmd/am/schema.sql` (`task_meta` + `idx_task_meta_key`); `cmd/am/store.go`
+  (`normalizeMetaKey`, `applyMetaTx`, `Task.Meta`, `TaskFilter.MetaKey`, `NextFilter`,
+  `CreateTaskInput.Meta`, the ListTasks stitch, the NextTask predicate comment); `cmd/am/server.go`
+  (`meta` in create/patch bodies, `?meta_key=`, `meta_key` in `handleNext`); `cmd/am/cli.go`
+  (`multiFlags`, `parseMetaFlags`, `metaKeyArg`, `cmdShow` meta line); `cmd/am/wait.go`
+  (`checkReady` metaKey); `cmd/am/web/app.js` (modal Meta section, `task.patched` feed suffix);
+  the 25 Phase P tests listed in the CHANGELOG entry.
+
+### ADR-027: Scoped agent identity & enforcement — client-asserted `X-Agent-Scope`, one `scopeOf` resolution point, hybrid read policy, proposals carve-out by (category, project) pair, `tasks.created_by` via migration v5, denials log-only (Phase Q)
+- Status: Active
+- Context: The agentic_brain integration (requirement R4) needs agents **confined** to a slice of
+  the board — a category (the common case) or a single project (tighter) — so an autonomous fleet
+  can share one instance without one agent mutating another's work. Phase O built the category
+  layer for exactly this; Phase Q is the enforcement. This is the third phase of the train ADR-025
+  opened (Phase P task metadata in parallel); the category dashboard + scoped feed (Phase R) and
+  scope tokens (Phase S) build on it.
+- Decision:
+  1. **Client-asserted scope, one resolution point.** A scope rides as the `X-Agent-Scope` header
+     (`category[/project]`, trimmed + lowercased like slugs); `scopeOf(r)` in `server.go` is the
+     **sole** reader of it. Phase S (scope tokens) swaps the scope's *source* there without touching
+     a single handler. Like `X-Agent`, the header is **accident prevention for an agent following
+     its config, not a security boundary** against crafted HTTP (no auth — `security.md`'s caveat
+     applies); R5 scope tokens are the upgrade path. An absent header is the zero (unscoped) Scope
+     and passes every check; a malformed one (empty/whitespace segments, >1 slash) is `400
+     validation` everywhere (`parseScope` wraps `ErrValidation`); well-formed but unknown slugs are
+     **not** validated against the DB (mutations 403, unfiltered lists come back empty).
+  2. **Hybrid enforcement placement, justified by immutability.** The scope pre-checks
+     (`checkTaskMut`/`checkTaskRead`/`checkComment`/`checkCreate`/`checkProjectMut`/`checkProjectRead`/
+     `narrowScope`) run in the handler, **outside** the store transaction. This is sound only
+     because `task→project` and `project→category` are immutable today (`category_id` is not
+     patchable — ADR-025; a task never moves projects). The one exception that must stay in-tx is
+     **`am next`**: `narrowScope` merges the scope into the `NextFilter` **before** `NextTask`, so
+     the scope is part of the candidate predicate inside the atomic pick+claim — a scoped agent can
+     never be handed an out-of-scope task even racing unscoped callers. Comments on
+     `PatchTask`/`PatchProject` record that the pre-checks must move in-tx if a move feature ever
+     ships.
+  3. **Reads policy: loud where named, silent where browsing.** Named/explicit out-of-scope reads
+     fail **loudly** with 403 — `GET /api/tasks/{id}`, `GET …/graph`, and an explicit
+     `?project=`/`?category=` that contradicts the scope — mirroring the orchestrator's
+     "ask-first outside your subtree" rule. Unfiltered lists are **silently narrowed** (missing
+     filters filled from the scope), keeping `am ls` ergonomic for a scoped agent. The **proposals
+     project is readable by all** (proposals are meant to be seen). `am wait` carries the scope on
+     its REST re-checks (out-of-scope `--done`/`--ready` → exit 8) but the SSE **stream stays
+     unscoped** (Phase R residual) — out-of-scope events merely trigger re-checks that keep failing,
+     no hot-spin and no false release (the ADR-023 pattern: event payloads are triggers, not state).
+  4. **`am next` carve-out does NOT extend the proposals exception.** `narrowScope(…, allowProposals)`
+     is `true` for reads, `false` for next: an agent whose scope already covers the proposals project
+     still picks them by plain in-scope matching, but the carve-out never auto-feeds another scope's
+     proposals into a pickup.
+  5. **Denials are log-only — no `scope.denied` event kind.** Every 403 logs
+     `agentman: out_of_scope: actor=<id> scope=<scope> <METHOD> <PATH>` server-side (`denyScope`).
+     Feeding denials into the SSE feed was rejected as noise + a partial-information leak; the
+     21-kind catalog is **unchanged** this phase. Revisit only with a real audit requirement.
+  6. **`tasks.created_by` via migration v5, best-effort backfill from the event log.**
+     `currentSchemaVersion` 4 → 5 (`schema.sql` stays the frozen v1 baseline): `ALTER TABLE tasks
+     ADD COLUMN created_by TEXT`, then backfill from the **LATEST** `task.created` event's actor —
+     **latest, not first**, because `tasks.id` is a reusable SQLite rowid (no `AUTOINCREMENT`) and
+     `DeleteTask` leaves a deleted task's events behind, so an id's oldest creation event may belong
+     to a deleted predecessor; the newest is always the current incarnation's. Tasks whose events
+     were pruned stay NULL and never match the own-proposal comment rule (the safe direction). New
+     tasks set `created_by` from `actorOf(r)` (default `"human"`). `created_by` is exposed only on
+     `GET /api/tasks/{id}` (and read by the scope checks) — **not** on list rows, keeping list
+     payloads stable. Forward-only, idempotent, version bump in the same tx; the import ceiling
+     tracks `currentSchemaVersion` (v5 imports, v6 refused).
+  7. **Proposals carve-out keyed by the (category, project) PAIR, inert when missing.** Task
+     creation — and commenting on one's OWN proposal tickets (`created_by == X-Agent`,
+     NULL/empty never matches) — in the designated proposals project is allowed from any scope.
+     The project is `--proposals CAT/PROJ` / `AGENTMAN_PROPOSALS` / default `meta/proposals` (flag
+     beats env; both segments required — a bare category is rejected at `am serve` startup,
+     `fail(1)`, because it would widen the carve-out to a whole category). The carve-out matches the
+     **pair** at every site (`isProposals` is the single slug-keyed helper; `checkTaskRead`/
+     `checkComment` check the pair directly): slugs are globally unique (ADR-025), so without the
+     category check a scoped agent could **squat** the slug inside its own category and capture every
+     other scope's proposals. A same-slug project in another category falls through to the normal
+     rules; a **missing** designated project leaves the gate open and the store 404s, so the
+     carve-out is inert, never an error or a hole. `NewServer` defaults to `{meta, proposals}` so
+     embedded/test servers behave like production.
+  8. **Category endpoints 403 for any scoped agent; project create only for a category-scoped agent
+     in its own category.** The category layer sits above every scope, so `POST /api/categories` and
+     category archive/unarchive are 403 for any non-zero scope. `POST /api/projects` is allowed for
+     a category-scoped agent creating into its **own** effective category (empty body category =
+     `general`) and 403 otherwise — and **always** 403 for a project-scoped agent (a project scope
+     cannot reshape its category). Project mutations (patch/archive/unarchive/delete) require the
+     project itself in scope (no proposals carve-out — proposing is creating tasks, never reshaping
+     the project).
+- New error: `ErrOutOfScope` → `403 {"error":"out_of_scope"}` → **CLI exit code 8** (wired through
+  `exitCodeFor`, the single source, so `doOrFail` and the bulk verbs inherit it). No new event
+  kinds, no schema-visible changes beyond `tasks.created_by`.
+- Rationale: a single header + a single `scopeOf` reader keeps the whole feature swap-ready for
+  scope tokens; placing the checks outside the tx is cheap and provably safe under today's
+  immutability invariants; the loud-named / silent-unfiltered split matches how an orchestrator and
+  an exploring agent each read the board; the pair-keyed carve-out is the minimum that both lets any
+  agent file proposals and resists slug squatting; log-only denials avoid leaking cross-scope
+  activity into the feed.
+- Consequences (accepted residuals — see `known-risks-and-gaps.md`): `/api/events` and `/api/stream`
+  still leak cross-scope activity to scoped agents until Phase R; `GET /api/projects` /
+  `GET /api/categories` lists are not narrowed (board metadata visible, task data is not); an
+  explicit unknown `?project=` (or a project-scoped create into an unknown slug) returns 403 rather
+  than 404/empty — the server cannot prove it in-scope, so it fails loud; `created_by` backfill is
+  best-effort (pruned-events tasks stay NULL); exit 8 from `am wait`'s host-guard path is cosmetic;
+  TOCTOU between a scope check and the mutation is impossible only because of immutability — revisit
+  with any move feature.
+- Evidence: `cmd/am/store.go` (`Scope`/`parseScope`/`Scope.String`/`IsZero`, `ErrOutOfScope`,
+  migration v5, `taskScope`, `projectCategory`, `Task.CreatedBy`, the `CreateTask` `created_by`
+  insert, the `PatchTask`/`PatchProject`/`NextTask` scope-note comments); `cmd/am/server.go`
+  (`scopeOf`, `scopeAllows`, `denyScope`, `checkTaskMut`/`checkTaskRead`/`checkComment`/`isProposals`/
+  `checkCreate`/`checkProjectRead`/`checkProjectMut`/`narrowScope`, the per-handler pre-checks,
+  `Server.proposals`, `writeErr` `ErrOutOfScope` → 403, `NewServer` default); `cmd/am/identity.go`
+  (`identityRecord`, `resolveIdentity`/`resolveScope`, scoped `cmdInit`, `cmdWhoami` scope line);
+  `cmd/am/client.go` (`Client.scope`, the `X-Agent-Scope` send, `exitCodeFor` 403 → 8);
+  `cmd/am/wait.go` (`waiter.scope`, the 403 → exit 8 re-checks); `cmd/am/main.go` (`--proposals` /
+  `AGENTMAN_PROPOSALS`, `usage()` scope/exit-8 lines); the 32 Phase Q tests listed in the CHANGELOG
+  entry.
+
+### ADR-028: Category dashboard + scoped feed — hub category fan-out resolved at Subscribe, `?category=` feed/stream filtering excluding category-level events, category stats folded into `/api/categories`, dashboard hash routing with overview-as-landing (Phase R)
+- Status: Active
+- Context: The agentic_brain integration (requirement R6) needs a **human** view organized by
+  category — a category-home landing page showing where work is happening, drill-down into a
+  single category's board, and a feed/stream that can be scoped to one category. This is the
+  fourth phase of the train ADR-025 opened (after Phase P task metadata, Phase Q scoping
+  enforcement); only Phase S (scope tokens, R5) remains after it. The Phase Q residual that
+  `/api/events` and `/api/stream` were not category-filterable (and the Phase O note that
+  `category.*` events would be "revisited in Phase R") are both closed here. Unlike the agent
+  scope of Phase Q, the dashboard is **unscoped** — a human sees everything; "category view" is a
+  query-param lens, not an identity scope (no `X-Agent-Scope` is sent).
+- Decision:
+  1. **Hub category fan-out resolved at Subscribe into a project-ID set, not per-event.** A
+     category subscription resolves the category's projects **once** when the stream opens
+     (`ProjectIDsInCategory` → `map[int64]bool`, carried in the hub's new `subFilter`/`subscriber`
+     fields), so `Broadcast` stays a pure in-memory membership check with **no per-event DB hits**
+     — the R9 SSE contract that the hub remains non-blocking and in-memory (the IADR-001 SSE
+     design). A category-scoped subscriber receives an event only when its `ProjectID` is in the
+     resolved set; cross-category and **category-level (ProjectID==0) events are dropped**.
+  2. **`project.created` carve-out preserved through the category branch.** A brand-new project's
+     `project.created` reaches every subscriber regardless of scope (the pre-existing carve-out, so
+     a new tab can appear live even on a category-scoped dashboard). This is the one event that
+     bypasses the membership check.
+  3. **Post-open project staleness window accepted.** A project created *after* a category stream
+     subscribes is not in that subscriber's resolved project-ID set, so its task events won't stream
+     until the dashboard re-opens the stream (which it does on every view change). The REST snapshot
+     remains the source of truth, and the `project.created` carve-out still surfaces the new project
+     itself. Re-resolving the set per event (or invalidating on `project.created`) was rejected as
+     re-introducing DB work into `Broadcast` for a window the dashboard already closes on navigation.
+     Documented in `hub.go`.
+  4. **`?category=` feed/stream filtering EXCLUDES category-level (NULL-project) events by design.**
+     On `GET /api/events` (all of `?since=`/`?tail=`/`?before=`) and `GET /api/stream`, a category
+     scope matches only events whose project lives in the category (`c.id=?` in the SQL; the
+     in-memory set check on the stream). The category's own `category.*` events (NULL `project_id`)
+     are **instance-wide admin events that belong to the All/overview feed**, not a single
+     category's drill-down. Composes with `?project=` (ANDed). `RecentEvents` was refactored to
+     compose its WHERE clause from a `[]string` slice (it now joins up to three conditions —
+     project, category, archived-cascade); `ListEvents`/`ListEventsBefore` kept the incremental
+     `q +=` style (their archived-cascade branch is mutually exclusive with the project/category
+     branches).
+  5. **Unknown-category divergence: `/api/events` 404s, `/api/stream` falls back silently.** An
+     unknown category on the REST feed flows through the `categoryID` `ErrNotFound` sentinel →
+     `404 not_found` (a one-shot lookup should fail loudly, like an unknown project on
+     `/api/tasks`). On the long-lived SSE stream an unknown category is **ignored silently** (the
+     subscriber sees the unfiltered stream) — matching the endpoint's existing unknown-`project`
+     swallow; a best-effort stream should not be torn down over a stale slug.
+  6. **Category counts + `active_agents` folded into `GET /api/categories`, always present.** The
+     overview needs them on first paint; a separate endpoint would add a round-trip and a
+     partial-render flash. `ListCategoriesWithStats` runs two queries merged in Go: `counts`
+     (`{todo, doing, blocked, done}`) sum only the category's **non-archived** projects' tasks (an
+     archived project's tasks are excluded even when `?archived=true` lists the category), and
+     `active_agents` are the distinct non-human actors on **task-bearing** events
+     (`task_id IS NOT NULL AND actor != 'human'`) within a **30-minute** window, sorted. The
+     `task_id IS NOT NULL` predicate makes `comment.added` count as activity while category/project
+     admin churn does not; excluding the literal `human` keeps the signal to autonomous agents. No
+     opt-in flag and **no scope enforcement** (the dashboard is unscoped).
+  7. **Dashboard hash routing with the category overview as the landing view.** Views are linkable
+     and the browser back button works, with `route()` as the single hash→state mapper: `#/` →
+     overview (category home, the landing view and empty-hash default), `#/all` → the cross-category
+     board (the original behavior), `#/cat/<slug>` → a single category's board. A view change resets
+     the within-view project selection and re-opens the SSE stream with the new scope. The overview
+     keeps one global, unfiltered recent-activity feed; the category board scopes board/feed/stream
+     via `?category=` (or `?project=` when one project is selected). All new DOM is built with
+     `el()`/`textContent` (no `innerHTML`), so the existing `TestDashboardNoXSSSinks` guard covers it.
+  8. **No-JS-runner verification stands (ADR-018).** The server surface (the `?category=` filtering,
+     the augmented `/api/categories` payload, the hub fan-out) is covered by Go tests
+     (`server_test.go`, `sse_test.go`, the new `hub_test.go`, `store_test.go`); the rendering
+     (overview cards, hash routing, breadcrumb, per-view stream re-open) relies on
+     preview/smoke + the source-level XSS-sink guard, consistent with the deliberate no-JS-runner
+     decision (no npm/jsdom). The hub's membership logic was pulled into direct unit tests
+     (`hub_test.go`) precisely because it is the load-bearing in-memory invariant.
+- New error / kinds / schema: **none.** No new event kinds (catalog stays **21**), no new error
+  codes, no new exit codes, no schema change (`currentSchemaVersion` stays **5**), no migration.
+  `am wait`/`wait.go` is unchanged — the wait stream still deliberately does not narrow on a
+  category scope (the category-scoped REST re-check is the authority, ADR-023); adding `?category=`
+  to the wait stream was judged non-trivial and skipped per the map's "only if trivial" condition.
+- Rationale: resolving the category fan-out once keeps `Broadcast` a pure in-memory check (the SSE
+  hub's defining property); the NULL-project exclusion keeps a drill-down showing work *inside* the
+  category while instance-wide admin events stay on the overview; folding stats into the existing
+  list endpoint avoids a first-paint flash; hash routing is the minimal linkable/back-button
+  mechanism with no router library; the unscoped dashboard matches the human operator's role.
+- Consequences (accepted residuals — see `known-risks-and-gaps.md`): the **post-open project
+  staleness window** on a category stream (closed on view change; REST is authoritative); a
+  **cosmetic overview-count-debounce** can fire after navigating away — guarded by a re-check of
+  `view` at fire time so it never writes to the now-hidden `#overview`; the overview's `counts`
+  derivation is covered by `TestListCategoriesCounts` but the rendering is not behaviorally tested
+  (no JS runner); the `/api/events`+`/api/stream` Phase Q residual is now **closed for the
+  dashboard** via `?category=`, but `am wait`'s SSE stream still streams unscoped by design.
+- Evidence: `cmd/am/hub.go` (`subFilter`, `subscriber.categoryID`/`projectIDs`, the Subscribe-time
+  resolution, the `Broadcast` membership check + `project.created` carve-out + post-open-window
+  comment); `cmd/am/store.go` (`CategoryStat`, `ListCategoriesWithStats`, `ProjectIDsInCategory`,
+  the `category` parameter + NULL-project-exclusion comments on `ListEvents`/`ListEventsBefore`/
+  `RecentEvents`, the `RecentEvents` `[]string` WHERE refactor); `cmd/am/server.go`
+  (`handleListCategories` → `ListCategoriesWithStats`, the `?category=` plumbing in `handleEvents`,
+  the resolve-once + silent-fallback in `handleStream`, `Subscribe(subFilter{…})`);
+  `cmd/am/web/{index.html,app.css,app.js}` (`#overview`/`#breadcrumb`, `route`/`navigate`/
+  `applyView`/`loadOverview`/`renderOverview`/`catCard`/`allCard`/`setBreadcrumb`, `viewParams`/
+  `projectsInView`, the per-view stream re-open and debounced count refresh); the 8 Phase R tests
+  listed in the CHANGELOG entry (`hub_test.go`, `TestEventsCategoryFilter`,
+  `TestSSECategoryScopedStream`, `TestSSECategoryReconnectReplay`, `TestListCategoriesCounts`).
 
 ## Inferred Decisions
 

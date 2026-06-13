@@ -7,11 +7,16 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 - **Schema-migration runner: forward-only, no rollback path** (was High → now Low). The forward-only
   runner that reads/bumps `meta.schema_version` (ADR-010) is now exercised end-to-end: Phase 2 shipped
-  the first real step (`ALTER TABLE projects ADD COLUMN archived_at TEXT` at `version: 2`) and
-  Phase K the second (`ALTER TABLE tasks ADD COLUMN claimed_at TEXT` at `version: 3`,
-  `currentSchemaVersion = 3`), each applied with its version bump in one tx and covered by tests. Residual:
-  no down-migrations; a DB recorded at a version newer than the binary is accepted leniently (its
-  unknown steps are simply skipped, no error). → `data-model.md`, `decision-records.md` ADR-010.
+  the first real step (`ALTER TABLE projects ADD COLUMN archived_at TEXT` at `version: 2`),
+  Phase K the second (`ALTER TABLE tasks ADD COLUMN claimed_at TEXT` at `version: 3`),
+  Phase O the third (`version: 4` — `projects.category_id`/`uid`/vault columns, `general` seed,
+  uid backfill), and Phase Q the fourth (`version: 5` — `tasks.created_by` + best-effort backfill
+  from the latest `task.created` event; `currentSchemaVersion = 5`), each applied with its version
+  bump in one tx and covered by tests. Residual:
+  no down-migrations. The too-new-DB leniency is **resolved (Phase O)**: `OpenStore` now refuses a
+  DB recorded at a version newer than the binary supports (clear "upgrade am" error), the same
+  ceiling `validateImportCandidate` applies to snapshots. → `data-model.md`,
+  `decision-records.md` ADR-010/ADR-025.
 - **Single-writer throughput ceiling** (Low for stated scope). `SetMaxOpenConns(1)` serializes all
   writes; correct and simple, but caps write concurrency. → ADR-003.
 - **Module boundaries are by convention only** (Medium, maintainability). One flat `main` package
@@ -49,6 +54,26 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   Residual (Low) from earlier: the live SSE broadcast (`hub.Broadcast`) is not archive-filtered —
   an event on a project archived after the SSE connection was opened can flash transiently in the
   feed until the next `ListEvents` reload filters it out. → `data-model.md`.
+- **Category events are invisible to project-/category-scoped SSE subscribers** (Low, deliberate).
+  The `category.*` event kinds carry a NULL `project_id`, so they reach **unscoped** subscribers
+  only — a `?project=`- or `?category=`-scoped stream filters them out. Phase R made this a
+  **deliberate semantic**: `/api/events` and `/api/stream` now take a `?category=` lens (closing
+  the "revisit in Phase R" note), and that lens intentionally excludes category-level NULL-project
+  events — a category drill-down shows work *inside* the category; the instance-wide `category.*`
+  events live on the All/overview feed. `am wait --ready -c` still deliberately streams unscoped
+  and re-checks via the category-scoped REST call (chattier but correct — the wait stream was left
+  unchanged). → ADR-025, ADR-028.
+- **Hub category-stream post-open project staleness window** (Low, by design; Phase R). A
+  `?category=` SSE subscription resolves the category's project-id set **once** at Subscribe
+  (`ProjectIDsInCategory`) so `Broadcast` stays a pure in-memory check; a project created *after*
+  that subscription opens is not in the set, so its task events don't stream until the dashboard
+  re-opens the stream (which it does on every view change). The `project.created` carve-out still
+  surfaces the new project itself, and the REST snapshot is authoritative. Accepted to keep
+  `Broadcast` DB-free. → ADR-028, `hub.go`.
+- **Overview count-refresh debounce can fire after navigating away** (Low, cosmetic; Phase R). On
+  the category-home overview, `onEvent` debounces a `loadOverview()` (250 ms) on task/project/
+  category events; the debounced callback **re-checks `view === "overview"` at fire time** so it
+  never writes to the now-hidden `#overview`. Harmless either way. → `frontend.md`.
 - **Identity collisions in one directory** (Low). Two agents in the same working dir share the
   per-dir identity unless one sets `AGENTMAN_AGENT`. → ADR-008.
 - **Update bootstrap** (Low). A machine must do one manual `go install …@latest` to get a binary
@@ -77,6 +102,53 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   clean and fast; for large, dense DAGs edge crossings can accumulate. Mitigated by pan/zoom and
   the separate isolated-task grid lane. Acceptable for a personal board's scale.
 
+## Task-Metadata Residuals (Phase P)
+
+- **Values are presence-filtered only, by design** (Low). `?meta_key=`/`--meta KEY` match a key's
+  existence, never its value — a value-match filter would be a new decision (ADR-026). Workers
+  read values from `am show <id> --json`.
+- **List-row meta stitch adds one bind variable per returned row** (Low). `ListTasks` fills
+  `meta` via a follow-up `SELECT … WHERE task_id IN (?,?,…)` — one placeholder per row, bounded
+  by the list `limit` (the CLI sends 50; the dashboard 500), far below SQLite's bind-variable
+  ceiling. Revisit if the limit cap is ever raised dramatically.
+- **List payloads are no longer strictly terse** (Low). List rows now carry each task's full
+  `meta` map (values ≤ 500 bytes each) — a deliberate widening of the "terse projection"
+  convention so filters and workers don't need a per-task `GET`. Tasks with many large meta
+  values fatten every list response and SSE-triggered board reload.
+
+## Scope-Enforcement Residuals (Phase Q)
+
+- **Scope is a client-asserted label, not a security boundary** (Medium, by design). `X-Agent-Scope`
+  confines a *config-following* agent (accident prevention); any local caller can forge or omit it.
+  **Phase S (scope tokens)** turns it into a verified credential — `scopeOf(r)` is the single swap
+  point. → `security.md`, ADR-027.
+- **`/api/events` + `/api/stream` are not narrowed by `X-Agent-Scope`** (Low, deliberate). A
+  scoped agent can still read the global activity feed; the SSE stream stays unscoped against the
+  identity scope, so `am wait` re-checks via the scoped REST call (chattier but correct — no
+  hot-spin, no false release). **Phase R closed the dashboard side** by adding an *unscoped*
+  `?category=` query-param lens to both endpoints (a human's category drill-down, not an identity
+  scope); the agent `am wait` stream remains intentionally unscoped. → ADR-028.
+- **`GET /api/projects` / `GET /api/categories` lists are not narrowed by scope** (Low,
+  deliberate). Board *metadata* (slugs/names) is visible to any scope; task *data* is the
+  enforcement point. Phase R **kept these unscoped on purpose** — `/api/categories` even gained
+  per-category stats for the unscoped human dashboard (category view is a query-param lens, not an
+  identity scope). → ADR-028.
+- **Unknown explicit `?project=` for a scoped agent returns 403, not 404/empty** (Low, by design).
+  The server cannot prove an unknown slug in-scope, so it fails loud — mild existence ambiguity
+  accepted in exchange for a fail-loud default. Same for a project-scoped agent creating into an
+  unknown slug.
+- **`created_by` backfill is best-effort** (Low). Tasks whose `task.created` events were pruned
+  (`am db prune`) before the v5 migration stay NULL and never match the own-proposal comment rule
+  (the safe direction). `ListTasks` rows deliberately omit `created_by` (only `GET /task` and the
+  scope checks read it — keeps list payloads stable).
+- **Exit 8 reachable from a host-guard 403** (Low, cosmetic). `am wait`'s re-checks map any 403 to
+  exit 8; a host-allowlist rejection (`hostGuard`) would surface as "out of scope" rather than a
+  guard error. Localhost-only, low impact.
+- **TOCTOU between scope check and mutation is impossible only via immutability** (Low). The scope
+  pre-checks run outside the store tx; this is sound solely because `task→project` and
+  `project→category` are immutable today. If a task/project move feature ships, the checks must move
+  in-tx (recorded in the `PatchTask`/`PatchProject` scope-note comments). → ADR-027.
+
 ## Security Risks
 
 (Full detail in `security.md`.)
@@ -94,11 +166,14 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
     symbol/package scan finds nothing; module-level hit only). Transitive dep via `modernc.org/libc`.
     Clears by upgrading `golang.org/x/sys` to ≥ v0.44.0 if ever desired. Does not affect CI.
 - **Spoofable audit actor** (Low) — `events.actor` comes from the unauthenticated `X-Agent` header.
+- **Scope confinement is client-asserted** (Medium, by design; Phase Q) — `X-Agent-Scope` is not a
+  boundary against crafted HTTP. See *Scope-Enforcement Residuals* above and `security.md`; Phase S
+  scope tokens are the fix.
 
 ## Testing Gaps
 
-- Coverage now spans store/server/migrate/db/cli/sse/identity/wait/web tests (10 files, 144 tests,
-  `-race`-clean): the **atomic claim** (race, `-race`-clean), events cursor, store CRUD/validation,
+- Coverage now spans store/server/migrate/db/cli/sse/hub/identity/wait/web tests (11 files, 239
+  tests, `-race`-clean): the **atomic claim** (race, `-race`-clean), events cursor, store CRUD/validation,
   validation→status mapping, the Host/CSRF/CSP guards, project archive/unarchive (store round-trip
   + idempotency and the HTTP endpoints incl. 404), the v2 migration (adds `archived_at` +
   apply/bump/idempotency/rollback), DB export/import (roundtrip+perms, backup creation, garbage
@@ -155,10 +230,61 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   `TestTaskLabelsTableExistsOnReopenedDB`, `TestLabelEndpoints`), plus the CLI surface
   (`TestCmdLsGrepWireFormat`, `TestCmdLabelAddRemove`, `TestCmdLabelPrintsLabels`,
   `TestCmdLabelUsage`).
+  Phase O added 30 category/stable-ID/vault/migration tests: the store layer
+  (`TestCreateCategory`, `TestArchiveUnarchiveCategory`, `TestCreateProjectWithCategory`,
+  `TestPatchProject`, `TestCategoryArchiveCascade`, `TestListTasksCategoryFilterComposes`,
+  `TestNextTaskCategoryScoping`, `TestCreateTaskArchivedCategory`), the HTTP surface
+  (`TestCategoryEndpoints`, `TestProjectPayloadAndCategoryFilter`, `TestListTasksCategoryParam`,
+  `TestNextEndpointCategoryBody`, `TestPatchProjectEndpoint`,
+  `TestCreateTaskArchivedCategory400`), the CLI (`TestCmdCategoryVerbs`,
+  `TestCmdProjectNewRequiresCategory`, `TestCmdProjectEdit`, `TestCmdLsCategoryWireFormat`,
+  `TestCmdNextCategory`, `TestCmdShowDashCStillPrintsComments`, `TestRewriteShowComments`),
+  category-scoped wait (`TestWaitReadyCategoryScoped`, `TestWaitReadyCategoryEnv`,
+  `TestWaitReadyCategoryTimeout`), the v4 migration + version ceiling (`TestMigrationV4Fresh`,
+  `TestMigrationV4ExistingDB`, `TestOpenStoreRejectsNewerSchema`), and db export/import
+  (`TestExportContainsCategories`, `TestImportPreCategorySnapshot`,
+  `TestImportRejectsNewerSchema`).
+  Phase P added 25 task-metadata tests: the store layer (`TestTaskMetaCRUD`,
+  `TestTaskMetaValidation` — incl. normalized-key collision rejection on create and patch,
+  `TestPatchTaskMetaAtomicOneEvent`, `TestPatchTaskMetaNoOpNoEvent`,
+  `TestMetaOnlyPatchDoesNotBumpUpdatedAt`, `TestNextTaskMetaFilter`,
+  `TestNextTaskMetaRaceDistinctWinners`, `TestListTasksMetaKeyFilter`,
+  `TestListTasksReturnsMeta`, `TestDeleteTaskCascadesMeta`,
+  `TestTaskMetaTableExistsOnReopenedDB`), the HTTP surface (`TestCreateTaskWithMeta`,
+  `TestPatchTaskMetaEndpoint`, `TestNextEndpointMetaBody`, `TestListTasksMetaKeyParam`),
+  meta-scoped waits (`TestWaitReadyMetaNoHotSpin`, `TestWaitReadyMetaReleasedByCreate`,
+  `TestWaitReadyMetaReleasedByPrereqDone`, `TestWaitMetaUsageErrors`), and the CLI
+  (`TestParseMultiFlag`, `TestCmdNewMetaWireFormat`, `TestCmdEditMetaSinglePatch`,
+  `TestCmdNextMetaWireFormat`, `TestCmdLsMetaWireFormat`, `TestCmdShowPrintsMeta`).
+  Phase Q added 32 scope/enforcement tests: the store layer (`TestTaskScopeAndProjectCategory`,
+  `TestNextTaskRaceScopedCategoryMeta`), the HTTP scope sweep (`TestScopeClaimEnforcement`,
+  `TestScopeNextEnforcement`, `TestScopeStealStale`, `TestScopeProposalsCarveOut`,
+  `TestScopeProposalsConfigurable`, `TestScopeProposalsMissingProjectInert`,
+  `TestScopeProposalsWrongCategoryNoCarveOut`, `TestScopeProposalsSquat`, `TestScopeMutationSweep`,
+  `TestScopeProjectScopedAgent`, `TestScopeReads`, `TestScopeHeaderValidation`,
+  `TestScopeProjectCategoryEndpoints`), the v5 `created_by` migration (`TestMigrationV5Fresh`,
+  `TestMigrationV5ExistingDB`), the CLI exit-8 mapping (`TestExitCodeForOutOfScope`,
+  `TestCmdClaimOutOfScopeExit8`, `TestCmdNextOutOfScopeExit8`, `TestClientSendsScopeHeader`,
+  `TestCmdStatusBulkOutOfScope`), scoped identity (`TestInitScopedWritesJSON`,
+  `TestInitScopedCategoryProject`, `TestInitProjectRequiresCategory`,
+  `TestLegacyPlainIdentityUnscoped`, `TestScopeEnvOverride`, `TestWhoamiPrintsScope`,
+  `TestParseScope`), and scoped waits (`TestWaitReadyScopedTimeout`, `TestWaitReadyScopedReleased`,
+  `TestWaitReadyExplicitOutOfScopeExit8`).
+  Phase R added 8 category-dashboard/scoped-feed tests: category stats
+  (`TestListCategoriesCounts` in `store_test.go`), the `?category=` feed filter
+  (`TestEventsCategoryFilter` in `server_test.go`), the category-scoped SSE stream + reconnect
+  (`TestSSECategoryScopedStream`, `TestSSECategoryReconnectReplay` in `sse_test.go`), and the new
+  `hub_test.go` unit tests of the in-memory fan-out (`TestHubCategoryScopedBroadcast`,
+  `TestHubProjectScopedBroadcast`, `TestHubUnscopedBroadcast`, `TestHubBroadcastNilNoPanic`). The
+  dashboard **rendering** (overview cards, hash routing, breadcrumb, per-view stream re-open, live
+  count refresh) stays in the behavioral-JS gap below — the server surface those views ride on is
+  the part that is Go-tested.
   **Still untested:** behavioral dashboard JS — the "Manage projects" modal, the delete confirm
   flows (task/comment/project), the feed pagination button, the dependency section UI (prereq chips,
   add-prereq dropdown, blocks list), the **graph overlay** (layout, pan/zoom, transitive highlight,
-  detail panel, live refresh), the search box and label chips/Labels section (Phase M),
+  detail panel, live refresh), the search box and label chips/Labels section (Phase M), the
+  read-only modal Meta section (Phase P), the **category overview + hash routing** (overview cards,
+  drill-down, breadcrumb/back, per-view stream re-open, debounced count refresh — Phase R),
   and other client-side logic — because the project deliberately
   adopts **no JS test runner** (preserves the no-npm/single-binary ethos; ADR-018). The
   `web_test.go` sink guard mitigates XSS regressions at the source level; the dependency UI and

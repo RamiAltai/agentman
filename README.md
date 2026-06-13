@@ -24,8 +24,9 @@ you (browser) ◄──SSE────┘        sole writer · broadcasts every
 - **Real-time.** Every change streams to the dashboard over SSE — no refresh.
 - **Zero ops.** A single static binary (pure-Go SQLite, no cgo), localhost, no auth, no
   database server. Back up = copy one file (or `am db export` for a consistent snapshot).
-- **Multi-project & multi-agent.** Group tasks into projects; atomic task claims so two
-  agents never grab the same ticket.
+- **Multi-project & multi-agent.** Group tasks into projects and projects into **categories**
+  (`instance → category → project → task`); atomic task claims so two agents never grab the
+  same ticket.
 - **Polished dashboard.** A responsive kanban board with drag-and-drop status changes, a
   collapsible/resizable live activity feed, and keyboard shortcuts.
 
@@ -68,12 +69,17 @@ terminal (or let your agents do it):
 
 ```sh
 am init bugfix              # set this session's identity → e.g. bugfix_060626_4821
-am project new web "Web"    # create a project
+am project new web "Web" -c general   # create a project (every DB starts with a "general" category)
 id=$(am new "fix login" -p web)   # create a task, get its id
 am claim "$id"             # take it (atomic; exit 4 if already taken)
 am note "$id" "on it"      # comment
 am status "$id" done       # todo | doing | blocked | done
 ```
+
+Projects live inside **categories** (`am category new work "Work"`, then
+`am project new pentest-x -c work`); a fresh database always has the default category
+`general`, and `-c` (or `AGENTMAN_CATEGORY`) also scopes `am ls`, `am next`, and
+`am wait --ready` to one category.
 
 Everything you do on the dashboard flows through the same API the agents use, so human and
 agent actions both show up live.
@@ -82,8 +88,16 @@ agent actions both show up live.
 
 The embedded web UI (no build step, no npm) is a live kanban board:
 
-- **Columns** — Todo / In Progress / Blocked / Done, with per-project tabs and counts.
-  Click multiple project tabs to **filter across several at once**; **All** clears the filter.
+- **Category home (landing view)** — opens to a grid of **category cards**, each showing the
+  category's task counts (todo / doing / blocked / done) and the agents active in it in the last
+  30 minutes. Click a card to **drill into that category's board**; an **"All" card** opens the
+  cross-category board. Views are linkable and the **browser back button works** — the URL hash
+  is `#/` (home), `#/all` (cross-category board), or `#/cat/<slug>` (one category). A
+  **"← Categories"** breadcrumb returns to the home view.
+- **Columns** — Todo / In Progress / Blocked / Done, with per-project tabs and counts. In a
+  category board the tabs show only that category's projects; in the **All** view they show every
+  project. Click multiple project tabs to **filter across several at once**; the **All** tab
+  clears the within-view filter.
 - **Drag a card** between columns to change its status; click a card to open a wide,
   **resizable** ticket with description, comments, and full history.
 - **Activity feed** you can **collapse** or **drag-resize** (it becomes an overlay drawer on
@@ -118,6 +132,9 @@ The embedded web UI (no build step, no npm) is a live kanban board:
   live SSE reloads). Cards show up to 3 **label chips** (then a `+N` overflow chip) — click a chip
   to filter the board by that label (a header chip with ✕ clears it). The task modal has a
   **Labels** section: chips with ✕ remove buttons and an "Add label…" input that submits on Enter.
+- **Task metadata:** the task modal shows a read-only **Meta** section listing the task's
+  `key=value` pairs (set via `am new`/`am edit --meta k=v`), and `task.patched` feed lines note
+  which meta keys changed.
 - **Stale claims:** a card in *In Progress* with an assignee and no activity for 30+ minutes
   shows an amber **⏳ stale** chip, and a stale-claim takeover (`am claim --steal-stale`)
   appears in the activity feed as *"X reclaimed #N from Y"*.
@@ -132,14 +149,15 @@ Any agent that can run shell commands can use `am`. For **Claude Code**, the one
 The short version — drop this into your `~/.claude/CLAUDE.md` (or a project `CLAUDE.md`):
 
 ```md
-## Task board (am) — run `am init <tasktype>` once, then:
+## Task board (am) — run `am init <tasktype>` once (add `-c CAT [-p PROJ]` to scope), then:
 am ls --ready         # todo tasks with no open prereqs (pick these up)
 am ls --status todo   # work to pick up        am ls --mine    # my tasks
 am claim <id>         # take it (exit 4 = already claimed or blocked by prereqs)
 am dep add <id> <prereq>   # add a prerequisite   am dep rm <id> <prereq>
 am show <id> -c       # detail + depends on/blocks + comments  am note <id> "msg"
 am status <id> done   # todo|doing|blocked|done  am new "title" -p <proj>
-am projects --all     # list projects (incl. archived)
+am projects --all     # list projects (incl. archived)   am categories --all  # list categories
+am project new <slug> [name] -c <category>   # create a project (category required)
 am project archive <slug>   # hide a project    am project unarchive <slug>
 Output is terse text (add --json to parse). Silence = success.
 ```
@@ -160,31 +178,44 @@ am whoami            # show current identity
 Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting the
 `AGENTMAN_AGENT` env var overrides it (useful for several agents in one directory).
 
+**Scoped identity.** `am init <tasktype> -c <category> [-p <project>]` confines the agent to a
+category (or a single project): the scope is recorded in the identity file (as JSON) and sent on
+every request as `X-Agent-Scope`. The server then rejects out-of-scope mutations and named reads
+with `403 out_of_scope` → **exit 8**, and silently narrows unfiltered lists (`am ls`/`am next`) to
+the scope. One carve-out: any agent may file tasks into the **proposals project** (default
+`meta/proposals`, set with `am serve --proposals`). `am whoami` shows the scope on a second line;
+`AGENTMAN_SCOPE` overrides the file. The scope is a **client-asserted label** (accident prevention
+for a config-following agent, not authentication — see [Security](#security)); a pre-existing
+unscoped identity file keeps working, re-run `am init -c …` to add a scope.
+
 ## CLI reference
 
 | Command | What it does |
 |---|---|
-| `am ls [--mine] [--status S] [-p P] [--all] [--ready] [--blocked] [--stale D] [--grep TEXT] [--label L]` | list tasks (hides done; `--ready` = todo with no open prereqs; `--blocked` = ≥1 open prereq; `--stale D` = assigned, not done, no activity for D — Go duration, e.g. `30m`, `48h`; `--grep` = substring match on title or body, ASCII-case-insensitive; `--label`/`-l` = tasks carrying that label) |
-| `am show <id> [-c]` | task detail + `depends on:` / `blocks:` lines; comments with `-c` |
-| `am new "title" [--body B] [-p P] [--priority N]` | create a task; prints the new id |
+| `am ls [--mine] [--status S] [-p P] [-c CAT] [--all] [--ready] [--blocked] [--stale D] [--grep TEXT] [--label L] [--meta KEY]` | list tasks (hides done; `-c` = category scope; `--ready` = todo with no open prereqs; `--blocked` = ≥1 open prereq; `--stale D` = assigned, not done, no activity for D — Go duration, e.g. `30m`, `48h`; `--grep` = substring match on title or body, ASCII-case-insensitive; `--label`/`-l` = tasks carrying that label; `--meta KEY` = tasks carrying that meta key) |
+| `am show <id> [-c]` | task detail + `depends on:` / `blocks:` / `meta:` lines; comments with `-c` (for `show` only, `-c` means comments, not category) |
+| `am new "title" [--body B] [-p P] [--priority N] [--meta k=v]...` | create a task; prints the new id (no `-c` — the project determines the category; `--meta` is repeatable) |
 | `am claim <id> [--steal-stale D]` | atomic: assign me + → doing (exit 4 if already taken **or** has open prereqs); `--steal-stale D` takes over a claim idle for ≥ D (exit 4 with `not stale yet` if still fresh) |
-| `am next [-p P]` | atomic pick + claim of the best ready task (priority, then FIFO); prints its id; exit 3 if nothing is ready |
+| `am next [-p P] [-c CAT] [--meta KEY]` | atomic pick + claim of the best ready task (priority, then FIFO; `--meta` = only tasks carrying that key); prints its id; exit 3 if nothing is ready |
 | `am wait <id> --done [--timeout D]` | block until the task is done (exit 7 on timeout; default 10m; D is a Go duration or seconds) |
-| `am wait --ready [-p P] [--timeout D]` | block until some ready task exists; prints its id |
+| `am wait --ready [-p P] [-c CAT] [--meta KEY] [--timeout D]` | block until some ready task exists (in scope); prints its id |
 | `am status <id...> <todo\|doing\|blocked\|done>` | change status — several ids at once is fine (blocked → 409 if doing/done and open prereqs) |
 | `am assign <id...> <agent\|me\|->` | reassign one or more tasks (`-` = unassign) |
 | `am note <id> "text"` | add a comment (alias: `comment`) |
-| `am edit <id> [--title T] [--body B] [--priority N]` | edit fields |
+| `am edit <id> [--title T] [--body B] [--priority N] [--meta k=v]...` | edit fields; `--meta` is repeatable and applies in one atomic edit — `--meta k=` (empty value) removes the key |
 | `am drop <id>` | release: unassign + → todo |
 | `am rm <id>` | hard-delete a task (permanent; cascades its comments + dep edges); exit 3 if not found |
 | `am dep add <id> <prereq> [prereq…]` | add one or more prerequisites to a task (same project; rejects cycles) |
 | `am dep rm <id> <prereq>` | remove a prerequisite edge |
 | `am label <id> [+l …] [-l …]` | with no args: print the task's labels; `+foo` (or bare `foo`) adds, `-bar` removes. Labels are lowercased, 1–50 chars of `a-z 0-9 . _ -` |
-| `am projects [--all]` · `am project new <slug> [name]` | list (`--all` includes archived) / create projects |
+| `am projects [--all]` · `am project new <slug> [name] -c <category>` | list (`--all` includes archived) / create projects — category required (`-c` or `AGENTMAN_CATEGORY`; every DB has `general`) |
+| `am project edit <slug> [--slug NEW] [--name N] [--vault-id X] [--vault-path Y]` | rename a project (its stable `uid` never changes) / set the vault binding (`--vault-id=` / `--vault-path=` with an empty value clears it) |
 | `am project archive <slug>` · `am project unarchive <slug>` | soft-archive (hide) / restore a project |
 | `am project rm <slug> --yes` | hard-delete a project **and ALL its tasks/comments** (permanent; `--yes` required) |
-| `am init <tasktype>` · `am whoami` | identity |
-| `am serve [--port 8787] [--db PATH] [--log]` | run the dashboard + API |
+| `am categories [--all]` · `am category new <slug> [name]` | list (`--all` includes archived) / create categories |
+| `am category archive <slug>` · `am category unarchive <slug>` | soft-archive a category (hides its projects/tasks; blocks new tasks/projects under it) / restore it |
+| `am init <tasktype> [-c CAT [-p PROJ]]` · `am whoami` | identity (optionally **scoped** to a category or one project — confines this agent; out-of-scope ops exit 8); `whoami` adds a `scope:` line when scoped |
+| `am serve [--port 8787] [--db PATH] [--log] [--proposals CAT/PROJ]` | run the dashboard + API (`--proposals` = the scope carve-out project any agent may file into; default `meta/proposals`) |
 | `am db export [path] [--db PATH]` | write a consistent DB snapshot (prints the path) |
 | `am db import <path> [--db PATH] [--yes]` | restore a snapshot (stop `am serve` first; backs up current DB) |
 | `am db prune (--before <YYYY-MM-DD> \| --keep <N>) [--db PATH] [--yes]` | trim old events from the DB (offline; events only; stop `am serve` first) |
@@ -193,28 +224,53 @@ Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting 
 `<id>` accepts a global id (`13`) or a project ref (`web-3`). `--status` accepts a comma
 list. Priority is `0` urgent … `3` low (default `2`). Durations use Go syntax (`30m`, `48h` —
 not `2d`). Add `--json` to any read to parse.
-Exit codes: `0` ok · `3` not found · `4` already claimed, blocked, or not stale yet · `5` invalid · `6` server down · `7` wait timed out.
+Exit codes: `0` ok · `3` not found · `4` already claimed, blocked, or not stale yet · `5` invalid · `6` server down · `7` wait timed out · `8` out of scope.
 
 ## HTTP API
 
 The CLI is a thin client over this (also what the dashboard uses). `X-Agent` header sets the
-actor.
+actor; the optional `X-Agent-Scope` header (`category[/project]`) confines the caller — out-of-scope
+mutations and named reads return `403 {"error":"out_of_scope"}` (CLI exit 8). It is a client-asserted
+label, not authentication (see [Security](#security)).
 
 ```
-GET    /api/projects                              GET    /api/tasks/{id}          (returns depends_on + blocks)
-POST   /api/projects {slug,name}                 PATCH  /api/tasks/{id} {status?,assignee?,title?,body?,priority?}
-DELETE /api/projects/{slug}                       POST   /api/tasks/{id}/claim    (409 if open prereqs; body {"steal_stale":"<dur>"} = stale takeover, 409 not_stale if fresh)
-                                                  POST   /api/tasks/next         {project?} atomic pick+claim of the best ready task (404 if none)
-POST   /api/projects/{slug}/archive              POST   /api/projects/{slug}/unarchive
-GET    /api/tasks?project=&status=&assignee=     POST   /api/tasks/{id}/comments {body}
-       &ready=true|&blocked=true|&stale=<dur>    DELETE /api/tasks/{id}/comments/{cid}
-       |&q=<text>|&label=<l>                     POST   /api/tasks/{id}/deps {depends_on:<id-or-ref>}
-POST   /api/tasks {project,title,...}            DELETE /api/tasks/{id}/deps/{depId}
-DELETE /api/tasks/{id}                           POST   /api/tasks/{id}/labels {label}
-                                                 DELETE /api/tasks/{id}/labels/{label}
+GET    /api/categories?archived=true             GET    /api/tasks/{id}          (returns depends_on + blocks)
+       (+ per-category counts & active_agents)
+POST   /api/categories {slug,name?}              PATCH  /api/tasks/{id} {status?,assignee?,title?,body?,priority?,meta?}
+POST   /api/categories/{slug}/archive            POST   /api/tasks/{id}/claim    (409 if open prereqs; body {"steal_stale":"<dur>"} = stale takeover, 409 not_stale if fresh)
+POST   /api/categories/{slug}/unarchive          POST   /api/tasks/next         {project?,category?,meta_key?} atomic pick+claim of the best ready task (404 if none)
+GET    /api/projects?category=<slug>             POST   /api/tasks/{id}/comments {body}
+POST   /api/projects {slug,name,category?}       DELETE /api/tasks/{id}/comments/{cid}
+PATCH  /api/projects/{slug} {slug?,name?,         POST   /api/tasks/{id}/deps {depends_on:<id-or-ref>}
+       vault_project_id?,vault_path?}            DELETE /api/tasks/{id}/deps/{depId}
+DELETE /api/projects/{slug}                      POST   /api/tasks/{id}/labels {label}
+POST   /api/projects/{slug}/archive              DELETE /api/tasks/{id}/labels/{label}
+POST   /api/projects/{slug}/unarchive
+GET    /api/tasks?project=&category=&status=&assignee=
+       &ready=true|&blocked=true|&stale=<dur>|&q=<text>|&label=<l>|&meta_key=<k>
+POST   /api/tasks {project,title,meta?,...}      DELETE /api/tasks/{id}
 GET    /api/events?since=|?tail=|?before=        GET    /api/stream  (SSE)
+       [&project=][&category=]                          [?project=|?category= scope]
 GET    /api/projects/{slug}/graph               {nodes,edges}; read-only DAG (no events)
 ```
+
+Category and project payloads carry a **stable id** (`uid`: `amc_…` / `amp_…`) that never
+changes across slug renames — bind external systems to it, not the slug. Projects also carry
+optional `vault_project_id` / `vault_path` binding fields. Creating into an archived category
+fails with `400 {"error":"category_archived"}`.
+
+`GET /api/categories` returns each category augmented with `counts` (todo/doing/blocked/done over
+its non-archived projects) and `active_agents` (non-human actors active in the last 30 minutes) —
+what the dashboard's category-home view renders. `GET /api/events` and `GET /api/stream` accept a
+`?category=<slug>` lens that scopes the feed/stream to that category's projects' events (it
+excludes instance-wide category-level events; an unknown category is 404 on `/api/events`, ignored
+on the stream). This is an unscoped query-param choice — distinct from the agent `X-Agent-Scope`
+identity scope.
+
+Tasks carry optional free-form **metadata** (`"meta": {"k":"v", …}`): keys are normalized like
+labels (lowercase, 1–50 chars of `a-z 0-9 . _ -`), values are opaque strings up to 500 bytes.
+Set pairs on create or PATCH (an empty-string value removes the key); filter by key **presence**
+with `?meta_key=` / the `meta_key` next-body field. Task JSON includes `"meta"` when present.
 
 ```sh
 curl -s 127.0.0.1:8787/api/tasks?project=web
@@ -227,7 +283,10 @@ curl -s -H 'X-Agent: claude-1' -X POST 127.0.0.1:8787/api/tasks/13/claim
 |---|---|
 | `AGENTMAN_URL` | server the CLI talks to (default `http://127.0.0.1:8787`) |
 | `AGENTMAN_PROJECT` | default project for `am ls` / `am new` |
+| `AGENTMAN_CATEGORY` | default category scope for `am ls` / `am next` / `am wait --ready` / `am project new` |
+| `AGENTMAN_SCOPE` | override the identity file's confinement scope sent as `X-Agent-Scope` (e.g. `work` or `work/api`) |
 | `AGENTMAN_AGENT` | identity override (else `am init` file) |
+| `AGENTMAN_PROPOSALS` / `--proposals` | (serve) the scope carve-out project any agent may file into (default `meta/proposals`) |
 | `AGENTMAN_PORT` / `--port` | server port (default `8787`) |
 | `AGENTMAN_DB` / `--db` | database path (default `~/.agentman/agentman.db`) |
 | `AGENTMAN_NO_UPDATE_CHECK` | set to `1` to disable the startup "update available" check |
@@ -298,6 +357,11 @@ behind; disable that with `AGENTMAN_NO_UPDATE_CHECK=1`.
 `am serve` binds to `127.0.0.1` with **no authentication** — it's a personal, local board.
 Don't expose the port to untrusted networks. If you need remote/multi-user access, put it
 behind a reverse proxy with auth, or open an issue.
+
+Agent **scopes** (`X-Agent-Scope`, `am init -c …`) confine a *config-following* agent to its slice
+of the board, but they are **client-asserted labels, not a security boundary** — any local caller
+can forge or omit the header. Treat scope confinement as accident prevention, not access control;
+verified scope tokens are a future step. See `architecture/security.md`.
 
 ## Development
 
