@@ -16,6 +16,7 @@ type Client struct {
 	base  string
 	agent string
 	scope string // "cat" or "cat/proj"; empty = unscoped
+	token string // bearer token; when set it carries the scope and the header is dropped
 	http  *http.Client
 }
 
@@ -25,6 +26,7 @@ func NewClient() *Client {
 		base:  strings.TrimRight(base, "/"),
 		agent: resolveAgent(),
 		scope: resolveScope(),
+		token: resolveToken(),
 		http:  &http.Client{Timeout: 10 * time.Second},
 	}
 }
@@ -47,7 +49,13 @@ func (c *Client) do(method, path string, body any) (int, []byte) {
 	if c.agent != "" {
 		req.Header.Set("X-Agent", c.agent)
 	}
-	if c.scope != "" {
+	// A token carries the scope server-side, so when one is present we send it
+	// as Authorization: Bearer and STOP sending X-Agent-Scope — the server
+	// ignores the header anyway (scopeOf gives the token precedence), and not
+	// sending it keeps the wire honest about where the scope comes from.
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	} else if c.scope != "" {
 		req.Header.Set("X-Agent-Scope", c.scope)
 	}
 	resp, err := c.http.Do(req)
@@ -61,13 +69,17 @@ func (c *Client) do(method, path string, body any) (int, []byte) {
 
 // exitCodeFor maps an HTTP status (0 = transport error) to the CLI exit-code
 // convention: 0 ok · 3 not found · 4 conflict · 5 validation · 6 server down ·
-// 8 out of scope · 1 other. Single source for doOrFail and the bulk verbs.
+// 8 out of scope · 9 bad token · 1 other. Single source for doOrFail and the
+// bulk verbs. 9 is distinct from 8 on purpose: a bad credential must hard-fail,
+// not be swallowed as a per-id scope-skip in a bulk loop.
 func exitCodeFor(st int) int {
 	switch {
 	case st >= 200 && st < 300:
 		return 0
 	case st == 0:
 		return 6
+	case st == 401:
+		return 9
 	case st == 404:
 		return 3
 	case st == 409:
@@ -99,6 +111,8 @@ func (c *Client) doOrFail(method, path string, body any) []byte {
 		fail(5, "%s", apiErr(data, "invalid request"))
 	case 8:
 		fail(8, "%s", apiErr(data, "out of scope"))
+	case 9:
+		fail(9, "%s", apiErr(data, "invalid or revoked token"))
 	default:
 		fail(1, "%s", apiErr(data, "error "+strconv.Itoa(st)))
 	}

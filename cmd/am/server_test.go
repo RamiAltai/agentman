@@ -2371,3 +2371,315 @@ func TestEventsCategoryFilter(t *testing.T) {
 		t.Fatalf("?category=nope = %d, want 404", rn.StatusCode)
 	}
 }
+
+// ---------- Phase S: scope tokens ----------
+
+// mintToken issues a token bound to scope via the unscoped admin endpoint and
+// returns its plaintext. A non-201 fails the test.
+func mintToken(t *testing.T, ts *httptest.Server, scope string) string {
+	t.Helper()
+	r := do(t, ts, http.MethodPost, "/api/tokens", `{"scope":"`+scope+`"}`,
+		map[string]string{"Content-Type": "application/json"})
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusCreated {
+		t.Fatalf("mint token %s = %d, want 201", scope, r.StatusCode)
+	}
+	var body struct {
+		ID, Scope, Token, CreatedAt string
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		t.Fatalf("decode mint body: %v", err)
+	}
+	if body.Token == "" {
+		t.Fatalf("mint response carried no token")
+	}
+	return body.Token
+}
+
+// bearer builds request headers carrying a bearer token (and agent).
+func bearer(agent, token string) map[string]string {
+	return map[string]string{"X-Agent": agent, "Authorization": "Bearer " + token, "Content-Type": "application/json"}
+}
+
+// TestTokenAdmin_RequiresUnscoped: the three admin endpoints are refused for any
+// scoped caller (header or scoped token) and allowed only for an unscoped one.
+func TestTokenAdmin_RequiresUnscoped(t *testing.T) {
+	ts := newTestServer(t)
+	scopedBoard(t, ts)
+
+	// A scoped token to attempt admin with.
+	scopedTok := mintToken(t, ts, "work")
+
+	type ep struct {
+		method, path string
+		ok           int // success status when unscoped
+	}
+	eps := []ep{
+		{http.MethodPost, "/api/tokens", http.StatusCreated},
+		{http.MethodGet, "/api/tokens", http.StatusOK},
+	}
+	for _, e := range eps {
+		body := ""
+		if e.method == http.MethodPost {
+			body = `{"scope":"work"}`
+		}
+		// X-Agent-Scope header → 403.
+		rh := do(t, ts, e.method, e.path, body, scoped("agent-w", "work"))
+		rh.Body.Close()
+		if rh.StatusCode != http.StatusForbidden {
+			t.Fatalf("%s %s with scope header = %d, want 403", e.method, e.path, rh.StatusCode)
+		}
+		// Scoped bearer token → 403.
+		rb := do(t, ts, e.method, e.path, body, bearer("agent-w", scopedTok))
+		rb.Body.Close()
+		if rb.StatusCode != http.StatusForbidden {
+			t.Fatalf("%s %s with scoped token = %d, want 403", e.method, e.path, rb.StatusCode)
+		}
+		// Unscoped → success.
+		ru := do(t, ts, e.method, e.path, body, map[string]string{"Content-Type": "application/json"})
+		ru.Body.Close()
+		if ru.StatusCode != e.ok {
+			t.Fatalf("%s %s unscoped = %d, want %d", e.method, e.path, ru.StatusCode, e.ok)
+		}
+	}
+
+	// revoke: mint one unscoped first, then prove scoped revoke is refused.
+	revokeTok := mintToken(t, ts, "personal")
+	var rb struct{ ID string }
+	{
+		r := do(t, ts, http.MethodGet, "/api/tokens", "", map[string]string{"Content-Type": "application/json"})
+		var toks []Token
+		json.NewDecoder(r.Body).Decode(&toks)
+		r.Body.Close()
+		for _, tk := range toks {
+			if tk.Category == "personal" {
+				rb.ID = tk.ID
+			}
+		}
+	}
+	_ = revokeTok
+	if rb.ID == "" {
+		t.Fatalf("could not find the personal token id to revoke")
+	}
+	rh := do(t, ts, http.MethodPost, "/api/tokens/"+rb.ID+"/revoke", "", scoped("agent-w", "work"))
+	rh.Body.Close()
+	if rh.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped revoke = %d, want 403", rh.StatusCode)
+	}
+	rs := do(t, ts, http.MethodPost, "/api/tokens/"+rb.ID+"/revoke", "", bearer("agent-w", scopedTok))
+	rs.Body.Close()
+	if rs.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped-token revoke = %d, want 403", rs.StatusCode)
+	}
+	ru := do(t, ts, http.MethodPost, "/api/tokens/"+rb.ID+"/revoke", "", map[string]string{"Content-Type": "application/json"})
+	ru.Body.Close()
+	if ru.StatusCode != http.StatusOK {
+		t.Fatalf("unscoped revoke = %d, want 200", ru.StatusCode)
+	}
+}
+
+// TestTokenScopeOverridesHeader: a bearer token's bound scope wins over any
+// X-Agent-Scope header on the same request.
+func TestTokenScopeOverridesHeader(t *testing.T) {
+	ts := newTestServer(t)
+	workID, personalID := scopedBoard(t, ts)
+	workTok := mintToken(t, ts, "work")
+
+	// Token=work, header=personal: evaluated against work — claim work succeeds.
+	hdr := map[string]string{"X-Agent": "agent-w", "Authorization": "Bearer " + workTok, "X-Agent-Scope": "personal", "Content-Type": "application/json"}
+	rw := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", "", hdr)
+	rw.Body.Close()
+	if rw.StatusCode != http.StatusOK {
+		t.Fatalf("token=work header=personal claim work = %d, want 200 (token wins)", rw.StatusCode)
+	}
+	// Same headers, claim the personal task → 403 (header did NOT widen scope).
+	rp := do(t, ts, http.MethodPost, "/api/tasks/"+personalID+"/claim", "", hdr)
+	rp.Body.Close()
+	if rp.StatusCode != http.StatusForbidden {
+		t.Fatalf("token=work header=personal claim personal = %d, want 403", rp.StatusCode)
+	}
+}
+
+// TestInvalidTokenRejected: a bogus or revoked bearer token is 401 unauthorized,
+// NOT 200 and NOT 403 — including the security-regression guard that a delete
+// with a bogus token does not slip through as 204.
+func TestInvalidTokenRejected(t *testing.T) {
+	ts := newTestServer(t)
+	workID, _ := scopedBoard(t, ts)
+
+	// Bogus token on a claim → 401.
+	rb := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", "", bearer("agent-x", "amt_bogus"))
+	defer rb.Body.Close()
+	if rb.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("bogus-token claim = %d, want 401", rb.StatusCode)
+	}
+	var body map[string]string
+	json.NewDecoder(rb.Body).Decode(&body)
+	if body["error"] != "unauthorized" {
+		t.Fatalf("401 body = %v, want unauthorized", body)
+	}
+
+	// Revoked token → 401 too.
+	tok := mintToken(t, ts, "work")
+	var id string
+	{
+		r := do(t, ts, http.MethodGet, "/api/tokens", "", nil)
+		var toks []Token
+		json.NewDecoder(r.Body).Decode(&toks)
+		r.Body.Close()
+		id = toks[0].ID
+	}
+	rr := do(t, ts, http.MethodPost, "/api/tokens/"+id+"/revoke", "", nil)
+	rr.Body.Close()
+	rv := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", "", bearer("agent-x", tok))
+	rv.Body.Close()
+	if rv.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("revoked-token claim = %d, want 401", rv.StatusCode)
+	}
+
+	// Security-regression guard: DELETE with a bogus token must be 401, NOT 204.
+	rd := do(t, ts, http.MethodDelete, "/api/tasks/"+workID, "", bearer("agent-x", "amt_bogus"))
+	rd.Body.Close()
+	if rd.StatusCode == http.StatusNoContent {
+		t.Fatalf("delete with bogus token = 204 — a bad credential mutated data")
+	}
+	if rd.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("delete with bogus token = %d, want 401", rd.StatusCode)
+	}
+}
+
+// TestNoTokenPathUnchanged: with no Authorization header, X-Agent-Scope behaves
+// exactly as in Phase Q.
+func TestNoTokenPathUnchanged(t *testing.T) {
+	ts := newTestServer(t)
+	workID, personalID := scopedBoard(t, ts)
+
+	rin := do(t, ts, http.MethodPost, "/api/tasks/"+personalID+"/claim", "", scoped("agent-p", "personal"))
+	rin.Body.Close()
+	if rin.StatusCode != http.StatusOK {
+		t.Fatalf("header-scoped in-scope claim = %d, want 200", rin.StatusCode)
+	}
+	rout := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", "", scoped("agent-p", "personal"))
+	rout.Body.Close()
+	if rout.StatusCode != http.StatusForbidden {
+		t.Fatalf("header-scoped out-of-scope claim = %d, want 403", rout.StatusCode)
+	}
+}
+
+// TestTokenScopeMatrix re-verifies the Phase Q enforcement matrix with the scope
+// driven by a minted token instead of a header.
+func TestTokenScopeMatrix(t *testing.T) {
+	ts, store := newTestServerWithStore(t)
+	workID, personalID := scopedBoard(t, ts)
+	mustCreateProposals(t, ts)
+	pTok := mintToken(t, ts, "personal")
+
+	// next never returns out-of-scope work even when work has a more urgent task.
+	do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"wproj","title":"urgent work","priority":0}`,
+		map[string]string{"Content-Type": "application/json"}).Body.Close()
+	rn := do(t, ts, http.MethodPost, "/api/tasks/next", "", bearer("agent-p", pTok))
+	if rn.StatusCode != http.StatusOK {
+		rn.Body.Close()
+		t.Fatalf("token-scoped next = %d, want 200", rn.StatusCode)
+	}
+	var tk Task
+	json.NewDecoder(rn.Body).Decode(&tk)
+	rn.Body.Close()
+	if tk.Project != "pproj" {
+		t.Fatalf("token-scoped next picked %q, want pproj", tk.Project)
+	}
+
+	// claim out-of-scope → 403.
+	rc := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", "", bearer("agent-p", pTok))
+	rc.Body.Close()
+	if rc.StatusCode != http.StatusForbidden {
+		t.Fatalf("token-scoped out-of-scope claim = %d, want 403", rc.StatusCode)
+	}
+
+	// steal-stale out-of-scope → 403.
+	rs0 := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", "", map[string]string{"X-Agent": "agent-gone"})
+	rs0.Body.Close()
+	n, _ := strconv.ParseInt(workID, 10, 64)
+	backdateTask(t, store, n)
+	rs := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", `{"steal_stale":"1h"}`, bearer("agent-p", pTok))
+	rs.Body.Close()
+	if rs.StatusCode != http.StatusForbidden {
+		t.Fatalf("token-scoped out-of-scope steal = %d, want 403", rs.StatusCode)
+	}
+
+	// bulk per-id: in-scope status succeeds, out-of-scope 403 (drive both via the token).
+	rok := do(t, ts, http.MethodPatch, "/api/tasks/"+personalID, `{"status":"doing"}`, bearer("agent-p", pTok))
+	rok.Body.Close()
+	if rok.StatusCode != http.StatusOK {
+		t.Fatalf("token-scoped in-scope patch = %d, want 200", rok.StatusCode)
+	}
+	rbad := do(t, ts, http.MethodPatch, "/api/tasks/"+workID, `{"status":"doing"}`, bearer("agent-p", pTok))
+	rbad.Body.Close()
+	if rbad.StatusCode != http.StatusForbidden {
+		t.Fatalf("token-scoped out-of-scope patch = %d, want 403", rbad.StatusCode)
+	}
+
+	// proposals carve-out under a token: create allowed, comment on own allowed,
+	// other out-of-scope create → 403.
+	rp := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"proposals","title":"idea"}`, bearer("agent-p", pTok))
+	if rp.StatusCode != http.StatusCreated {
+		rp.Body.Close()
+		t.Fatalf("token-scoped create in proposals = %d, want 201", rp.StatusCode)
+	}
+	var prop Task
+	json.NewDecoder(rp.Body).Decode(&prop)
+	rp.Body.Close()
+	propID := strconv.FormatInt(prop.ID, 10)
+	rcm := do(t, ts, http.MethodPost, "/api/tasks/"+propID+"/comments",
+		`{"body":"mine"}`, bearer("agent-p", pTok))
+	rcm.Body.Close()
+	if rcm.StatusCode != http.StatusCreated {
+		t.Fatalf("token-scoped comment on own proposal = %d, want 201", rcm.StatusCode)
+	}
+	roc := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"wproj","title":"sneaky"}`, bearer("agent-p", pTok))
+	roc.Body.Close()
+	if roc.StatusCode != http.StatusForbidden {
+		t.Fatalf("token-scoped create in wproj = %d, want 403", roc.StatusCode)
+	}
+}
+
+// TestCreateTokenResponse: the 201 body carries the plaintext once; the ls JSON
+// never contains a token or token_hash key.
+func TestCreateTokenResponse(t *testing.T) {
+	ts := newTestServer(t)
+	scopedBoard(t, ts)
+
+	r := do(t, ts, http.MethodPost, "/api/tokens", `{"scope":"work"}`,
+		map[string]string{"Content-Type": "application/json"})
+	if r.StatusCode != http.StatusCreated {
+		r.Body.Close()
+		t.Fatalf("create token = %d, want 201", r.StatusCode)
+	}
+	raw, _ := io.ReadAll(r.Body)
+	r.Body.Close()
+	var created map[string]any
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatalf("decode create body: %v", err)
+	}
+	tokVal, _ := created["token"].(string)
+	if !strings.HasPrefix(tokVal, "amt_") {
+		t.Fatalf("create body token = %q, want amt_ plaintext", tokVal)
+	}
+	if created["scope"] != "work" {
+		t.Fatalf("create body scope = %v, want work", created["scope"])
+	}
+
+	rl := do(t, ts, http.MethodGet, "/api/tokens", "", nil)
+	lsRaw, _ := io.ReadAll(rl.Body)
+	rl.Body.Close()
+	s := string(lsRaw)
+	if strings.Contains(s, `"token"`) || strings.Contains(s, "token_hash") {
+		t.Fatalf("ls JSON leaked a token/hash key: %s", s)
+	}
+	if strings.Contains(s, tokVal) {
+		t.Fatalf("ls JSON leaked the plaintext token value: %s", s)
+	}
+}

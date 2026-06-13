@@ -3443,3 +3443,143 @@ func TestListCategoriesCounts(t *testing.T) {
 		t.Fatalf("active_agents = %v, want [robo-fresh] (human excluded, robo-old aged out)", work.ActiveAgents)
 	}
 }
+
+// ---------- Phase S: scope tokens ----------
+
+// seedScopeWorld creates the categories/projects token tests bind to.
+func seedScopeWorld(t *testing.T, st *Store) {
+	t.Helper()
+	if _, _, err := st.CreateCategory("work", "Work"); err != nil {
+		t.Fatalf("CreateCategory work: %v", err)
+	}
+	if _, _, err := st.CreateCategory("personal", "Personal"); err != nil {
+		t.Fatalf("CreateCategory personal: %v", err)
+	}
+	if _, _, err := st.CreateProject("api", "API", "work"); err != nil {
+		t.Fatalf("CreateProject api: %v", err)
+	}
+}
+
+// TestCreateToken_HashNotPlaintext proves the stored row is the sha256 hash and
+// never the plaintext, and that ListTokens exposes neither hash nor plaintext.
+func TestCreateToken_HashNotPlaintext(t *testing.T) {
+	st := openTestStore(t)
+	seedScopeWorld(t, st)
+
+	plain, tok, err := st.CreateToken(Scope{Category: "work"})
+	if err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+	if !strings.HasPrefix(plain, "amt_") || len(plain) != 4+32 {
+		t.Fatalf("plaintext = %q, want amt_ + 32 hex", plain)
+	}
+	if !strings.HasPrefix(tok.ID, "tk_") {
+		t.Fatalf("token id = %q, want tk_ prefix", tok.ID)
+	}
+
+	// The DB column holds the hash, not the plaintext.
+	var stored string
+	if err := st.db.QueryRow("SELECT token_hash FROM tokens WHERE id=?", tok.ID).Scan(&stored); err != nil {
+		t.Fatalf("read token_hash: %v", err)
+	}
+	if stored == plain {
+		t.Fatalf("token_hash equals plaintext — plaintext was stored")
+	}
+	if stored != hashToken(plain) {
+		t.Fatalf("token_hash = %q, want sha256(plaintext) %q", stored, hashToken(plain))
+	}
+
+	// ListTokens carries no hash/plaintext (Token has no such field, and a row
+	// scan of the listed metadata must not surface the secret).
+	toks, err := st.ListTokens()
+	if err != nil {
+		t.Fatalf("ListTokens: %v", err)
+	}
+	if len(toks) != 1 {
+		t.Fatalf("ListTokens len = %d, want 1", len(toks))
+	}
+	if toks[0].ID != tok.ID || toks[0].Category != "work" || toks[0].Project != "" {
+		t.Fatalf("listed token = %+v, want id %s cat work no project", toks[0], tok.ID)
+	}
+}
+
+// TestResolveToken covers the happy path plus the two security-critical misses
+// (unknown and revoked both → ErrInvalidToken, never a zero Scope).
+func TestResolveToken(t *testing.T) {
+	st := openTestStore(t)
+	seedScopeWorld(t, st)
+
+	plain, tok, err := st.CreateToken(Scope{Category: "work", Project: "api"})
+	if err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+
+	sc, err := st.ResolveToken(plain)
+	if err != nil {
+		t.Fatalf("ResolveToken: %v", err)
+	}
+	if sc.Category != "work" || sc.Project != "api" {
+		t.Fatalf("ResolveToken scope = %+v, want work/api", sc)
+	}
+
+	if _, err := st.ResolveToken("amt_deadbeef"); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("ResolveToken(unknown) err = %v, want ErrInvalidToken", err)
+	}
+
+	if _, err := st.RevokeToken(tok.ID); err != nil {
+		t.Fatalf("RevokeToken: %v", err)
+	}
+	sc, err = st.ResolveToken(plain)
+	if !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("ResolveToken(revoked) err = %v, want ErrInvalidToken", err)
+	}
+	if !sc.IsZero() {
+		// A non-zero scope on a revoked token would silently grant access.
+		t.Fatalf("ResolveToken(revoked) scope = %+v, want zero", sc)
+	}
+}
+
+// TestCreateToken_ScopeValidation rejects unknown/mis-bound scopes at mint.
+func TestCreateToken_ScopeValidation(t *testing.T) {
+	st := openTestStore(t)
+	seedScopeWorld(t, st)
+
+	if _, _, err := st.CreateToken(Scope{Category: "nosuch"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("mint unknown category err = %v, want ErrNotFound", err)
+	}
+	if _, _, err := st.CreateToken(Scope{Category: "work", Project: "ghost"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("mint unknown project err = %v, want ErrNotFound", err)
+	}
+	// api belongs to work, not personal — refuse the cross-category bind.
+	if _, _, err := st.CreateToken(Scope{Category: "personal", Project: "api"}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("mint cross-category project err = %v, want ErrValidation", err)
+	}
+
+	if _, _, err := st.ArchiveCategory("work", "tester"); err != nil {
+		t.Fatalf("ArchiveCategory: %v", err)
+	}
+	if _, _, err := st.CreateToken(Scope{Category: "work"}); !errors.Is(err, ErrCategoryArchived) {
+		t.Fatalf("mint archived category err = %v, want ErrCategoryArchived", err)
+	}
+}
+
+// TestRevokeToken: unknown id and double-revoke both 404.
+func TestRevokeToken(t *testing.T) {
+	st := openTestStore(t)
+	seedScopeWorld(t, st)
+
+	if _, err := st.RevokeToken("tk_nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("revoke unknown err = %v, want ErrNotFound", err)
+	}
+
+	_, tok, err := st.CreateToken(Scope{Category: "work"})
+	if err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+	if _, err := st.RevokeToken(tok.ID); err != nil {
+		t.Fatalf("first revoke: %v", err)
+	}
+	if _, err := st.RevokeToken(tok.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("double revoke err = %v, want ErrNotFound", err)
+	}
+}

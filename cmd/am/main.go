@@ -88,6 +88,8 @@ func main() {
 		cmdCategories(c, a)
 	case "category":
 		cmdCategory(c, a)
+	case "token":
+		cmdToken(c, a)
 	case "dep":
 		cmdDep(c, a)
 	case "help", "-h", "--help":
@@ -223,6 +225,9 @@ func usage() {
   am category new <slug> [name]               create a category
   am category archive <slug>             soft-archive a category (hides its projects)
   am category unarchive <slug>           restore an archived category
+  am token new --scope <cat[/proj]>           mint a scope-bound bearer token (prints it once; stored in identity)
+  am token ls [--json]                        list tokens (id / scope / created / [revoked])
+  am token revoke <id>                        revoke a token (silent success)
   am version                                  print version
   am update [version]                         reinstall the latest (or a given) version
   am db export [path] [--db PATH]                            export a DB snapshot (prints path)
@@ -236,8 +241,9 @@ Scope: 'am init <tasktype> -c CAT [-p PROJ]' confines this identity — out-of-s
 Env: AGENTMAN_URL (default http://127.0.0.1:8787), AGENTMAN_PROJECT (default project),
      AGENTMAN_CATEGORY (default category scope for ls/next/wait/project new),
      AGENTMAN_SCOPE (override the identity file's scope, e.g. work or work/api),
+     AGENTMAN_TOKEN (override the identity file's bearer token; sent as Authorization: Bearer),
      AGENTMAN_PROPOSALS (serve: the carve-out project, default meta/proposals).
      Add --json to any read to parse output.
-Exit codes: 0 ok · 3 not found · 4 already claimed · 5 invalid · 6 server down · 7 timed out · 8 out of scope.
+Exit codes: 0 ok · 3 not found · 4 already claimed · 5 invalid · 6 server down · 7 timed out · 8 out of scope · 9 bad token.
 `)
 }

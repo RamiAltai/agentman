@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -606,6 +607,73 @@ func cmdCategory(c *Client, a Args) {
 		c.doOrFail("POST", "/api/categories/"+a.at(1)+"/unarchive", nil)
 	default:
 		fail(1, "usage: am category <new|archive|unarchive> ...")
+	}
+}
+
+func cmdToken(c *Client, a Args) {
+	switch a.at(0) {
+	case "new":
+		scope := a.flag("scope")
+		if scope == "" {
+			fail(5, "usage: am token new --scope <category[/project]>")
+		}
+		data := c.doOrFail("POST", "/api/tokens", map[string]any{"scope": scope})
+		var resp struct {
+			ID    string `json:"id"`
+			Scope string `json:"scope"`
+			Token string `json:"token"`
+		}
+		json.Unmarshal(data, &resp)
+		// Persist the token into the identity record (merge — never clobber the
+		// existing agent/scope), so future commands send it automatically.
+		storeToken(resp.Token)
+		// Plaintext on stdout line 1 so `tok=$(am token new --scope work)` works;
+		// the hint goes to stderr so it never pollutes the captured value.
+		fmt.Println(resp.Token)
+		fmt.Fprintln(os.Stderr, "stored in identity; sent as Authorization: Bearer on future requests")
+	case "ls":
+		data := c.doOrFail("GET", "/api/tokens", nil)
+		var toks []Token
+		json.Unmarshal(data, &toks)
+		if a.has("json") {
+			printJSON(toks)
+			return
+		}
+		for _, t := range toks {
+			revoked := ""
+			if t.RevokedAt != "" {
+				revoked = " (revoked)"
+			}
+			fmt.Printf("%-19s %-20s %-24s%s\n", t.ID, trunc(t.Scope().String(), 20), t.CreatedAt, revoked)
+		}
+	case "revoke":
+		if a.at(1) == "" {
+			fail(1, "usage: am token revoke <id>")
+		}
+		c.doOrFail("POST", "/api/tokens/"+a.at(1)+"/revoke", nil)
+	default:
+		fail(1, "usage: am token <new|ls|revoke> ...")
+	}
+}
+
+// storeToken merges a freshly-minted token into this directory's identity
+// record without disturbing the agent id or scope. If no identity file exists
+// yet (token minted before `am init`), it writes a record carrying just the
+// token — a later `am init` would overwrite it, which is acceptable since the
+// token is re-mintable.
+func storeToken(token string) {
+	agent, scope, _ := resolveIdentity()
+	rec := identityRecord{Agent: agent, Scope: scope, Token: token}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		fail(1, "token new: %v", err)
+	}
+	f := identityFile()
+	if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+		fail(1, "token new: %v", err)
+	}
+	if err := os.WriteFile(f, b, 0o644); err != nil {
+		fail(1, "token new: %v", err)
 	}
 }
 
