@@ -1180,6 +1180,11 @@ func (s *Store) CreateTask(in CreateTaskInput) (*Task, *Event, error) {
 		if v == "" || len(v) > maxTitleLen {
 			return nil, nil, fmt.Errorf("%w: meta value must be 1-%d bytes", ErrValidation, maxTitleLen)
 		}
+		// Two raw keys collapsing to one normalized key would make the winner
+		// map-iteration nondeterministic — reject instead.
+		if _, dup := meta[nk]; dup {
+			return nil, nil, fmt.Errorf("%w: duplicate meta key after normalization: %q", ErrValidation, nk)
+		}
 		meta[nk] = v
 	}
 	pid, err := s.projectID(in.Project)
@@ -1891,23 +1896,33 @@ func (s *Store) RemoveLabel(taskID int64, label, actor string) (*Event, error) {
 // error aborts the caller's tx, so a multi-key patch is all-or-nothing. The
 // returned delta maps key → [old, new] (nil = absent) for keys that changed.
 func applyMetaTx(tx *sql.Tx, taskID int64, meta map[string]string) (map[string]any, bool, error) {
-	keys := make([]string, 0, len(meta))
-	for k := range meta {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	delta := map[string]any{}
-	for _, rawK := range keys {
+	// Normalize every key up front and reject collisions (two raw keys → one
+	// normalized key): applying both would pick a map-iteration-order winner
+	// and record a just-written value as "old" in the delta.
+	norm := make(map[string]string, len(meta))
+	for rawK, v := range meta {
 		k, err := normalizeMetaKey(rawK)
 		if err != nil {
 			return nil, false, err
 		}
+		if _, dup := norm[k]; dup {
+			return nil, false, fmt.Errorf("%w: duplicate meta key after normalization: %q", ErrValidation, k)
+		}
+		norm[k] = v
+	}
+	keys := make([]string, 0, len(norm))
+	for k := range norm {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	delta := map[string]any{}
+	for _, k := range keys {
 		var old sql.NullString
-		err = tx.QueryRow("SELECT value FROM task_meta WHERE task_id=? AND key=?", taskID, k).Scan(&old)
+		err := tx.QueryRow("SELECT value FROM task_meta WHERE task_id=? AND key=?", taskID, k).Scan(&old)
 		if err != nil && err != sql.ErrNoRows {
 			return nil, false, err
 		}
-		v := meta[rawK]
+		v := norm[k]
 		if v == "" { // empty value = remove the key
 			if !old.Valid {
 				continue // already absent — silent no-op

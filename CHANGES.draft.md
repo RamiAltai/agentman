@@ -37,6 +37,11 @@ filterable unit across `am ls`, `am next`, and `am wait --ready`.
 - `POST /api/tasks/next` body gains `"meta_key": "K"` — only tasks carrying
   the key are pickable. Bad key → 400; no carrier → 404. Priority-then-FIFO
   ordering and the single conditional-UPDATE atomicity are unchanged.
+- Two raw keys in one request that normalize to the same key (e.g.
+  `{"Auto":"a","auto":"b"}`) are rejected on BOTH create and patch — 400
+  `validation` (CLI exit 5), message `duplicate meta key after
+  normalization: "auto"`. Applying both would pick a map-iteration-order
+  winner; rejection keeps requests deterministic and all-or-nothing.
 - Error mapping reuses the existing sentinels (`ErrValidation` → 400 → CLI
   exit 5). **No new error codes, no new exit codes.**
 
@@ -59,7 +64,8 @@ filterable unit across `am ls`, `am next`, and `am wait --ready`.
   `Args.multi`, and `a.all(k)`; single-value flags remain last-wins).
 - `am new "title" ... [--meta k=v]...` — all pairs ride in the one POST.
   `--meta k=` (empty value) and `--meta bare` (no `=`) are usage errors
-  (exit 5). Tokens split at the FIRST `=`; values may contain `=`.
+  (exit 5). Tokens split at the FIRST `=`; values may contain `=`. The
+  inline usage string (`am new` with no title) now lists `[--meta k=v]...`.
 - `am edit <id> [--meta k=v]... [--meta k=]` — all repeated flags fold into
   ONE PATCH (structural atomicity: the dispatcher's auto+packet flip is one
   tx/one event); `--meta k=` removes the key. "nothing to change" message now
@@ -140,7 +146,8 @@ filterable unit across `am ls`, `am next`, and `am wait --ready`.
 
 ## Tests added (per file)
 
-- `store_test.go`: TestTaskMetaCRUD, TestTaskMetaValidation,
+- `store_test.go`: TestTaskMetaCRUD, TestTaskMetaValidation (incl.
+  normalized-key collision rejection on create and patch),
   TestPatchTaskMetaAtomicOneEvent, TestPatchTaskMetaNoOpNoEvent,
   TestMetaOnlyPatchDoesNotBumpUpdatedAt, TestNextTaskMetaFilter,
   TestNextTaskMetaRaceDistinctWinners, TestListTasksMetaKeyFilter,

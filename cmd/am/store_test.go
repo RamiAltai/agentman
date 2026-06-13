@@ -2800,6 +2800,12 @@ func TestTaskMetaValidation(t *testing.T) {
 		Meta: map[string]string{"k": ""}}); !errors.Is(err, ErrValidation) {
 		t.Fatalf("empty meta value at create err = %v, want ErrValidation", err)
 	}
+	// Two raw keys normalizing to the same key at create — nondeterministic
+	// winner, so the whole request is rejected.
+	if _, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "t",
+		Meta: map[string]string{"Auto": "a", "auto": "b"}}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("colliding meta keys at create err = %v, want ErrValidation", err)
+	}
 
 	tk, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "patchee"})
 	if err != nil {
@@ -2820,6 +2826,17 @@ func TestTaskMetaValidation(t *testing.T) {
 	// Oversized value via patch.
 	if _, _, err := st.PatchTask(tk.ID, map[string]any{"meta": map[string]any{"k": strings.Repeat("v", maxTitleLen+1)}}, "a"); !errors.Is(err, ErrValidation) {
 		t.Fatalf("501-byte patch value err = %v, want ErrValidation", err)
+	}
+	// Colliding raw keys via patch — rejected before any row is touched.
+	if _, _, err := st.PatchTask(tk.ID, map[string]any{"meta": map[string]any{"Auto": "a", "auto": "b"}}, "a"); !errors.Is(err, ErrValidation) {
+		t.Fatalf("colliding meta keys via patch err = %v, want ErrValidation", err)
+	}
+	got, err := st.GetTask(tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got.Meta["auto"]; ok {
+		t.Fatalf("meta after rejected collision = %v, want no auto key", got.Meta)
 	}
 }
 
