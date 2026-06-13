@@ -168,7 +168,11 @@ func requestLogger(next http.Handler) http.Handler {
 
 func (s *Server) handleListCategories(w http.ResponseWriter, r *http.Request) {
 	includeArchived := r.URL.Query().Get("archived") == "true"
-	cs, err := s.store.ListCategories(includeArchived)
+	// Stats (task counts + recently-active agents, 30-min window) are always
+	// folded into the payload — the dashboard's category-home view needs them and
+	// there is no scope enforcement here (the dashboard is unscoped: a human sees
+	// everything; category view is a query-param choice, not an identity scope).
+	cs, err := s.store.ListCategoriesWithStats(includeArchived, 30*time.Minute)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -851,8 +855,11 @@ func (s *Server) handleProjectGraph(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+	// ?category= scopes the feed to one category's projects; it EXCLUDES that
+	// category's own (NULL-project) events on purpose (see store.ListEvents).
+	cat := q.Get("category")
 	if t := q.Get("tail"); t != "" { // newest-first, for the dashboard feed bootstrap
-		evs, max, err := s.store.RecentEvents(q.Get("project"), atoiDefault(t, 40))
+		evs, max, err := s.store.RecentEvents(q.Get("project"), cat, atoiDefault(t, 40))
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -861,7 +868,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if b := q.Get("before"); b != "" { // newest-first, paging older events
-		evs, err := s.store.ListEventsBefore(atoi64Default(b, 0), q.Get("project"), atoiDefault(q.Get("limit"), 40))
+		evs, err := s.store.ListEventsBefore(atoi64Default(b, 0), q.Get("project"), cat, atoiDefault(q.Get("limit"), 40))
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -870,7 +877,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	since := atoi64Default(q.Get("since"), 0)
-	evs, last, err := s.store.ListEvents(since, q.Get("project"), atoiDefault(q.Get("limit"), 0))
+	evs, last, err := s.store.ListEvents(since, q.Get("project"), cat, atoiDefault(q.Get("limit"), 0))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -893,6 +900,23 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			pid = id
 		}
 	}
+	// ?category= scopes the stream to one category's projects. Resolve the
+	// project-id set ONCE here so Broadcast stays a pure in-memory check. An
+	// unknown category is ignored silently (matches the unknown-project swallow
+	// above) — the subscriber simply sees the unfiltered stream.
+	cat := q.Get("category")
+	var cid int64
+	var projectIDs map[int64]bool
+	if cat != "" {
+		if id, err := s.store.categoryID(cat); err == nil {
+			cid = id
+			if set, err := s.store.ProjectIDsInCategory(id); err == nil {
+				projectIDs = set
+			}
+		} else {
+			cat = "" // unknown category: fall back to unfiltered
+		}
+	}
 
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
@@ -901,7 +925,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	h.Set("X-Accel-Buffering", "no")
 
 	// Subscribe FIRST so no event is lost between snapshot and live stream.
-	sub := s.hub.Subscribe(pid)
+	sub := s.hub.Subscribe(subFilter{projectID: pid, categoryID: cid, projectIDs: projectIDs})
 	defer s.hub.Unsubscribe(sub)
 
 	// Resume point: Last-Event-ID header (set by EventSource on reconnect) or ?since=.
@@ -914,7 +938,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	// Replay the gap [since, maxAtSub] from the durable log.
 	if since < maxAtSub {
-		if evs, _, err := s.store.ListEvents(since, q.Get("project"), 500); err == nil {
+		if evs, _, err := s.store.ListEvents(since, q.Get("project"), cat, 500); err == nil {
 			for i := range evs {
 				if evs[i].ID > maxAtSub {
 					break

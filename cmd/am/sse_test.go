@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -208,5 +209,113 @@ func TestSSEReplayOnReconnect(t *testing.T) {
 		if id <= firstID {
 			t.Errorf("replayed id %d is not > firstID %d", id, firstID)
 		}
+	}
+}
+
+// openStream opens an SSE connection and waits for the retry: preamble, proving
+// the subscription is live before the caller triggers events.
+func openStream(t *testing.T, ctx context.Context, ts *httptest.Server, path string) (*http.Response, *bufio.Reader) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+path, nil)
+	if err != nil {
+		t.Fatalf("NewRequest %s: %v", path, err)
+	}
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stream %s status = %d, want 200", path, resp.StatusCode)
+	}
+	br := bufio.NewReader(resp.Body)
+	waitForRetry(t, ctx, br)
+	return resp, br
+}
+
+// TestSSECategoryScopedStream verifies /api/stream?category= delivers only the
+// scoped category's project events, lets the project.created carve-out through
+// regardless of category, and keeps a second subscriber on the other category
+// isolated.
+func TestSSECategoryScopedStream(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateCategory(t, ts, "acat")
+	mustCreateCategory(t, ts, "bcat")
+	mustCreateProjectIn(t, ts, "aproj", "acat")
+	mustCreateProjectIn(t, ts, "bproj", "bcat")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Subscriber A scoped to acat; subscriber B scoped to bcat.
+	respA, brA := openStream(t, ctx, ts, "/api/stream?category=acat")
+	defer respA.Body.Close()
+	respB, brB := openStream(t, ctx, ts, "/api/stream?category=bcat")
+	defer respB.Body.Close()
+
+	// A task in bproj must NOT reach A, but a task in aproj must.
+	mustCreateTask(t, ts, "bproj", "B Task")
+	mustCreateTask(t, ts, "aproj", "A Task")
+
+	// A should see the aproj task.created (and never the bproj one — the bproj
+	// event has a lower id, so if A wrongly delivered it, this read would catch
+	// the wrong title first).
+	ev := readSSEUntil(t, ctx, brA, func(e sseEvent) bool { return e.kind == "task.created" })
+	if !strings.Contains(ev.data, "A Task") {
+		t.Fatalf("subscriber A first task.created = %q, want the aproj task", ev.data)
+	}
+
+	// B should see its own task, not A's.
+	evB := readSSEUntil(t, ctx, brB, func(e sseEvent) bool { return e.kind == "task.created" })
+	if !strings.Contains(evB.data, "B Task") {
+		t.Fatalf("subscriber B first task.created = %q, want the bproj task", evB.data)
+	}
+
+	// project.created carve-out: a new project in bcat still reaches A (so a new
+	// tab can appear live even on a category-scoped dashboard).
+	mustCreateProjectIn(t, ts, "aproj2", "acat")
+	mustCreateProjectIn(t, ts, "bproj2", "bcat")
+	pc := readSSEUntil(t, ctx, brA, func(e sseEvent) bool { return e.kind == "project.created" })
+	if pc.kind != "project.created" {
+		t.Fatalf("subscriber A did not receive project.created carve-out")
+	}
+}
+
+// TestSSECategoryReconnectReplay verifies a category-scoped reconnect replays
+// only that category's gap events (not the other category's).
+func TestSSECategoryReconnectReplay(t *testing.T) {
+	ts, store := newTestServerWithStore(t)
+	mustCreateCategory(t, ts, "acat")
+	mustCreateCategory(t, ts, "bcat")
+	mustCreateProjectIn(t, ts, "aproj", "acat")
+	mustCreateProjectIn(t, ts, "bproj", "bcat")
+
+	// Capture a cursor, then create one task in each category during the "gap".
+	maxBefore, err := store.MaxEventID()
+	if err != nil {
+		t.Fatalf("MaxEventID: %v", err)
+	}
+	mustCreateTask(t, ts, "bproj", "B Gap")
+	mustCreateTask(t, ts, "aproj", "A Gap")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		ts.URL+"/api/stream?category=acat&since="+strconv.FormatInt(maxBefore, 10), nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("GET stream: %v", err)
+	}
+	defer resp.Body.Close()
+	br := bufio.NewReader(resp.Body)
+
+	// The first replayed task.created must be A's "A Gap" (B's "B Gap" has a lower
+	// event id, so if it were wrongly replayed it would arrive first).
+	ev := readSSEUntil(t, ctx, br, func(e sseEvent) bool { return e.kind == "task.created" })
+	if !strings.Contains(ev.data, "A Gap") {
+		t.Fatalf("first replayed task.created = %q, want the aproj task (bproj must be excluded)", ev.data)
 	}
 }

@@ -10,7 +10,11 @@ const PRIO_OPTS = ["0 — Urgent", "1 — High", "2 — Normal", "3 — Low"];
 const FEED_W_KEY = "am.feedW", FEED_COLLAPSED_KEY = "am.feedCollapsed";
 
 let projects = [];
-let selected = new Set();    // selected project slugs; empty = "All"
+let selected = new Set();    // selected project slugs; empty = "All" (within the current view)
+let view = "overview";       // "overview" (category home) | "all" (cross-category board) | "category"
+let activeCategory = "";     // category slug when view==="category"
+let categories = [];         // CategoryStat[] for the overview (counts + active_agents)
+let overviewTimer = null;    // debounce for live overview count refresh
 let tasks = new Map();       // id -> task (terse)
 let cursor = 0;              // highest event id seen (SSE since=)
 let es = null, backoff = 1000, refreshTimer = null, openTaskId = null, lastFocus = null, dragId = null;
@@ -70,11 +74,30 @@ async function api(method, path, body) {
   return data;
 }
 
+// viewParams returns the scope query params for data calls (board/feed/stream).
+// A single selected project always wins (?project=); otherwise a category view
+// scopes to its category (?category=); the "all" view and the overview's global
+// feed are unscoped.
+function viewParams() {
+  if (selected.size === 1) return { project: [...selected][0] };
+  if (view === "category" && activeCategory) return { category: activeCategory };
+  return {};
+}
+
 function qstr(extra) {
   const p = new URLSearchParams(extra || {});
-  if (selected.size === 1) p.set("project", [...selected][0]);
+  const scope = viewParams();
+  if (scope.project) p.set("project", scope.project);
+  else if (scope.category) p.set("category", scope.category);
   const s = p.toString();
   return s ? "?" + s : "";
+}
+
+// projectsInView is the set of projects relevant to the current view: the active
+// category's projects in a category board, or all projects in the "all" view.
+function projectsInView() {
+  if (view === "category" && activeCategory) return projects.filter((p) => p.category === activeCategory);
+  return projects;
 }
 
 function setStatus(text, cls) {
@@ -129,9 +152,12 @@ async function loadFeed() {
 
 function renderTabs() {
   const nav = $("tabs");
-  const allOpen = projects.reduce((n, p) => n + openCount(p.counts), 0);
+  const inView = projectsInView();
+  const allOpen = inView.reduce((n, p) => n + openCount(p.counts), 0);
+  // In a category board the "All" tab spans that category's projects; in the
+  // "all" view it spans every project.
   nav.replaceChildren(tab("", "All", allOpen));
-  for (const p of projects) nav.append(tab(p.slug, p.name, openCount(p.counts)));
+  for (const p of inView) nav.append(tab(p.slug, p.name, openCount(p.counts)));
   nav.append(el("button", { class: "tab add", onclick: openNewProject, title: "New project", "aria-label": "New project" }, "＋"));
   nav.append(el("button", { class: "tab add", onclick: openManageProjects, title: "Manage projects", "aria-label": "Manage projects" }, "⋯"));
 }
@@ -299,6 +325,125 @@ async function toggleProject(slug) {
   renderTabs();
   try { await loadBoard(); await loadFeed(); } catch (e) { setStatus("error", "warn"); }
   connect();
+}
+
+// ---------- view routing (hash) ----------
+//
+// #/            → overview (category home, the landing view)
+// #/all         → cross-category board (the original board behavior)
+// #/cat/<slug>  → a single category's board (drill-down)
+//
+// Navigation goes through the URL hash so views are linkable and the browser's
+// back button works; route() is the single place that maps a hash to view state.
+
+function navigate(hash) {
+  if (location.hash === hash) route(); // same hash → no hashchange fires; route directly
+  else location.hash = hash;
+}
+
+async function route() {
+  const h = location.hash || "#/";
+  let next = "overview", cat = "";
+  if (h === "#/all") next = "all";
+  else if (h.startsWith("#/cat/")) { next = "category"; cat = decodeURIComponent(h.slice("#/cat/".length)); }
+  await applyView(next, cat);
+}
+
+async function applyView(next, cat) {
+  view = next;
+  activeCategory = cat;
+  selected.clear(); // a view change resets the within-view project selection
+  document.body.classList.toggle("view-overview", view === "overview");
+  setBreadcrumb();
+  try {
+    if (view === "overview") {
+      await loadOverview();
+      await loadFeed(); // one global, unfiltered recent-activity feed on the overview
+    } else {
+      renderTabs();
+      await loadBoard();
+      await loadFeed();
+    }
+  } catch (e) {
+    setStatus("error", "warn");
+  }
+  connect(); // re-open the stream with the new scope (?category= or unfiltered)
+}
+
+// setBreadcrumb fills the header back/breadcrumb element for the current view.
+function setBreadcrumb() {
+  const bc = $("breadcrumb");
+  if (!bc) return;
+  bc.replaceChildren();
+  if (view === "overview") return; // overview is the root; no back element
+  bc.append(el("button", { class: "crumb-back", onclick: () => navigate("#/"), title: "Back to categories" }, "← Categories"));
+  if (view === "category" && activeCategory) {
+    const c = categories.find((x) => x.slug === activeCategory);
+    bc.append(el("span", { class: "crumb-current" }, (c && c.name) || activeCategory));
+  } else if (view === "all") {
+    bc.append(el("span", { class: "crumb-current" }, "All"));
+  }
+}
+
+// ---------- overview (category home) ----------
+
+async function loadOverview() {
+  categories = await api("GET", "/api/categories");
+  renderOverview();
+  setBreadcrumb(); // category names are now known
+}
+
+function renderOverview() {
+  const root = $("overview");
+  if (!root) return;
+  root.replaceChildren();
+  const grid = el("div", { class: "cat-grid" });
+  // An "All" card opens the cross-category board.
+  grid.append(allCard());
+  for (const c of categories) grid.append(catCard(c));
+  root.append(grid);
+}
+
+function allCard() {
+  const total = projects.reduce((n, p) => n + openCount(p.counts), 0);
+  const card = el("div", {
+    class: "cat-card cat-card-all", role: "link", tabindex: "0",
+    onclick: () => navigate("#/all"),
+    onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); navigate("#/all"); } },
+  });
+  card.append(el("div", { class: "cat-name" }, "All"));
+  card.append(el("div", { class: "cat-sub" }, total + " open across all categories"));
+  return card;
+}
+
+function catCard(c) {
+  const slug = c.slug;
+  const card = el("div", {
+    class: "cat-card", role: "link", tabindex: "0",
+    onclick: () => navigate("#/cat/" + encodeURIComponent(slug)),
+    onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); navigate("#/cat/" + encodeURIComponent(slug)); } },
+  });
+  card.append(el("div", { class: "cat-name" }, c.name || slug));
+  const counts = c.counts || {};
+  const chips = el("div", { class: "count-chips" });
+  for (const [key, label] of COLS) {
+    chips.append(el("span", { class: "count-chip", title: label },
+      el("span", { class: "swatch", style: "background:" + ST[key] }),
+      String(counts[key] || 0)));
+  }
+  card.append(chips);
+  const agents = (c.active_agents || []);
+  const row = el("div", { class: "active-agents" });
+  if (agents.length === 0) {
+    row.append(el("span", { class: "no-agents" }, "no active agents"));
+  } else {
+    for (const a of agents.slice(0, 6)) {
+      row.append(el("span", { class: "avatar active-agent-avatar", title: a }, initials(a)));
+    }
+    if (agents.length > 6) row.append(el("span", { class: "more-agents" }, "+" + (agents.length - 6)));
+  }
+  card.append(row);
+  return card;
 }
 
 // ---------- label filter ----------
@@ -822,7 +967,17 @@ function onEvent(ev) {
   $("feedList").prepend(feedItem(ev));
   trimFeed();
   if (ev.kind === "project.created" || ev.kind === "project.unarchived" ||
-      ev.kind === "category.archived" || ev.kind === "category.unarchived") loadProjects().catch(() => {});
+      ev.kind === "category.archived" || ev.kind === "category.unarchived" ||
+      ev.kind === "category.created") loadProjects().catch(() => {});
+  // Overview view: no board/modal to reconcile — keep the global feed live and
+  // debounce-refresh the category cards on any task/project/category change.
+  if (view === "overview") {
+    if (/^(task|project|category)\./.test(ev.kind)) {
+      clearTimeout(overviewTimer);
+      overviewTimer = setTimeout(() => loadOverview().catch(() => {}), 250);
+    }
+    return;
+  }
   if (ev.kind === "project.archived") {
     const archivedSlug = (ev.data || {}).slug;
     if (selected.has(archivedSlug)) {
@@ -884,7 +1039,9 @@ async function loadOlderActivity() {
   const limit = 50;
   try {
     const params = { before: String(feedOldest), limit: String(limit) };
-    if (selected.size === 1) params.project = [...selected][0];
+    const scope = viewParams();
+    if (scope.project) params.project = scope.project;
+    else if (scope.category) params.category = scope.category;
     const qs = new URLSearchParams(params);
     const res = await api("GET", "/api/events?" + qs.toString());
     const evs = res.events || [];
@@ -1074,10 +1231,14 @@ $("modal").onclick = (e) => { if (e.target.id === "modal") closeModal(); };
 document.addEventListener("keydown", onKey);
 initFeed();
 
+window.addEventListener("hashchange", () => { route().catch(() => {}); });
+
 (async function init() {
-  try { await loadProjects(); await loadBoard(); await loadFeed(); }
-  catch (e) { setStatus("error: " + e.message, "warn"); }
-  connect();
+  // Load projects first (the overview's "All" card and the board tabs both need
+  // them), then let route() apply the view named by the URL hash. route() handles
+  // its own data loads (overview vs board) and opens the stream.
+  try { await loadProjects(); } catch (e) { setStatus("error: " + e.message, "warn"); }
+  route().catch((e) => setStatus("error: " + e.message, "warn"));
 })();
 
 // ===================== dependency graph overlay =====================

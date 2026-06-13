@@ -101,6 +101,15 @@ type Category struct {
 	ArchivedAt string `json:"archived_at,omitempty"`
 }
 
+// CategoryStat is a Category augmented with the rollups the dashboard's
+// category-home view needs: task counts (summed over the category's non-archived
+// projects) and the agents active in the category within a recent window.
+type CategoryStat struct {
+	Category
+	Counts       map[string]int `json:"counts"`
+	ActiveAgents []string       `json:"active_agents"`
+}
+
 type Project struct {
 	ID             int64          `json:"id"`
 	UID            string         `json:"uid"` // stable id, amp_<16 hex>, never changes
@@ -487,6 +496,108 @@ func (s *Store) ListCategories(includeArchived bool) ([]Category, error) {
 			return nil, err
 		}
 		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ListCategoriesWithStats lists categories (honoring includeArchived) augmented
+// with task counts and recently-active agents. Counts sum each category's tasks
+// across its NON-archived projects (an archived project's tasks are excluded
+// even when includeArchived shows the category). Active agents are the distinct
+// non-human actors whose recent events touched a task in the category within
+// activeWindow. Two queries, merged in Go by category id.
+func (s *Store) ListCategoriesWithStats(includeArchived bool, activeWindow time.Duration) ([]CategoryStat, error) {
+	cats, err := s.ListCategories(includeArchived)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]CategoryStat, 0, len(cats))
+	byID := make(map[int64]*CategoryStat, len(cats))
+	for i := range cats {
+		out = append(out, CategoryStat{
+			Category:     cats[i],
+			Counts:       map[string]int{"todo": 0, "doing": 0, "blocked": 0, "done": 0},
+			ActiveAgents: []string{},
+		})
+	}
+	for i := range out {
+		byID[out[i].ID] = &out[i]
+	}
+
+	// Counts: only non-archived projects contribute tasks.
+	crows, err := s.db.Query(`SELECT c.id,
+	         COALESCE(SUM(t.status='todo'),0),
+	         COALESCE(SUM(t.status='doing'),0),
+	         COALESCE(SUM(t.status='blocked'),0),
+	         COALESCE(SUM(t.status='done'),0)
+	      FROM categories c
+	      LEFT JOIN projects p ON p.category_id = c.id AND p.archived_at IS NULL
+	      LEFT JOIN tasks t ON t.project_id = p.id
+	      GROUP BY c.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer crows.Close()
+	for crows.Next() {
+		var cid int64
+		var todo, doing, blocked, done int
+		if err := crows.Scan(&cid, &todo, &doing, &blocked, &done); err != nil {
+			return nil, err
+		}
+		if cs := byID[cid]; cs != nil {
+			cs.Counts = map[string]int{"todo": todo, "doing": doing, "blocked": blocked, "done": done}
+		}
+	}
+	if err := crows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Active agents: distinct non-human actors on task-bearing events within the
+	// window, keyed by category. task_id IS NOT NULL ensures comment.added counts
+	// (commenting is activity) while category-level events (project/category
+	// admin) do not. Ordered for stable output.
+	cutoff := time.Now().Add(-activeWindow).UTC().Format("2006-01-02T15:04:05.000Z")
+	arows, err := s.db.Query(`SELECT DISTINCT c.id, events.actor
+	      FROM events
+	      JOIN projects p ON p.id = events.project_id
+	      JOIN categories c ON c.id = p.category_id
+	      WHERE events.task_id IS NOT NULL
+	        AND events.actor != 'human'
+	        AND events.created_at > ?
+	      ORDER BY c.id, events.actor`, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer arows.Close()
+	for arows.Next() {
+		var cid int64
+		var actor string
+		if err := arows.Scan(&cid, &actor); err != nil {
+			return nil, err
+		}
+		if cs := byID[cid]; cs != nil {
+			cs.ActiveAgents = append(cs.ActiveAgents, actor)
+		}
+	}
+	return out, arows.Err()
+}
+
+// ProjectIDsInCategory returns the set of project ids belonging to a category,
+// by category id. Used by the hub to resolve a category subscription into a
+// project-id set once at Subscribe time (no per-event DB hits).
+func (s *Store) ProjectIDsInCategory(cid int64) (map[int64]bool, error) {
+	rows, err := s.db.Query("SELECT id FROM projects WHERE category_id=?", cid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[int64]bool)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
 	}
 	return out, rows.Err()
 }
@@ -2110,7 +2221,7 @@ func (s *Store) AddComment(id int64, author, body string) (*Comment, *Event, err
 
 // ---------- events / feed ----------
 
-func (s *Store) ListEvents(since int64, project string, limit int) ([]Event, int64, error) {
+func (s *Store) ListEvents(since int64, project, category string, limit int) ([]Event, int64, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 200
 	}
@@ -2127,7 +2238,19 @@ func (s *Store) ListEvents(since int64, project string, limit int) ([]Event, int
 		}
 		q += " AND events.project_id=?"
 		args = append(args, pid)
-	} else {
+	}
+	if category != "" {
+		cid, err := s.categoryID(category)
+		if err != nil {
+			return nil, since, err
+		}
+		// c.id=? matches only events whose project lives in the category. This
+		// intentionally EXCLUDES category-level events (NULL project_id) — they
+		// belong to the All/overview feed, not a single category's drill-down.
+		q += " AND c.id=?"
+		args = append(args, cid)
+	}
+	if project == "" && category == "" {
 		q += " AND (events.project_id IS NULL OR (p.archived_at IS NULL AND c.archived_at IS NULL))"
 	}
 	q += " ORDER BY events.id ASC LIMIT ?"
@@ -2155,7 +2278,7 @@ func (s *Store) ListEvents(since int64, project string, limit int) ([]Event, int
 // ListEventsBefore returns events with id < before, newest-first, up to limit.
 // It mirrors the archived-project filter used by ListEvents and RecentEvents.
 // Default limit 40, cap 200.
-func (s *Store) ListEventsBefore(before int64, project string, limit int) ([]Event, error) {
+func (s *Store) ListEventsBefore(before int64, project, category string, limit int) ([]Event, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 40
 	}
@@ -2172,7 +2295,18 @@ func (s *Store) ListEventsBefore(before int64, project string, limit int) ([]Eve
 		}
 		q += " AND events.project_id=?"
 		args = append(args, pid)
-	} else {
+	}
+	if category != "" {
+		cid, err := s.categoryID(category)
+		if err != nil {
+			return nil, err
+		}
+		// c.id=? excludes category-level (NULL project_id) events on purpose; see
+		// ListEvents.
+		q += " AND c.id=?"
+		args = append(args, cid)
+	}
+	if project == "" && category == "" {
 		q += " AND (events.project_id IS NULL OR (p.archived_at IS NULL AND c.archived_at IS NULL))"
 	}
 	q += " ORDER BY events.id DESC LIMIT ?"
@@ -2203,11 +2337,12 @@ func (s *Store) MaxEventID() (int64, error) {
 
 // RecentEvents returns the newest events first (for the dashboard feed bootstrap)
 // along with the max event id, which the client uses as its SSE cursor.
-func (s *Store) RecentEvents(project string, limit int) ([]Event, int64, error) {
+func (s *Store) RecentEvents(project, category string, limit int) ([]Event, int64, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 40
 	}
 	var args []any
+	var where []string
 	q := `SELECT events.id,COALESCE(events.project_id,0),COALESCE(events.task_id,0),events.actor,events.kind,events.data,events.created_at
 	      FROM events LEFT JOIN projects p ON p.id = events.project_id
 	      LEFT JOIN categories c ON c.id = p.category_id`
@@ -2216,11 +2351,23 @@ func (s *Store) RecentEvents(project string, limit int) ([]Event, int64, error) 
 		if err != nil {
 			return nil, 0, err
 		}
-		q += " WHERE events.project_id=?"
+		where = append(where, "events.project_id=?")
 		args = append(args, pid)
-	} else {
-		q += " WHERE (events.project_id IS NULL OR (p.archived_at IS NULL AND c.archived_at IS NULL))"
 	}
+	if category != "" {
+		cid, err := s.categoryID(category)
+		if err != nil {
+			return nil, 0, err
+		}
+		// c.id=? excludes category-level (NULL project_id) events on purpose; see
+		// ListEvents.
+		where = append(where, "c.id=?")
+		args = append(args, cid)
+	}
+	if project == "" && category == "" {
+		where = append(where, "(events.project_id IS NULL OR (p.archived_at IS NULL AND c.archived_at IS NULL))")
+	}
+	q += " WHERE " + strings.Join(where, " AND ")
 	q += " ORDER BY events.id DESC LIMIT ?"
 	args = append(args, limit)
 	rows, err := s.db.Query(q, args...)

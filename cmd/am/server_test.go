@@ -2272,3 +2272,102 @@ func TestScopeProjectCategoryEndpoints(t *testing.T) {
 		t.Fatalf("scoped delete of own project = %d, want 200", rdo.StatusCode)
 	}
 }
+
+// mustCreateProjectIn creates a project under an explicit category (the default
+// mustCreateProject lands in "general").
+func mustCreateProjectIn(t *testing.T, ts *httptest.Server, slug, category string) {
+	t.Helper()
+	resp := do(t, ts, http.MethodPost, "/api/projects",
+		`{"slug":"`+slug+`","name":"`+slug+`","category":"`+category+`"}`,
+		map[string]string{"Content-Type": "application/json"})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create project %q in %q = %d, want 201", slug, category, resp.StatusCode)
+	}
+}
+
+// eventKinds decodes the events array from an /api/events response body.
+func eventKinds(t *testing.T, resp *http.Response) []Event {
+	t.Helper()
+	defer resp.Body.Close()
+	var out struct {
+		Events []Event `json:"events"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode events: %v", err)
+	}
+	return out.Events
+}
+
+// TestEventsCategoryFilter verifies ?category= scopes the feed to one category's
+// project events, excluding category-level (NULL-project) events and other
+// categories' events, across the tail/before/since access modes.
+func TestEventsCategoryFilter(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateCategory(t, ts, "acat")
+	mustCreateCategory(t, ts, "bcat")
+	mustCreateProjectIn(t, ts, "aproj", "acat")
+	mustCreateProjectIn(t, ts, "bproj", "bcat")
+	aTask := mustCreateTask(t, ts, "aproj", "A task")
+	mustCreateTask(t, ts, "bproj", "B task")
+
+	// Default (?since=0): only acat's project events; no category.* and no bproj.
+	got := eventKinds(t, do(t, ts, http.MethodGet, "/api/events?category=acat", "", nil))
+	if len(got) == 0 {
+		t.Fatalf("?category=acat returned no events")
+	}
+	aTaskID, _ := strconv.ParseInt(aTask, 10, 64)
+	for _, e := range got {
+		if strings.HasPrefix(e.Kind, "category.") {
+			t.Fatalf("category-level event leaked into ?category=acat: %+v", e)
+		}
+		if e.TaskID != 0 && e.TaskID != aTaskID {
+			t.Fatalf("foreign-task event leaked into ?category=acat: %+v", e)
+		}
+	}
+	// Exactly the project.created for aproj and task.created for aTask.
+	wantKinds := map[string]bool{"project.created": false, "task.created": false}
+	for _, e := range got {
+		if _, ok := wantKinds[e.Kind]; ok {
+			wantKinds[e.Kind] = true
+		}
+	}
+	for k, seen := range wantKinds {
+		if !seen {
+			t.Fatalf("?category=acat missing expected %s event (got %d events)", k, len(got))
+		}
+	}
+
+	// ?tail= (newest-first bootstrap) honors the filter too.
+	tail := eventKinds(t, do(t, ts, http.MethodGet, "/api/events?category=acat&tail=50", "", nil))
+	for _, e := range tail {
+		if strings.HasPrefix(e.Kind, "category.") {
+			t.Fatalf("?tail with category leaked category-level event: %+v", e)
+		}
+		if e.ProjectID == 0 {
+			t.Fatalf("?tail with category leaked NULL-project event: %+v", e)
+		}
+	}
+
+	// ?before= (older-page) honors the filter.
+	maxID := int64(0)
+	for _, e := range got {
+		if e.ID > maxID {
+			maxID = e.ID
+		}
+	}
+	before := eventKinds(t, do(t, ts, http.MethodGet,
+		"/api/events?category=acat&before="+strconv.FormatInt(maxID+1, 10), "", nil))
+	for _, e := range before {
+		if e.ProjectID == 0 {
+			t.Fatalf("?before with category leaked NULL-project event: %+v", e)
+		}
+	}
+
+	// Unknown category → ErrNotFound surfaces as 404 (the categoryID sentinel).
+	rn := do(t, ts, http.MethodGet, "/api/events?category=nope", "", nil)
+	rn.Body.Close()
+	if rn.StatusCode != http.StatusNotFound {
+		t.Fatalf("?category=nope = %d, want 404", rn.StatusCode)
+	}
+}

@@ -39,7 +39,7 @@ func TestListEventsBefore(t *testing.T) {
 	_ = archTask
 
 	// Collect all event IDs in ascending order.
-	allEvs, _, err := st.ListEvents(0, "", 500)
+	allEvs, _, err := st.ListEvents(0, "", "", 500)
 	if err != nil {
 		t.Fatalf("ListEvents: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestListEventsBefore(t *testing.T) {
 
 	// before= the last event id: should return all but the last, newest-first.
 	lastID := allEvs[len(allEvs)-1].ID
-	got, err := st.ListEventsBefore(lastID, "", 100)
+	got, err := st.ListEventsBefore(lastID, "", "", 100)
 	if err != nil {
 		t.Fatalf("ListEventsBefore: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestListEventsBefore(t *testing.T) {
 	if _, _, err := st.ArchiveProject("archproj", "tester"); err != nil {
 		t.Fatal(err)
 	}
-	gotAfterArchive, err := st.ListEventsBefore(lastID+1, "", 100)
+	gotAfterArchive, err := st.ListEventsBefore(lastID+1, "", "", 100)
 	if err != nil {
 		t.Fatalf("ListEventsBefore after archive: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestListEventsBefore(t *testing.T) {
 	}
 
 	// Explicit project="archproj" should still return that project's events even archived.
-	archEvs, err := st.ListEventsBefore(lastID+1, "archproj", 100)
+	archEvs, err := st.ListEventsBefore(lastID+1, "archproj", "", 100)
 	if err != nil {
 		t.Fatalf("ListEventsBefore(archproj): %v", err)
 	}
@@ -99,7 +99,7 @@ func TestListEventsBefore(t *testing.T) {
 	}
 
 	// Limit is respected.
-	limited, err := st.ListEventsBefore(lastID+1, "", 2)
+	limited, err := st.ListEventsBefore(lastID+1, "", "", 2)
 	if err != nil {
 		t.Fatalf("ListEventsBefore limited: %v", err)
 	}
@@ -800,7 +800,7 @@ func TestFeedHidesArchivedProjectEvents(t *testing.T) {
 	}
 
 	// Unfiltered RecentEvents must NOT include any event whose project_id is alpha's.
-	recent, _, err := st.RecentEvents("", 50)
+	recent, _, err := st.RecentEvents("", "", 50)
 	if err != nil {
 		t.Fatalf("RecentEvents: %v", err)
 	}
@@ -811,7 +811,7 @@ func TestFeedHidesArchivedProjectEvents(t *testing.T) {
 	}
 
 	// Unfiltered ListEvents must NOT include alpha's events.
-	all, _, err := st.ListEvents(0, "", 200)
+	all, _, err := st.ListEvents(0, "", "", 200)
 	if err != nil {
 		t.Fatalf("ListEvents: %v", err)
 	}
@@ -822,7 +822,7 @@ func TestFeedHidesArchivedProjectEvents(t *testing.T) {
 	}
 
 	// Explicit project=alpha MUST still return alpha's events.
-	alphaEvs, _, err := st.RecentEvents("alpha", 50)
+	alphaEvs, _, err := st.RecentEvents("alpha", "", 50)
 	if err != nil {
 		t.Fatalf("RecentEvents(alpha): %v", err)
 	}
@@ -839,7 +839,7 @@ func TestFeedHidesArchivedProjectEvents(t *testing.T) {
 	if _, _, err := st.UnarchiveProject("alpha", "tester"); err != nil {
 		t.Fatal(err)
 	}
-	recentAfter, _, err := st.RecentEvents("", 50)
+	recentAfter, _, err := st.RecentEvents("", "", 50)
 	if err != nil {
 		t.Fatalf("RecentEvents after unarchive: %v", err)
 	}
@@ -919,7 +919,7 @@ func TestDeleteTaskCascadesComments(t *testing.T) {
 	}
 
 	// task.deleted event must exist.
-	evs, _, err := st.ListEvents(0, "web", 200)
+	evs, _, err := st.ListEvents(0, "web", "", 200)
 	if err != nil {
 		t.Fatalf("ListEvents: %v", err)
 	}
@@ -1069,7 +1069,7 @@ func TestEventsCursorStrictlyIncreasing(t *testing.T) {
 		t.Fatalf("PatchTask: %v", err)
 	}
 
-	all, last, err := st.ListEvents(0, "", 0)
+	all, last, err := st.ListEvents(0, "", "", 0)
 	if err != nil {
 		t.Fatalf("ListEvents: %v", err)
 	}
@@ -1087,7 +1087,7 @@ func TestEventsCursorStrictlyIncreasing(t *testing.T) {
 
 	// since-cursor: events after the first should exclude it.
 	cursor := all[0].ID
-	rest, _, err := st.ListEvents(cursor, "", 0)
+	rest, _, err := st.ListEvents(cursor, "", "", 0)
 	if err != nil {
 		t.Fatalf("ListEvents(since): %v", err)
 	}
@@ -1101,7 +1101,7 @@ func TestEventsCursorStrictlyIncreasing(t *testing.T) {
 	}
 
 	// RecentEvents returns newest first and the same max id.
-	recent, max, err := st.RecentEvents("", 0)
+	recent, max, err := st.RecentEvents("", "", 0)
 	if err != nil {
 		t.Fatalf("RecentEvents: %v", err)
 	}
@@ -2488,7 +2488,7 @@ func TestCategoryArchiveCascade(t *testing.T) {
 	}
 
 	// Default event feed hides events from projects in archived categories.
-	evs, _, err := st.ListEvents(0, "", 500)
+	evs, _, err := st.ListEvents(0, "", "", 500)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2499,7 +2499,7 @@ func TestCategoryArchiveCascade(t *testing.T) {
 		}
 	}
 	// Explicit ?project= still returns them (unchanged branch).
-	pevs, _, err := st.ListEvents(0, "pentest", 500)
+	pevs, _, err := st.ListEvents(0, "pentest", "", 500)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3336,5 +3336,110 @@ func TestNextTaskRaceScopedCategoryMeta(t *testing.T) {
 			t.Fatalf("task #%d claimed twice", r.task.ID)
 		}
 		seen[r.task.ID] = true
+	}
+}
+
+// TestListCategoriesCounts covers the stats folded into ListCategoriesWithStats:
+// task counts summed across a category's non-archived projects, and the distinct
+// non-human agents active within the window.
+func TestListCategoriesCounts(t *testing.T) {
+	st := openTestStore(t)
+
+	if _, _, err := st.CreateCategory("work", "Work"); err != nil {
+		t.Fatalf("CreateCategory work: %v", err)
+	}
+	// Two projects under "work"; one will be archived. mustCreateProject lands in
+	// "general", so create explicitly under the named category here.
+	for _, slug := range []string{"alpha", "beta"} {
+		if _, _, err := st.CreateProject(slug, slug, "work"); err != nil {
+			t.Fatalf("CreateProject %s: %v", slug, err)
+		}
+	}
+
+	// alpha: 2 todo, 1 doing, 1 done. beta (to be archived): 3 todo.
+	// Actor "human" on setup so the only non-human actors in the active-agents
+	// query are the ones the assertions deliberately introduce below.
+	mk := func(project, title, status string) int64 {
+		tk, _, err := st.CreateTask(CreateTaskInput{Project: project, Title: title, Actor: "human"})
+		if err != nil {
+			t.Fatalf("CreateTask %s/%s: %v", project, title, err)
+		}
+		if status != "todo" {
+			if _, _, err := st.PatchTask(tk.ID, map[string]any{"status": status}, "human"); err != nil {
+				t.Fatalf("PatchTask status %s: %v", status, err)
+			}
+		}
+		return tk.ID
+	}
+	mk("alpha", "a1", "todo")
+	mk("alpha", "a2", "todo")
+	mk("alpha", "a3", "doing")
+	mk("alpha", "a4", "done")
+	mk("beta", "b1", "todo")
+	mk("beta", "b2", "todo")
+	mk("beta", "b3", "todo")
+
+	// Archive beta — its tasks must drop out of the work category's counts.
+	if _, _, err := st.ArchiveProject("beta", "human"); err != nil {
+		t.Fatalf("ArchiveProject beta: %v", err)
+	}
+
+	cats, err := st.ListCategoriesWithStats(false, 30*time.Minute)
+	if err != nil {
+		t.Fatalf("ListCategoriesWithStats: %v", err)
+	}
+	var work *CategoryStat
+	for i := range cats {
+		if cats[i].Slug == "work" {
+			work = &cats[i]
+		}
+	}
+	if work == nil {
+		t.Fatalf("work category not found in %+v", cats)
+	}
+	// Only alpha contributes (beta archived): 2 todo, 1 doing, 0 blocked, 1 done.
+	want := map[string]int{"todo": 2, "doing": 1, "blocked": 0, "done": 1}
+	for k, v := range want {
+		if work.Counts[k] != v {
+			t.Fatalf("work counts[%s] = %d, want %d (counts=%+v)", k, work.Counts[k], v, work.Counts)
+		}
+	}
+
+	// Active agents: a comment by a non-human agent within the window counts;
+	// a comment whose event is backdated past the window does not; human never.
+	freshTask := mk("alpha", "fresh", "todo")
+	if _, _, err := st.AddComment(freshTask, "robo-fresh", "still here"); err != nil {
+		t.Fatalf("AddComment robo-fresh: %v", err)
+	}
+	if _, _, err := st.AddComment(freshTask, "human", "human comment"); err != nil {
+		t.Fatalf("AddComment human: %v", err)
+	}
+	// robo-old's only event is backdated outside the window.
+	oldEv, _, err := st.AddComment(freshTask, "robo-old", "long ago")
+	if err != nil {
+		t.Fatalf("AddComment robo-old: %v", err)
+	}
+	_ = oldEv
+	if _, err := st.db.Exec(
+		"UPDATE events SET created_at=? WHERE actor='robo-old' AND task_id=?",
+		"2020-01-01T00:00:00.000Z", freshTask); err != nil {
+		t.Fatalf("backdate robo-old event: %v", err)
+	}
+
+	cats, err = st.ListCategoriesWithStats(false, 30*time.Minute)
+	if err != nil {
+		t.Fatalf("ListCategoriesWithStats (2): %v", err)
+	}
+	work = nil
+	for i := range cats {
+		if cats[i].Slug == "work" {
+			work = &cats[i]
+		}
+	}
+	if work == nil {
+		t.Fatalf("work category not found (2)")
+	}
+	if len(work.ActiveAgents) != 1 || work.ActiveAgents[0] != "robo-fresh" {
+		t.Fatalf("active_agents = %v, want [robo-fresh] (human excluded, robo-old aged out)", work.ActiveAgents)
 	}
 }
