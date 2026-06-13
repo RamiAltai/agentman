@@ -23,6 +23,11 @@ convention is loose, it's called out.
   status, `-a` → assign, `-l` → label. One carve-out: `am show <id> -c` keeps meaning
   `--comments` — `main.go` rewrites `-c → --comments` for the `show` verb only
   (`rewriteShowComments`, before `parse()`).
+- **Repeatable value flags** register in the `multiFlags` map (`cli.go`, like `boolFlags` —
+  registration is global across verbs); every occurrence is collected in order into `Args.multi`
+  and read with `a.all(k)`. A flag is multi OR single (last-wins `Args.flags`), never both.
+  Prefer repetition over comma-splitting one value when values are opaque (may contain commas).
+  `--meta` is the first multi flag; it has no short alias.
 - Sentinel errors: `ErrNotFound`, `ErrConflict`, `ErrValidation`, `ErrProjectArchived` (→ HTTP 400 `project_archived`), `ErrCategoryArchived` (→ HTTP 400 `category_archived`); typed `*ConflictError{Assignee}`; typed `*BlockedError{OpenPrereqs []int64}` (→ HTTP 409 `{"error":"blocked","open_prereqs":[…]}`); typed `*NotStaleError{Assignee}` (→ HTTP 409 `{"error":"not_stale","assignee":…}`).
 - Event kinds: dotted `noun.verb` strings — `task.created`, `task.claimed`, `task.reclaimed`,
   `task.status`, `task.assign`, `task.patched`, `task.deleted`, `task.dep_added`,
@@ -66,7 +71,12 @@ convention is loose, it's called out.
 ## Validation
 
 - Status: `validStatus` map + SQL `CHECK`. Reject empty title/slug/body with `ErrValidation`.
-- `PatchTask` applies only known keys (`status/assignee/title/body/priority`) and ignores the rest.
+- `PatchTask` applies only known keys (`status/assignee/title/body/priority/meta`) and ignores
+  the rest.
+- Meta keys are normalized at the boundary (`normalizeMetaKey` — label rules: trim + lowercase,
+  1–50 chars of `a-z 0-9 . _ -`); values are opaque, 1–500 bytes (`maxTitleLen`; empty = remove,
+  PATCH only). Two raw keys normalizing to the same key in one request → `ErrValidation`
+  (deterministic all-or-nothing requests).
 
 ## Logging
 
@@ -92,7 +102,7 @@ convention is loose, it's called out.
 - `go test -race ./cmd/am/` (or `go test ./...`); table-driven tests (see `cmd/am/update_test.go`).
   Coverage spans pure logic, the store, HTTP, migrations, offline DB tooling, CLI verbs + exit codes,
   SSE streaming/reconnect, `am wait`, identity, and the dashboard XSS-sink guard — 10 test files,
-  174 tests.
+  199 tests.
 - **`osExit` testability var** — `cli.go` declares `var osExit = os.Exit`; `fail()` calls `osExit`
   rather than `os.Exit` directly. Tests in `cli_test.go` replace it via `captureExit(t, fn)`,
   which substitutes a panic-based stub so exit codes can be asserted without terminating the process.

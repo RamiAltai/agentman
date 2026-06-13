@@ -44,7 +44,9 @@ the port can read and mutate every project/task/comment.
 - The `?q=` search input is parameterized like everything else, run through `likeEscape` (so
   `%`/`_`/`\` can't act as LIKE wildcards) and capped at 500 bytes (→ 400); labels are validated by
   `normalizeLabel` against a strict charset (`^[a-z0-9._-]+$`, 1–50 bytes) before any SQL
-  (`cmd/am/store.go`).
+  (`cmd/am/store.go`). Meta keys (incl. the `?meta_key=` filter input) go through
+  `normalizeMetaKey` against the same charset; meta values are opaque but capped at 500 bytes and
+  always bound as parameters.
 
 ## Output Encoding
 

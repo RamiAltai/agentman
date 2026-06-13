@@ -173,8 +173,30 @@ The first phase of the agentic_brain integration train (requirements R1/R2/R3/R8
     existing projects, backfills uids; zero data loss; pre-v4 snapshots stay importable;
     `OpenStore` rejects a DB with a newer `schema_version` than the binary supports.
   - 4 new event kinds (total 21); +30 tests (now 174).
-  → ADR-025, `data-model.md`, `backend.md`, `CHANGELOG.md`. Phases **P** (task metadata),
-  **Q** (scoping enforcement), **R** (category dashboard), **S** (scope tokens) follow.
+  → ADR-025, `data-model.md`, `backend.md`, `CHANGELOG.md`. Phase **P** (task metadata) has
+  shipped (below); phases **Q** (scoping enforcement), **R** (category dashboard), and
+  **S** (scope tokens) follow.
+
+## Phase P — Task metadata (shipped, beyond original roadmap)
+
+The second phase of the agentic_brain train (requirement R7 in `agentman_requirements.md`,
+outside this repo). Tracked in `REVIEW.md` alongside Phases J–O.
+
+- [x] **P1 · Task metadata: `key=value` pairs + presence filters** — _L_ — **shipped (Phase P)**
+  - New `task_meta` table (`CREATE TABLE IF NOT EXISTS` — no migration step, schema version
+    stays 4); keys normalized like labels, values opaque ≤ 500 bytes; key PRESENCE is the
+    filterable unit.
+  - API: `"meta"` on `POST /api/tasks` (empty values rejected) and `PATCH /api/tasks/{id}`
+    (upsert; empty value removes; multi-key all-or-nothing; duplicate-after-normalization keys
+    rejected); `?meta_key=` on `GET /api/tasks`; `"meta_key"` on `POST /api/tasks/next`;
+    `meta` in list rows and `GET /api/tasks/{id}`.
+  - CLI: repeatable `--meta k=v` on `am new`/`am edit` (new `multiFlags` parser registry; all
+    flags fold into one request), single `--meta KEY` on `am ls`/`am next`/`am wait --ready`,
+    `meta:` line in `am show`. Dashboard: read-only modal Meta section + `(meta: …)` feed suffix.
+  - No new event kinds (`task.created`/`task.patched` deltas carry meta; total stays 21);
+    meta-only patches don't bump `updated_at`; `NextTask` refactored to a `NextFilter` struct
+    (Phase Q extension point); +25 tests (now 199).
+  → ADR-026, `data-model.md`, `backend.md`, `CHANGELOG.md`.
 
 ## Phase G — Security posture (deferred by design)
 
@@ -191,11 +213,12 @@ and only matter if the network bind ever widens. (`architecture/security.md`)
 
 ### Suggested order
 
-Phases A, B (except the ongoing B3 process), C, D, E, F, H, I, and O are **complete**. **G** stays
-parked unless the access model changes. For newer work, see `REVIEW.md` Phases J–O: Phase J
+Phases A, B (except the ongoing B3 process), C, D, E, F, H, I, O, and P are **complete**. **G**
+stays parked unless the access model changes. For newer work, see `REVIEW.md` Phases J–P: Phase J
 (correctness & hygiene), Phase K (stale-claim recovery — `am ls --stale`,
 `am claim --steal-stale`), Phase L (agent work loop — `am next`, `am wait`, bulk
-`status`/`assign`), Phase M (findability — `am ls --grep`/`--label`, `am label`), and Phase O
-(agentic_brain foundation — categories, stable IDs, vault binding, migration v4) have
-shipped; release binaries remain proposed, and the agentic_brain train continues with Phases
-P (task metadata), Q (scoping enforcement), R (category dashboard), and S (scope tokens).
+`status`/`assign`), Phase M (findability — `am ls --grep`/`--label`, `am label`), Phase O
+(agentic_brain foundation — categories, stable IDs, vault binding, migration v4), and Phase P
+(task metadata — `--meta` k=v pairs + presence-filtered `next`/`wait`) have shipped; release
+binaries remain proposed, and the agentic_brain train continues with Phases Q (scoping
+enforcement), R (category dashboard), and S (scope tokens).

@@ -23,11 +23,11 @@ POST  /api/projects                 handleCreateProject     {slug,name,category?
 PATCH /api/projects/{slug}          handlePatchProject      {slug?,name?,vault_project_id?,vault_path?} (uid/category never patchable; empty string clears a vault field; no-op → 200, no event; dup slug → 409)
 POST  /api/projects/{slug}/archive    handleArchiveProject
 POST  /api/projects/{slug}/unarchive  handleUnarchiveProject
-GET   /api/tasks                    handleListTasks         ?project=&category=&status=&assignee=&limit=&ready=true|&blocked=true|&stale=<dur>|&q=<text>|&label=<l>  (no scope ⇒ hides archived-project AND archived-category tasks; category composes with every other filter; stale = assigned + not done + no activity for ≥ dur; q = substring match on title OR body, ASCII-case-insensitive, > 500 bytes → 400; label = exact match after normalization, invalid → 400)
-POST  /api/tasks                    handleCreateTask        {project,title,body?,priority?,assignee?}  (archived category → 400 category_archived)
-GET   /api/tasks/{id}               handleGetTask           (task + comments + recent events + depends_on + blocks)
-PATCH /api/tasks/{id}               handlePatchTask         {status?,assignee?,title?,body?,priority?}  (hard-blocked if open prereqs + doing/done target)
-POST  /api/tasks/next               handleNext              {project?,category?,assignee?} atomic pick+claim of the best ready task (todo, unassigned, no open prereqs, non-archived project AND category); 404 when none qualifies (or bad slug)
+GET   /api/tasks                    handleListTasks         ?project=&category=&status=&assignee=&limit=&ready=true|&blocked=true|&stale=<dur>|&q=<text>|&label=<l>|&meta_key=<k>  (no scope ⇒ hides archived-project AND archived-category tasks; category composes with every other filter; stale = assigned + not done + no activity for ≥ dur; q = substring match on title OR body, ASCII-case-insensitive, > 500 bytes → 400; label = exact match after normalization, invalid → 400; meta_key = key-presence match after normalization, invalid → 400; rows include meta)
+POST  /api/tasks                    handleCreateTask        {project,title,body?,priority?,assignee?,meta?}  (archived category → 400 category_archived; empty meta values → 400)
+GET   /api/tasks/{id}               handleGetTask           (task + comments + recent events + depends_on + blocks + meta)
+PATCH /api/tasks/{id}               handlePatchTask         {status?,assignee?,title?,body?,priority?,meta?}  (hard-blocked if open prereqs + doing/done target; meta upsert — empty value removes the key; meta-only patch doesn't bump updated_at)
+POST  /api/tasks/next               handleNext              {project?,category?,assignee?,meta_key?} atomic pick+claim of the best ready task (todo, unassigned, no open prereqs, non-archived project AND category, carrying meta_key if given); 404 when none qualifies (or bad slug)
 POST  /api/tasks/{id}/claim         handleClaim             (atomic; X-Agent = claimant; hard-blocked if open prereqs → 409 blocked; body {"steal_stale":"<dur>"} → StealStaleClaim stale takeover, 409 not_stale if still fresh)
 POST  /api/tasks/{id}/comments      handleComment           {body}
 POST  /api/tasks/{id}/deps          handleAddDep            {depends_on: <id-or-ref>}  add prerequisite edge
@@ -77,7 +77,8 @@ Key methods: `CreateCategory`, `ListCategories`, `ArchiveCategory`, `UnarchiveCa
 `PatchProject`, `ArchiveProject`,
 `UnarchiveProject`, `DeleteProject`, `ListTasks`, `GetTask`, `CreateTask`, `PatchTask`,
 `ClaimTask`, `StealStaleClaim`, `NextTask`, `AddComment`, `DeleteComment`, `ListEvents`, `RecentEvents`,
-`ListEventsBefore`, `DeleteTask`, `AddDep`, `RemoveDep`, `AddLabel`, `RemoveLabel`, `ProjectGraph`.
+`ListEventsBefore`, `DeleteTask`, `AddDep`, `RemoveDep`, `AddLabel`, `RemoveLabel`, `ProjectGraph`,
+plus the meta helpers `normalizeMetaKey` and `applyMetaTx` (Phase P).
 `ArchiveProject`/`UnarchiveProject` (and their category counterparts) are transactional and
 idempotent (no event when already in the target state); all four project lifecycle paths load
 their response payload via the shared `getProjectTx`, so every project JSON carries the extended
@@ -129,6 +130,24 @@ matches `title LIKE ? ESCAPE '\' OR body LIKE ? ESCAPE '\'` with the pattern run
 ASCII-case-insensitive (SQLite LIKE semantics). The handler caps `?q=` at `maxTitleLen`
 (500 bytes) → 400, bounding LIKE work.
 
+**Task metadata** (Phase P / ADR-026): tasks carry free-form `key=value` pairs in the
+`task_meta` table. Keys are normalized by `normalizeMetaKey` (reuses `labelRe`/`maxLabelLen`:
+trim + lowercase, 1–50 chars of `a-z 0-9 . _ -`; failure → `ErrValidation` with its own message
+text); values are opaque, 1–500 bytes (`maxTitleLen`). `CreateTask` validates every pair up front
+(empty values rejected — removal has no meaning at create) and writes the rows + a `"meta"` field
+in the `task.created` event data in the insert tx. `PatchTask` routes a `"meta"` object through
+`applyMetaTx(tx, taskID, meta)` — a sorted-key walk that upserts via
+`INSERT … ON CONFLICT DO UPDATE`, deletes on an empty value (absent key = silent no-op), and
+returns a delta map (`{"k": [old, new]}`, `null` = absent) merged into the `task.patched` event;
+any error aborts the caller's tx, so multi-key patches are all-or-nothing. Both paths reject two
+raw keys that normalize to the same key (`duplicate meta key after normalization`). A
+**meta-only patch skips the `updated_at` bump** (metadata must not refresh a stale claim — the
+label/dep precedent); mixed patches still bump. `ListTasks` filters by **key presence** via
+`TaskFilter.MetaKey` (`?meta_key=`, an `EXISTS` on `task_meta`) and stitches each row's `meta`
+with **one follow-up SELECT** (values may contain `,`/`=`, so the labels `GROUP_CONCAT` trick is
+unsafe); `GetTask` loads meta too, but `getTaskTx` deliberately does **not** (labels parity —
+PATCH/claim responses omit it). **No new event kinds, error codes, or exit codes** were added.
+
 `ClaimTask` and `PatchTask` call the helper `hasOpenPrereqs` before writing: if any prerequisite
 task is not `done`, they return a `*BlockedError{OpenPrereqs: []int64{…}}`. `ClaimTask` blocks
 unconditionally on open prereqs; `PatchTask` blocks only when the target status is `doing` or
@@ -161,15 +180,18 @@ any activity (claim, patch, status, comment) keeps a claim fresh.
 **Atomic pick+claim** (`NextTask`, Phase L / ADR-023) extends the primitive with a subquery:
 `UPDATE … WHERE id = (SELECT t.id … WHERE t.status='todo' AND t.assignee IS NULL AND
 p.archived_at IS NULL AND c.archived_at IS NULL [AND t.project_id=?] [AND p.category_id=?]
-AND NOT EXISTS (<open-prereq>) ORDER BY t.priority ASC,
+[AND EXISTS (task_meta key)] AND NOT EXISTS (<open-prereq>) ORDER BY t.priority ASC,
 t.id ASC LIMIT 1) RETURNING id, project_id`. The open-prereq `NOT EXISTS` matches ListTasks' Ready
 filter exactly; ordering is priority ASC (0 = most urgent) with an id-ASC FIFO tiebreak
 (deliberately not `am ls`'s `updated_at DESC` display order — a pickup queue drains oldest-first).
 The archived-category exclusion is **unconditional** (scoped or not), like the archived-project
-rule; the optional category scope (`{"category"?}` in the body / `am next -c`) composes with the
-project scope.
-Zero rows ⇒ `ErrNotFound` (nothing ready, or — same 404, accepted ambiguity — a bad project or
-category slug).
+rule. Since Phase P the signature is **`NextTask(f NextFilter, agent string)`** with
+`NextFilter{Project, Category, MetaKey}` — the scope dimensions compose, and Phase Q extends the
+struct instead of widening the signature again. The `MetaKey` predicate is **textually identical
+to ListTasks'** (the wait/next invariant: a task that releases `am wait --ready --meta K` must be
+pickable by `am next --meta K`; enforced by comment at both sites).
+Zero rows ⇒ `ErrNotFound` (nothing ready, no carrier of the meta key, or — same 404, accepted
+ambiguity — a bad project or category slug).
 Emits the existing `task.claimed` event with the same payload shape as `ClaimTask`. Tasks already
 assigned to the caller are skipped (candidates require `assignee IS NULL`). `am wait` has **no
 server-side component** — it is a CLI-side SSE consumer over the existing `/api/stream` (see
@@ -190,9 +212,12 @@ See `data-model.md` for the schema.
 ## Models and Schemas
 
 Go structs in `cmd/am/store.go`: `Category`, `Project`, `Task`, `Comment`, `Event`, `TaskFilter`,
-`CreateTaskInput`. SQL schema in `cmd/am/schema.sql` (embedded via `//go:embed schema.sql`).
+`NextFilter`, `CreateTaskInput`. SQL schema in `cmd/am/schema.sql` (embedded via
+`//go:embed schema.sql`).
 `Category` and `Project` carry a stable `uid` (`amc_`/`amp_` + 16 hex, `newUID`); `Project`
-additionally carries `category` (slug), `vault_project_id`, and `vault_path`.
+additionally carries `category` (slug), `vault_project_id`, and `vault_path`. `Task` carries
+`Meta map[string]string` (`json:"meta,omitempty"`); `TaskFilter` and `NextFilter` carry `MetaKey`;
+`CreateTaskInput` carries `Meta`.
 
 ## Authentication and Authorization
 
@@ -211,6 +236,9 @@ trusted). No per-resource authorization. See `security.md` (ADR-002/ADR-011 in `
   server-side; `PatchProject` validates a new slug the same way).
 - Priority coerced via `toInt`. Unknown PATCH keys are ignored (only known fields applied in
   `PatchTask`).
+- Meta keys validated by `normalizeMetaKey` (1–50 chars of `a-z 0-9 . _ -` after trim+lowercase);
+  meta values 1–500 bytes (`maxTitleLen`; empty = remove, PATCH only); a non-object `meta`,
+  non-string values, or two raw keys normalizing to the same key → `ErrValidation` (400).
 - Handlers map `ErrValidation` → HTTP 400.
 - Creating a task into an archived project is rejected: `CreateTask` returns `ErrProjectArchived`
   → HTTP 400 `{"error":"project_archived"}`. Creating a task — or a project — under an archived
@@ -273,7 +301,7 @@ per request after completion: `METHOD PATH STATUS LATENCY ACTOR` (actor = `X-Age
 
 ## Testing
 
-There are ten test files (run `go test -race ./cmd/am/`; 174 tests, all green):
+There are ten test files (run `go test -race ./cmd/am/`; 199 tests, all green):
 - `cmd/am/update_test.go` — version-comparison logic.
 - `cmd/am/store_test.go` — atomic-claim race (concurrent, `-race`-clean), events-cursor monotonicity,
   store CRUD + validation (`ErrValidation`), project archive/unarchive round-trip + idempotency,
@@ -292,7 +320,12 @@ There are ten test files (run `go test -race ./cmd/am/`; 174 tests, all green):
   `TestTaskLabelsTableExistsOnReopenedDB`, and categories (Phase O): `TestCreateCategory`,
   `TestArchiveUnarchiveCategory`, `TestCreateProjectWithCategory`, `TestPatchProject`,
   `TestCategoryArchiveCascade`, `TestListTasksCategoryFilterComposes`,
-  `TestNextTaskCategoryScoping`, `TestCreateTaskArchivedCategory`.
+  `TestNextTaskCategoryScoping`, `TestCreateTaskArchivedCategory`, and task metadata (Phase P):
+  `TestTaskMetaCRUD`, `TestTaskMetaValidation` (incl. normalized-key collision rejection on
+  create and patch), `TestPatchTaskMetaAtomicOneEvent`, `TestPatchTaskMetaNoOpNoEvent`,
+  `TestMetaOnlyPatchDoesNotBumpUpdatedAt`, `TestNextTaskMetaFilter`,
+  `TestNextTaskMetaRaceDistinctWinners`, `TestListTasksMetaKeyFilter`,
+  `TestListTasksReturnsMeta`, `TestDeleteTaskCascadesMeta`, `TestTaskMetaTableExistsOnReopenedDB`.
 - `cmd/am/server_test.go` — validation→status mapping (400/404/409), `hostGuard`, `csrfGuard`,
   `securityHeaders`, `listenAddr` loopback regression, archive/unarchive endpoints + 404,
   hard-delete HTTP endpoints (`TestDeleteTaskEndpoint`, `TestDeleteProjectEndpoint`,
@@ -306,7 +339,9 @@ There are ten test files (run `go test -race ./cmd/am/`; 174 tests, all green):
   `TestLabelEndpoints` (add/remove label endpoints + validation 400),
   and Phase O: `TestCategoryEndpoints`, `TestProjectPayloadAndCategoryFilter`,
   `TestListTasksCategoryParam`, `TestNextEndpointCategoryBody`, `TestPatchProjectEndpoint`,
-  `TestCreateTaskArchivedCategory400`
+  `TestCreateTaskArchivedCategory400`,
+  and Phase P: `TestCreateTaskWithMeta`, `TestPatchTaskMetaEndpoint`, `TestNextEndpointMetaBody`,
+  `TestListTasksMetaKeyParam`
   (via `net/http/httptest`).
 - `cmd/am/migrate_test.go` — migration runner (apply/skip/idempotent/rollback), incl. the v2 step
   that adds `projects.archived_at`, the v3 step that adds `tasks.claimed_at`
@@ -335,7 +370,12 @@ There are ten test files (run `go test -race ./cmd/am/`; 174 tests, all green):
   Phase O added `TestCmdCategoryVerbs`, `TestCmdProjectNewRequiresCategory` (exit 5 without
   `-c`/`AGENTMAN_CATEGORY`), `TestCmdProjectEdit` (incl. explicit-empty vault clears),
   `TestCmdLsCategoryWireFormat`, `TestCmdNextCategory`, and the `-c` alias-rewrite regression
-  pair `TestCmdShowDashCStillPrintsComments` / `TestRewriteShowComments`.
+  pair `TestCmdShowDashCStillPrintsComments` / `TestRewriteShowComments`;
+  Phase P added `TestParseMultiFlag` (the `multiFlags`/`Args.multi` parser),
+  `TestCmdNewMetaWireFormat` (all `--meta` pairs in one POST; usage errors for `k=`/bare tokens),
+  `TestCmdEditMetaSinglePatch` (repeated flags fold into ONE PATCH), `TestCmdNextMetaWireFormat`,
+  `TestCmdLsMetaWireFormat` (single-key filter form; `key=value` rejected), and
+  `TestCmdShowPrintsMeta` (sorted `meta:` line).
 - `cmd/am/wait_test.go` — `am wait` (Phase L). `TestWaitDoneAlreadySatisfied`,
   `TestWaitDoneEventArrives`, `TestWaitDoneCrossProject` (`AGENTMAN_PROJECT` must not scope the
   `--done` stream), `TestWaitReadyOnPrereqDone` (blocked task becomes ready when its
@@ -343,7 +383,10 @@ There are ten test files (run `go test -race ./cmd/am/`; 174 tests, all green):
   `TestWaitServerDown` (exit 6), `TestWaitUsageErrors`, `TestParseWaitTimeout` (bare seconds +
   Go durations), `TestWaitBadTimeoutExit5`; Phase O added `TestWaitReadyCategoryScoped`,
   `TestWaitReadyCategoryEnv`, `TestWaitReadyCategoryTimeout` (`-c`/`AGENTMAN_CATEGORY` scope the
-  readiness re-check; the stream stays unscoped).
+  readiness re-check; the stream stays unscoped); Phase P added `TestWaitReadyMetaNoHotSpin`
+  (a meta-scoped wait doesn't release on non-carrier ready tasks),
+  `TestWaitReadyMetaReleasedByCreate`, `TestWaitReadyMetaReleasedByPrereqDone`, and
+  `TestWaitMetaUsageErrors` (`--done --meta` exit 1; two `--meta` / `key=value` exit 5).
 - `cmd/am/sse_test.go` — SSE streaming + reconnect (Phase E2). `TestSSEDeliversLiveEvent`
   subscribes to `/api/stream`, creates a task, and asserts the `task.created` event arrives live.
   `TestSSEReplayOnReconnect` reconnects with `Last-Event-ID` and asserts that events created while
@@ -367,7 +410,8 @@ brought the total to **95** at the time; Phase J's hygiene tests and Phase K's 1
 tests brought it to **107**; Phase L's 23 work-loop tests brought it to **130**; Phase M's 14
 findability tests (8 store, 2 server, 4 CLI — listed above) brought it to **144**; Phase O's 30
 category/stable-ID/vault/migration tests (8 store, 6 server, 7 CLI, 3 wait, 3 db, 3 migrate —
-listed above) bring it to **174**.
+listed above) brought it to **174**; Phase P's 25 task-metadata tests (11 store, 4 server,
+4 wait, 6 CLI — listed above) bring it to **199**.
 
 SSE streaming/reconnect, CLI verbs, exit-code mapping, and identity are now covered. The
 dashboard has a source-level XSS-sink guard but **no behavioral JS tests** — the project

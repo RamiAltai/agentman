@@ -87,6 +87,20 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   clean and fast; for large, dense DAGs edge crossings can accumulate. Mitigated by pan/zoom and
   the separate isolated-task grid lane. Acceptable for a personal board's scale.
 
+## Task-Metadata Residuals (Phase P)
+
+- **Values are presence-filtered only, by design** (Low). `?meta_key=`/`--meta KEY` match a key's
+  existence, never its value — a value-match filter would be a new decision (ADR-026). Workers
+  read values from `am show <id> --json`.
+- **List-row meta stitch adds one bind variable per returned row** (Low). `ListTasks` fills
+  `meta` via a follow-up `SELECT … WHERE task_id IN (?,?,…)` — one placeholder per row, bounded
+  by the list `limit` (the CLI sends 50; the dashboard 500), far below SQLite's bind-variable
+  ceiling. Revisit if the limit cap is ever raised dramatically.
+- **List payloads are no longer strictly terse** (Low). List rows now carry each task's full
+  `meta` map (values ≤ 500 bytes each) — a deliberate widening of the "terse projection"
+  convention so filters and workers don't need a per-task `GET`. Tasks with many large meta
+  values fatten every list response and SSE-triggered board reload.
+
 ## Security Risks
 
 (Full detail in `security.md`.)
@@ -107,7 +121,7 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 ## Testing Gaps
 
-- Coverage now spans store/server/migrate/db/cli/sse/identity/wait/web tests (10 files, 174 tests,
+- Coverage now spans store/server/migrate/db/cli/sse/identity/wait/web tests (10 files, 199 tests,
   `-race`-clean): the **atomic claim** (race, `-race`-clean), events cursor, store CRUD/validation,
   validation→status mapping, the Host/CSRF/CSP guards, project archive/unarchive (store round-trip
   + idempotency and the HTTP endpoints incl. 404), the v2 migration (adds `archived_at` +
@@ -179,10 +193,23 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   `TestMigrationV4ExistingDB`, `TestOpenStoreRejectsNewerSchema`), and db export/import
   (`TestExportContainsCategories`, `TestImportPreCategorySnapshot`,
   `TestImportRejectsNewerSchema`).
+  Phase P added 25 task-metadata tests: the store layer (`TestTaskMetaCRUD`,
+  `TestTaskMetaValidation` — incl. normalized-key collision rejection on create and patch,
+  `TestPatchTaskMetaAtomicOneEvent`, `TestPatchTaskMetaNoOpNoEvent`,
+  `TestMetaOnlyPatchDoesNotBumpUpdatedAt`, `TestNextTaskMetaFilter`,
+  `TestNextTaskMetaRaceDistinctWinners`, `TestListTasksMetaKeyFilter`,
+  `TestListTasksReturnsMeta`, `TestDeleteTaskCascadesMeta`,
+  `TestTaskMetaTableExistsOnReopenedDB`), the HTTP surface (`TestCreateTaskWithMeta`,
+  `TestPatchTaskMetaEndpoint`, `TestNextEndpointMetaBody`, `TestListTasksMetaKeyParam`),
+  meta-scoped waits (`TestWaitReadyMetaNoHotSpin`, `TestWaitReadyMetaReleasedByCreate`,
+  `TestWaitReadyMetaReleasedByPrereqDone`, `TestWaitMetaUsageErrors`), and the CLI
+  (`TestParseMultiFlag`, `TestCmdNewMetaWireFormat`, `TestCmdEditMetaSinglePatch`,
+  `TestCmdNextMetaWireFormat`, `TestCmdLsMetaWireFormat`, `TestCmdShowPrintsMeta`).
   **Still untested:** behavioral dashboard JS — the "Manage projects" modal, the delete confirm
   flows (task/comment/project), the feed pagination button, the dependency section UI (prereq chips,
   add-prereq dropdown, blocks list), the **graph overlay** (layout, pan/zoom, transitive highlight,
-  detail panel, live refresh), the search box and label chips/Labels section (Phase M),
+  detail panel, live refresh), the search box and label chips/Labels section (Phase M), the
+  read-only modal Meta section (Phase P),
   and other client-side logic — because the project deliberately
   adopts **no JS test runner** (preserves the no-npm/single-binary ethos; ADR-018). The
   `web_test.go` sink guard mitigates XSS regressions at the source level; the dependency UI and

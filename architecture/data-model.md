@@ -4,8 +4,8 @@
 
 Storage is a single **SQLite** database (default `~/.agentman/agentman.db`), WAL mode, owned by
 one writer process. Schema is in `cmd/am/schema.sql` (embedded and executed at startup by
-`store.OpenStore`). Eight tables: `meta`, `categories`, `projects`, `tasks`, `task_deps`,
-`task_labels`, `comments`, `events`.
+`store.OpenStore`). Nine tables: `meta`, `categories`, `projects`, `tasks`, `task_deps`,
+`task_labels`, `task_meta`, `comments`, `events`.
 All timestamps are ISO-8601 UTC **TEXT** (`strftime('%Y-%m-%dT%H:%M:%fZ','now')`), so they sort
 lexically.
 
@@ -19,6 +19,7 @@ lexically.
 | `tasks` | Tickets (status, priority, assignee, dual id) | `schema.sql`, `store.go Task` |
 | `task_deps` | Prerequisite edges between tasks (many-to-many, same-project only) | `schema.sql`, `store.go DepRef` |
 | `task_labels` | Free-form tags on tasks (many-to-many, label text stored inline — no catalog) | `schema.sql`, `store.go Task.Labels` |
+| `task_meta` | Free-form `key → value` pairs on tasks (values opaque; key PRESENCE is the filterable unit; no catalog) | `schema.sql`, `store.go Task.Meta` |
 | `comments` | Threaded notes on a task | `schema.sql`, `store.go Comment` |
 | `events` | Append-only mutation log = activity feed + SSE backbone + cursor | `schema.sql`, `store.go Event` |
 
@@ -57,6 +58,21 @@ lexically.
   ASCII-case-insensitive, which does **not** search labels or comments. Like `task_deps`, the
   table is added via `CREATE TABLE IF NOT EXISTS` in `schema.sql` — no migration-runner step, no
   version bump (ADR-024).
+- **`task_meta.(task_id, key)`** — composite PK; `task_id` is an FK to `tasks.id` with
+  `ON DELETE CASCADE`; index `idx_task_meta_key(key)` supports the presence filter. Like
+  `task_labels` there is no separate catalog — a key exists iff some task carries it. Keys are
+  normalized at the boundary (`normalizeMetaKey`, reusing the label rules: trimmed, lowercased,
+  1–50 chars of `a-z 0-9 . _ -` — the charset excludes `=`/space/`,`, keeping CLI `key=value`
+  tokens unambiguous); two raw keys that normalize to the same key in one request are rejected
+  (`400 validation`). **Values are opaque** strings, 1–500 bytes (`maxTitleLen`) — never
+  filterable; key **presence** is the filterable unit (`GET /api/tasks?meta_key=`,
+  `TaskFilter.MetaKey`, `NextFilter.MetaKey`). On PATCH an empty-string value **removes** the key
+  (absent-key removal is a silent no-op); at create empty values are rejected. Setting/removing
+  meta alone does **not** bump the task's `updated_at` (metadata must not refresh a stale claim —
+  the label/dep precedent). List rows include `meta` via a **follow-up SELECT** (values may
+  contain `,`/`=`, so the labels `GROUP_CONCAT` trick is unsafe here). Like `task_deps` and
+  `task_labels`, the table is added via `CREATE TABLE IF NOT EXISTS` in `schema.sql` — no
+  migration-runner step, no version bump (ADR-026).
 - **`projects.archived_at`** — TEXT, **NULL = active**; an ISO-8601 UTC timestamp set when the
   project is archived (`store.go ArchiveProject`) and cleared back to NULL on unarchive
   (`UnarchiveProject`). Soft-archive is reversible; default project lists hide archived rows.
@@ -91,14 +107,17 @@ lexically.
   delta like task patches (e.g. `{"slug":["old","new"]}`); the `category.*` kinds carry `{slug}`
   and have a **NULL `project_id`** (they reach unscoped SSE subscribers only — project-scoped
   subscribers filter on project id; Phase R revisits).
-- **`events.data`** — compact JSON delta, e.g. `{"status":["todo","doing"]}`.
+- **`events.data`** — compact JSON delta, e.g. `{"status":["todo","doing"]}`. Since Phase P a
+  `task.patched` delta may carry a `"meta"` sub-object (`{"meta":{"k":[old,new]}}`, `null` =
+  absent) and `task.created` data may carry `"meta":{k:v}` — same kinds, richer payloads (no new
+  event kinds were added; the catalog stays at 21).
 
 ### Indexes
 
 `idx_tasks_project_status(project_id,status)`, `idx_tasks_assignee(assignee)`,
 `idx_tasks_updated(updated_at)`, `idx_task_deps_prereq(depends_on_id)`,
-`idx_task_labels_label(label)`, `idx_comments_task(task_id,id)`, `idx_events_since(id)`,
-`idx_projects_uid(uid)` (UNIQUE), `idx_projects_category(category_id)`.
+`idx_task_labels_label(label)`, `idx_task_meta_key(key)`, `idx_comments_task(task_id,id)`,
+`idx_events_since(id)`, `idx_projects_uid(uid)` (UNIQUE), `idx_projects_category(category_id)`.
 
 ## Relationships
 
@@ -108,16 +127,17 @@ lexically.
 - `task_deps.task_id → tasks.id` — `ON DELETE CASCADE`.
 - `task_deps.depends_on_id → tasks.id` — `ON DELETE CASCADE`.
 - `task_labels.task_id → tasks.id` — `ON DELETE CASCADE`.
+- `task_meta.task_id → tasks.id` — `ON DELETE CASCADE`.
 - `comments.task_id → tasks.id` — `ON DELETE CASCADE`.
 - `events.project_id` / `events.task_id` — **denormalized, nullable, NOT foreign keys** (so events
   survive even if the referenced row is gone; e.g. `project.created` has no task). Confirmed:
   `schema.sql` defines no FK on `events`.
 
 Ownership: a category groups projects (no delete cascade — categories are only soft-archived);
-a project owns its tasks; a task owns its comments, its labels, and its dependency
+a project owns its tasks; a task owns its comments, its labels, its meta pairs, and its dependency
 edges (both directions cascade). Cascade deletes flow project → tasks → comments; deleting a task
-also removes its `task_labels` rows and all `task_deps` rows where it is either the dependent or
-the prerequisite. **Events are never deleted** (append-only).
+also removes its `task_labels` and `task_meta` rows and all `task_deps` rows where it is either
+the dependent or the prerequisite. **Events are never deleted** (append-only).
 
 ## Sensitive Data
 
@@ -136,10 +156,16 @@ the prerequisite. **Events are never deleted** (append-only).
   on task delete (both directions). Labels are attached via `POST /api/tasks/{id}/labels`
   (`AddLabel`, emits `task.labeled`) and removed via `DELETE /api/tasks/{id}/labels/{label}`
   (`RemoveLabel`, emits `task.unlabeled`); both are idempotent (no-op commits without an event)
-  and neither bumps the task's `updated_at`.
+  and neither bumps the task's `updated_at`. Meta pairs can be set at create time
+  (`POST /api/tasks` `"meta"`; written in the same tx, and the `task.created` event data then
+  includes `"meta"`).
 - **Update:** `tasks` (status/assignee/title/body/priority, plus `claimed_at` kept in step
   with the assignee — set on claim/steal/assign, NULLed on unassign); `updated_at` set explicitly
-  in each `UPDATE` (no trigger). Projects are also patchable since Phase O (`PatchProject`:
+  in each `UPDATE` (no trigger). `PATCH /api/tasks/{id}` also accepts `"meta"` (upsert via
+  `applyMetaTx`; empty value removes the key; multi-key all-or-nothing in one tx; the changed
+  keys appear as a `"meta"` sub-object in the `task.patched` delta, `{"k": [old, new]}` with
+  `null` for absent). A **meta-only patch does not bump `updated_at`** — mixed field+meta patches
+  still do. Projects are also patchable since Phase O (`PatchProject`:
   slug/name/`vault_project_id`/`vault_path`; `uid` and `category_id` never — one
   `project.patched` event per non-empty patch).
 - **Archive (soft, projects and categories):** a project can be **soft-archived** —
@@ -223,9 +249,9 @@ import snapshots.
 entirely new table (rather than altering an existing one), placing a `CREATE TABLE IF NOT EXISTS`
 in `schema.sql` is sufficient — `OpenStore` runs `schema.sql` on every start, so the new table
 appears in existing DBs automatically. The migration runner is only needed for `ALTER TABLE` on
-existing tables (where `IF NOT EXISTS` can't help). Examples: `task_deps` (Phase H) and
-`task_labels` (Phase M, ADR-024) were both added this way, with no `schemaMigrations` step and
-no `currentSchemaVersion` bump.
+existing tables (where `IF NOT EXISTS` can't help). Examples: `task_deps` (Phase H),
+`task_labels` (Phase M, ADR-024), and `task_meta` (Phase P, ADR-026) were all added this way,
+with no `schemaMigrations` step and no `currentSchemaVersion` bump.
 
 Backup/restore:
 
@@ -256,6 +282,7 @@ erDiagram
   tasks ||--o{ task_deps : "depends on (task_id)"
   tasks ||--o{ task_deps : "is prerequisite of (depends_on_id)"
   tasks ||--o{ task_labels : "tagged with"
+  tasks ||--o{ task_meta : "carries meta"
   categories {
     int id PK
     text uid UK "amc_<16 hex>, immutable"
@@ -295,6 +322,11 @@ erDiagram
   task_labels {
     int task_id FK "PK + cascade"
     text label "PK; normalized lowercase"
+  }
+  task_meta {
+    int task_id FK "PK + cascade"
+    text key "PK; normalized like labels"
+    text value "opaque, 1-500 bytes"
   }
   comments {
     int id PK

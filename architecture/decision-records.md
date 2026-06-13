@@ -697,6 +697,78 @@ without evidence.
   `cmd/am/web/app.js` (category feed cases, project-strip reload); the 30 Phase O tests listed
   in the CHANGELOG entry.
 
+### ADR-026: Task metadata — `task_meta` join table, key-presence filters, repeatable-flag CLI parser, empty-value removal, delta reuse with no new event kinds, `NextFilter` refactor (Phase P)
+- Status: Active
+- Context: The agentic_brain integration (requirement R7) needs free-form `key=value` pairs on
+  tasks — e.g. marking a task `auto=true` so an autonomous worker loop can wait for and pick up
+  exactly the tasks meant for it — with the pair settable at create and edit time and the key
+  filterable across `am ls`, `am next`, and `am wait --ready`. This is Phase P of the train ADR-025
+  opened; scoping enforcement (Phase Q) builds on the same filter plumbing.
+- Decision:
+  1. **`task_meta` join table, not a JSON column** — `task_meta(task_id, key, value)` with
+     composite PK `(task_id, key)`, `ON DELETE CASCADE`, and index `idx_task_meta_key`. Like
+     `task_labels` there is no separate catalog — a key exists iff some task carries it. A JSON
+     column would make the presence filter a string-scan instead of an indexed `EXISTS`. Shipped
+     via `CREATE TABLE IF NOT EXISTS` in `schema.sql` — **no migration step, no version bump**
+     (`currentSchemaVersion` stays 4; the `task_labels`/`task_deps` precedent; old DBs heal on
+     reopen, guarded by `TestTaskMetaTableExistsOnReopenedDB`).
+  2. **Repeatable-flag parser registry** (`multiFlags` + `Args.multi` + `a.all(k)`) rather than
+     comma-splitting one flag value — meta values are opaque and may contain commas; repetition is
+     the unambiguous CLI shape. A flag is multi OR single (last-wins), never both; `--meta` is the
+     first multi flag, is NOT in `boolFlags`, and has no short alias. Tokens split at the FIRST
+     `=`, so values may themselves contain `=`.
+  3. **Empty value removes on edit, `ErrValidation` on create** — PATCH needs a removal verb
+     inside one atomic body (`--meta k=` / `"k":""`); create has nothing to remove, so an empty
+     value there is a 400. Absent-key removal is a silent no-op.
+  4. **Keys normalized like labels, values opaque ≤ `maxTitleLen`** — `normalizeMetaKey` reuses
+     `labelRe`/`maxLabelLen` (trim, lowercase, 1–50 chars of `a-z 0-9 . _ -`): keys are
+     filter/index material, and the charset excludes `=`/space/`,`, keeping CLI tokens and any
+     future concat safe. Values render on cards/SSE payloads so they get the 500-byte title cap,
+     but are otherwise uninterpreted.
+  5. **Duplicate keys after normalization are rejected** (create AND patch) — two raw keys
+     collapsing to one normalized key (`{"Auto":"a","auto":"b"}`) would make the winner
+     map-iteration-nondeterministic and record a just-written value as "old" in the delta;
+     instead `400 validation` with `duplicate meta key after normalization: "auto"`. Keeps
+     requests deterministic and all-or-nothing. **No new error codes, no new exit codes.**
+  6. **Reuse `task.created`/`task.patched` instead of new event kinds** — the catalog stays at
+     **21**. `task.created` data gains `"meta": {k: v}`; `task.patched` gains a `"meta"`
+     sub-object in the existing delta shape (`{"meta": {"k": [old, new]}}`, `null` = absent), so
+     old/new are preserved for audit. One event per PATCH regardless of key count; `applyMetaTx`
+     walks keys in sorted order so payloads and failure points are deterministic, and any error
+     aborts the caller's tx (multi-key atomicity).
+  7. **Meta-only patches do NOT bump `updated_at`** — meta is metadata like labels; refreshing
+     the activity timestamp would keep a stale claim alive (`--steal-stale` judges staleness from
+     `updated_at` — the ADR-022/ADR-024 `AddLabel`/dep-edge precedent). Mixed field+meta patches
+     still bump. Guarded by `TestMetaOnlyPatchDoesNotBumpUpdatedAt`.
+  8. **Meta in `ListTasks`/`GetTask` but not `getTaskTx`** (labels parity) — the terse tx-internal
+     read stays cheap, so PATCH/claim responses omit meta like they omit labels. The list stitch
+     is **one follow-up SELECT, not `GROUP_CONCAT`** — values may contain the separator, so the
+     labels concat trick is unsafe; one extra parameterized query per list call is the safe shape.
+  9. **`NextTask(project, category, agent)` → `NextTask(f NextFilter, agent)`** with
+     `NextFilter{Project, Category, MetaKey}` — a fourth string parameter would be unreadable and
+     Phase Q adds more scope dimensions; extending the struct beats widening the signature again.
+  10. **Same-predicate next/wait invariant** — the NextTask meta predicate is textually identical
+      to ListTasks' `MetaKey` predicate (enforced by comment at both sites): a task that releases
+      `am wait --ready --meta K` must be pickable by `am next --meta K`, so a worker loop can't
+      hot-spin on a wait that `next` then refuses. `--meta` on `wait --ready` narrows only the
+      REST re-check, never the SSE stream (ADR-023: event payloads are triggers, not state).
+- Rationale: every piece rides proven machinery — the `EXISTS` filter builder, the
+  `CREATE TABLE IF NOT EXISTS` no-migration path, the delta-event shape, the conditional-UPDATE
+  pickup — so the change surface is small; presence-only filtering keeps the predicate cheap and
+  indexed while values stay free-form; rejecting normalization collisions buys determinism for
+  the price of one map lookup.
+- Consequences: values are not filterable (presence only — a value-match filter would be a new
+  decision); list responses grow by the tasks' meta payloads (values ≤ 500 bytes each); the list
+  stitch adds one bind variable per returned row (bounded by the list `limit`); the dashboard can
+  display but not edit meta (CLI/API-only writes for now).
+- Evidence: `cmd/am/schema.sql` (`task_meta` + `idx_task_meta_key`); `cmd/am/store.go`
+  (`normalizeMetaKey`, `applyMetaTx`, `Task.Meta`, `TaskFilter.MetaKey`, `NextFilter`,
+  `CreateTaskInput.Meta`, the ListTasks stitch, the NextTask predicate comment); `cmd/am/server.go`
+  (`meta` in create/patch bodies, `?meta_key=`, `meta_key` in `handleNext`); `cmd/am/cli.go`
+  (`multiFlags`, `parseMetaFlags`, `metaKeyArg`, `cmdShow` meta line); `cmd/am/wait.go`
+  (`checkReady` metaKey); `cmd/am/web/app.js` (modal Meta section, `task.patched` feed suffix);
+  the 25 Phase P tests listed in the CHANGELOG entry.
+
 ## Inferred Decisions
 
 ### IADR-001: SSE chosen over WebSockets

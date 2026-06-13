@@ -40,7 +40,7 @@ via `//go:embed`, so a running/old binary serves stale assets. Hard-refresh the 
 ## Running Tests
 
 ```sh
-go test -race ./cmd/am/                     # run all tests with the race detector (174 tests)
+go test -race ./cmd/am/                     # run all tests with the race detector (199 tests)
 go test ./...                               # equivalent short form
 go test -run TestUpdateAvailable -v ./cmd/am/
 ```
@@ -58,7 +58,11 @@ Tests live next to the code in `cmd/am/` (10 test files):
   filter, delete cascade, no `updated_at` bump, fresh-table existence); and categories (Phase O):
   create/archive/unarchive, project-in-category creation, `PatchProject`, the archived-category
   cascade, the composing `?category=` task filter, category-scoped `NextTask`, and task creation
-  into an archived category rejected.
+  into an archived category rejected; and task metadata (Phase P): meta CRUD + validation (incl.
+  duplicate-after-normalization rejection), one-event atomic multi-key patches, no-op patches
+  emit no event, meta-only patches don't bump `updated_at`, the meta-filtered `NextTask` (incl.
+  the distinct-winners race), the `MetaKey` list filter, list rows returning meta, delete
+  cascade, and fresh-table existence on reopen.
 - `server_test.go` — HTTP status mapping (404 / 400 / lost-claim 409), the Host/CSRF guards and
   security headers, the archive/unarchive endpoints, HTTP 400 on task creation into an archived
   project (`TestCreateTaskIntoArchivedProject400`), `TestWriteErrHidesInternalDetail` (500 returns
@@ -68,7 +72,8 @@ Tests live next to the code in `cmd/am/` (10 test files):
   (`TestListTasksQueryParam`), the label endpoints (`TestLabelEndpoints`), and the Phase O
   surfaces (`TestCategoryEndpoints`, `TestProjectPayloadAndCategoryFilter`,
   `TestListTasksCategoryParam`, `TestNextEndpointCategoryBody`, `TestPatchProjectEndpoint`,
-  `TestCreateTaskArchivedCategory400`).
+  `TestCreateTaskArchivedCategory400`), and the Phase P meta surfaces (`TestCreateTaskWithMeta`,
+  `TestPatchTaskMetaEndpoint`, `TestNextEndpointMetaBody`, `TestListTasksMetaKeyParam`).
 - `migrate_test.go` — the forward-only migration runner (apply + version bump, skip ≤ current,
   idempotency, rollback), the v2 `archived_at` / v3 `claimed_at` columns, the v4
   category/stable-ID/vault migration (`TestMigrationV4Fresh`, `TestMigrationV4ExistingDB`), and
@@ -90,7 +95,10 @@ Tests live next to the code in `cmd/am/` (10 test files):
   Phase O category verbs (`TestCmdCategoryVerbs`, `TestCmdProjectNewRequiresCategory`,
   `TestCmdProjectEdit`, `TestCmdLsCategoryWireFormat`, `TestCmdNextCategory`, and the
   `am show -c` alias-rewrite regression `TestCmdShowDashCStillPrintsComments` /
-  `TestRewriteShowComments`); and pure
+  `TestRewriteShowComments`); the Phase P `--meta` surface (`TestParseMultiFlag` — the repeatable
+  `multiFlags` parser, `TestCmdNewMetaWireFormat`, `TestCmdEditMetaSinglePatch` — repeated flags
+  fold into one PATCH, `TestCmdNextMetaWireFormat`, `TestCmdLsMetaWireFormat`,
+  `TestCmdShowPrintsMeta`); and pure
   formatter/parse table tests.
 - `sse_test.go` — SSE streaming + reconnect (Phase E2). `TestSSEDeliversLiveEvent` opens
   `/api/stream`, creates a task, and asserts the `task.created` event arrives live.
@@ -107,7 +115,9 @@ Tests live next to the code in `cmd/am/` (10 test files):
   must not scope the `--done` stream) waits; exit 7 on timeout, exit 3 not-found, exit 6 server
   down, usage errors, and the `parseWaitTimeout` table. Phase O added the category-scoped
   `--ready` waits (`TestWaitReadyCategoryScoped`, `TestWaitReadyCategoryEnv`,
-  `TestWaitReadyCategoryTimeout`).
+  `TestWaitReadyCategoryTimeout`); Phase P added the meta-scoped `--ready` waits
+  (`TestWaitReadyMetaNoHotSpin`, `TestWaitReadyMetaReleasedByCreate`,
+  `TestWaitReadyMetaReleasedByPrereqDone`, `TestWaitMetaUsageErrors`).
 
 Behavioral dashboard JS (the modal flows, delete confirms, feed pagination) remains untested —
 see `known-risks-and-gaps.md`. New behavioral tests are welcome.

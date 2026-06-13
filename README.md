@@ -124,6 +124,9 @@ The embedded web UI (no build step, no npm) is a live kanban board:
   live SSE reloads). Cards show up to 3 **label chips** (then a `+N` overflow chip) — click a chip
   to filter the board by that label (a header chip with ✕ clears it). The task modal has a
   **Labels** section: chips with ✕ remove buttons and an "Add label…" input that submits on Enter.
+- **Task metadata:** the task modal shows a read-only **Meta** section listing the task's
+  `key=value` pairs (set via `am new`/`am edit --meta k=v`), and `task.patched` feed lines note
+  which meta keys changed.
 - **Stale claims:** a card in *In Progress* with an assignee and no activity for 30+ minutes
   shows an amber **⏳ stale** chip, and a stale-claim takeover (`am claim --steal-stale`)
   appears in the activity feed as *"X reclaimed #N from Y"*.
@@ -171,17 +174,17 @@ Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting 
 
 | Command | What it does |
 |---|---|
-| `am ls [--mine] [--status S] [-p P] [-c CAT] [--all] [--ready] [--blocked] [--stale D] [--grep TEXT] [--label L]` | list tasks (hides done; `-c` = category scope; `--ready` = todo with no open prereqs; `--blocked` = ≥1 open prereq; `--stale D` = assigned, not done, no activity for D — Go duration, e.g. `30m`, `48h`; `--grep` = substring match on title or body, ASCII-case-insensitive; `--label`/`-l` = tasks carrying that label) |
-| `am show <id> [-c]` | task detail + `depends on:` / `blocks:` lines; comments with `-c` (for `show` only, `-c` means comments, not category) |
-| `am new "title" [--body B] [-p P] [--priority N]` | create a task; prints the new id (no `-c` — the project determines the category) |
+| `am ls [--mine] [--status S] [-p P] [-c CAT] [--all] [--ready] [--blocked] [--stale D] [--grep TEXT] [--label L] [--meta KEY]` | list tasks (hides done; `-c` = category scope; `--ready` = todo with no open prereqs; `--blocked` = ≥1 open prereq; `--stale D` = assigned, not done, no activity for D — Go duration, e.g. `30m`, `48h`; `--grep` = substring match on title or body, ASCII-case-insensitive; `--label`/`-l` = tasks carrying that label; `--meta KEY` = tasks carrying that meta key) |
+| `am show <id> [-c]` | task detail + `depends on:` / `blocks:` / `meta:` lines; comments with `-c` (for `show` only, `-c` means comments, not category) |
+| `am new "title" [--body B] [-p P] [--priority N] [--meta k=v]...` | create a task; prints the new id (no `-c` — the project determines the category; `--meta` is repeatable) |
 | `am claim <id> [--steal-stale D]` | atomic: assign me + → doing (exit 4 if already taken **or** has open prereqs); `--steal-stale D` takes over a claim idle for ≥ D (exit 4 with `not stale yet` if still fresh) |
-| `am next [-p P] [-c CAT]` | atomic pick + claim of the best ready task (priority, then FIFO); prints its id; exit 3 if nothing is ready |
+| `am next [-p P] [-c CAT] [--meta KEY]` | atomic pick + claim of the best ready task (priority, then FIFO; `--meta` = only tasks carrying that key); prints its id; exit 3 if nothing is ready |
 | `am wait <id> --done [--timeout D]` | block until the task is done (exit 7 on timeout; default 10m; D is a Go duration or seconds) |
-| `am wait --ready [-p P] [-c CAT] [--timeout D]` | block until some ready task exists; prints its id |
+| `am wait --ready [-p P] [-c CAT] [--meta KEY] [--timeout D]` | block until some ready task exists (in scope); prints its id |
 | `am status <id...> <todo\|doing\|blocked\|done>` | change status — several ids at once is fine (blocked → 409 if doing/done and open prereqs) |
 | `am assign <id...> <agent\|me\|->` | reassign one or more tasks (`-` = unassign) |
 | `am note <id> "text"` | add a comment (alias: `comment`) |
-| `am edit <id> [--title T] [--body B] [--priority N]` | edit fields |
+| `am edit <id> [--title T] [--body B] [--priority N] [--meta k=v]...` | edit fields; `--meta` is repeatable and applies in one atomic edit — `--meta k=` (empty value) removes the key |
 | `am drop <id>` | release: unassign + → todo |
 | `am rm <id>` | hard-delete a task (permanent; cascades its comments + dep edges); exit 3 if not found |
 | `am dep add <id> <prereq> [prereq…]` | add one or more prerequisites to a task (same project; rejects cycles) |
@@ -212,9 +215,9 @@ actor.
 
 ```
 GET    /api/categories?archived=true             GET    /api/tasks/{id}          (returns depends_on + blocks)
-POST   /api/categories {slug,name?}              PATCH  /api/tasks/{id} {status?,assignee?,title?,body?,priority?}
+POST   /api/categories {slug,name?}              PATCH  /api/tasks/{id} {status?,assignee?,title?,body?,priority?,meta?}
 POST   /api/categories/{slug}/archive            POST   /api/tasks/{id}/claim    (409 if open prereqs; body {"steal_stale":"<dur>"} = stale takeover, 409 not_stale if fresh)
-POST   /api/categories/{slug}/unarchive          POST   /api/tasks/next         {project?,category?} atomic pick+claim of the best ready task (404 if none)
+POST   /api/categories/{slug}/unarchive          POST   /api/tasks/next         {project?,category?,meta_key?} atomic pick+claim of the best ready task (404 if none)
 GET    /api/projects?category=<slug>             POST   /api/tasks/{id}/comments {body}
 POST   /api/projects {slug,name,category?}       DELETE /api/tasks/{id}/comments/{cid}
 PATCH  /api/projects/{slug} {slug?,name?,         POST   /api/tasks/{id}/deps {depends_on:<id-or-ref>}
@@ -223,8 +226,8 @@ DELETE /api/projects/{slug}                      POST   /api/tasks/{id}/labels {
 POST   /api/projects/{slug}/archive              DELETE /api/tasks/{id}/labels/{label}
 POST   /api/projects/{slug}/unarchive
 GET    /api/tasks?project=&category=&status=&assignee=
-       &ready=true|&blocked=true|&stale=<dur>|&q=<text>|&label=<l>
-POST   /api/tasks {project,title,...}            DELETE /api/tasks/{id}
+       &ready=true|&blocked=true|&stale=<dur>|&q=<text>|&label=<l>|&meta_key=<k>
+POST   /api/tasks {project,title,meta?,...}      DELETE /api/tasks/{id}
 GET    /api/events?since=|?tail=|?before=        GET    /api/stream  (SSE)
 GET    /api/projects/{slug}/graph               {nodes,edges}; read-only DAG (no events)
 ```
@@ -233,6 +236,11 @@ Category and project payloads carry a **stable id** (`uid`: `amc_…` / `amp_…
 changes across slug renames — bind external systems to it, not the slug. Projects also carry
 optional `vault_project_id` / `vault_path` binding fields. Creating into an archived category
 fails with `400 {"error":"category_archived"}`.
+
+Tasks carry optional free-form **metadata** (`"meta": {"k":"v", …}`): keys are normalized like
+labels (lowercase, 1–50 chars of `a-z 0-9 . _ -`), values are opaque strings up to 500 bytes.
+Set pairs on create or PATCH (an empty-string value removes the key); filter by key **presence**
+with `?meta_key=` / the `meta_key` next-body field. Task JSON includes `"meta"` when present.
 
 ```sh
 curl -s 127.0.0.1:8787/api/tasks?project=web

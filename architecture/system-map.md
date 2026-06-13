@@ -22,7 +22,7 @@ broadcast → dashboard**. Confirmed via `cmd/am/main.go`, `cmd/am/server.go`, `
 | `cmd/am/hub.go` | SSE subscriber hub (broadcast/fan-out) | `Hub`, `subscriber` |
 | `cmd/am/store.go` | All SQLite access; types; atomic claim; events | `Store` + domain structs |
 | `cmd/am/db.go` | `am db export`/`import`/`prune` (offline snapshot/restore/retention) | `cmdDB`, `exportDB`, `importDB`, `pruneEvents` |
-| `cmd/am/schema.sql` | DB schema (embedded) | `meta/categories/projects/tasks/task_deps/task_labels/comments/events` |
+| `cmd/am/schema.sql` | DB schema (embedded) | `meta/categories/projects/tasks/task_deps/task_labels/task_meta/comments/events` |
 | `cmd/am/client.go` | CLI HTTP client; HTTP-status → exit-code mapping | `Client`, `doOrFail`, `exitCodeFor` |
 | `cmd/am/cli.go` | CLI verb parsing + terse/JSON formatters | `cmd*`, `parse`, `fail` |
 | `cmd/am/wait.go` | `am wait` (SSE-driven blocking waits, exit 7 on timeout) | `cmdWait`, `waiter`, `readSSEFrame` |
@@ -80,11 +80,13 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   `GET/POST /api/tasks` (`?category=<slug>` scopes by category; `?ready=true` / `?blocked=true`
   filter by prereq state; `?stale=<dur>`
   filters to assigned, not-done tasks with no activity for ≥ dur; `?q=<text>` substring search on
-  title OR body; `?label=<l>` exact label match),
-  `GET/PATCH /api/tasks/{id}` (GET returns `depends_on`/`blocks`),
-  `DELETE /api/tasks/{id}` (hard-delete + cascade to comments + dep edges),
+  title OR body; `?label=<l>` exact label match; `?meta_key=<k>` meta-key presence match; POST
+  takes optional `meta` key=value pairs),
+  `GET/PATCH /api/tasks/{id}` (GET returns `depends_on`/`blocks` + `meta`; PATCH takes optional
+  `meta` — empty value removes a key; meta-only patches don't bump `updated_at`),
+  `DELETE /api/tasks/{id}` (hard-delete + cascade to comments + dep edges + meta),
   `POST /api/tasks/next` (atomic pick+claim of the best ready task, optional
-  `{"project"?,"category"?}` scope; 404 if none),
+  `{"project"?,"category"?,"meta_key"?}` scope; 404 if none),
   `POST /api/tasks/{id}/claim` (body `{"steal_stale":"<dur>"}` = stale-claim takeover, 409
   `not_stale` if still fresh), `POST /api/tasks/{id}/comments`,
   `DELETE /api/tasks/{id}/comments/{cid}`,
@@ -127,9 +129,10 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   prereq ids. Stale-claim recovery: `am ls --stale <dur>` lists assigned, not-done tasks with no
   activity for ≥ dur (Go duration syntax, e.g. `30m`, `48h`); `am claim <id> --steal-stale <dur>`
   atomically takes over a stale claim (exit 4 with `not stale yet` if the claim is still fresh).
-  Agent work loop: `am next [-p P] [-c CAT]` atomically picks + claims the best ready task via
-  `POST /api/tasks/next` (prints the claimed id; exit 3 if none); `am wait <id> --done` /
-  `am wait --ready [-p P] [-c CAT]` block until the condition holds (SSE-driven, in
+  Agent work loop: `am next [-p P] [-c CAT] [--meta KEY]` atomically picks + claims the best
+  ready task via `POST /api/tasks/next` (prints the claimed id; exit 3 if none);
+  `am wait <id> --done` /
+  `am wait --ready [-p P] [-c CAT] [--meta KEY]` block until the condition holds (SSE-driven, in
   `cmd/am/wait.go`;
   exit 7 on timeout, default 10m); `am status <id...> <st>` and `am assign <id...> <who>` accept
   multiple ids (client-side loop, one event per task; exit = first failure's code).
@@ -138,6 +141,11 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   `GET /api/tasks`; `am label <id> [+add ...] [-remove ...]` adds/removes labels (bare token =
   add; lowercase 1-50 chars of `a-z 0-9 . _ -`), and bare `am label <id>` prints the task's
   labels on one line.
+  Task metadata (Phase P): repeatable `--meta k=v` on `am new`/`am edit` (all pairs ride in one
+  request; `--meta k=` on `edit` removes the key; tokens split at the first `=`); a single
+  `--meta KEY` presence filter on `am ls`/`am next`/`am wait --ready` (two keys or `key=value`
+  → exit 5; `--done --meta` → usage error); `am show <id>` prints a sorted `meta: k=v …` line
+  when meta exists.
 - **Dashboard** — `cmd/am/web/app.js`: vanilla SPA; SSE consumer; board/modal/feed rendering.
   Includes a `⋯` "Manage projects" button in the tab bar that opens a modal (`openManageProjects`/
   `renderManageList`) listing all projects (active + archived via `GET /api/projects?archived=true`),
@@ -159,7 +167,9 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   `category.archived`/`category.unarchived` so the archive cascade shows live.
   The task modal has a **Dependencies** section: "Depends on" chips with a ✕ remove button, an
   "Add prerequisite…" dropdown of same-project tasks, and a read-only "Blocks" list. A hard-block
-  409 surfaces the blocking prereq ids and reverts the UI.
+  409 surfaces the blocking prereq ids and reverts the UI. A read-only **Meta** section after
+  Labels lists the task's key=value pairs (sorted; set via CLI/API only), and `task.patched`
+  feed lines append `(meta: k1, k2)` when the event delta contains meta.
   A **"Graph"** button in the header (and the `g` keyboard shortcut) opens a full-screen
   **dependency-graph overlay**: a layered SVG DAG of all tasks in a project, with pan/zoom,
   transitive-path highlighting on click, a right detail panel, a legend, and live refresh from SSE

@@ -71,6 +71,13 @@ Evidence:
   `NextTask`), `am wait <id> --done` / `am wait --ready` block on the SSE stream until a task
   finishes or work appears (exit 7 on timeout), and `am status`/`am assign` take multiple ids.
   Evidence: `cmd/am/store.go`, `cmd/am/wait.go`, `cmd/am/cli.go`.
+- **Task metadata** (Phase P): free-form `key=value` pairs on tasks (`am new`/`am edit
+  --meta k=v`; `--meta k=` removes). Keys are normalized like labels; values are opaque
+  (≤ 500 bytes). Key **presence** is filterable on `am ls`/`am next`/`am wait --ready`
+  (`--meta KEY`, `?meta_key=`, the `meta_key` next-body field) — the hook an autonomous worker
+  loop uses to wait for and pick up exactly the tasks marked for it (e.g. `auto=true`), built for
+  the agentic_brain integration (R7). Evidence: `cmd/am/store.go` (`applyMetaTx`,
+  `normalizeMetaKey`, `NextFilter`), `cmd/am/cli.go` (`multiFlags`), `cmd/am/server.go`.
 - **Findability** so a grown board stays navigable: substring search over task titles and bodies
   (`am ls --grep <text>` / `GET /api/tasks?q=`; a header search box on the dashboard) and
   lightweight free-form labels (`am label <id> +bug -wip`, `am ls --label <l>`; clickable label
@@ -117,6 +124,8 @@ Evidence:
 - **Comment** — a threaded note on a task.
 - **Label** — a lightweight free-form tag on a task (normalized lowercase; no separate catalog —
   a label exists iff some task carries it).
+- **Meta** — a free-form `key → value` pair on a task (key normalized like a label; value opaque,
+  ≤ 500 bytes). Key presence — never the value — is the filterable unit; no separate catalog.
 - **Event** — an append-only record of every mutation; powers the activity feed, SSE stream, and
   reconnect replay (`events.id` is the cursor / SSE `Last-Event-ID`).
 - **Agent identity** — `{tasktype}_{DDMMYY}_{4 digits}`, attached as the actor on writes.
@@ -126,7 +135,8 @@ Evidence:
 Inferred (Confidence: Medium–High) from `README.md` "Security" and the localhost bind:
 - **Not** a multi-tenant / authenticated / internet-facing service. No auth, binds `127.0.0.1`.
 - **Not** a heavyweight project manager (no sprints, due dates, or attachments today; the only
-  metadata beyond status/priority/assignee is lightweight free-form labels, added in Phase M).
+  metadata beyond status/priority/assignee is lightweight free-form labels — Phase M — and
+  opaque `key=value` meta pairs — Phase P).
 - **Not** a hosted SaaS — it's a single local binary; "back up = copy one file."
 
 ## Evidence
@@ -141,6 +151,6 @@ Inferred (Confidence: Medium–High) from `README.md` "Security" and the localho
   SQLite design (`SetMaxOpenConns(1)`) implies modest scale, but this is not documented.
 - **Roadmap.** Near-term gap-closing work is now tracked in `ROADMAP.md` (repo root). Labels and
   search shipped in Phase M; the agentic_brain foundation (categories, stable IDs, vault binding)
-  shipped in Phase O, with task metadata (P), scoping enforcement (Q), the category dashboard (R),
-  and scope tokens (S) to follow; longer-term ideas (auth, remote access, due dates, prebuilt
-  binaries) remain discussion-only — treat those as unconfirmed.
+  shipped in Phase O and task metadata in Phase P, with scoping enforcement (Q), the category
+  dashboard (R), and scope tokens (S) to follow; longer-term ideas (auth, remote access, due
+  dates, prebuilt binaries) remain discussion-only — treat those as unconfirmed.

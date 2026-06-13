@@ -47,27 +47,30 @@ Set your identity once at the start of a task:
     am init <tasktype>     # e.g. `am init bugfix` → bugfix_060626_4821 (remembered for this directory)
 Then use `am` normally (`am whoami` shows it).
 
-    am next [-p P] [-c C]      # pick up work: atomically claims the best ready task,
+    am next [-p P] [-c C] [--meta KEY]   # pick up work: atomically claims the best ready task,
                                #   prints its id (exit 3 = nothing ready) — start here
     am wait <id> --done        # block until a task is done (exit 7 on timeout; default 10m)
-    am wait --ready [-p P] [-c C]   # block until some ready task exists (prints its id)
+    am wait --ready [-p P] [-c C] [--meta KEY]   # block until some ready task exists (prints its id)
     am ls --ready              # todo tasks with no open prereqs (read-only view)
     am ls --status todo        # unclaimed work to pick up      am ls --mine   # my tasks
     am ls --blocked            # tasks blocked by unfinished prereqs (do not claim these)
     am ls --stale 30m          # claimed tasks with no activity for 30m (likely dead agents)
     am ls --grep "auth"        # search task titles + bodies (substring, case-insensitive)
     am ls --label bug          # only tasks carrying a label (also -l bug)
+    am ls --meta auto          # only tasks carrying a meta KEY (presence, not value)
     am ls -c <category>        # only tasks in one category (also on next / wait --ready)
     am label <id> +bug -wip    # add/remove labels (bare `am label <id>` prints them)
     am claim <id>              # take a SPECIFIC task (exit 4 = already claimed OR prereqs not done)
     am claim <id> --steal-stale 30m   # take over a claim idle ≥30m (exit 4 = still fresh)
-    am show <id> -c            # full detail + depends on/blocks + comments
+    am show <id> -c            # full detail + depends on/blocks + meta + comments
     am note <id> "progress"    # leave a short comment as you work
     am status <id...> done     # todo | doing | blocked | done (several ids at once is fine)
     am dep add <id> <prereq>   # add a prerequisite (same project; rejects cycles)
     am dep rm <id> <prereq>    # remove a prerequisite
-    am new "title" -p <proj>   # create a task (prints its id); exits non-zero with
-                               #   `project_archived` if the target project is archived
+    am new "title" -p <proj> [--meta k=v]...   # create a task (prints its id); exits non-zero
+                               #   with `project_archived` if the target project is archived
+    am edit <id> --meta k=v --meta k2=   # set/update meta pairs; `--meta k2=` (empty) removes
+                               #   the key; all repeated --meta flags apply in ONE atomic edit
     am projects --all          # list projects, incl. archived (marked "(archived)")
     am categories [--all]      # list categories (projects live inside categories)
     am category new <slug> [name]      # create a category
@@ -95,6 +98,22 @@ already assigned to you — claim those explicitly with `am claim <id>`. Note th
 (`am ls --ready`, `am wait --ready`) is wider than `am next`: it includes todo tasks that are
 pre-assigned to someone, which `am next` never picks — so a `wait --ready && next` loop can
 wake on a pre-assigned task and get exit 3 from `next`. Treat exit 3 there as "loop again",
+not an error.
+
+**Metadata & the worker loop:** tasks can carry free-form `key=value` metadata
+(`am new … --meta auto=true --meta packet=plan.md`, `am edit <id> --meta k=v`; `--meta k=`
+removes). `--meta KEY` on `ls`/`next`/`wait --ready` filters by the KEY's **presence** — values
+are opaque to the board and never filtered on. A worker that should only handle tasks marked for
+it loops like this:
+
+    am wait --ready --meta auto    # block until a ready task carrying `auto` exists
+    id=$(am next --meta auto)      # atomically claim it (exit 3 = someone else got it → loop again)
+    am show "$id" --json           # read the values from the "meta" object (e.g. packet=plan.md)
+
+`wait --ready --meta K` and `next --meta K` apply the **same predicate**, so a task that releases
+the wait is always pickable by `next` and the loop never hot-spins on ready tasks that don't carry
+the key. The pre-assigned caveat above still applies (`wait --ready` can wake on a task
+pre-assigned to someone, which `next` never picks) — treat exit 3 from `next` as "loop again",
 not an error.
 
 **Dependencies:** if a task has unfinished prerequisites, claiming it fails with exit 4 and a

@@ -1,7 +1,7 @@
 # Frontend Architecture
 
 There **is** a frontend: a small single-page dashboard in `cmd/am/web/`
-(`index.html` 69 lines, `app.css` 607 lines, `app.js` 1796 lines), embedded into the binary via
+(`index.html` 69 lines, `app.css` 612 lines, `app.js` 1820 lines), embedded into the binary via
 `//go:embed web` (`cmd/am/server.go`) and served at `/`. It is the human-facing view; agents do
 not use it.
 
@@ -64,7 +64,9 @@ All built imperatively in `app.js` (no component framework):
   `task.reclaimed` event (stale-claim takeover) renders as *"X reclaimed #N from Y"* (the previous
   assignee comes from `data.assignee[0]`) and is colored like a claim (`evKind` maps it to
   `"claimed"`). `task.labeled` / `task.unlabeled` events render as *"X labeled #N +l"* /
-  *"X unlabeled #N -l"* (new cases in both `evText` and `describeText`). The feed supports
+  *"X unlabeled #N -l"* (new cases in both `evText` and `describeText`). `task.patched` lines
+  append **`(meta: k1, k2)`** — the sorted changed keys — when the event delta contains a `meta`
+  sub-object (Phase P; in both `evText` and `describeText`). The feed supports
   **backward pagination** via a "Load older activity" button appended **outside** `#feedList` (so
   `trimFeed` can't remove it); clicking it fetches `GET /api/events?before=<oldest-loaded-id>` and
   appends the results. `feedOldest` tracks the lowest event id currently in the feed; `feedPaginated`
@@ -95,6 +97,10 @@ All built imperatively in `app.js` (no component framework):
   button (`DELETE /api/tasks/{id}/labels/{label}`), plus an **"Add label…" input** that submits on
   **Enter** (`POST /api/tasks/{id}/labels {label}`); a validation 400 shows an inline `.ferr` hint
   ("labels are 1-50 chars of a-z 0-9 . _ -").
+  After Labels comes a **read-only Meta section** (Phase P) — rendered only when the task carries
+  meta: one `.meta-row` per pair (keys sorted; `.meta-key` muted, `.meta-val` monospace), built
+  with `el()`/`textContent` only. Meta pairs are set via the CLI/API (`--meta k=v`), not the
+  dashboard.
 - **Dependency-graph overlay** — `openGraphOverlay` / `closeGraphOverlay` / `renderGraph` /
   `renderGraphDetail`: a full-screen overlay (`#graphOverlay`) that visualises the task dependency
   DAG for a project. Entry points: the **"Graph"** button in the header `.actions` (`#graphBtn`)
@@ -190,7 +196,8 @@ screens. The `safe` keyword falls back to `flex-start` when columns overflow the
 horizontal scrolling on narrow screens never clips the leftmost column. New CSS classes support the
 Manage-projects modal: `.proj-list`, `.proj-row`, `.badge-archived`, `.btn-archive` (and
 `.btn-archive.unarchive`). The card chips use `.tag-blocked` / `.tag-ready` / `.tag-stale`
-(amber pill for the ⏳ stale badge). The graph overlay is styled via `.graph-overlay`, `.graph-shell`,
+(amber pill for the ⏳ stale badge). The modal's Meta section uses `.meta-row` / `.meta-key` /
+`.meta-val` (tones match `.dep-status`; monospace value). The graph overlay is styled via `.graph-overlay`, `.graph-shell`,
 `.graph-header`, `.graph-body`, `.graph-svg`, `.graph-detail`, `.graph-legend`, and assorted
 `.gnode-*` / `.gedge-*` / `.gd-*` classes for nodes, edges, and the detail panel.
 
@@ -255,7 +262,7 @@ behavior in these docs is from source reading and manual verification. (Gap; see
 - **Native HTML5 drag-and-drop doesn't fire on touch** → mobile relies on the status dropdown /
   `[ ]` keys (documented fallback in code comments).
 - **Full board re-render per event batch** (debounced) — fine at small scale, O(n) at large scale.
-- Single 1708-line `app.js`, no module split, no minification. Behavioral JS logic is not
+- Single 1820-line `app.js`, no module split, no minification. Behavioral JS logic is not
   automatically tested (deliberate no-JS-runner decision); XSS-sink safety is enforced by the
   `TestDashboardNoXSSSinks` Go guard. The delete confirm flows, feed pagination, dependency UI,
   and the graph overlay are still untested at the behavioral level.

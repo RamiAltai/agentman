@@ -11,6 +11,76 @@ fresh `[Unreleased]` section.
 
 ### Added
 
+- **Task metadata (Phase P)** — free-form `key=value` pairs on tasks, with key-PRESENCE filters
+  across the listing and pickup verbs (agentic_brain requirement R7).
+  - **`meta` on tasks**: keys are normalized and validated like labels (trimmed, lowercased,
+    1–50 chars of `a-z 0-9 . _ -` — `normalizeMetaKey` reuses `labelRe`/`maxLabelLen`); values are
+    opaque strings, 1–500 bytes (the title cap — they render onto board cards and SSE payloads).
+    Key **presence** (never the value) is the filterable unit. Two raw keys that normalize to the
+    same key (e.g. `{"Auto":"a","auto":"b"}`) are rejected on BOTH create and patch —
+    `400 validation` (CLI exit 5), message `duplicate meta key after normalization: "auto"` —
+    applying both would pick a map-iteration-order winner; rejection keeps requests deterministic
+    and all-or-nothing.
+  - **API**: `POST /api/tasks` gains optional `"meta": {"k":"v", …}` (all pairs validated up
+    front; empty values rejected at create — removal has no meaning there).
+    `PATCH /api/tasks/{id}` accepts `"meta"` with upsert semantics — an empty-string value
+    **removes** the key (absent-key removal is a silent no-op); non-string values or a non-object
+    `meta` → 400; multi-key patches are all-or-nothing (one tx; a validation failure on any key
+    rolls back every key). `GET /api/tasks` gains `?meta_key=K` (presence filter; composes with
+    every existing filter incl. `ready`/`category`/`status`; bad key → 400), and list rows now
+    include `meta` (stitched via one follow-up SELECT — values may contain `,`/`=`, so the labels
+    `GROUP_CONCAT` trick is unsafe for them). `GET /api/tasks/{id}` returns `"meta": {…}` (omitted
+    when empty). `POST /api/tasks/next` gains `"meta_key": "K"` — only tasks carrying the key are
+    pickable (bad key → 400; no carrier → 404; priority-then-FIFO ordering and the single
+    conditional-UPDATE atomicity unchanged). Error mapping reuses the existing sentinels
+    (`ErrValidation` → 400 → CLI exit 5) — **no new error codes, no new exit codes**.
+  - **Events**: **no new event kinds** (catalog stays at **21**). `task.created` data gains
+    `"meta": {k: v}` when the task is created with meta; `task.patched` data gains a `"meta"`
+    sub-object in the existing delta shape — `{"meta": {"k": [old, new]}}` with `null` for absent
+    (removal = `[old, null]`, add = `[null, new]`); one event per PATCH regardless of how many
+    keys changed. **Meta-only patches do NOT bump `updated_at`** — meta is metadata like labels;
+    refreshing the activity timestamp would keep a stale claim alive (ADR-024 / `AddLabel`
+    precedent). Mixed field+meta patches still bump.
+  - **CLI**: new repeatable `--meta` flag — the parser gained a `multiFlags` registry,
+    `Args.multi`, and `a.all(k)` (single-value flags remain last-wins; `--meta` has no short
+    alias). `am new "title" … [--meta k=v]...` sends all pairs in the one POST (`--meta k=` and
+    `--meta bare` are usage errors, exit 5; tokens split at the FIRST `=`, so values may contain
+    `=`). `am edit <id> [--meta k=v]... [--meta k=]` folds all repeated flags into ONE PATCH (one
+    tx, one event); `--meta k=` removes the key; the "nothing to change" message now mentions
+    `--meta`. `am ls`/`am next`/`am wait --ready` take a single `--meta KEY` (two `--meta` →
+    exit 5; `key=value` form → exit 5; `am wait <id> --done --meta K` is a usage error, exit 1).
+    `am show <id>` prints one `meta: k=v k2=v2` line (keys sorted) after the labels line, only
+    when meta exists. `usage()` updated for all five verbs.
+  - **Dashboard**: the task modal gains a read-only **Meta** section after Labels (sorted keys;
+    muted key, monospace value; built with `el()`/`textContent` only); feed/history `task.patched`
+    lines append `(meta: k1, k2)` when the event delta contains meta. New CSS:
+    `.meta-row`/`.meta-key`/`.meta-val`.
+  - **Storage / store API**: new table `task_meta (task_id, key, value, PRIMARY KEY (task_id,
+    key))` with `ON DELETE CASCADE` from tasks + index `idx_task_meta_key`, shipped via
+    `CREATE TABLE IF NOT EXISTS` in `schema.sql` — **no migration step, no schema_version bump**
+    (`currentSchemaVersion` stays 4; the `task_labels` precedent). New `applyMetaTx` (sorted-key
+    walk, upsert via `INSERT … ON CONFLICT DO UPDATE`, delete on empty value, returns the delta)
+    and `normalizeMetaKey`; `Task.Meta`/`TaskFilter.MetaKey`/`CreateTaskInput.Meta` threaded
+    through. **`NextTask` signature changed** to `NextTask(f NextFilter, agent string)` with
+    `NextFilter{Project, Category, MetaKey}` — Phase Q extends the struct instead of widening the
+    signature again. The NextTask meta predicate is textually identical to ListTasks' (the
+    wait/next same-condition invariant: a task that releases `am wait --ready --meta K` must be
+    pickable by `am next --meta K`). `getTaskTx` deliberately does NOT load meta (labels parity —
+    PATCH/claim responses omit it); the SSE stream is untouched (`--meta` narrows only the REST
+    re-check, ADR-023).
+  - Tests (+25, now 199): `TestTaskMetaCRUD`, `TestTaskMetaValidation` (incl. normalized-key
+    collision rejection on create and patch), `TestPatchTaskMetaAtomicOneEvent`,
+    `TestPatchTaskMetaNoOpNoEvent`, `TestMetaOnlyPatchDoesNotBumpUpdatedAt`,
+    `TestNextTaskMetaFilter`, `TestNextTaskMetaRaceDistinctWinners`, `TestListTasksMetaKeyFilter`,
+    `TestListTasksReturnsMeta`, `TestDeleteTaskCascadesMeta`,
+    `TestTaskMetaTableExistsOnReopenedDB` (store); `TestCreateTaskWithMeta`,
+    `TestPatchTaskMetaEndpoint`, `TestNextEndpointMetaBody`, `TestListTasksMetaKeyParam` (HTTP);
+    `TestWaitReadyMetaNoHotSpin`, `TestWaitReadyMetaReleasedByCreate`,
+    `TestWaitReadyMetaReleasedByPrereqDone`, `TestWaitMetaUsageErrors` (wait);
+    `TestParseMultiFlag`, `TestCmdNewMetaWireFormat`, `TestCmdEditMetaSinglePatch`,
+    `TestCmdNextMetaWireFormat`, `TestCmdLsMetaWireFormat`, `TestCmdShowPrintsMeta` (CLI).
+    → ADR-026.
+
 - **agentic_brain foundation (Phase O)** — the category layer, stable IDs, and vault binding
   that let agentman plug into the agentic_brain system (requirements R1/R2/R3/R8).
   - **Categories: a new layer above projects** (`instance → category → project → task`). New

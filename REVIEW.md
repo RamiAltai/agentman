@@ -149,9 +149,30 @@ this repo): categories, stable IDs, vault binding, migration v4. Satisfies requi
   stay importable; `OpenStore` now rejects a too-new `schema_version`
   - 4 new event kinds (`category.created/archived/unarchived`, `project.patched`; total 21);
     +30 tests (now 174). → ADR-025, `CHANGELOG.md`.
-  - Next in the train: **Phase P** task metadata (`meta` k=v + meta-filtered `next`/`wait`, R7),
-    **Phase Q** scoping enforcement (identity scope, exit 8, proposal-inbox carve-out, R4),
-    **Phase R** category dashboard + scoped feed (R6), **Phase S** scope tokens (R5).
+  - Next in the train: **Phase P** task metadata (shipped, see below), **Phase Q** scoping
+    enforcement (identity scope, exit 8, proposal-inbox carve-out, R4), **Phase R** category
+    dashboard + scoped feed (R6), **Phase S** scope tokens (R5).
+
+### Phase P — Task metadata — **DONE (2026-06-13)**
+
+Second phase of the agentic_brain train: free-form `key=value` pairs on tasks with key-presence
+filters across the listing and pickup verbs. Satisfies requirement **R7**.
+
+- [x] P1 `task_meta` table + `meta` on create/patch/get/list — keys normalized like labels,
+  values opaque ≤ 500 bytes; empty value removes on edit (rejected at create); duplicate keys
+  after normalization rejected on both paths; meta-only patches don't bump `updated_at`;
+  no migration step (`CREATE TABLE IF NOT EXISTS`, schema version stays 4)
+- [x] P2 presence filters — `?meta_key=` on `GET /api/tasks`, `"meta_key"` in
+  `POST /api/tasks/next`, `--meta KEY` on `am ls`/`am next`/`am wait --ready`; `NextTask`
+  refactored to take a `NextFilter` struct (Phase Q extension point); the next/wait predicates
+  are textually identical so a released wait is always pickable
+- [x] P3 CLI repeatable `--meta k=v` (new `multiFlags` parser registry) on `am new`/`am edit`
+  (all flags fold into one request); `am show` `meta:` line; dashboard modal Meta section +
+  `(meta: …)` feed suffix on `task.patched`
+  - No new event kinds (catalog stays 21), no new error/exit codes; +25 tests (now 199).
+    → ADR-026, `CHANGELOG.md`.
+  - Next in the train: **Phase Q** scoping enforcement (R4), **Phase R** category dashboard +
+    scoped feed (R6), **Phase S** scope tokens (R5).
 
 ### Later / if demand appears
 - Due dates + `--due-before` filter; webhooks on event kinds (Slack/CI triggers);
