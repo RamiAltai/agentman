@@ -13,7 +13,7 @@ lexically.
 
 | Entity | Purpose | Source |
 |--------|---------|--------|
-| `meta` | Key/value config; currently only `schema_version` (the binary migrates to `'4'`) | `schema.sql` |
+| `meta` | Key/value config; currently only `schema_version` (the binary migrates to `'5'`) | `schema.sql` |
 | `categories` | The layer above projects (`instance → category → project → task`): `uid` stable id, `slug` unique lowercase, `name`, `archived_at` | `schema.sql`, `store.go Category` |
 | `projects` | Named boards (`slug` unique, `name`, `archived_at`, `category_id`, `uid` stable id, `vault_project_id`/`vault_path` binding) | `schema.sql` + migration v4, `store.go Project` |
 | `tasks` | Tickets (status, priority, assignee, dual id) | `schema.sql`, `store.go Task` |
@@ -25,9 +25,23 @@ lexically.
 
 ### Important fields
 
-- **`tasks.id`** — global autoincrement; the cheap wire reference (`#42`). **`tasks.ref`** —
-  per-project sequence (`web-3`), allocated as `MAX(ref)+1` within the project in the insert tx
-  (`store.go CreateTask`); `UNIQUE(project_id, ref)`.
+- **`tasks.id`** — the cheap wire reference (`#42`). It is a plain `INTEGER PRIMARY KEY` (a SQLite
+  **rowid**, no `AUTOINCREMENT`), so a deleted task's id can be reused by a later insert — this is
+  why the v5 `created_by` backfill keys off the *latest* `task.created` event, not the first (see
+  `created_by` below). **`tasks.ref`** — per-project sequence (`web-3`), allocated as `MAX(ref)+1`
+  within the project in the insert tx (`store.go CreateTask`); `UNIQUE(project_id, ref)`.
+- **`tasks.created_by`** — TEXT, the actor that created the task (Phase Q, for the proposals
+  carve-out: a scoped agent may comment on its OWN proposal tickets). Set on every new task from the
+  request actor (`actorOf(r)`, default `"human"`; the store-level `actorOr` fallback `"anon"` is
+  only reachable for direct store callers passing an empty actor). Added by schema **migration v5**
+  (`ALTER TABLE tasks ADD COLUMN created_by TEXT`) with a **best-effort backfill** from the durable
+  event log — the actor of the task's **latest** `task.created` event (latest, not first: `tasks.id`
+  is a reusable rowid, so an id's oldest creation event may belong to a deleted predecessor; the
+  newest always belongs to the current incarnation). Tasks whose events were pruned (`am db prune`)
+  stay NULL and simply never match the own-proposal comment rule (the safe direction). Returned as
+  `created_by` on `GET /api/tasks/{id}` (omitted when empty); **deliberately NOT carried on list
+  rows** — only the single-task read and the server's scope checks (`taskScope`) read it, keeping
+  list payloads stable.
 - **`tasks.status`** — `CHECK (status IN ('todo','doing','blocked','done'))`, default `todo`.
 - **`tasks.priority`** — INTEGER, `0=urgent … 3=low`, default `2`.
 - **`tasks.assignee`** — TEXT, **NULL = unclaimed** (the claim guard depends on this).
@@ -205,10 +219,12 @@ the dependent or the prerequisite. **Events are never deleted** (append-only).
   A deleted project has no row, so the JOIN yields NULL, which the `archived_at IS NULL` check
   passes — making the deleted project's earlier event history visible in the feed (acceptable as an
   audit trail; this differs from a *soft-archived* project whose events are hidden while the row exists).
-  **`ref` reuse:** the global `tasks.id` autoincrement never reuses (wire references stay stable),
-  but a per-project human `ref` (e.g. `web-3`) can be reused if the highest-numbered task in a
-  project is deleted and a new task is then created (no counter/migration was added — acceptable
-  for a personal board).
+  **`ref`/`id` reuse:** `tasks.id` is a SQLite rowid (no `AUTOINCREMENT`), so a deleted task's id
+  can be reused by a later insert — wire references are stable while a task lives, but not unique
+  across the whole history (the v5 `created_by` backfill compensates by reading the latest creation
+  event). Likewise a per-project human `ref` (e.g. `web-3`) can be reused if the highest-numbered
+  task in a project is deleted and a new task is then created (no counter/migration was added —
+  acceptable for a personal board).
   CLI: `am rm <id>` (silent success; exit 3 if not found); `am project rm <slug> --yes` (requires
   `--yes` or it errors with a hint; cascade-deletes the project and all its tasks/comments).
   Missing target → `ErrNotFound` → HTTP 404.
@@ -226,17 +242,21 @@ the dependent or the prerequisite. **Events are never deleted** (append-only).
 bumps `meta.schema_version` in one transaction; steps are integer-ordered and idempotent.
 
 To add a column/table change, append a `{version, apply}` step to `schemaMigrations` and raise
-`currentSchemaVersion` (`cmd/am/store.go`, now `4`). `schemaMigrations` is **no longer empty**: its
+`currentSchemaVersion` (`cmd/am/store.go`, now `5`). `schemaMigrations` is **no longer empty**: its
 first real step is `{version: 2}`, which runs `ALTER TABLE projects ADD COLUMN archived_at TEXT`;
-Phase K added `{version: 3}`, which runs `ALTER TABLE tasks ADD COLUMN claimed_at TEXT`; and
+Phase K added `{version: 3}`, which runs `ALTER TABLE tasks ADD COLUMN claimed_at TEXT`;
 Phase O added `{version: 4}` — the category/stable-ID/vault-binding migration: it adds
 `projects.category_id`, `projects.uid` (+ unique index), `projects.vault_project_id`,
 `projects.vault_path`, and `idx_projects_category`; seeds the default category `general`
 **unconditionally** (fresh installs get it too); attaches every existing project to it; and
-backfills a distinct `amp_` uid per project (task ids/refs/`claimed_at`/labels untouched). The
+backfills a distinct `amp_` uid per project (task ids/refs/`claimed_at`/labels untouched); and
+Phase Q added `{version: 5}` — `ALTER TABLE tasks ADD COLUMN created_by TEXT`, then a best-effort
+backfill of `created_by` from each task's **latest** `task.created` event actor (latest, not first,
+because `tasks.id` is a reusable rowid — see `created_by` above; pruned-events tasks stay NULL). The
 `categories` table itself ships in `schema.sql` (`CREATE TABLE IF NOT EXISTS` runs before
-migrations on both fresh and existing DBs); the projects `CREATE TABLE` in `schema.sql` stays the
-**frozen v1 baseline** — the new columns come only from the v4 step.
+migrations on both fresh and existing DBs); the projects and tasks `CREATE TABLE` statements in
+`schema.sql` stay the **frozen v1 baseline** — the added columns come only from the migration steps
+(projects' from v4, `tasks.created_by` from v5).
 `schema.sql` still seeds a fresh DB at version 1, so the forward-only runner is **exercised
 end-to-end** — each step applies its change and commits the `meta.schema_version` bump in the same
 transaction (was foundation-only in Phase 0). Known limitations: forward-only (no down-migrations);
@@ -310,6 +330,7 @@ erDiagram
     text body
     text status "todo|doing|blocked|done"
     text assignee "NULL = unclaimed"
+    text created_by "actor that created it; NULL = unknown (pruned events)"
     int priority "0..3"
     text created_at
     text updated_at

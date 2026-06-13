@@ -8,12 +8,35 @@
 
 **None.** `am serve` binds `127.0.0.1` (`cmd/am/main.go`, `Addr: "127.0.0.1:" + port`) and accepts
 all requests. The `X-Agent` header (`server.go actorOf`) is an **actor label for attribution, not a
-credential** — any caller may claim any identity, including `"human"` (the dashboard's value).
+credential** — any caller may claim any identity, including `"human"` (the dashboard's value). The
+`X-Agent-Scope` header (Phase Q, `server.go scopeOf`) is the same kind of **client-asserted label**,
+not a credential — see Authorization below.
 
 ## Authorization
 
-**None.** There are no roles, ownership checks, or per-resource permissions. Anyone who can reach
-the port can read and mutate every project/task/comment.
+**None that is a security control.** There are no roles, credentials, or authenticated
+per-resource permissions. Anyone who can reach the port can read and mutate every
+project/task/comment by sending the right headers.
+
+**Scope confinement (Phase Q) is accident prevention, not authorization.** An agent may carry an
+**`X-Agent-Scope`** header (`category[/project]`), which the server enforces on every mutation and
+on named reads — out-of-scope → `403 {"error":"out_of_scope"}` (CLI exit 8). This keeps an agent
+that *follows its config* inside its slice of the board (a category, or one project). But like
+`X-Agent`, the scope header is **client-asserted and unauthenticated**: any caller can send any
+scope, or omit it entirely to act unscoped. It is therefore **not a security boundary against
+crafted HTTP** — it is fleet-coordination hygiene. The honest framing (mirrored from the
+requirements): scope confinement stops an agent from *accidentally* clobbering another's work; it
+does **not** stop a malicious local process. **Phase S (scope tokens) is the upgrade path** that
+turns the asserted scope into a verified credential. `scopeOf(r)` in `server.go` is the single
+reader of the header, so Phase S swaps the scope's source there without touching handlers.
+
+**Known coverage gaps in Phase Q (deliberate, closed later):**
+- `GET /api/events` and `GET /api/stream` are **not** scope-filtered — a scoped agent can still
+  read the global activity feed (Phase R closes this with a category-scoped feed).
+- `GET /api/projects` and `GET /api/categories` list endpoints are **not** narrowed — board
+  metadata (slugs/names) is visible to any scope; task *data* is the enforcement point this phase.
+- An explicit unknown `?project=` for a scoped agent returns 403 (not 404/empty) — the server
+  cannot prove it in-scope, so it fails loud (mild existence ambiguity, accepted).
 
 ## Trust Boundaries
 
@@ -126,6 +149,10 @@ the server. Their security-relevant properties:
 - XSS-safe DOM rendering; parameterized SQL; request body size cap.
 - The **`events` table is a de-facto audit log** (actor, kind, timestamp, delta) — but the actor is
   spoofable since `X-Agent` is unauthenticated, so it's attribution, not non-repudiation.
+- **Scope confinement** (`X-Agent-Scope`, Phase Q) — the server rejects out-of-scope mutations and
+  named reads with `403 out_of_scope` and logs each denial (`agentman: out_of_scope: …`). A control
+  for **accidental** cross-scope action by a config-following agent, **not** auth (the header is
+  client-asserted; Phase S scope tokens upgrade it). Denials are log-only — no event kind.
 
 ## Security Gaps
 
@@ -137,6 +164,10 @@ the server. Their security-relevant properties:
 5. ~~500s expose internal error text~~ — **fixed (Phase D1)**; 500s return `{"error":"internal"}`; detail only in server-side logs.
 6. ~~No dependency vulnerability scanning~~ — **added (Phase F)**; `govulncheck ./...` runs in CI. Residual: no Dependabot.
 7. Audit actor is spoofable (no identity verification).
+8. **Scope is client-asserted** (Phase Q) — `X-Agent-Scope` confines a config-following agent but
+   is not a boundary against crafted HTTP (any caller can forge or omit it). Phase S scope tokens
+   are the fix. Residual reads: `/api/events`, `/api/stream`, `GET /api/projects`,
+   `GET /api/categories` are not scope-filtered yet (Phase R) — see Authorization above.
 
 ## Secure Implementation Checklist
 

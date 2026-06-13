@@ -198,6 +198,31 @@ outside this repo). Tracked in `REVIEW.md` alongside Phases J–O.
     (Phase Q extension point); +25 tests (now 199).
   → ADR-026, `data-model.md`, `backend.md`, `CHANGELOG.md`.
 
+## Phase Q — Scoped agent identity & enforcement (shipped, beyond original roadmap)
+
+The third phase of the agentic_brain train (requirement R4 in `agentman_requirements.md`,
+outside this repo). Tracked in `REVIEW.md` alongside Phases J–P.
+
+- [x] **Q1 · Scope identity + server enforcement + exit 8** — _L_ — **shipped (Phase Q)**
+  - `am init <tasktype> -c CAT [-p PROJ]` records a scope (JSON identity file; legacy plain-text =
+    unscoped); `AGENTMAN_SCOPE` overrides; `am whoami` shows a `scope:` line. The CLI sends
+    `X-Agent-Scope` on every request; `scopeOf(r)` is the sole server-side reader (Phase S
+    swap-point).
+  - Enforcement on every mutation + named reads: out of scope → `403 {"error":"out_of_scope"}` →
+    **new CLI exit code 8**. Reads policy: loud 403 on named/explicit out-of-scope, silent narrowing
+    of unfiltered lists, proposals readable by all. `am next` merges the scope into the `NextFilter`
+    inside the atomic pick+claim. Category endpoints 403 for any scope; project-create only for a
+    category-scoped agent in its own category.
+  - Proposals carve-out (`am serve --proposals` / `AGENTMAN_PROPOSALS`, default `meta/proposals`):
+    task creation + own-proposal comments allowed from any scope, matched by the (category, project)
+    pair (slug-squat-proof), inert when missing, not extended to `am next`.
+  - `tasks.created_by` via **migration v5** (`currentSchemaVersion = 5`; best-effort backfill from
+    the latest `task.created` event). Denials log-only — no new event kind (catalog stays 21).
+    `X-Agent-Scope` is client-asserted (accident prevention, not auth; Phase S scope tokens upgrade
+    it). +32 tests (now 231).
+  → ADR-027, `data-model.md`, `backend.md`, `security.md`, `known-risks-and-gaps.md`, `CHANGELOG.md`.
+    Next in the train: **Phase R** category dashboard + scoped feed (R6), **Phase S** scope tokens (R5).
+
 ## Phase G — Security posture (deferred by design)
 
 agentman is loopback-only with no auth; the bind **is** the access control, hardened by the
@@ -218,7 +243,8 @@ stays parked unless the access model changes. For newer work, see `REVIEW.md` Ph
 (correctness & hygiene), Phase K (stale-claim recovery — `am ls --stale`,
 `am claim --steal-stale`), Phase L (agent work loop — `am next`, `am wait`, bulk
 `status`/`assign`), Phase M (findability — `am ls --grep`/`--label`, `am label`), Phase O
-(agentic_brain foundation — categories, stable IDs, vault binding, migration v4), and Phase P
-(task metadata — `--meta` k=v pairs + presence-filtered `next`/`wait`) have shipped; release
-binaries remain proposed, and the agentic_brain train continues with Phases Q (scoping
-enforcement), R (category dashboard), and S (scope tokens).
+(agentic_brain foundation — categories, stable IDs, vault binding, migration v4), Phase P
+(task metadata — `--meta` k=v pairs + presence-filtered `next`/`wait`), and Phase Q (scoped agent
+identity & enforcement — `am init -c`, `X-Agent-Scope`, exit 8, proposals carve-out, migration v5)
+have shipped; release binaries remain proposed, and the agentic_brain train continues with Phases R
+(category dashboard) and S (scope tokens).

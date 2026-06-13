@@ -51,8 +51,18 @@ Evidence:
   `instance → category → project → task → comment`. One `am serve` instance and one DB cover
   everything; `-c <cat>` / `AGENTMAN_CATEGORY` scope `am ls`/`am next`/`am wait --ready`, and
   archiving a category hides everything under it (creation into it is blocked). Built for the
-  agentic_brain integration, where agents will later be confined to a category. Evidence:
+  agentic_brain integration, where agents are confined to a category (Phase Q below). Evidence:
   `cmd/am/store.go` (`Category`, migration v4), `cmd/am/cli.go`, `cmd/am/server.go`.
+- **Scoped agent identity & enforcement** (Phase Q): an agent can be confined to a category
+  (default) or one project (`am init <tasktype> -c CAT [-p PROJ]`). The scope rides as the
+  `X-Agent-Scope` header and the server enforces it on every mutation and on named reads — the
+  hierarchy is the enforcement axis (`task→project→category` immutability makes the check sound
+  outside the store tx). Out of scope → `403 out_of_scope` → CLI exit 8; unfiltered lists are
+  silently narrowed; any agent may still file into a **proposals** project (default `meta/proposals`).
+  The scope is a client-asserted label (accident prevention, not auth — scope tokens are a later
+  phase); `tasks.created_by` (migration v5) backs the "comment on your own proposal" carve-out.
+  Built for agentic_brain requirement R4. Evidence: `cmd/am/server.go` (`scopeOf`, `check*`,
+  `narrowScope`), `cmd/am/identity.go`, `cmd/am/store.go` (`Scope`, migration v5).
 - **Stable IDs + vault binding** (Phase O): categories and projects carry an immutable `uid`
   (`amc_`/`amp_` + 16 hex) that survives slug renames (`am project edit --slug`), and projects
   can store `vault_project_id`/`vault_path` pointers back to the agentic_brain vault
@@ -151,6 +161,6 @@ Inferred (Confidence: Medium–High) from `README.md` "Security" and the localho
   SQLite design (`SetMaxOpenConns(1)`) implies modest scale, but this is not documented.
 - **Roadmap.** Near-term gap-closing work is now tracked in `ROADMAP.md` (repo root). Labels and
   search shipped in Phase M; the agentic_brain foundation (categories, stable IDs, vault binding)
-  shipped in Phase O and task metadata in Phase P, with scoping enforcement (Q), the category
-  dashboard (R), and scope tokens (S) to follow; longer-term ideas (auth, remote access, due
-  dates, prebuilt binaries) remain discussion-only — treat those as unconfirmed.
+  shipped in Phase O, task metadata in Phase P, and scoped agent identity & enforcement in Phase Q,
+  with the category dashboard (R) and scope tokens (S) to follow; longer-term ideas (auth, remote
+  access, due dates, prebuilt binaries) remain discussion-only — treat those as unconfirmed.

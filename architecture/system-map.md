@@ -26,7 +26,7 @@ broadcast → dashboard**. Confirmed via `cmd/am/main.go`, `cmd/am/server.go`, `
 | `cmd/am/client.go` | CLI HTTP client; HTTP-status → exit-code mapping | `Client`, `doOrFail`, `exitCodeFor` |
 | `cmd/am/cli.go` | CLI verb parsing + terse/JSON formatters | `cmd*`, `parse`, `fail` |
 | `cmd/am/wait.go` | `am wait` (SSE-driven blocking waits, exit 7 on timeout) | `cmdWait`, `waiter`, `readSSEFrame` |
-| `cmd/am/identity.go` | Per-directory agent identity (`am init`/`am whoami`) | `resolveAgent`, `identityFile` |
+| `cmd/am/identity.go` | Per-directory agent identity + scope (`am init`/`am whoami`) | `resolveIdentity`, `resolveAgent`, `resolveScope`, `identityRecord`, `identityFile` |
 | `cmd/am/version.go` | Version reporting (`am version`) | `version()`, `injectedVersion` (ldflags) |
 | `cmd/am/update.go` | `am update` + startup update check | `cmdUpdate`, `checkForUpdate` |
 | `cmd/am/*_test.go` | Tests: `update/store/server/migrate/db/cli/sse/identity/wait/web_test` | claim race, HTTP guards, migrations, deletes, CLI/exit codes, SSE replay, identity, waits/timeouts, XSS guard |
@@ -46,19 +46,28 @@ Unknown/absent: no `internal/`, `pkg/`, `Makefile`, `Dockerfile`, or `.gorelease
   dispatches before the `Client` is built, operating directly on the SQLite file (`export`,
   `import`, and `prune` all refuse while a server is running); everything else
   constructs a `Client` (`NewClient()`); `serve` calls `runServe()`.
-- **Server entry:** `runServe()` opens the store, builds `Server` (`NewServer`), optionally
-  enables request logging (`--log` flag or `AGENTMAN_LOG` env var, any non-empty value; use
-  `AGENTMAN_LOG=1`), and runs `http.Server{Addr: "127.0.0.1:"+port}`.
+- **Server entry:** `runServe()` opens the store, builds `Server` (`NewServer`), sets the proposals
+  carve-out project from `--proposals CAT/PROJ` / `AGENTMAN_PROPOSALS` (default `meta/proposals`;
+  both segments required or startup `fail(1)`), optionally enables request logging (`--log` flag or
+  `AGENTMAN_LOG` env var, any non-empty value; use `AGENTMAN_LOG=1`), and runs
+  `http.Server{Addr: "127.0.0.1:"+port}`.
 - **HTTP route table:** `Server.Handler()` in `cmd/am/server.go` (see Major Modules).
 
 ## Runtime Flow
 
 **Agent write (e.g. `am claim 13`):**
-`cmd/am/cli.go cmdClaim` → `Client.do` (HTTP POST `/api/tasks/13/claim`, `X-Agent` header) →
-`server.go handleClaim` → `store.go ClaimTask` (atomic `UPDATE … RETURNING`, inserts an `events`
-row in the same tx) → on commit `Hub.Broadcast(event)` → every SSE subscriber (open dashboards)
-receives it → exit code mapped from HTTP status via `client.go exitCodeFor` (the single source,
-used by `doOrFail` and the bulk `status`/`assign` loop).
+`cmd/am/cli.go cmdClaim` → `Client.do` (HTTP POST `/api/tasks/13/claim`, `X-Agent` +
+`X-Agent-Scope` headers when set) → `server.go handleClaim` → **scope pre-check** (`scopeOf(r)` then
+`checkTaskMut`; out of scope → `403 out_of_scope` → CLI exit 8) → `store.go ClaimTask` (atomic
+`UPDATE … RETURNING`, inserts an `events` row in the same tx) → on commit `Hub.Broadcast(event)` →
+every SSE subscriber (open dashboards) receives it → exit code mapped from HTTP status via
+`client.go exitCodeFor` (the single source, used by `doOrFail` and the bulk `status`/`assign` loop).
+
+**Scope flow (Phase Q):** the CLI resolves a scope from the identity file or `AGENTMAN_SCOPE`
+(`resolveScope`) and sends it as `X-Agent-Scope`. On the server, `scopeOf(r)` is the **sole** reader
+of the header (the Phase S scope-token swap point); each handler runs a `check*`/`narrowScope`
+helper before touching the store. `am next` merges the scope into the `NextFilter` *inside* the
+atomic pick+claim. Denials are logged (`denyScope`) and never broadcast.
 
 **Human action on the dashboard:** identical path — the browser calls the same JSON API; its
 own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
@@ -118,6 +127,10 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   [--vault-id X] [--vault-path Y]` (vault binding; explicit-empty clears); `-c <cat>` scopes
   `am ls`, `am next`, and `am wait --ready` (`am show <id> -c` still means `--comments` — `main.go
   rewriteShowComments` rewrites it for `show` only).
+  Scoped identity (Phase Q): `am init <tasktype> [-c CAT [-p PROJ]]` records a scope in the identity
+  file (JSON when scoped, legacy bare-id plain text when not); `am whoami` prints a `scope:` line
+  when scoped; the resolved scope (`AGENTMAN_SCOPE` overrides the file) rides as `X-Agent-Scope` on
+  every request and yields exit 8 on any `403 out_of_scope`.
   Hard-delete verbs: `am rm <id>` (silent success, exit 3 if not found); `am project rm <slug> --yes`
   (requires `--yes`; cascade-deletes project + all tasks/comments). `am db prune (--before <date> |
   --keep <N>) [--yes]` — offline events-only retention.

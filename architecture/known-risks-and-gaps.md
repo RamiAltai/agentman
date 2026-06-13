@@ -8,10 +8,11 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 - **Schema-migration runner: forward-only, no rollback path** (was High → now Low). The forward-only
   runner that reads/bumps `meta.schema_version` (ADR-010) is now exercised end-to-end: Phase 2 shipped
   the first real step (`ALTER TABLE projects ADD COLUMN archived_at TEXT` at `version: 2`),
-  Phase K the second (`ALTER TABLE tasks ADD COLUMN claimed_at TEXT` at `version: 3`), and
+  Phase K the second (`ALTER TABLE tasks ADD COLUMN claimed_at TEXT` at `version: 3`),
   Phase O the third (`version: 4` — `projects.category_id`/`uid`/vault columns, `general` seed,
-  uid backfill; `currentSchemaVersion = 4`), each applied with its version bump in one tx and
-  covered by tests. Residual:
+  uid backfill), and Phase Q the fourth (`version: 5` — `tasks.created_by` + best-effort backfill
+  from the latest `task.created` event; `currentSchemaVersion = 5`), each applied with its version
+  bump in one tx and covered by tests. Residual:
   no down-migrations. The too-new-DB leniency is **resolved (Phase O)**: `OpenStore` now refuses a
   DB recorded at a version newer than the binary supports (clear "upgrade am" error), the same
   ceiling `validateImportCandidate` applies to snapshots. → `data-model.md`,
@@ -101,6 +102,35 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   convention so filters and workers don't need a per-task `GET`. Tasks with many large meta
   values fatten every list response and SSE-triggered board reload.
 
+## Scope-Enforcement Residuals (Phase Q)
+
+- **Scope is a client-asserted label, not a security boundary** (Medium, by design). `X-Agent-Scope`
+  confines a *config-following* agent (accident prevention); any local caller can forge or omit it.
+  **Phase S (scope tokens)** turns it into a verified credential — `scopeOf(r)` is the single swap
+  point. → `security.md`, ADR-027.
+- **`/api/events` + `/api/stream` are not scope-filtered** (Low, deliberate). A scoped agent can
+  still read the global activity feed; the SSE stream stays unscoped, so `am wait` re-checks via the
+  scoped REST call (chattier but correct — no hot-spin, no false release). Closed by **Phase R**
+  (category-scoped feed). Same residual the Phase O `category.*` events note already tracks.
+- **`GET /api/projects` / `GET /api/categories` lists are not narrowed** (Low, deliberate). Board
+  *metadata* (slugs/names) is visible to any scope; task *data* is the enforcement point this phase.
+  Phase R revisits.
+- **Unknown explicit `?project=` for a scoped agent returns 403, not 404/empty** (Low, by design).
+  The server cannot prove an unknown slug in-scope, so it fails loud — mild existence ambiguity
+  accepted in exchange for a fail-loud default. Same for a project-scoped agent creating into an
+  unknown slug.
+- **`created_by` backfill is best-effort** (Low). Tasks whose `task.created` events were pruned
+  (`am db prune`) before the v5 migration stay NULL and never match the own-proposal comment rule
+  (the safe direction). `ListTasks` rows deliberately omit `created_by` (only `GET /task` and the
+  scope checks read it — keeps list payloads stable).
+- **Exit 8 reachable from a host-guard 403** (Low, cosmetic). `am wait`'s re-checks map any 403 to
+  exit 8; a host-allowlist rejection (`hostGuard`) would surface as "out of scope" rather than a
+  guard error. Localhost-only, low impact.
+- **TOCTOU between scope check and mutation is impossible only via immutability** (Low). The scope
+  pre-checks run outside the store tx; this is sound solely because `task→project` and
+  `project→category` are immutable today. If a task/project move feature ships, the checks must move
+  in-tx (recorded in the `PatchTask`/`PatchProject` scope-note comments). → ADR-027.
+
 ## Security Risks
 
 (Full detail in `security.md`.)
@@ -118,10 +148,13 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
     symbol/package scan finds nothing; module-level hit only). Transitive dep via `modernc.org/libc`.
     Clears by upgrading `golang.org/x/sys` to ≥ v0.44.0 if ever desired. Does not affect CI.
 - **Spoofable audit actor** (Low) — `events.actor` comes from the unauthenticated `X-Agent` header.
+- **Scope confinement is client-asserted** (Medium, by design; Phase Q) — `X-Agent-Scope` is not a
+  boundary against crafted HTTP. See *Scope-Enforcement Residuals* above and `security.md`; Phase S
+  scope tokens are the fix.
 
 ## Testing Gaps
 
-- Coverage now spans store/server/migrate/db/cli/sse/identity/wait/web tests (10 files, 199 tests,
+- Coverage now spans store/server/migrate/db/cli/sse/identity/wait/web tests (10 files, 231 tests,
   `-race`-clean): the **atomic claim** (race, `-race`-clean), events cursor, store CRUD/validation,
   validation→status mapping, the Host/CSRF/CSP guards, project archive/unarchive (store round-trip
   + idempotency and the HTTP endpoints incl. 404), the v2 migration (adds `archived_at` +
@@ -205,6 +238,20 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   `TestWaitReadyMetaReleasedByPrereqDone`, `TestWaitMetaUsageErrors`), and the CLI
   (`TestParseMultiFlag`, `TestCmdNewMetaWireFormat`, `TestCmdEditMetaSinglePatch`,
   `TestCmdNextMetaWireFormat`, `TestCmdLsMetaWireFormat`, `TestCmdShowPrintsMeta`).
+  Phase Q added 32 scope/enforcement tests: the store layer (`TestTaskScopeAndProjectCategory`,
+  `TestNextTaskRaceScopedCategoryMeta`), the HTTP scope sweep (`TestScopeClaimEnforcement`,
+  `TestScopeNextEnforcement`, `TestScopeStealStale`, `TestScopeProposalsCarveOut`,
+  `TestScopeProposalsConfigurable`, `TestScopeProposalsMissingProjectInert`,
+  `TestScopeProposalsWrongCategoryNoCarveOut`, `TestScopeProposalsSquat`, `TestScopeMutationSweep`,
+  `TestScopeProjectScopedAgent`, `TestScopeReads`, `TestScopeHeaderValidation`,
+  `TestScopeProjectCategoryEndpoints`), the v5 `created_by` migration (`TestMigrationV5Fresh`,
+  `TestMigrationV5ExistingDB`), the CLI exit-8 mapping (`TestExitCodeForOutOfScope`,
+  `TestCmdClaimOutOfScopeExit8`, `TestCmdNextOutOfScopeExit8`, `TestClientSendsScopeHeader`,
+  `TestCmdStatusBulkOutOfScope`), scoped identity (`TestInitScopedWritesJSON`,
+  `TestInitScopedCategoryProject`, `TestInitProjectRequiresCategory`,
+  `TestLegacyPlainIdentityUnscoped`, `TestScopeEnvOverride`, `TestWhoamiPrintsScope`,
+  `TestParseScope`), and scoped waits (`TestWaitReadyScopedTimeout`, `TestWaitReadyScopedReleased`,
+  `TestWaitReadyExplicitOutOfScopeExit8`).
   **Still untested:** behavioral dashboard JS — the "Manage projects" modal, the delete confirm
   flows (task/comment/project), the feed pagination button, the dependency section UI (prereq chips,
   add-prereq dropdown, blocks list), the **graph overlay** (layout, pan/zoom, transitive highlight,

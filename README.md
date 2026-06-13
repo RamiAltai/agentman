@@ -141,7 +141,7 @@ Any agent that can run shell commands can use `am`. For **Claude Code**, the one
 The short version — drop this into your `~/.claude/CLAUDE.md` (or a project `CLAUDE.md`):
 
 ```md
-## Task board (am) — run `am init <tasktype>` once, then:
+## Task board (am) — run `am init <tasktype>` once (add `-c CAT [-p PROJ]` to scope), then:
 am ls --ready         # todo tasks with no open prereqs (pick these up)
 am ls --status todo   # work to pick up        am ls --mine    # my tasks
 am claim <id>         # take it (exit 4 = already claimed or blocked by prereqs)
@@ -170,6 +170,16 @@ am whoami            # show current identity
 Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting the
 `AGENTMAN_AGENT` env var overrides it (useful for several agents in one directory).
 
+**Scoped identity.** `am init <tasktype> -c <category> [-p <project>]` confines the agent to a
+category (or a single project): the scope is recorded in the identity file (as JSON) and sent on
+every request as `X-Agent-Scope`. The server then rejects out-of-scope mutations and named reads
+with `403 out_of_scope` → **exit 8**, and silently narrows unfiltered lists (`am ls`/`am next`) to
+the scope. One carve-out: any agent may file tasks into the **proposals project** (default
+`meta/proposals`, set with `am serve --proposals`). `am whoami` shows the scope on a second line;
+`AGENTMAN_SCOPE` overrides the file. The scope is a **client-asserted label** (accident prevention
+for a config-following agent, not authentication — see [Security](#security)); a pre-existing
+unscoped identity file keeps working, re-run `am init -c …` to add a scope.
+
 ## CLI reference
 
 | Command | What it does |
@@ -196,8 +206,8 @@ Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting 
 | `am project rm <slug> --yes` | hard-delete a project **and ALL its tasks/comments** (permanent; `--yes` required) |
 | `am categories [--all]` · `am category new <slug> [name]` | list (`--all` includes archived) / create categories |
 | `am category archive <slug>` · `am category unarchive <slug>` | soft-archive a category (hides its projects/tasks; blocks new tasks/projects under it) / restore it |
-| `am init <tasktype>` · `am whoami` | identity |
-| `am serve [--port 8787] [--db PATH] [--log]` | run the dashboard + API |
+| `am init <tasktype> [-c CAT [-p PROJ]]` · `am whoami` | identity (optionally **scoped** to a category or one project — confines this agent; out-of-scope ops exit 8); `whoami` adds a `scope:` line when scoped |
+| `am serve [--port 8787] [--db PATH] [--log] [--proposals CAT/PROJ]` | run the dashboard + API (`--proposals` = the scope carve-out project any agent may file into; default `meta/proposals`) |
 | `am db export [path] [--db PATH]` | write a consistent DB snapshot (prints the path) |
 | `am db import <path> [--db PATH] [--yes]` | restore a snapshot (stop `am serve` first; backs up current DB) |
 | `am db prune (--before <YYYY-MM-DD> \| --keep <N>) [--db PATH] [--yes]` | trim old events from the DB (offline; events only; stop `am serve` first) |
@@ -206,12 +216,14 @@ Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting 
 `<id>` accepts a global id (`13`) or a project ref (`web-3`). `--status` accepts a comma
 list. Priority is `0` urgent … `3` low (default `2`). Durations use Go syntax (`30m`, `48h` —
 not `2d`). Add `--json` to any read to parse.
-Exit codes: `0` ok · `3` not found · `4` already claimed, blocked, or not stale yet · `5` invalid · `6` server down · `7` wait timed out.
+Exit codes: `0` ok · `3` not found · `4` already claimed, blocked, or not stale yet · `5` invalid · `6` server down · `7` wait timed out · `8` out of scope.
 
 ## HTTP API
 
 The CLI is a thin client over this (also what the dashboard uses). `X-Agent` header sets the
-actor.
+actor; the optional `X-Agent-Scope` header (`category[/project]`) confines the caller — out-of-scope
+mutations and named reads return `403 {"error":"out_of_scope"}` (CLI exit 8). It is a client-asserted
+label, not authentication (see [Security](#security)).
 
 ```
 GET    /api/categories?archived=true             GET    /api/tasks/{id}          (returns depends_on + blocks)
@@ -254,7 +266,9 @@ curl -s -H 'X-Agent: claude-1' -X POST 127.0.0.1:8787/api/tasks/13/claim
 | `AGENTMAN_URL` | server the CLI talks to (default `http://127.0.0.1:8787`) |
 | `AGENTMAN_PROJECT` | default project for `am ls` / `am new` |
 | `AGENTMAN_CATEGORY` | default category scope for `am ls` / `am next` / `am wait --ready` / `am project new` |
+| `AGENTMAN_SCOPE` | override the identity file's confinement scope sent as `X-Agent-Scope` (e.g. `work` or `work/api`) |
 | `AGENTMAN_AGENT` | identity override (else `am init` file) |
+| `AGENTMAN_PROPOSALS` / `--proposals` | (serve) the scope carve-out project any agent may file into (default `meta/proposals`) |
 | `AGENTMAN_PORT` / `--port` | server port (default `8787`) |
 | `AGENTMAN_DB` / `--db` | database path (default `~/.agentman/agentman.db`) |
 | `AGENTMAN_NO_UPDATE_CHECK` | set to `1` to disable the startup "update available" check |
@@ -325,6 +339,11 @@ behind; disable that with `AGENTMAN_NO_UPDATE_CHECK=1`.
 `am serve` binds to `127.0.0.1` with **no authentication** — it's a personal, local board.
 Don't expose the port to untrusted networks. If you need remote/multi-user access, put it
 behind a reverse proxy with auth, or open an issue.
+
+Agent **scopes** (`X-Agent-Scope`, `am init -c …`) confine a *config-following* agent to its slice
+of the board, but they are **client-asserted labels, not a security boundary** — any local caller
+can forge or omit the header. Treat scope confinement as accident prevention, not access control;
+verified scope tokens are a future step. See `architecture/security.md`.
 
 ## Development
 

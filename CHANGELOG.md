@@ -11,6 +11,89 @@ fresh `[Unreleased]` section.
 
 ### Added
 
+- **Scoped agent identity & enforcement (Phase Q)** — agents can be confined to a category
+  (default) or a single project (tighter); the server enforces the scope on every mutation and on
+  named reads (agentic_brain requirement R4).
+  - **Scope on identity (`am init <tasktype> [-c CAT [-p PROJ]]`)**: an optional scope is recorded
+    in the per-directory identity file and sent as the new **`X-Agent-Scope`** header
+    (`category[/project]`, e.g. `personal` or `work/api`) on every request. `-p` without `-c` is a
+    usage error (exit 5); the scope is validated locally (`parseScope`) — no server round-trip, and
+    stdout is still only the id so `id=$(am init …)` keeps working. **Identity-file format**: a
+    scoped init writes JSON `{"agent":"…","scope":"cat[/proj]"}`; an unscoped init keeps the legacy
+    bare-id plain text. **R8 compatibility**: any pre-existing plain-text identity file reads as an
+    **unscoped** identity (no migration of identity files) — after upgrading, re-run `am init -c …`
+    to gain a scope. `am whoami` prints the bare id on line 1 (unchanged) and a second
+    `scope: cat[/proj]` line only when scoped. New env **`AGENTMAN_SCOPE`** overrides the file's
+    scope (non-empty only), composing per-field with the existing `AGENTMAN_AGENT` override.
+  - **Server enforcement**: `scopeOf(r)` is the SOLE reader of `X-Agent-Scope` (the Phase S
+    scope-token swap point); an absent header is unscoped (the human, the dashboard) and unchanged.
+    Out-of-scope → **`403 {"error":"out_of_scope"}`** (new `ErrOutOfScope` sentinel) → **new CLI
+    exit code `8`** (the catalog is now `0/3/4/5/6/7/8`). A malformed scope (empty/whitespace
+    segments or >1 slash) → `400 validation` on every scope-checked endpoint. Every denial is
+    **logged server-side** (`agentman: out_of_scope: actor=<id> scope=<scope> <METHOD> <PATH>`) —
+    **log-only by design, no new event kind** (the 21-kind catalog is unchanged; feeding denials
+    into the SSE stream was rejected as noise + a partial-information leak).
+  - **Per-verb coverage (scoped callers only)**: task mutations (claim incl. `steal_stale`, patch
+    incl. each id of a bulk `am status`/`am assign`, delete, comment-delete, deps, labels) require
+    the task to be in scope; `POST /api/tasks` requires the target project in scope **or** the
+    proposals project; `POST /api/tasks/next` merges the scope into the `NextFilter` **before** the
+    atomic pick+claim (a scoped agent can never be handed an out-of-scope task, even racing unscoped
+    callers); project mutations (patch/archive/unarchive/delete) and `GET …/graph` are project-level
+    checks; `POST /api/projects` is allowed only for a **category-scoped** agent in its **own**
+    category (project-scoped agents may not create projects); `POST /api/categories` and
+    archive/unarchive are **403 for any scoped agent** (the category layer is above every scope).
+  - **Reads policy**: **loud 403** on named/explicit out-of-scope reads (`GET /api/tasks/{id}`,
+    `…/graph`, an explicit `?project=`/`?category=` that contradicts the scope — mirrors the
+    orchestrator's ask-first rule); **silent narrowing** of unfiltered lists (an unfiltered `am ls`
+    shows only the agent's world); the **proposals project is readable by all**. `am wait`'s REST
+    re-checks carry the scope (out-of-scope `--done`/`--ready` exit 8); the SSE stream itself stays
+    unscoped (Phase R residual), so out-of-scope events merely trigger re-checks — no hot-spin, no
+    false release.
+  - **Proposals carve-out**: task creation (and commenting on one's OWN tasks) in a designated
+    proposals project is allowed **from any scope** — `am serve --proposals CAT/PROJ`, env
+    `AGENTMAN_PROPOSALS`, default **`meta/proposals`** (flag beats env; both segments required — a
+    bare category is rejected at startup, `fail(1)`). The carve-out matches the **(category,
+    project) PAIR** at every site (`isProposals`): because slugs are globally unique, a same-slug
+    project in another category gets no special treatment (closes a slug-squat where a scoped agent
+    could capture other scopes' proposals). It is **inert when the project is missing** (the gate
+    passes, the store 404s) and **does not extend to `am next`** (an agent whose scope already
+    covers the proposals project still picks them via plain in-scope matching).
+  - **`tasks.created_by` via migration v5** (`currentSchemaVersion` 4 → 5; `schema.sql` stays the
+    frozen v1 baseline): `ALTER TABLE tasks ADD COLUMN created_by TEXT`, then a best-effort backfill
+    from the durable event log — the actor of the task's **LATEST** `task.created` event (latest,
+    not first: `tasks.id` is a reusable SQLite rowid, so an id's oldest creation event may belong to
+    a deleted predecessor; the newest is the current incarnation). Tasks whose events were pruned
+    stay NULL and never match the own-proposal comment rule (the safe direction). New tasks set
+    `created_by` from the request actor (`actorOf(r)`, default `"human"`). `created_by` is returned
+    by `GET /api/tasks/{id}` (omitted when empty); **list rows deliberately do not carry it** (keeps
+    list payloads stable — only the single-task read and the scope checks consult it). Forward-only,
+    idempotent, version bump in the same tx; `db.go`'s import ceiling tracks `currentSchemaVersion`,
+    so a v5 snapshot now imports and a v6 one is refused.
+  - **Scope checks run outside the store transaction** — sound today only because `task→project`
+    and `project→category` are immutable; comments on `PatchTask`/`PatchProject` record that the
+    checks must move in-tx if a task/project move feature ever ships.
+  - **`X-Agent-Scope` is a client-asserted label** (like `X-Agent`) — accident prevention for an
+    agent following its config, **not** a security boundary against crafted HTTP. Phase S (scope
+    tokens) is the upgrade path. **No new event kinds, no new error bodies beyond `out_of_scope`.**
+  - Tests (+32, now 231): `cmd/am/migrate_test.go` — `TestMigrationV5Fresh`,
+    `TestMigrationV5ExistingDB` (backfill from `task.created`; pruned-events task stays NULL; a
+    reused rowid backfills from the LATEST creation event; idempotent reopen); `TestMigrationV4Fresh`
+    /`TestMigrationV4ExistingDB` un-hardcoded to `currentSchemaVersion`. `cmd/am/db_test.go` —
+    `TestImportPreCategorySnapshot`/`TestImportRejectsNewerSchema` un-hardcoded. `cmd/am/store_test.go`
+    — `TestTaskScopeAndProjectCategory`, `TestNextTaskRaceScopedCategoryMeta`. `cmd/am/server_test.go`
+    — `TestScopeClaimEnforcement`, `TestScopeNextEnforcement`, `TestScopeStealStale`,
+    `TestScopeProposalsCarveOut`, `TestScopeProposalsConfigurable`,
+    `TestScopeProposalsMissingProjectInert`, `TestScopeProposalsWrongCategoryNoCarveOut`,
+    `TestScopeProposalsSquat`, `TestScopeMutationSweep`, `TestScopeProjectScopedAgent`,
+    `TestScopeReads`, `TestScopeHeaderValidation`, `TestScopeProjectCategoryEndpoints`.
+    `cmd/am/cli_test.go` — `TestExitCodeForOutOfScope`, `TestCmdClaimOutOfScopeExit8`,
+    `TestCmdNextOutOfScopeExit8`, `TestClientSendsScopeHeader`, `TestCmdStatusBulkOutOfScope`.
+    `cmd/am/identity_test.go` — `TestInitScopedWritesJSON`, `TestInitScopedCategoryProject`,
+    `TestInitProjectRequiresCategory`, `TestLegacyPlainIdentityUnscoped`, `TestScopeEnvOverride`,
+    `TestWhoamiPrintsScope`, `TestParseScope`. `cmd/am/wait_test.go` — `TestWaitReadyScopedTimeout`,
+    `TestWaitReadyScopedReleased`, `TestWaitReadyExplicitOutOfScopeExit8`.
+    → ADR-027.
+
 - **Task metadata (Phase P)** — free-form `key=value` pairs on tasks, with key-PRESENCE filters
   across the listing and pickup verbs (agentic_brain requirement R7).
   - **`meta` on tasks**: keys are normalized and validated like labels (trimmed, lowercased,

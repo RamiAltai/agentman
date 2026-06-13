@@ -8,6 +8,7 @@ First, make sure the server is running on the machine your agents use:
 ```sh
 am serve            # http://127.0.0.1:8787
 am serve --log      # same, with per-request logging to stderr (or: AGENTMAN_LOG=1 am serve)
+am serve --proposals meta/proposals   # set the scope carve-out project (default meta/proposals)
 ```
 
 `--log` / `AGENTMAN_LOG=1` enables opt-in request logging: one line per request
@@ -44,8 +45,9 @@ The live dashboard runs at http://127.0.0.1:8787. Use the board when working on 
 tasks or when the user wants progress visible — don't create tickets for trivial requests.
 
 Set your identity once at the start of a task:
-    am init <tasktype>     # e.g. `am init bugfix` → bugfix_060626_4821 (remembered for this directory)
-Then use `am` normally (`am whoami` shows it).
+    am init <tasktype>              # e.g. `am init bugfix` → bugfix_060626_4821 (this directory)
+    am init <tasktype> -c CAT [-p PROJ]   # SCOPED: confine this identity to a category (or one project)
+Then use `am` normally (`am whoami` shows the id, plus a `scope:` line when scoped).
 
     am next [-p P] [-c C] [--meta KEY]   # pick up work: atomically claims the best ready task,
                                #   prints its id (exit 3 = nothing ready) — start here
@@ -86,7 +88,17 @@ Choose the project with `-p <slug>` (or set AGENTMAN_PROJECT) and the category s
 `-c <slug>` (or set AGENTMAN_CATEGORY — scopes ls/next/wait --ready and is the default for
 `project new`). Exception: `am show <id> -c` means --comments, not category. Output is terse
 text — add `--json` to parse. Silence = success. Exit codes: 0 ok · 3 not found · 4 already
-claimed or blocked by prereqs · 6 server down · 7 wait timed out.
+claimed or blocked by prereqs · 5 invalid · 6 server down · 7 wait timed out · 8 out of scope.
+
+**Scoped identity:** `am init <tasktype> -c CAT [-p PROJ]` confines this agent to a category (or one
+project). Out-of-scope mutations and named reads (`am claim`/`status`/`edit`/`show <id>` of a task
+outside your scope, `am next -p`/`-c` outside it) are rejected with **exit 8 (out of scope)**;
+unfiltered `am ls`/`am next` are silently narrowed to your scope. One carve-out: you can always file
+tasks into the **proposals project** (default `meta/proposals`) from any scope — that's the inbox
+for asking another scope's owner to do something. (`AGENTMAN_SCOPE` overrides the file's scope;
+`X-Agent-Scope` is the wire header — a client-asserted label, accident prevention, not auth.)
+**After upgrading:** a pre-Phase-Q identity file is read as **unscoped** — re-run `am init -c …` to
+gain a scope.
 
 **The work loop:** `am next` is the pickup verb — it atomically picks AND claims the
 highest-priority ready task (FIFO within a priority), so two agents calling it concurrently

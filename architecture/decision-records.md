@@ -769,6 +769,112 @@ without evidence.
   (`checkReady` metaKey); `cmd/am/web/app.js` (modal Meta section, `task.patched` feed suffix);
   the 25 Phase P tests listed in the CHANGELOG entry.
 
+### ADR-027: Scoped agent identity & enforcement — client-asserted `X-Agent-Scope`, one `scopeOf` resolution point, hybrid read policy, proposals carve-out by (category, project) pair, `tasks.created_by` via migration v5, denials log-only (Phase Q)
+- Status: Active
+- Context: The agentic_brain integration (requirement R4) needs agents **confined** to a slice of
+  the board — a category (the common case) or a single project (tighter) — so an autonomous fleet
+  can share one instance without one agent mutating another's work. Phase O built the category
+  layer for exactly this; Phase Q is the enforcement. This is the third phase of the train ADR-025
+  opened (Phase P task metadata in parallel); the category dashboard + scoped feed (Phase R) and
+  scope tokens (Phase S) build on it.
+- Decision:
+  1. **Client-asserted scope, one resolution point.** A scope rides as the `X-Agent-Scope` header
+     (`category[/project]`, trimmed + lowercased like slugs); `scopeOf(r)` in `server.go` is the
+     **sole** reader of it. Phase S (scope tokens) swaps the scope's *source* there without touching
+     a single handler. Like `X-Agent`, the header is **accident prevention for an agent following
+     its config, not a security boundary** against crafted HTTP (no auth — `security.md`'s caveat
+     applies); R5 scope tokens are the upgrade path. An absent header is the zero (unscoped) Scope
+     and passes every check; a malformed one (empty/whitespace segments, >1 slash) is `400
+     validation` everywhere (`parseScope` wraps `ErrValidation`); well-formed but unknown slugs are
+     **not** validated against the DB (mutations 403, unfiltered lists come back empty).
+  2. **Hybrid enforcement placement, justified by immutability.** The scope pre-checks
+     (`checkTaskMut`/`checkTaskRead`/`checkComment`/`checkCreate`/`checkProjectMut`/`checkProjectRead`/
+     `narrowScope`) run in the handler, **outside** the store transaction. This is sound only
+     because `task→project` and `project→category` are immutable today (`category_id` is not
+     patchable — ADR-025; a task never moves projects). The one exception that must stay in-tx is
+     **`am next`**: `narrowScope` merges the scope into the `NextFilter` **before** `NextTask`, so
+     the scope is part of the candidate predicate inside the atomic pick+claim — a scoped agent can
+     never be handed an out-of-scope task even racing unscoped callers. Comments on
+     `PatchTask`/`PatchProject` record that the pre-checks must move in-tx if a move feature ever
+     ships.
+  3. **Reads policy: loud where named, silent where browsing.** Named/explicit out-of-scope reads
+     fail **loudly** with 403 — `GET /api/tasks/{id}`, `GET …/graph`, and an explicit
+     `?project=`/`?category=` that contradicts the scope — mirroring the orchestrator's
+     "ask-first outside your subtree" rule. Unfiltered lists are **silently narrowed** (missing
+     filters filled from the scope), keeping `am ls` ergonomic for a scoped agent. The **proposals
+     project is readable by all** (proposals are meant to be seen). `am wait` carries the scope on
+     its REST re-checks (out-of-scope `--done`/`--ready` → exit 8) but the SSE **stream stays
+     unscoped** (Phase R residual) — out-of-scope events merely trigger re-checks that keep failing,
+     no hot-spin and no false release (the ADR-023 pattern: event payloads are triggers, not state).
+  4. **`am next` carve-out does NOT extend the proposals exception.** `narrowScope(…, allowProposals)`
+     is `true` for reads, `false` for next: an agent whose scope already covers the proposals project
+     still picks them by plain in-scope matching, but the carve-out never auto-feeds another scope's
+     proposals into a pickup.
+  5. **Denials are log-only — no `scope.denied` event kind.** Every 403 logs
+     `agentman: out_of_scope: actor=<id> scope=<scope> <METHOD> <PATH>` server-side (`denyScope`).
+     Feeding denials into the SSE feed was rejected as noise + a partial-information leak; the
+     21-kind catalog is **unchanged** this phase. Revisit only with a real audit requirement.
+  6. **`tasks.created_by` via migration v5, best-effort backfill from the event log.**
+     `currentSchemaVersion` 4 → 5 (`schema.sql` stays the frozen v1 baseline): `ALTER TABLE tasks
+     ADD COLUMN created_by TEXT`, then backfill from the **LATEST** `task.created` event's actor —
+     **latest, not first**, because `tasks.id` is a reusable SQLite rowid (no `AUTOINCREMENT`) and
+     `DeleteTask` leaves a deleted task's events behind, so an id's oldest creation event may belong
+     to a deleted predecessor; the newest is always the current incarnation's. Tasks whose events
+     were pruned stay NULL and never match the own-proposal comment rule (the safe direction). New
+     tasks set `created_by` from `actorOf(r)` (default `"human"`). `created_by` is exposed only on
+     `GET /api/tasks/{id}` (and read by the scope checks) — **not** on list rows, keeping list
+     payloads stable. Forward-only, idempotent, version bump in the same tx; the import ceiling
+     tracks `currentSchemaVersion` (v5 imports, v6 refused).
+  7. **Proposals carve-out keyed by the (category, project) PAIR, inert when missing.** Task
+     creation — and commenting on one's OWN proposal tickets (`created_by == X-Agent`,
+     NULL/empty never matches) — in the designated proposals project is allowed from any scope.
+     The project is `--proposals CAT/PROJ` / `AGENTMAN_PROPOSALS` / default `meta/proposals` (flag
+     beats env; both segments required — a bare category is rejected at `am serve` startup,
+     `fail(1)`, because it would widen the carve-out to a whole category). The carve-out matches the
+     **pair** at every site (`isProposals` is the single slug-keyed helper; `checkTaskRead`/
+     `checkComment` check the pair directly): slugs are globally unique (ADR-025), so without the
+     category check a scoped agent could **squat** the slug inside its own category and capture every
+     other scope's proposals. A same-slug project in another category falls through to the normal
+     rules; a **missing** designated project leaves the gate open and the store 404s, so the
+     carve-out is inert, never an error or a hole. `NewServer` defaults to `{meta, proposals}` so
+     embedded/test servers behave like production.
+  8. **Category endpoints 403 for any scoped agent; project create only for a category-scoped agent
+     in its own category.** The category layer sits above every scope, so `POST /api/categories` and
+     category archive/unarchive are 403 for any non-zero scope. `POST /api/projects` is allowed for
+     a category-scoped agent creating into its **own** effective category (empty body category =
+     `general`) and 403 otherwise — and **always** 403 for a project-scoped agent (a project scope
+     cannot reshape its category). Project mutations (patch/archive/unarchive/delete) require the
+     project itself in scope (no proposals carve-out — proposing is creating tasks, never reshaping
+     the project).
+- New error: `ErrOutOfScope` → `403 {"error":"out_of_scope"}` → **CLI exit code 8** (wired through
+  `exitCodeFor`, the single source, so `doOrFail` and the bulk verbs inherit it). No new event
+  kinds, no schema-visible changes beyond `tasks.created_by`.
+- Rationale: a single header + a single `scopeOf` reader keeps the whole feature swap-ready for
+  scope tokens; placing the checks outside the tx is cheap and provably safe under today's
+  immutability invariants; the loud-named / silent-unfiltered split matches how an orchestrator and
+  an exploring agent each read the board; the pair-keyed carve-out is the minimum that both lets any
+  agent file proposals and resists slug squatting; log-only denials avoid leaking cross-scope
+  activity into the feed.
+- Consequences (accepted residuals — see `known-risks-and-gaps.md`): `/api/events` and `/api/stream`
+  still leak cross-scope activity to scoped agents until Phase R; `GET /api/projects` /
+  `GET /api/categories` lists are not narrowed (board metadata visible, task data is not); an
+  explicit unknown `?project=` (or a project-scoped create into an unknown slug) returns 403 rather
+  than 404/empty — the server cannot prove it in-scope, so it fails loud; `created_by` backfill is
+  best-effort (pruned-events tasks stay NULL); exit 8 from `am wait`'s host-guard path is cosmetic;
+  TOCTOU between a scope check and the mutation is impossible only because of immutability — revisit
+  with any move feature.
+- Evidence: `cmd/am/store.go` (`Scope`/`parseScope`/`Scope.String`/`IsZero`, `ErrOutOfScope`,
+  migration v5, `taskScope`, `projectCategory`, `Task.CreatedBy`, the `CreateTask` `created_by`
+  insert, the `PatchTask`/`PatchProject`/`NextTask` scope-note comments); `cmd/am/server.go`
+  (`scopeOf`, `scopeAllows`, `denyScope`, `checkTaskMut`/`checkTaskRead`/`checkComment`/`isProposals`/
+  `checkCreate`/`checkProjectRead`/`checkProjectMut`/`narrowScope`, the per-handler pre-checks,
+  `Server.proposals`, `writeErr` `ErrOutOfScope` → 403, `NewServer` default); `cmd/am/identity.go`
+  (`identityRecord`, `resolveIdentity`/`resolveScope`, scoped `cmdInit`, `cmdWhoami` scope line);
+  `cmd/am/client.go` (`Client.scope`, the `X-Agent-Scope` send, `exitCodeFor` 403 → 8);
+  `cmd/am/wait.go` (`waiter.scope`, the 403 → exit 8 re-checks); `cmd/am/main.go` (`--proposals` /
+  `AGENTMAN_PROPOSALS`, `usage()` scope/exit-8 lines); the 32 Phase Q tests listed in the CHANGELOG
+  entry.
+
 ## Inferred Decisions
 
 ### IADR-001: SSE chosen over WebSockets

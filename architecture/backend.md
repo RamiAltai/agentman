@@ -46,6 +46,52 @@ GET   /api/projects/{slug}/graph    handleProjectGraph      {nodes:[]Task, edges
 `{id}` accepts a global id (`13`) or a project ref (`web-3`), resolved by `store.resolveTaskID`.
 Responses are JSON via `writeJSON`; errors via `writeErr`.
 
+**Scope enforcement (Phase Q / ADR-027).** Every handler that mutates or names a resource runs a
+scope pre-check derived from the `X-Agent-Scope` header (`scopeOf(r)` — the sole reader; an absent
+header is unscoped and passes everything). Out-of-scope → `ErrOutOfScope` → `403
+{"error":"out_of_scope"}` → CLI exit 8. The per-route picture:
+- **Task mutations** — `checkTaskMut` (the task must be in scope): `POST …/claim` (covers
+  `steal_stale` too), `PATCH /api/tasks/{id}` (covers each id of a bulk `am status`/`am assign`),
+  `DELETE /api/tasks/{id}`, `DELETE …/comments/{cid}`, `POST/DELETE …/deps[/…]` (checked on the
+  *dependent* task only — the store's same-project dep rule covers the prereq), `POST/DELETE
+  …/labels[/…]`.
+- **`POST /api/tasks`** — `checkCreate`: target project in scope **or** the proposals project; for a
+  project-scoped agent anything ≠ its project is 403 (no existence check); for a category-scoped
+  agent an unknown slug stays **404** (matching unscoped create).
+- **`POST /api/tasks/{id}/comments`** — `checkComment`: in scope, OR (task in the proposals project
+  AND `created_by == X-Agent`; NULL/empty `created_by` never matches).
+- **`POST /api/tasks/next`** — `narrowScope(allowProposals=false)` merges the scope into the
+  `NextFilter` **before** `NextTask`, inside the atomic pick+claim; explicit out-of-scope
+  `project`/`category` → 403, absent ones injected from the scope. The proposals carve-out does
+  **not** extend to next.
+- **`GET /api/tasks`** — `narrowScope(allowProposals=true)`: explicit `?project=`/`?category=` that
+  contradicts the scope → 403 (loud); missing filters filled from the scope (silent narrowing);
+  `?project=<proposals>` allowed. Same path scopes `am wait --ready`'s REST re-check.
+- **`GET /api/tasks/{id}`** — `checkTaskRead`: 403 out of scope (named reads fail loudly);
+  proposals tasks 200.
+- **`GET /api/projects/{slug}/graph`** — `checkProjectRead` (project-level; proposals allowed).
+- **`POST /api/projects`** — allowed only for a category-scoped agent in its OWN effective category
+  (empty body category = `general`); 403 for any other category and for project-scoped agents.
+- **`PATCH/DELETE /api/projects/{slug}`, archive/unarchive** — `checkProjectMut` (project in scope;
+  no proposals carve-out).
+- **`POST /api/categories`, archive/unarchive** — 403 for ANY scoped agent (the category layer is
+  above every scope).
+- **Untouched:** `GET /api/events`, `GET /api/stream`, `GET /api/projects`, `GET /api/categories`
+  (list endpoints stay unfiltered; the task layer is the enforcement point this phase — Phase R
+  residual, see `known-risks-and-gaps.md`).
+
+The proposals carve-out project is `Server.proposals` (a `Scope`), set from `--proposals CAT/PROJ` /
+`AGENTMAN_PROPOSALS` (default `meta/proposals`; `NewServer` defaults to `{meta, proposals}`). The
+single helper `isProposals(slug)` matches the **(category, project) pair** — a same-slug project in
+another category is not the carve-out (slugs are globally unique, so the pair check blocks a
+slug-squat); a missing designated project leaves the gate open and the store 404s (the carve-out
+stays inert). Every denial is logged (`denyScope`): `agentman: out_of_scope: actor=<id> scope=<scope>
+<METHOD> <PATH>` — **log-only, no event kind**. The check helpers and `narrowScope` take the
+`*http.Request` so the log line can carry actor/method/path; the checks run **outside** the store
+transaction, which is sound only because `task→project` and `project→category` are immutable (the
+`PatchTask`/`PatchProject` scope-note comments record that they must move in-tx if a move feature
+ever ships).
+
 `am db export`/`am db import`/`am db prune` have **no HTTP route** — they are CLI-only local-file
 operations. The `db` command is dispatched in `cmd/am/main.go` *before* the HTTP client is built
 (`cmdDB`, ahead of `NewClient()`), so it works directly on the SQLite file (`cmd/am/db.go`).
@@ -86,7 +132,12 @@ fields (`uid`, `category`, vault binding).
 `CreateTask` checks the target project's `archived_at` before the insert and returns
 `ErrProjectArchived` if archived — creation into an archived project is rejected; it also checks
 the project's **category** and returns `ErrCategoryArchived` (→ `400 category_archived`) when
-that is archived. `CreateProject` applies the same two checks to its target category (unknown
+that is archived. It writes `tasks.created_by` from `CreateTaskInput.Actor` (Phase Q; the handler
+passes `actorOf(r)`, default `"human"`).
+The store also exposes two thin scope-support reads: `taskScope(id)` (category slug, project slug,
+and `created_by` for a task in one SELECT — everything the scope checks need; `ErrNotFound` for an
+unknown id) and `projectCategory(slug)` (a project's category slug; `ErrNotFound` for an unknown
+project). `CreateProject` applies the same two checks to its target category (unknown
 slug → 404; archived → 400), defaults an empty category to `general` (keeps the dashboard's
 `{slug,name}` POST working), and generates the `amp_` uid (`newUID`, with `isUniqueErr` retry).
 `PatchProject` (Phase O) mirrors `PatchTask`: allowed keys `slug`/`name`/`vault_project_id`/
@@ -186,8 +237,11 @@ filter exactly; ordering is priority ASC (0 = most urgent) with an id-ASC FIFO t
 (deliberately not `am ls`'s `updated_at DESC` display order — a pickup queue drains oldest-first).
 The archived-category exclusion is **unconditional** (scoped or not), like the archived-project
 rule. Since Phase P the signature is **`NextTask(f NextFilter, agent string)`** with
-`NextFilter{Project, Category, MetaKey}` — the scope dimensions compose, and Phase Q extends the
-struct instead of widening the signature again. The `MetaKey` predicate is **textually identical
+`NextFilter{Project, Category, MetaKey}`. **Scope contract (Phase Q):** a scoped caller's
+`X-Agent-Scope` is merged into `f` by the handler (`narrowScope`) **before** `NextTask` runs, so the
+agent's scope is part of the candidate predicate **inside** the atomic pick+claim — a scoped agent
+can never be handed an out-of-scope task, even racing unscoped callers. The `MetaKey` predicate is
+**textually identical
 to ListTasks'** (the wait/next invariant: a task that releases `am wait --ready --meta K` must be
 pickable by `am next --meta K`; enforced by comment at both sites).
 Zero rows ⇒ `ErrNotFound` (nothing ready, no carrier of the meta key, or — same 404, accepted
@@ -212,12 +266,14 @@ See `data-model.md` for the schema.
 ## Models and Schemas
 
 Go structs in `cmd/am/store.go`: `Category`, `Project`, `Task`, `Comment`, `Event`, `TaskFilter`,
-`NextFilter`, `CreateTaskInput`. SQL schema in `cmd/am/schema.sql` (embedded via
-`//go:embed schema.sql`).
+`NextFilter`, `CreateTaskInput`, plus **`Scope`** (Phase Q — `{Category, Project}` with
+`IsZero`/`String` and the package-level `parseScope`). SQL schema in `cmd/am/schema.sql` (embedded
+via `//go:embed schema.sql`).
 `Category` and `Project` carry a stable `uid` (`amc_`/`amp_` + 16 hex, `newUID`); `Project`
 additionally carries `category` (slug), `vault_project_id`, and `vault_path`. `Task` carries
-`Meta map[string]string` (`json:"meta,omitempty"`); `TaskFilter` and `NextFilter` carry `MetaKey`;
-`CreateTaskInput` carries `Meta`.
+`Meta map[string]string` (`json:"meta,omitempty"`) and `CreatedBy` (`json:"created_by,omitempty"`,
+populated by `getTaskTx`/`GetTask`, not by list rows); `TaskFilter` and `NextFilter` carry `MetaKey`;
+`CreateTaskInput` carries `Meta` and `Actor` (the latter written to `tasks.created_by` on insert).
 
 ## Authentication and Authorization
 
@@ -266,10 +322,11 @@ No job queue. Long-lived goroutines only:
 ## Error Handling
 
 Sentinel errors in `store.go`: `ErrNotFound`, `ErrConflict`, `ErrValidation`, `ErrProjectArchived`,
-`ErrCategoryArchived`,
+`ErrCategoryArchived`, `ErrOutOfScope` (Phase Q),
 typed `*ConflictError{Assignee}`, typed `*BlockedError{OpenPrereqs []int64}`, and typed
 `*NotStaleError{Assignee}`. `writeErr`
-(`server.go`) maps them: 404 / 409 / 400, with
+(`server.go`) maps them: 404 / 409 / 400 / 403, with
+`ErrOutOfScope` → `403 {"error":"out_of_scope"}`, and
 `ConflictError` → `409 {"error":"already_claimed","assignee":…}`,
 `BlockedError` → `409 {"error":"blocked","open_prereqs":[…]}`,
 `NotStaleError` → `409 {"error":"not_stale","assignee":…}`,
@@ -282,7 +339,8 @@ stderr — it is never sent to the client). Delete handlers (`handleDeleteTask`,
 missing (`ErrNotFound`). The CLI re-maps HTTP status to **exit codes** via `client.go
 exitCodeFor` (the single source, used by `doOrFail` and the bulk `status`/`assign` loop):
 `3` not found · `4` conflict/blocked/not-stale · `5` validation/project_archived · `6` server down
-· `1` other; plus `7` = `am wait` timeout (CLI-side, no HTTP status involved).
+· `8` out of scope (any 403) · `1` other; plus `7` = `am wait` timeout (CLI-side, no HTTP status
+involved).
 A `blocked` 409 prints e.g. `claim: #3 blocked — prereqs not done (#1 #2)`; a `not_stale` 409
 prints e.g. `claim: #3 held by agent-a (not stale yet)`. Bulk `am status`/`am assign` print one
 stderr line per failing id (`status: #13 not_found`), continue, and exit with the first failure's
@@ -301,7 +359,7 @@ per request after completion: `METHOD PATH STATUS LATENCY ACTOR` (actor = `X-Age
 
 ## Testing
 
-There are ten test files (run `go test -race ./cmd/am/`; 199 tests, all green):
+There are ten test files (run `go test -race ./cmd/am/`; 231 tests, all green):
 - `cmd/am/update_test.go` — version-comparison logic.
 - `cmd/am/store_test.go` — atomic-claim race (concurrent, `-race`-clean), events-cursor monotonicity,
   store CRUD + validation (`ErrValidation`), project archive/unarchive round-trip + idempotency,
@@ -325,7 +383,11 @@ There are ten test files (run `go test -race ./cmd/am/`; 199 tests, all green):
   create and patch), `TestPatchTaskMetaAtomicOneEvent`, `TestPatchTaskMetaNoOpNoEvent`,
   `TestMetaOnlyPatchDoesNotBumpUpdatedAt`, `TestNextTaskMetaFilter`,
   `TestNextTaskMetaRaceDistinctWinners`, `TestListTasksMetaKeyFilter`,
-  `TestListTasksReturnsMeta`, `TestDeleteTaskCascadesMeta`, `TestTaskMetaTableExistsOnReopenedDB`.
+  `TestListTasksReturnsMeta`, `TestDeleteTaskCascadesMeta`, `TestTaskMetaTableExistsOnReopenedDB`,
+  and scope (Phase Q): `TestTaskScopeAndProjectCategory` (`taskScope`/`projectCategory`,
+  `created_by` default, `ErrNotFound`), `TestNextTaskRaceScopedCategoryMeta` (N workers, a
+  Category+MetaKey filter, out-of-scope + keyless decoys at higher priority → distinct in-scope
+  meta-carrying winners).
 - `cmd/am/server_test.go` — validation→status mapping (400/404/409), `hostGuard`, `csrfGuard`,
   `securityHeaders`, `listenAddr` loopback regression, archive/unarchive endpoints + 404,
   hard-delete HTTP endpoints (`TestDeleteTaskEndpoint`, `TestDeleteProjectEndpoint`,
@@ -341,24 +403,35 @@ There are ten test files (run `go test -race ./cmd/am/`; 199 tests, all green):
   `TestListTasksCategoryParam`, `TestNextEndpointCategoryBody`, `TestPatchProjectEndpoint`,
   `TestCreateTaskArchivedCategory400`,
   and Phase P: `TestCreateTaskWithMeta`, `TestPatchTaskMetaEndpoint`, `TestNextEndpointMetaBody`,
-  `TestListTasksMetaKeyParam`
+  `TestListTasksMetaKeyParam`,
+  and the Phase Q scope sweep (helpers `scopedBoard`/`mustCreateProposals`/`scoped`):
+  `TestScopeClaimEnforcement`, `TestScopeNextEnforcement`, `TestScopeStealStale`,
+  `TestScopeProposalsCarveOut`, `TestScopeProposalsConfigurable`,
+  `TestScopeProposalsMissingProjectInert`, `TestScopeProposalsWrongCategoryNoCarveOut`,
+  `TestScopeProposalsSquat`, `TestScopeMutationSweep` (every mutating verb, 403 out-of-scope vs
+  success in-scope), `TestScopeProjectScopedAgent`, `TestScopeReads` (named 403 / narrowing /
+  proposals / graph), `TestScopeHeaderValidation` (400s + unknown-slug scope),
+  `TestScopeProjectCategoryEndpoints`
   (via `net/http/httptest`).
 - `cmd/am/migrate_test.go` — migration runner (apply/skip/idempotent/rollback), incl. the v2 step
   that adds `projects.archived_at`, the v3 step that adds `tasks.claimed_at`
-  (`TestMigrationV3AddsClaimedAt`), and the v4 category/stable-ID step (`TestMigrationV4Fresh`,
+  (`TestMigrationV3AddsClaimedAt`), the v4 category/stable-ID step (`TestMigrationV4Fresh`,
   `TestMigrationV4ExistingDB` — seeded `general`, distinct `amp_` uids, task data untouched,
-  no double-apply on reopen); `TestOpenStoreRejectsNewerSchema` (the open-time version ceiling).
+  no double-apply on reopen), and the v5 `created_by` step (`TestMigrationV5Fresh`,
+  `TestMigrationV5ExistingDB` — backfill from `task.created`; pruned-events task stays NULL; a
+  reused rowid backfills from the LATEST creation event; idempotent reopen). The v4 cases and
+  `TestOpenStoreRejectsNewerSchema` are un-hardcoded to `currentSchemaVersion`(+1).
 - `cmd/am/db_test.go` — `db export`/`import` roundtrip + file perms (0o600), backup creation + perms,
   garbage rejection, server-liveness check; `TestPruneEventsKeep`, `TestPruneEventsBefore`,
   `TestPruneEventsBeforeSameDayBoundary` (prune); Phase O: `TestExportContainsCategories`,
   `TestImportPreCategorySnapshot` (v1-baseline required-table set keeps old snapshots
-  importable), `TestImportRejectsNewerSchema`.
+  importable), `TestImportRejectsNewerSchema` (the latter two un-hardcoded to `currentSchemaVersion`).
 - `cmd/am/cli_test.go` — CLI command-path + exit-code tests (Phase E1). Exercises verbs against a
   real `httptest` server via a directly-constructed `Client`, using `captureStdout`/`captureExit`
   helpers. Covers: `cmdNew` prints only the numeric id; `cmdLs` produces terse output; mutations
   (`cmdStatus`/`cmdNote`/`cmdDrop`) are silent on success; and the exit-code mapping in
   `client.go doOrFail` — 3 (not found), 4 (conflict), 5 (validation/`project_archived`), 6 (server
-  down). Also table-tests for `parse`/`Args` and the pure formatters
+  down), 8 (out of scope). Also table-tests for `parse`/`Args` and the pure formatters
   (`taskLine`/`statusShort`/`assignee`/`trunc`/`apiErr`); Phase K added `TestExitNotStale`
   (exit 4 + `not stale yet` message) and `TestStaleFlagsWireFormat` (`--stale` / `--steal-stale`
   wire encoding); Phase L added `TestCmdNextPrintsOnlyID`, `TestExitNextNoneReady` (exit 3),
@@ -375,7 +448,11 @@ There are ten test files (run `go test -race ./cmd/am/`; 199 tests, all green):
   `TestCmdNewMetaWireFormat` (all `--meta` pairs in one POST; usage errors for `k=`/bare tokens),
   `TestCmdEditMetaSinglePatch` (repeated flags fold into ONE PATCH), `TestCmdNextMetaWireFormat`,
   `TestCmdLsMetaWireFormat` (single-key filter form; `key=value` rejected), and
-  `TestCmdShowPrintsMeta` (sorted `meta:` line).
+  `TestCmdShowPrintsMeta` (sorted `meta:` line);
+  Phase Q added `TestExitCodeForOutOfScope` (403 → 8), `TestCmdClaimOutOfScopeExit8`,
+  `TestCmdNextOutOfScopeExit8`, `TestClientSendsScopeHeader` (the `X-Agent-Scope` wire send), and
+  `TestCmdStatusBulkOutOfScope` (per-id 403 line + continue + exit 8; 404-before-403 ordering →
+  exit 3).
 - `cmd/am/wait_test.go` — `am wait` (Phase L). `TestWaitDoneAlreadySatisfied`,
   `TestWaitDoneEventArrives`, `TestWaitDoneCrossProject` (`AGENTMAN_PROJECT` must not scope the
   `--done` stream), `TestWaitReadyOnPrereqDone` (blocked task becomes ready when its
@@ -386,7 +463,10 @@ There are ten test files (run `go test -race ./cmd/am/`; 199 tests, all green):
   readiness re-check; the stream stays unscoped); Phase P added `TestWaitReadyMetaNoHotSpin`
   (a meta-scoped wait doesn't release on non-carrier ready tasks),
   `TestWaitReadyMetaReleasedByCreate`, `TestWaitReadyMetaReleasedByPrereqDone`, and
-  `TestWaitMetaUsageErrors` (`--done --meta` exit 1; two `--meta` / `key=value` exit 5).
+  `TestWaitMetaUsageErrors` (`--done --meta` exit 1; two `--meta` / `key=value` exit 5);
+  Phase Q added `TestWaitReadyScopedTimeout` (an out-of-scope ready task never releases → exit 7),
+  `TestWaitReadyScopedReleased` (an in-scope create releases with the id), and
+  `TestWaitReadyExplicitOutOfScopeExit8`.
 - `cmd/am/sse_test.go` — SSE streaming + reconnect (Phase E2). `TestSSEDeliversLiveEvent`
   subscribes to `/api/stream`, creates a task, and asserts the `task.created` event arrives live.
   `TestSSEReplayOnReconnect` reconnects with `Last-Event-ID` and asserts that events created while
@@ -394,7 +474,10 @@ There are ten test files (run `go test -race ./cmd/am/`; 199 tests, all green):
   cursor).
 - `cmd/am/identity_test.go` — identity (Phase E3). `cmdInit`→`resolveAgent` roundtrip,
   `AGENTMAN_AGENT` env override wins, `sanitizeType` table, `newIdentity` format. Isolates via the
-  `AGENTMAN_AGENT_FILE` env seam so the real `~/.agentman` is never written.
+  `AGENTMAN_AGENT_FILE` env seam so the real `~/.agentman` is never written. Phase Q added
+  `TestInitScopedWritesJSON`, `TestInitScopedCategoryProject`, `TestInitProjectRequiresCategory`
+  (exit 5), `TestLegacyPlainIdentityUnscoped`, `TestScopeEnvOverride` (`AGENTMAN_SCOPE`),
+  `TestWhoamiPrintsScope`, and `TestParseScope` (table incl. `String`/`IsZero`).
 - `cmd/am/web_test.go` — dashboard XSS-sink guard (Phase E4). `TestDashboardNoXSSSinks` reads the
   embedded `web/app.js` + `web/index.html` via the `webFS` embed.FS and asserts that none of
   `.innerHTML`/`.outerHTML`/`.insertAdjacentHTML`/`document.write`/`eval(` appear — a source-level
@@ -411,7 +494,8 @@ tests brought it to **107**; Phase L's 23 work-loop tests brought it to **130**;
 findability tests (8 store, 2 server, 4 CLI — listed above) brought it to **144**; Phase O's 30
 category/stable-ID/vault/migration tests (8 store, 6 server, 7 CLI, 3 wait, 3 db, 3 migrate —
 listed above) brought it to **174**; Phase P's 25 task-metadata tests (11 store, 4 server,
-4 wait, 6 CLI — listed above) bring it to **199**.
+4 wait, 6 CLI — listed above) brought it to **199**; Phase Q's 32 scope/enforcement tests
+(2 store, 13 server, 5 CLI, 3 wait, 7 identity, 2 migrate — listed above) bring it to **231**.
 
 SSE streaming/reconnect, CLI verbs, exit-code mapping, and identity are now covered. The
 dashboard has a source-level XSS-sink guard but **no behavioral JS tests** — the project
@@ -437,9 +521,10 @@ deliberately adopts no JS test runner (preserves the single-binary/no-npm ethos)
 
 - **Migration runner is now exercised** — Phase 0 added `runMigrations` (ADR-010); Phase 2's first
   step (`ALTER TABLE projects ADD COLUMN archived_at TEXT`) proved the
-  additive-column path end-to-end, and v3 (`claimed_at`) and v4 (categories/stable IDs/vault
-  binding, `currentSchemaVersion = 4`) followed it. A DB *newer* than the binary is **no longer
-  accepted silently** — `OpenStore` refuses it with a clear "upgrade am" error (Phase O).
+  additive-column path end-to-end, and v3 (`claimed_at`), v4 (categories/stable IDs/vault binding),
+  and v5 (`tasks.created_by`, `currentSchemaVersion = 5`) followed it. A DB *newer* than the binary
+  is **no longer accepted silently** — `OpenStore` refuses it with a clear "upgrade am" error
+  (Phase O).
 - **Single-writer** caps write throughput; fine for a personal board, unproven at scale.
 - ~~**500s leak raw error strings**~~ — **fixed (Phase D1)**; 500s now return a generic `{"error":"internal"}` body; detail is logged server-side only.
 - **No request size/time limits** beyond a 1 MiB body cap and `ReadHeaderTimeout`.

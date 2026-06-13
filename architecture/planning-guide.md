@@ -58,11 +58,13 @@ Flag the change if it touches any of these invariants:
 
 - [ ] Schema change? A **forward-only migration runner exists and is exercised** (ADR-010) — append a
   `{version, apply}` step to `schemaMigrations` and raise `currentSchemaVersion` in `cmd/am/store.go`; do
-  **not** rely on `CREATE TABLE IF NOT EXISTS` to alter existing tables. The shipped v2–v4 steps
-  (the `projects.archived_at` / `tasks.claimed_at` `ALTER TABLE` migrations and the v4
-  category/stable-ID step with its seed + backfill) are the templates to
+  **not** rely on `CREATE TABLE IF NOT EXISTS` to alter existing tables. The shipped v2–v5 steps
+  (the `projects.archived_at` / `tasks.claimed_at` `ALTER TABLE` migrations, the v4
+  category/stable-ID step with its seed + backfill, and the v5 `tasks.created_by` step with its
+  best-effort event-log backfill) are the templates to
   copy. Add a migration test like `TestMigrationV2AddsArchivedAt` /
-  `TestMigrationV3AddsClaimedAt` / `TestMigrationV4ExistingDB` in `cmd/am/migrate_test.go`.
+  `TestMigrationV3AddsClaimedAt` / `TestMigrationV4ExistingDB` / `TestMigrationV5ExistingDB` in
+  `cmd/am/migrate_test.go`.
   Note `OpenStore` refuses a DB newer than `currentSchemaVersion` (Phase O), so version bumps are
   one-way for any binary that opens the DB.
 - [ ] New columns threaded through `schema.sql` → `store.go` structs → `CreateTask`/`PatchTask`/

@@ -171,8 +171,31 @@ filters across the listing and pickup verbs. Satisfies requirement **R7**.
   `(meta: …)` feed suffix on `task.patched`
   - No new event kinds (catalog stays 21), no new error/exit codes; +25 tests (now 199).
     → ADR-026, `CHANGELOG.md`.
-  - Next in the train: **Phase Q** scoping enforcement (R4), **Phase R** category dashboard +
-    scoped feed (R6), **Phase S** scope tokens (R5).
+  - Next in the train: **Phase Q** scoping enforcement (shipped, see below), **Phase R** category
+    dashboard + scoped feed (R6), **Phase S** scope tokens (R5).
+
+### Phase Q — Scoped agent identity & enforcement — **DONE (2026-06-13)**
+
+Third phase of the agentic_brain train: confine an agent to a category (or one project) and enforce
+it server-side. Satisfies requirement **R4**.
+
+- [x] Q1 Scope identity — `am init <tasktype> -c CAT [-p PROJ]` (JSON identity file; legacy
+  plain-text = unscoped, re-init after upgrade), `AGENTMAN_SCOPE` override, `am whoami` scope line;
+  the CLI sends `X-Agent-Scope` on every request
+- [x] Q2 Server enforcement — `scopeOf(r)` (sole reader, the Phase S swap point) + per-verb
+  `check*`/`narrowScope`; out of scope → `403 out_of_scope` → **new CLI exit code 8**; reads policy
+  loud-named / silent-unfiltered / proposals-readable; `am next` scope merged inside the atomic
+  pick+claim; category endpoints 403 for any scope, project-create only for a category-scoped agent
+  in its own category
+- [x] Q3 Proposals carve-out — `am serve --proposals` / `AGENTMAN_PROPOSALS` (default
+  `meta/proposals`), keyed by the (category, project) pair (slug-squat-proof), inert when missing,
+  not extended to `am next`; own-proposal comments via `tasks.created_by` (migration **v5**,
+  best-effort backfill from the latest `task.created` event)
+  - Denials log-only (no new event kind; catalog stays 21); `X-Agent-Scope` is client-asserted
+    (accident prevention, not auth — Phase S scope tokens upgrade it); +32 tests (now 231).
+    → ADR-027, `CHANGELOG.md`.
+  - Next in the train: **Phase R** category dashboard + scoped feed (R6), **Phase S** scope
+    tokens (R5).
 
 ### Later / if demand appears
 - Due dates + `--due-before` filter; webhooks on event kinds (Slack/CI triggers);
