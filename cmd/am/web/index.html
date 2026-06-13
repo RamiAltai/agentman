@@ -30,6 +30,10 @@
     <div class="actions">
       <input id="searchBox" type="search" class="search-input" placeholder="Search… ( / )" aria-label="Search tasks">
       <span id="labelFilterChip" class="label-filter hidden"></span>
+      <div class="filter-wrap">
+        <button id="filterBtn" class="iconbtn" aria-haspopup="true" aria-expanded="false" title="Filter tasks" aria-label="Filter tasks">Filter</button>
+        <div id="filterPanel" class="filter-panel hidden" role="dialog" aria-label="Board filters"></div>
+      </div>
       <button id="themeToggle" class="iconbtn ghost" title="Toggle light/dark theme" aria-label="Toggle color theme">
         <span class="theme-toggle-icon" aria-hidden="true"></span>
       </button>
