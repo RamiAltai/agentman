@@ -243,9 +243,8 @@ without evidence.
   surface (ADR-011) and avoids fighting the single-writer connection (ADR-003). Events-only scope
   is intentional — tasks/comments already have hard-delete; event rows are denormalized (ADR-004),
   so pruning them doesn't break referential integrity.
-- Residuals: prune is manual (no scheduled compaction); the `isServerRunning` guard checks
-  `AGENTMAN_URL` and is bypassable on non-default ports (same residual as `am db import`);
-  `feedPaginated` disabling `trimFeed` can grow the in-browser feed unbounded until reload.
+- Residuals: prune is manual, the `isServerRunning` guard is bypassable on non-default ports, and a
+  paginated feed disables `trimFeed` — all catalogued in `known-risks-and-gaps.md`.
 - Evidence: `cmd/am/store.go` (`ListEventsBefore`); `cmd/am/server.go` (`handleEvents` `?before=`
   branch); `cmd/am/db.go` (`pruneEvents`, `cmdDB` prune case); `cmd/am/web/app.js`
   (`feedOldest`, `feedPaginated`, `loadOlderActivity`, `loadOlderBtn`);
@@ -623,9 +622,9 @@ without evidence.
 - Context: The agentic_brain integration (requirements R1/R2/R3/R8) needs a **category** layer
   above projects (one instance, one DB, agents scoped down later), **stable IDs** the vault can
   bind to across slug renames, **vault binding metadata** on projects, and a migration that
-  carries every existing DB forward with zero data loss. This is Phase O ("Foundation") of that
-  train; scoping enforcement (Phase Q), the category dashboard (Phase R), and scope tokens
-  (Phase S) build on it, with task metadata (Phase P) in parallel.
+  carries every existing DB forward with zero data loss. This is the foundation layer the later
+  scoping (ADR-027), category dashboard (ADR-028), task metadata (ADR-026), and scope tokens
+  (ADR-029) build on.
 - Decision:
   1. **Stable-ID format: `amc_`/`amp_` + 16 lowercase hex** (`newUID` — 8 bytes of `crypto/rand`,
      stdlib only; no ULID dependency). Immutable after creation; survives slug renames; the
@@ -773,10 +772,9 @@ without evidence.
 - Status: Active
 - Context: The agentic_brain integration (requirement R4) needs agents **confined** to a slice of
   the board — a category (the common case) or a single project (tighter) — so an autonomous fleet
-  can share one instance without one agent mutating another's work. Phase O built the category
-  layer for exactly this; Phase Q is the enforcement. This is the third phase of the train ADR-025
-  opened (Phase P task metadata in parallel); the category dashboard + scoped feed (Phase R) and
-  scope tokens (Phase S) build on it.
+  can share one instance without one agent mutating another's work. This builds on the category
+  layer (ADR-025) and is in turn the substrate for the category dashboard + scoped feed (ADR-028)
+  and server-enforced scope tokens (ADR-029).
 - Decision:
   1. **Client-asserted scope, one resolution point.** A scope rides as the `X-Agent-Scope` header
      (`category[/project]`, trimmed + lowercased like slugs); `scopeOf(r)` in `server.go` is the
@@ -855,14 +853,10 @@ without evidence.
   an exploring agent each read the board; the pair-keyed carve-out is the minimum that both lets any
   agent file proposals and resists slug squatting; log-only denials avoid leaking cross-scope
   activity into the feed.
-- Consequences (accepted residuals — see `known-risks-and-gaps.md`): `/api/events` and `/api/stream`
-  still leak cross-scope activity to scoped agents until Phase R; `GET /api/projects` /
-  `GET /api/categories` lists are not narrowed (board metadata visible, task data is not); an
-  explicit unknown `?project=` (or a project-scoped create into an unknown slug) returns 403 rather
-  than 404/empty — the server cannot prove it in-scope, so it fails loud; `created_by` backfill is
-  best-effort (pruned-events tasks stay NULL); exit 8 from `am wait`'s host-guard path is cosmetic;
-  TOCTOU between a scope check and the mutation is impossible only because of immutability — revisit
-  with any move feature.
+- Consequences: accepted residuals (feed/stream not scope-narrowed, project/category lists not
+  narrowed, unknown explicit `?project=` → 403 not 404, best-effort `created_by` backfill,
+  cosmetic exit-8-from-host-guard, immutability-dependent TOCTOU) are catalogued in
+  `known-risks-and-gaps.md` (Scope-Enforcement Residuals).
 - Evidence: `cmd/am/store.go` (`Scope`/`parseScope`/`Scope.String`/`IsZero`, `ErrOutOfScope`,
   migration v5, `taskScope`, `projectCategory`, `Task.CreatedBy`, the `CreateTask` `created_by`
   insert, the `PatchTask`/`PatchProject`/`NextTask` scope-note comments); `cmd/am/server.go`
@@ -879,13 +873,11 @@ without evidence.
 - Status: Active
 - Context: The agentic_brain integration (requirement R6) needs a **human** view organized by
   category — a category-home landing page showing where work is happening, drill-down into a
-  single category's board, and a feed/stream that can be scoped to one category. This is the
-  fourth phase of the train ADR-025 opened (after Phase P task metadata, Phase Q scoping
-  enforcement); only Phase S (scope tokens, R5) remains after it. The Phase Q residual that
-  `/api/events` and `/api/stream` were not category-filterable (and the Phase O note that
-  `category.*` events would be "revisited in Phase R") are both closed here. Unlike the agent
-  scope of Phase Q, the dashboard is **unscoped** — a human sees everything; "category view" is a
-  query-param lens, not an identity scope (no `X-Agent-Scope` is sent).
+  single category's board, and a feed/stream that can be scoped to one category. This builds on the
+  category layer (ADR-025) and scoping enforcement (ADR-027), and closes the latter's residual that
+  `/api/events`/`/api/stream` were not category-filterable. Unlike the agent scope of ADR-027, the
+  dashboard is **unscoped** — a human sees everything; "category view" is a query-param lens, not an
+  identity scope (no `X-Agent-Scope` is sent).
 - Decision:
   1. **Hub category fan-out resolved at Subscribe into a project-ID set, not per-event.** A
      category subscription resolves the category's projects **once** when the stream opens
@@ -939,6 +931,9 @@ without evidence.
      keeps one global, unfiltered recent-activity feed; the category board scopes board/feed/stream
      via `?category=` (or `?project=` when one project is selected). All new DOM is built with
      `el()`/`textContent` (no `innerHTML`), so the existing `TestDashboardNoXSSSinks` guard covers it.
+     - **Superseded in part by ADR-032:** the navigation surface — the project-tab strip and the
+       `← Categories` breadcrumb-back button — was replaced by the left-rail navigation. The hash
+       routes and `route()` mapper remain valid; `#breadcrumb` survives as a plain scope-title label.
   8. **No-JS-runner verification stands (ADR-018).** The server surface (the `?category=` filtering,
      the augmented `/api/categories` payload, the hub fan-out) is covered by Go tests
      (`server_test.go`, `sse_test.go`, the new `hub_test.go`, `store_test.go`); the rendering
@@ -956,13 +951,11 @@ without evidence.
   category while instance-wide admin events stay on the overview; folding stats into the existing
   list endpoint avoids a first-paint flash; hash routing is the minimal linkable/back-button
   mechanism with no router library; the unscoped dashboard matches the human operator's role.
-- Consequences (accepted residuals — see `known-risks-and-gaps.md`): the **post-open project
-  staleness window** on a category stream (closed on view change; REST is authoritative); a
-  **cosmetic overview-count-debounce** can fire after navigating away — guarded by a re-check of
-  `view` at fire time so it never writes to the now-hidden `#overview`; the overview's `counts`
-  derivation is covered by `TestListCategoriesCounts` but the rendering is not behaviorally tested
-  (no JS runner); the `/api/events`+`/api/stream` Phase Q residual is now **closed for the
-  dashboard** via `?category=`, but `am wait`'s SSE stream still streams unscoped by design.
+- Consequences: accepted residuals (the post-open project staleness window on a category stream;
+  the cosmetic overview-count-debounce that can fire after navigating away) are catalogued in
+  `known-risks-and-gaps.md`. The ADR-027 feed/stream residual is now **closed for the dashboard**
+  via `?category=`, but `am wait`'s SSE stream still streams unscoped by design; the overview's
+  rendering is not behaviorally tested (no JS runner, ADR-018).
 - Evidence: `cmd/am/hub.go` (`subFilter`, `subscriber.categoryID`/`projectIDs`, the Subscribe-time
   resolution, the `Broadcast` membership check + `project.created` carve-out + post-open-window
   comment); `cmd/am/store.go` (`CategoryStat`, `ListCategoriesWithStats`, `ProjectIDsInCategory`,
@@ -978,12 +971,11 @@ without evidence.
 
 ### ADR-029: Scope tokens — token-scope-wins in the single `scopeOf` resolution point, sha256-hash-not-plaintext storage, mint-requires-unscoped, exit-9/401 for bad tokens, no token event kind (Phase S)
 - Status: Active
-- Context: The agentic_brain integration (requirement R5, SHOULD) needs Phase Q's **client-asserted**
-  scope (`X-Agent-Scope`, accident prevention only — any caller can forge or omit it, ADR-027) to
+- Context: The agentic_brain integration (requirement R5, SHOULD) needs the **client-asserted**
+  scope of ADR-027 (`X-Agent-Scope`, accident prevention only — any caller can forge or omit it) to
   become a **server-enforced** boundary: a credential the server binds to a scope, so a
-  config-following agent that holds only its own token cannot act as another scope. This is the
-  **fifth and final** phase of the train ADR-025 opened (after P metadata, Q scoping, R dashboard).
-  Non-goals (R9, unchanged): no TLS, no users, no rate limiting; the bind never leaves `127.0.0.1`.
+  config-following agent that holds only its own token cannot act as another scope. Non-goals (R9,
+  unchanged): no TLS, no users, no rate limiting; the bind never leaves `127.0.0.1`.
 - Decision (the seven choices):
   1. **`scopeOf` becomes a method `(s *Server) scopeOf(r)`** so it can reach the store to resolve
      tokens while remaining the **SINGLE** reader of request scope (the ADR-027 swap-point realized).
@@ -1035,15 +1027,14 @@ without evidence.
   as a credential; mint-requires-unscoped is the structural property that confines an agent (it cannot
   escalate by minting); a distinct exit 9 keeps a bad credential from being silently tolerated by the
   bulk-verb scope-skip semantics.
-- Consequences / residuals (accepted — see `known-risks-and-gaps.md`): this is **loopback-only with
-  no users** — a process that can read an identity file holds the token and can act as that scope, so
-  Phase S is **not** protection against arbitrary filesystem read; it upgrades R4's caveat from "any
-  header" to "a server-minted, scope-bound, revocable credential" but does **not** fully close it.
-  Revocation is immediate (`ResolveToken` checks `revoked_at` every request) but coarse — no
-  expiry/rotation (matches the SHOULD scope). Token-hash lookup is not constant-time (a non-issue at
-  loopback scale; constant-time over a DB lookup is infeasible). `am init` after a `token new` could
-  overwrite the token field (re-mintable, accepted). The full remote/multi-user auth+TLS project
-  (Phase G) stays parked.
+- Consequences / residuals: the load-bearing honesty note is that this is **loopback-only with no
+  users** — a process that can read an identity file holds the token and can act as that scope, so
+  scope tokens are **not** protection against arbitrary filesystem read; they upgrade the ADR-027
+  caveat from "any header" to "a server-minted, scope-bound, revocable credential" but do **not**
+  fully close it. The remaining accepted residuals (cleartext-over-loopback, coarse revocation with
+  no expiry, non-constant-time hash lookup, `am init` clobbering a stored token, the parked
+  remote/multi-user auth+TLS project) are catalogued in `known-risks-and-gaps.md` (Scope-Token
+  Residuals).
 - Evidence: `cmd/am/store.go` (`Token`/`Token.Scope`, `ErrInvalidToken`, `CreateToken`/`ListTokens`/
   `RevokeToken`/`ResolveToken`, `newToken`/`hashToken`); `cmd/am/schema.sql` (`tokens` +
   `idx_tokens_hash`); `cmd/am/server.go` (`(s *Server) scopeOf`/`bearerToken`, `tokenAdminGuard`,
@@ -1152,6 +1143,9 @@ without evidence.
      (`openNewCategory`) and there is **no inline new-category option inside the new-project picker**
      — that would nest one creation flow inside another. There is no category-**delete** control
      because there is no category-delete API.
+     - **Superseded in part by ADR-032:** Manage (and New project) moved off the header/tab bar into
+       the left-rail action rows; `openManage`/`openNewProject` and the Manage modal itself are
+       unchanged — only the entry point relocated.
   4. **Explicit reversal of two prior "by design" decisions.** This change closes documented parity
      gaps, so it deliberately undoes two earlier choices:
      - **ADR-025 / Phase O kept the project-create form category-unaware** (an empty category mapped
@@ -1197,6 +1191,67 @@ without evidence.
   `.cat-row`, `.btn-edit-proj`, `.meta-section`/`.meta-add-row`, `.btn-release`);
   `cmd/am/web_test.go` (`TestDashboardParityAffordances`).
 
+### ADR-032: Dashboard visual redesign — token design system, bold-violet theme, and left-rail navigation
+- Status: Active
+- Context: The dashboard had grown a dense, accent-noisy header (a project-tab strip plus a
+  `← Categories` breadcrumb-back button) and scattered color literals. It needed a calmer, legible
+  look and a primary-navigation surface that scales with categories/projects — without breaking the
+  no-npm/no-build-step invariant (ADR-001, ADR-007) or the XSS-safe DOM discipline (ADR-018). The
+  change is **frontend-only** (`cmd/am/web/`): no Go, API, schema, event-kind, error-code, exit-code,
+  or CLI surface is touched, and the dark/light theme **mechanism** (ADR-030) is unchanged — only
+  token *values* moved.
+- Decision (the three changes):
+  1. **Token design system.** Colors, spacing, and surfaces are CSS custom properties; task cards
+     were rebuilt around a labeled **status pill** (dot+word, `.status-pill`), an always-present
+     **priority-rank chip** P0–P3 for all four levels (`.chip-prio`, solid/filled via
+     `--chip-prio-ink`), a reserved **trouble** sub-row (`.ctrouble`: blocked/ready/stale) before
+     labels, and a blocked-column tint (`.col[data-status="blocked"]`). The card **left edge is now
+     status-colored** (`.col[data-status=…] .card` border-left), not priority-colored. Activity-feed
+     events are typed with a per-kind glyph+word (`EV_GLYPH`, `.ev-icon`, 3-col grid). Loading
+     **skeletons** and non-blocking **toasts** replace blank/blocking states. Accessibility: modal
+     focus trap + focus restore, Escape, `prefers-reduced-motion`; WCAG AA contrast in both themes.
+  2. **Bold & vivid violet theme.** `--accent` is violet (`#7d5cff` dark / `#6a40e0` light) with a
+     radial ambient glow (`--app-glow`), a gradient "+ Task" button (`--accent-btn`), status-colored
+     card edges, and status-tinted column headers. All accent **text** moved from `--accent` to
+     `--accent-strong` for AA. The theme mechanism (dark `:root` default + one
+     `:root[data-theme="light"]` override, FOUC head-script, `localStorage["am.theme"]`, toggle) is
+     unchanged per ADR-030 — only token values changed.
+  3. **Left-rail navigation.** A collapsible left rail (brand + Overview + All tasks + categories→
+     projects with open-counts + "New project" + "Manage", the last two as rail **actions**) replaces
+     the header project-tab strip **and** the `← Categories` breadcrumb-back button. A lean top bar
+     now holds the scope title (`#breadcrumb`, now just a label), search, Filter, "+ Task", and a
+     small utility cluster (Graph, theme toggle, Activity toggle, live status dot). New JS:
+     `renderRail()`/`railItem()`/`goProject()` plus a `pendingProject` handoff for single-project
+     select; layout shell is `body > .shell > (aside#rail, .appcol > (header, main))`. Collapse state
+     persists in `localStorage["am.railCollapsed"]`; an off-canvas drawer + `#railBackdrop` is used on
+     mobile (≤820px). `renderTabs()`/`tab()` were removed; `#tabs` is a hidden stub; `toggleProject()`
+     is retained only as a vestigial helper (the rail uses `goProject` for single-select).
+- Supersedes in part: **ADR-028** (its navigation/breadcrumb item — the tab strip + breadcrumb-back
+  button) and **ADR-031** (its manage-in-the-tab-bar item — Manage/New project moved into rail
+  actions). The hash routes (`route()`), the Manage/New-project modals themselves, and the ADR-030
+  theme mechanism all remain valid.
+- New error / kinds / schema: **none.** No new event kind (catalog stays **21**), no schema change
+  (`currentSchemaVersion` stays **5**), no new error or exit code, no API/CLI change. New persisted
+  client-side state: `localStorage["am.railCollapsed"]` (alongside `am.theme`/`am.feedW`/
+  `am.feedCollapsed`).
+- Rationale: a token system makes the design one source of color truth and keeps AA contrast tunable
+  per theme; the rail is the natural primary-nav surface as categories/projects grow and removes the
+  accent-heavy tab strip + a redundant back button; single-select via `goProject` matches how a human
+  drills into one project; collapse + off-canvas keep the rail out of the way on narrow/large screens.
+- Consequences / residuals (accepted): the behavioral JS (rail render/collapse, `goProject` handoff,
+  off-canvas drawer) is verified by source reading + manual check, not automated tests — the
+  documented no-JS-runner gap (ADR-018); `TestDashboardNoXSSSinks` still passes (all new DOM is
+  `el()`/`svg()`/`textContent`). `toggleProject()` lingers as dead-ish code until a future cleanup.
+- Evidence: `cmd/am/web/app.css` (token custom properties, `.status-pill`, `.chip-prio`/
+  `--chip-prio-ink`, `.ctrouble`, `.col[data-status=…]` edge/header tints, `.ev-icon`, skeleton/toast
+  styles, `--accent`/`--accent-strong`/`--accent-btn`/`--app-glow`, `.rail*`/`.shell`/`.appcol`, the
+  ≤820px off-canvas block); `cmd/am/web/index.html` (`.shell > aside#rail + .appcol`, `#railNav`/
+  `#railToggle`/`#railOpen`/`#railBackdrop`, `#breadcrumb` label, hidden `#tabs` stub);
+  `cmd/am/web/app.js` (`renderRail`/`railItem`/`goProject`/`pendingProject`, `EV_GLYPH`,
+  `RAIL_COLLAPSED_KEY`, `setRailCollapsed`/`openMobileRail`/`closeMobileRail`, vestigial
+  `toggleProject`); `cmd/am/web_test.go` (`TestDashboardNoXSSSinks`, `TestDashboardThemeAssets`,
+  `TestDashboardParityAffordances`).
+
 ## Inferred Decisions
 
 ### IADR-001: SSE chosen over WebSockets
@@ -1213,15 +1268,13 @@ without evidence.
 - Evidence: `cmd/am/web/app.js onEvent`/`renderBoard`.
 - Risk if Wrong: Medium — O(n) re-render limits very large boards; revisit before scaling.
 
-### IADR-003: No schema-migration framework — RESOLVED (Phase 0)
-- Confidence: High (now confirmed/resolved by ADR-010)
-- Original inference: relied on `CREATE TABLE IF NOT EXISTS` only; `meta.schema_version` written but
-  never read; no `ALTER`/migration runner.
-- Status: **Resolved + exercised.** Phase 0 added a forward-only runner (ADR-010) that reads/bumps
-  `meta.schema_version`; Phase 2 supplied its **first real step** — `schemaMigrations` now holds the
-  v2 `ALTER TABLE projects ADD COLUMN archived_at TEXT` (ADR-013), so `currentSchemaVersion = 2` and
-  the runner is exercised end-to-end (no remaining residual risk).
-- Evidence: `cmd/am/store.go` (`runMigrations`, `schemaMigrations` v2), `cmd/am/migrate_test.go`.
+### IADR-003: No schema-migration framework (later formalized by ADR-010/013)
+- Confidence: High.
+- Original inference: early code relied on `CREATE TABLE IF NOT EXISTS` only; `meta.schema_version`
+  was written but never read; no `ALTER`/migration runner.
+- Now: a forward-only runner reads/bumps `meta.schema_version` and applies ordered steps — see
+  ADR-010 (runner) and ADR-013 (first migration step).
+- Evidence: `cmd/am/store.go` (`runMigrations`, `schemaMigrations`), `cmd/am/migrate_test.go`.
 
 ### IADR-004: Native HTML5 drag-and-drop (no library, no touch)
 - Confidence: High
@@ -1234,16 +1287,8 @@ without evidence.
 
 These are **undecided/undocumented** in the repo (decide + record before building):
 - **Authentication / remote-access model** — discussed but not chosen or written down.
-- **Testing strategy & coverage targets** — Phase E closed the major gaps (CLI, SSE, identity,
-  dashboard XSS guard; ADR-018); behavioral dashboard JS is a documented deliberate gap. No
-  formal coverage target policy exists.
-- **Schema migration approach** — resolved + exercised; see IADR-003 / ADR-010 / ADR-013.
-- **Delete / archival semantics** — archive resolved as a reversible soft-delete (ADR-013); hard
-  delete resolved (ADR-015, Phase C1); `events` retention resolved (ADR-016, Phase C2: offline prune
-  + `?before=` cursor pagination); `comments` retention remains undecided (no bulk prune).
-- ~~**CI/CD & release automation**~~ — **CI resolved (Phase F / ADR-019)**. `.github/workflows/ci.yml`
-  gates push/PR with build/vet/gofmt/test(-race)/JS-syntax/govulncheck. Release automation (CD)
-  and a stated versioning policy remain undecided — releases are still manual `git tag` + push.
-- **Versioning / CHANGELOG policy** — tags exist (`v0.1.0`–`v0.3.0`); `CHANGELOG.md` (Keep a
-  Changelog format) and `ROADMAP.md` now exist in the repo root. Release automation and a stated
-  versioning policy remain undocumented.
+- **Testing strategy & coverage targets** — no formal coverage-target policy; behavioral dashboard
+  JS is a documented deliberate gap (ADR-018).
+- **`comments` retention** — no bulk prune or retention policy (only `events` is prunable).
+- **Release automation (CD) & versioning policy** — CI exists (ADR-019); releases are still manual
+  `git tag` + push, with no stated versioning policy.

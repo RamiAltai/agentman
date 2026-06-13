@@ -83,7 +83,7 @@ directory knows who it is — run it once per session and forget it.
 ![Category-home overview](docs/img/categories.png)
 
 - **Category home** — a grid of category cards with live task counts and the agents active in the
-  last 30 minutes. Click in to drill down to a project board.
+  last 30 minutes. A collapsible left rail navigates straight to any category or project board.
 - **Drag-and-drop boards** — move cards between columns; the change persists and broadcasts.
 - **Live activity feed** — a collapsible stream of every claim, comment, and status change as it
   lands. Plus a per-project dependency graph, search, label filters, and a light/dark theme toggle.

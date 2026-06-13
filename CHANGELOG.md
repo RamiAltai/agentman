@@ -11,6 +11,50 @@ fresh `[Unreleased]` section.
 
 ### Added
 
+- **Design-system dashboard redesign** — the embedded dashboard is rebuilt on a token-based CSS
+  custom-property system, with restructured task cards and a typed activity feed. **Frontend-only**
+  (`cmd/am/web/{index.html,app.js,app.css}`): no Go API, schema, event-kind, error-code, exit-code,
+  or CLI change (the catalog stays **21 event kinds**, `currentSchemaVersion` stays **5**, exit
+  codes stay `0/3/4/5/6/7/8/9`).
+  - **New card anatomy** — a labeled **status pill** (dot + word, `.status-pill`); an **always-on
+    priority rank chip** `P0`–`P3` for all four levels (`.chip-prio`); a reserved **"trouble"
+    sub-row** (`.ctrouble`, for blocked/ready/stale) rendered before labels; and a **status-tinted
+    blocked column** (`.col[data-status="blocked"]`). The card **left edge is now status-colored**
+    (`.col[data-status=…] .card` border-left), not priority-colored.
+  - **Typed activity feed** — each event carries a per-kind **glyph + word** (`EV_GLYPH`, `.ev-icon`)
+    in a 3-column grid.
+  - **Loading skeletons + non-blocking toasts**, and accessibility work: modal **focus trap + focus
+    restore**, Escape-to-close, and `prefers-reduced-motion` support, with **WCAG AA contrast in both
+    light and dark**.
+  - All new DOM stays on the `el()`/`svg()`/`textContent` no-`innerHTML` convention (covered by
+    `TestDashboardNoXSSSinks`); `index.html`/`app.css`/`app.js` are now 123/1140/2706 lines.
+
+- **"Bold & vivid" violet theme** — a refreshed palette retuned on top of the existing token system.
+  **Frontend-only** (`cmd/am/web/`): no Go API, schema, event-kind, error-code, exit-code, or CLI
+  change, and the **theme mechanism is unchanged** (dark `:root` default + single
+  `:root[data-theme="light"]` override, the inline FOUC head-script, the `am.theme` localStorage key,
+  and the toggle) — only token **values** changed.
+  - `--accent` is now **violet** (`#7d5cff` dark / `#6a40e0` light); a radial violet ambient
+    background glow (`--app-glow`); a gradient **+ Task** button (`--accent-btn`); **status-colored
+    card edges**; status-tinted column headers; and **solid/filled priority chips**
+    (`--chip-prio-ink`). All accent **text** moved from `--accent` to `--accent-strong` for AA
+    contrast.
+
+- **Left-rail navigation + lean top bar** — a collapsible left rail replaces the old header
+  project-tab strip and the "← Categories" breadcrumb-back button. **Frontend-only**
+  (`cmd/am/web/`): no Go API, schema, event-kind, error-code, exit-code, or CLI change.
+  - **Left rail** (`aside#rail`) — brand, **Overview**, **All tasks**, then categories → projects
+    with per-project **open-task counts**, plus **New project** and **Manage** as rail actions. New
+    JS `renderRail()`/`railItem()`/`goProject()` and a single-project `pendingProject` handoff;
+    `renderTabs()`/`tab()` are removed and `#tabs` is now a hidden stub (`toggleProject()` is
+    retained only as a vestigial helper). The layout shell is now `body > .shell > (aside#rail,
+    .appcol > (header, main))`.
+  - **Lean top bar** — the header (`#breadcrumb`, now just a scope-title label) carries search,
+    **Filter**, **+ Task**, and a small utility cluster (Graph, theme toggle, Activity toggle, live
+    status dot).
+  - **Collapse state persists** in the new localStorage key **`am.railCollapsed`**; on mobile
+    (≤ 820 px) the rail becomes an **off-canvas drawer** with a `#railBackdrop`.
+
 - **Dashboard CLI↔GUI parity** — the embedded dashboard can now do seven things that previously
   required dropping to the `am` CLI. **Frontend-only** (`cmd/am/web/{index.html,app.js,app.css}`):
   the HTTP API and store already supported every operation, so there is **no Go API, schema,

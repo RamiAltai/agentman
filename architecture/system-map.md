@@ -201,11 +201,15 @@ identity scope.
   `#/all` → cross-category board, `#/cat/<slug>` → a single category's board. The overview
   (`loadOverview`/`renderOverview`/`catCard`/`allCard`, in `#overview`) renders a card per category
   with count chips + active-agent avatars (from `GET /api/categories`'s `CategoryStat`) and an
-  "All" card; cards drill in via the hash. A header `#breadcrumb` ("← Categories" + view name)
-  shows on the board views. A category board scopes its tabs (`projectsInView`), board, feed, and
-  stream by `?category=` via `viewParams()`; the stream is re-opened on every view change, and the
-  overview's counts refresh debounced on `task.*`/`project.*`/`category.*` events.
-  Includes a `⋯` "Manage" button in the tab bar that opens a modal (`openManage`, alias
+  "All" card; cards drill in via the hash. Navigation lives in a collapsible **left rail**
+  (`renderRail`/`railItem`: brand, Overview, All tasks, a category→project tree with open-counts, and
+  "New project"/"Manage" rail actions; collapse state in `am.railCollapsed`, off-canvas drawer +
+  `#railBackdrop` on mobile). A rail project-click calls `goProject()` (single-project select via a
+  `pendingProject` handoff). The lean top bar's `#breadcrumb` is now just the current scope title
+  (`setBreadcrumb`). A category board scopes its board, feed, and stream by `?category=` via
+  `viewParams()`; the stream is re-opened on every view change, and the overview's counts refresh
+  debounced on `task.*`/`project.*`/`category.*` events.
+  Includes a `⋯` "Manage" rail action that opens a modal (`openManage`, alias
   `openManageProjects`) with a **Categories** section (`renderManageCategories` — every category incl.
   archived via `GET /api/categories?archived=true`, with Archive/Unarchive toggles) and a
   **Projects** section (`renderManageList` — all projects active + archived via

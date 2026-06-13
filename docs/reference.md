@@ -13,42 +13,47 @@ category; every database starts with a default `general` category.
 ## Dashboard
 
 The embedded web UI (no build step, no npm — plain HTML/CSS/vanilla JS via `go:embed`) is a
-live kanban board served at `http://127.0.0.1:8787`.
+live kanban board served at `http://127.0.0.1:8787`. Layout is a collapsible **left rail**
+(navigation) beside a lean top bar; a bold violet theme runs through both light and dark.
 
+- **Left rail (navigation)** — the brand, an **Overview** item (returns to the category home),
+  an **All tasks** item (cross-category board), then a **category → project tree** with per-item
+  open-task counts, plus **＋ New project** and **Manage** as rail actions at the foot. Clicking a
+  project selects **that one project** (single-select); a category row opens its board. The rail
+  collapses to icons, and becomes an off-canvas drawer on small screens.
 - **Category home (landing view)** — a grid of **category cards**, each showing the category's
   task counts (todo / doing / blocked / done) and the agents active in it in the last 30 minutes.
-  Click a card to **drill into that category's board**; an **"All" card** opens the cross-category
-  board. A dashed **＋ New category** add-card opens a modal (name + auto-derived slug) that creates
-  the category. Views are linkable and the **browser back button works** — the URL hash is `#/`
-  (home), `#/all` (cross-category board), or `#/cat/<slug>` (one category). A **"← Categories"**
-  breadcrumb returns home.
-- **Columns** — Todo / In Progress / Blocked / Done, with per-project tabs and counts. A category
-  board shows only that category's projects; the **All** view shows every project. Click multiple
-  project tabs to **filter across several at once**; the **All** tab clears the within-view filter.
+  Click a card to **drill into that category's board**. A dashed **＋ New category** add-card opens
+  a modal (name + auto-derived slug) that creates the category. Views are linkable and the
+  **browser back button works** — the URL hash is `#/` (home), `#/all` (cross-category board), or
+  `#/cat/<slug>` (one category).
+- **Columns** — Todo / In Progress / Blocked / Done, with counts. A category board shows only that
+  category's projects; the **All tasks** view shows every project. Selecting a project from the rail
+  filters the board to it.
 - **Drag a card** between columns to change its status; click a card to open a wide, **resizable**
   ticket with description, comments, and full history.
 - **Activity feed** you can **collapse** or **drag-resize** (an overlay drawer on small screens);
   task `#refs` in the feed are clickable.
 - **Responsive** from desktop down to mobile — columns stack and the panel overlays.
-- **Light & dark themes** — a header sun/moon button (before **Graph**) toggles between them. First
-  load follows your OS appearance (`prefers-color-scheme`); once you pick a theme it persists across
-  reloads (stored in the browser). No keyboard shortcut.
+- **Light & dark themes** — a top-bar theme toggle (after **Graph** in the utility cluster) switches
+  between them. First load follows your OS appearance (`prefers-color-scheme`); once you pick a theme
+  it persists across reloads (stored in the browser). No keyboard shortcut.
 - **Keyboard:** `n` new task · `a` toggle the activity panel · `/` focus search · `g` toggle the
   dependency graph · `Enter`/`Space` open a focused card · `[` / `]` move a focused card between
   statuses · `Esc` close a dialog.
-- **Manage (categories & projects):** the `⋯` button in the tab bar opens the **Manage** modal with
+- **Manage (categories & projects):** the **Manage** rail action opens the **Manage** modal with
   two sections:
   - **Categories** — every category (including archived ones), each with its open-task count and an
     **Archive** / **Unarchive** toggle. (There is no category delete — there is no delete API for
     categories.)
   - **Projects** — every project, each with an **Edit** button, an **Archive** / **Unarchive**
     toggle, and a two-step-confirm **Delete** (removes the project and all its tasks/comments).
-    Archiving hides a project from the tabs, task list, and feed; creating a task into an archived
+    Archiving hides a project from the rail, task list, and feed; creating a task into an archived
     project is blocked.
   - **Edit project** opens a sub-modal to **rename** the project (its name and slug — the rename is
     safe, the project's stable id is unchanged) and set its **vault binding** (vault project id /
     vault path).
-- **Create a project with a category:** the **＋** new-project button's modal has a required
+- **Create a project with a category:** the **＋ New project** rail action's modal has a required
   **Category** picker (defaulting to the category you're currently viewing, else `general`), so a
   project lands in the right category without the CLI.
 - **Dependencies:** the task modal has a **Dependencies** section — prerequisite chips with status
