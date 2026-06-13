@@ -14,15 +14,20 @@
 Routes are registered in one place — `Server.Handler()` (`cmd/am/server.go`):
 
 ```
-GET   /api/projects                 handleListProjects      ?archived=true includes archived
-POST  /api/projects                 handleCreateProject     {slug,name}
+GET   /api/categories               handleListCategories    ?archived=true includes archived
+POST  /api/categories               handleCreateCategory    {slug,name?} (slug trimmed + lowercased; name defaults to slug; dup slug → 409)
+POST  /api/categories/{slug}/archive   handleArchiveCategory   idempotent (no event on no-op)
+POST  /api/categories/{slug}/unarchive handleUnarchiveCategory idempotent (no event on no-op)
+GET   /api/projects                 handleListProjects      ?archived=true includes archived; ?category=<slug> scopes (and keeps an archived category inspectable)
+POST  /api/projects                 handleCreateProject     {slug,name,category?} (empty category defaults to "general"; unknown → 404; archived → 400 category_archived)
+PATCH /api/projects/{slug}          handlePatchProject      {slug?,name?,vault_project_id?,vault_path?} (uid/category never patchable; empty string clears a vault field; no-op → 200, no event; dup slug → 409)
 POST  /api/projects/{slug}/archive    handleArchiveProject
 POST  /api/projects/{slug}/unarchive  handleUnarchiveProject
-GET   /api/tasks                    handleListTasks         ?project=&status=&assignee=&limit=&ready=true|&blocked=true|&stale=<dur>|&q=<text>|&label=<l>  (no project ⇒ hides archived-project tasks; stale = assigned + not done + no activity for ≥ dur; q = substring match on title OR body, ASCII-case-insensitive, > 500 bytes → 400; label = exact match after normalization, invalid → 400)
-POST  /api/tasks                    handleCreateTask        {project,title,body?,priority?,assignee?}
+GET   /api/tasks                    handleListTasks         ?project=&category=&status=&assignee=&limit=&ready=true|&blocked=true|&stale=<dur>|&q=<text>|&label=<l>  (no scope ⇒ hides archived-project AND archived-category tasks; category composes with every other filter; stale = assigned + not done + no activity for ≥ dur; q = substring match on title OR body, ASCII-case-insensitive, > 500 bytes → 400; label = exact match after normalization, invalid → 400)
+POST  /api/tasks                    handleCreateTask        {project,title,body?,priority?,assignee?}  (archived category → 400 category_archived)
 GET   /api/tasks/{id}               handleGetTask           (task + comments + recent events + depends_on + blocks)
 PATCH /api/tasks/{id}               handlePatchTask         {status?,assignee?,title?,body?,priority?}  (hard-blocked if open prereqs + doing/done target)
-POST  /api/tasks/next               handleNext              {project?,assignee?} atomic pick+claim of the best ready task (todo, unassigned, no open prereqs, non-archived); 404 when none qualifies (or bad slug)
+POST  /api/tasks/next               handleNext              {project?,category?,assignee?} atomic pick+claim of the best ready task (todo, unassigned, no open prereqs, non-archived project AND category); 404 when none qualifies (or bad slug)
 POST  /api/tasks/{id}/claim         handleClaim             (atomic; X-Agent = claimant; hard-blocked if open prereqs → 409 blocked; body {"steal_stale":"<dur>"} → StealStaleClaim stale takeover, 409 not_stale if still fresh)
 POST  /api/tasks/{id}/comments      handleComment           {body}
 POST  /api/tasks/{id}/deps          handleAddDep            {depends_on: <id-or-ref>}  add prerequisite edge
@@ -67,20 +72,37 @@ large latency (inherent).
 
 Lives in `cmd/am/store.go` (there is no separate "service" layer — the store *is* the domain
 logic). Each mutating method returns `(result, *Event, error)`; the handler broadcasts the event.
-Key methods: `CreateProject`, `ListProjects(includeArchived bool)`, `ArchiveProject`,
+Key methods: `CreateCategory`, `ListCategories`, `ArchiveCategory`, `UnarchiveCategory`,
+`CreateProject(slug, name, category)`, `ListProjects(includeArchived bool, category string)`,
+`PatchProject`, `ArchiveProject`,
 `UnarchiveProject`, `DeleteProject`, `ListTasks`, `GetTask`, `CreateTask`, `PatchTask`,
 `ClaimTask`, `StealStaleClaim`, `NextTask`, `AddComment`, `DeleteComment`, `ListEvents`, `RecentEvents`,
-`ListEventsBefore`, `DeleteTask`, `AddDep`, `RemoveDep`, `AddLabel`, `RemoveLabel`, `ProjectGraph`. `ArchiveProject`/`UnarchiveProject` are transactional and
-idempotent (no event when already in the target state).
+`ListEventsBefore`, `DeleteTask`, `AddDep`, `RemoveDep`, `AddLabel`, `RemoveLabel`, `ProjectGraph`.
+`ArchiveProject`/`UnarchiveProject` (and their category counterparts) are transactional and
+idempotent (no event when already in the target state); all four project lifecycle paths load
+their response payload via the shared `getProjectTx`, so every project JSON carries the extended
+fields (`uid`, `category`, vault binding).
 `CreateTask` checks the target project's `archived_at` before the insert and returns
-`ErrProjectArchived` if archived — creation into an archived project is rejected.
-`ListEvents`/`RecentEvents` use `LEFT JOIN projects p ON p.id = events.project_id` and,
-when no explicit `project=` filter is supplied, exclude events whose project is archived via
-`(events.project_id IS NULL OR p.archived_at IS NULL)` — mirroring `ListTasks`. An explicit
+`ErrProjectArchived` if archived — creation into an archived project is rejected; it also checks
+the project's **category** and returns `ErrCategoryArchived` (→ `400 category_archived`) when
+that is archived. `CreateProject` applies the same two checks to its target category (unknown
+slug → 404; archived → 400), defaults an empty category to `general` (keeps the dashboard's
+`{slug,name}` POST working), and generates the `amp_` uid (`newUID`, with `isUniqueErr` retry).
+`PatchProject` (Phase O) mirrors `PatchTask`: allowed keys `slug`/`name`/`vault_project_id`/
+`vault_path` (vault fields ≤ 500 bytes, empty string clears), `uid`/`category_id` never
+patchable, unknown keys ignored, no-op → success with no event, otherwise one `project.patched`
+event with a compact delta.
+`ListEvents`/`RecentEvents` use `LEFT JOIN projects p … LEFT JOIN categories c` and,
+when no explicit `project=` filter is supplied, exclude events whose project OR category is
+archived via `(events.project_id IS NULL OR (p.archived_at IS NULL AND c.archived_at IS NULL))`
+— mirroring `ListTasks`. An explicit
 `?project=<slug>` filter still returns that project's events. `ListEventsBefore(before, project,
-limit)` applies the same archived-project filter and returns events with `id < before`,
+limit)` applies the same archived filter and returns events with `id < before`,
 newest-first (default limit 40, cap 200) — used by the `?before=` cursor branch in `handleEvents`
-for backward pagination.
+for backward pagination. `TaskFilter.Category` (`?category=`) composes with every other task
+filter; with a category scope but no project scope, `ListTasks` still hides archived *projects*
+but keeps the (possibly archived) category itself inspectable — same rule as the explicit-project
+case.
 
 `AddDep(taskID, dependsOnID, actor)` validates same-project membership, rejects self-deps, and
 runs a recursive CTE (`wouldCycle`) to reject transitive cycles before inserting into `task_deps`.
@@ -138,11 +160,16 @@ any activity (claim, patch, status, comment) keeps a claim fresh.
 
 **Atomic pick+claim** (`NextTask`, Phase L / ADR-023) extends the primitive with a subquery:
 `UPDATE … WHERE id = (SELECT t.id … WHERE t.status='todo' AND t.assignee IS NULL AND
-p.archived_at IS NULL [AND t.project_id=?] AND NOT EXISTS (<open-prereq>) ORDER BY t.priority ASC,
+p.archived_at IS NULL AND c.archived_at IS NULL [AND t.project_id=?] [AND p.category_id=?]
+AND NOT EXISTS (<open-prereq>) ORDER BY t.priority ASC,
 t.id ASC LIMIT 1) RETURNING id, project_id`. The open-prereq `NOT EXISTS` matches ListTasks' Ready
 filter exactly; ordering is priority ASC (0 = most urgent) with an id-ASC FIFO tiebreak
 (deliberately not `am ls`'s `updated_at DESC` display order — a pickup queue drains oldest-first).
-Zero rows ⇒ `ErrNotFound` (nothing ready, or — same 404, accepted ambiguity — a bad project slug).
+The archived-category exclusion is **unconditional** (scoped or not), like the archived-project
+rule; the optional category scope (`{"category"?}` in the body / `am next -c`) composes with the
+project scope.
+Zero rows ⇒ `ErrNotFound` (nothing ready, or — same 404, accepted ambiguity — a bad project or
+category slug).
 Emits the existing `task.claimed` event with the same payload shape as `ClaimTask`. Tasks already
 assigned to the caller are skipped (candidates require `assignee IS NULL`). `am wait` has **no
 server-side component** — it is a CLI-side SSE consumer over the existing `/api/stream` (see
@@ -162,8 +189,10 @@ See `data-model.md` for the schema.
 
 ## Models and Schemas
 
-Go structs in `cmd/am/store.go`: `Project`, `Task`, `Comment`, `Event`, `TaskFilter`,
+Go structs in `cmd/am/store.go`: `Category`, `Project`, `Task`, `Comment`, `Event`, `TaskFilter`,
 `CreateTaskInput`. SQL schema in `cmd/am/schema.sql` (embedded via `//go:embed schema.sql`).
+`Category` and `Project` carry a stable `uid` (`amc_`/`amp_` + 16 hex, `newUID`); `Project`
+additionally carries `category` (slug), `vault_project_id`, and `vault_path`.
 
 ## Authentication and Authorization
 
@@ -178,12 +207,15 @@ trusted). No per-resource authorization. See `security.md` (ADR-002/ADR-011 in `
 - Status validated against `validStatus` map and a SQL `CHECK (status IN (...))` constraint
   (`store.go`, `schema.sql`).
 - Empty title / slug / comment body rejected with `ErrValidation`; slug must not contain spaces
-  (`CreateProject`).
+  (`CreateProject`, `CreateCategory` — category slugs are additionally trimmed + lowercased
+  server-side; `PatchProject` validates a new slug the same way).
 - Priority coerced via `toInt`. Unknown PATCH keys are ignored (only known fields applied in
   `PatchTask`).
 - Handlers map `ErrValidation` → HTTP 400.
 - Creating a task into an archived project is rejected: `CreateTask` returns `ErrProjectArchived`
-  → HTTP 400 `{"error":"project_archived"}`.
+  → HTTP 400 `{"error":"project_archived"}`. Creating a task — or a project — under an archived
+  **category** is likewise rejected: `ErrCategoryArchived` → HTTP 400
+  `{"error":"category_archived"}` (CLI exit 5; no new exit codes).
 - Durations (`?stale=` query param, `steal_stale` claim-body field) are parsed with
   `time.ParseDuration` (Go syntax — `30m`, `48h`, not `2d`); a malformed or non-positive value →
   HTTP 400 `{"error":"invalid"}` (CLI exit 5).
@@ -206,6 +238,7 @@ No job queue. Long-lived goroutines only:
 ## Error Handling
 
 Sentinel errors in `store.go`: `ErrNotFound`, `ErrConflict`, `ErrValidation`, `ErrProjectArchived`,
+`ErrCategoryArchived`,
 typed `*ConflictError{Assignee}`, typed `*BlockedError{OpenPrereqs []int64}`, and typed
 `*NotStaleError{Assignee}`. `writeErr`
 (`server.go`) maps them: 404 / 409 / 400, with
@@ -213,6 +246,7 @@ typed `*ConflictError{Assignee}`, typed `*BlockedError{OpenPrereqs []int64}`, an
 `BlockedError` → `409 {"error":"blocked","open_prereqs":[…]}`,
 `NotStaleError` → `409 {"error":"not_stale","assignee":…}`,
 `ErrProjectArchived` → `400 {"error":"project_archived"}`,
+`ErrCategoryArchived` → `400 {"error":"category_archived"}`,
 `ErrValidation` → `400`; anything else → **HTTP 500 with a generic `{"error":"internal"}` body**
 (the real error is logged server-side via `log.Printf("agentman: internal error: %v", err)` to
 stderr — it is never sent to the client). Delete handlers (`handleDeleteTask`,
@@ -239,7 +273,7 @@ per request after completion: `METHOD PATH STATUS LATENCY ACTOR` (actor = `X-Age
 
 ## Testing
 
-There are ten test files (run `go test -race ./cmd/am/`; 144 tests, all green):
+There are ten test files (run `go test -race ./cmd/am/`; 174 tests, all green):
 - `cmd/am/update_test.go` — version-comparison logic.
 - `cmd/am/store_test.go` — atomic-claim race (concurrent, `-race`-clean), events-cursor monotonicity,
   store CRUD + validation (`ErrValidation`), project archive/unarchive round-trip + idempotency,
@@ -255,7 +289,10 @@ There are ten test files (run `go test -race ./cmd/am/`; 144 tests, all green):
   `TestListTasksQueryEscapesLikeWildcards` (LIKE wildcards in `?q=` are escaped, not interpreted),
   `TestAddRemoveLabel`, `TestLabelValidation`, `TestListTasksLabelFilter`,
   `TestAddLabelDoesNotBumpUpdatedAt`, `TestDeleteTaskCascadesLabels`,
-  `TestTaskLabelsTableExistsOnReopenedDB`.
+  `TestTaskLabelsTableExistsOnReopenedDB`, and categories (Phase O): `TestCreateCategory`,
+  `TestArchiveUnarchiveCategory`, `TestCreateProjectWithCategory`, `TestPatchProject`,
+  `TestCategoryArchiveCascade`, `TestListTasksCategoryFilterComposes`,
+  `TestNextTaskCategoryScoping`, `TestCreateTaskArchivedCategory`.
 - `cmd/am/server_test.go` — validation→status mapping (400/404/409), `hostGuard`, `csrfGuard`,
   `securityHeaders`, `listenAddr` loopback regression, archive/unarchive endpoints + 404,
   hard-delete HTTP endpoints (`TestDeleteTaskEndpoint`, `TestDeleteProjectEndpoint`,
@@ -266,14 +303,21 @@ There are ten test files (run `go test -race ./cmd/am/`; 144 tests, all green):
   (`?stale=` filter + 400 on bad duration), `TestStealStaleEndpoint` (steal body, `not_stale` 409),
   Phase L: `TestNextEndpoint` (FIFO picks, 404 when drained), `TestNextEndpointProjectBody`,
   and Phase M: `TestListTasksQueryParam` (`?q=` filter + 400 on over-long input),
-  `TestLabelEndpoints` (add/remove label endpoints + validation 400)
+  `TestLabelEndpoints` (add/remove label endpoints + validation 400),
+  and Phase O: `TestCategoryEndpoints`, `TestProjectPayloadAndCategoryFilter`,
+  `TestListTasksCategoryParam`, `TestNextEndpointCategoryBody`, `TestPatchProjectEndpoint`,
+  `TestCreateTaskArchivedCategory400`
   (via `net/http/httptest`).
 - `cmd/am/migrate_test.go` — migration runner (apply/skip/idempotent/rollback), incl. the v2 step
-  that adds `projects.archived_at` and the v3 step that adds `tasks.claimed_at`
-  (`TestMigrationV3AddsClaimedAt`).
+  that adds `projects.archived_at`, the v3 step that adds `tasks.claimed_at`
+  (`TestMigrationV3AddsClaimedAt`), and the v4 category/stable-ID step (`TestMigrationV4Fresh`,
+  `TestMigrationV4ExistingDB` — seeded `general`, distinct `amp_` uids, task data untouched,
+  no double-apply on reopen); `TestOpenStoreRejectsNewerSchema` (the open-time version ceiling).
 - `cmd/am/db_test.go` — `db export`/`import` roundtrip + file perms (0o600), backup creation + perms,
   garbage rejection, server-liveness check; `TestPruneEventsKeep`, `TestPruneEventsBefore`,
-  `TestPruneEventsBeforeSameDayBoundary` (prune).
+  `TestPruneEventsBeforeSameDayBoundary` (prune); Phase O: `TestExportContainsCategories`,
+  `TestImportPreCategorySnapshot` (v1-baseline required-table set keeps old snapshots
+  importable), `TestImportRejectsNewerSchema`.
 - `cmd/am/cli_test.go` — CLI command-path + exit-code tests (Phase E1). Exercises verbs against a
   real `httptest` server via a directly-constructed `Client`, using `captureStdout`/`captureExit`
   helpers. Covers: `cmdNew` prints only the numeric id; `cmdLs` produces terse output; mutations
@@ -287,13 +331,19 @@ There are ten test files (run `go test -race ./cmd/am/`; 144 tests, all green):
   id, exit = first failure's code), `TestCmdAssignBulk` (incl. `me`/`-` and single-id regression);
   Phase M added `TestCmdLsGrepWireFormat` (`--grep`/`--label` → `?q=`/`?label=` wire encoding),
   `TestCmdLabelAddRemove` (`+add`/`-remove` token dispatch), `TestCmdLabelPrintsLabels` (bare
-  `am label <id>` prints the labels), `TestCmdLabelUsage` (usage errors).
+  `am label <id>` prints the labels), `TestCmdLabelUsage` (usage errors);
+  Phase O added `TestCmdCategoryVerbs`, `TestCmdProjectNewRequiresCategory` (exit 5 without
+  `-c`/`AGENTMAN_CATEGORY`), `TestCmdProjectEdit` (incl. explicit-empty vault clears),
+  `TestCmdLsCategoryWireFormat`, `TestCmdNextCategory`, and the `-c` alias-rewrite regression
+  pair `TestCmdShowDashCStillPrintsComments` / `TestRewriteShowComments`.
 - `cmd/am/wait_test.go` — `am wait` (Phase L). `TestWaitDoneAlreadySatisfied`,
   `TestWaitDoneEventArrives`, `TestWaitDoneCrossProject` (`AGENTMAN_PROJECT` must not scope the
   `--done` stream), `TestWaitReadyOnPrereqDone` (blocked task becomes ready when its
   prereq is done), `TestWaitTimeout` (exit 7), `TestWaitTaskNotFound` (exit 3),
   `TestWaitServerDown` (exit 6), `TestWaitUsageErrors`, `TestParseWaitTimeout` (bare seconds +
-  Go durations), `TestWaitBadTimeoutExit5`.
+  Go durations), `TestWaitBadTimeoutExit5`; Phase O added `TestWaitReadyCategoryScoped`,
+  `TestWaitReadyCategoryEnv`, `TestWaitReadyCategoryTimeout` (`-c`/`AGENTMAN_CATEGORY` scope the
+  readiness re-check; the stream stays unscoped).
 - `cmd/am/sse_test.go` — SSE streaming + reconnect (Phase E2). `TestSSEDeliversLiveEvent`
   subscribes to `/api/stream`, creates a task, and asserts the `task.created` event arrives live.
   `TestSSEReplayOnReconnect` reconnects with `Last-Event-ID` and asserts that events created while
@@ -315,7 +365,9 @@ response for claim and patch). The +4 graph tests (`TestProjectGraph`, `TestProj
 in `store_test.go`; `TestProjectGraphEndpoint`, `TestProjectGraphEndpoint404` in `server_test.go`)
 brought the total to **95** at the time; Phase J's hygiene tests and Phase K's 10 stale-claim
 tests brought it to **107**; Phase L's 23 work-loop tests brought it to **130**; Phase M's 14
-findability tests (8 store, 2 server, 4 CLI — listed above) bring it to **144**.
+findability tests (8 store, 2 server, 4 CLI — listed above) brought it to **144**; Phase O's 30
+category/stable-ID/vault/migration tests (8 store, 6 server, 7 CLI, 3 wait, 3 db, 3 migrate —
+listed above) bring it to **174**.
 
 SSE streaming/reconnect, CLI verbs, exit-code mapping, and identity are now covered. The
 dashboard has a source-level XSS-sink guard but **no behavioral JS tests** — the project
@@ -329,16 +381,21 @@ deliberately adopts no JS test runner (preserves the single-binary/no-npm ethos)
 - **New task field:** add the column in `schema.sql`, the struct field in `store.go`, thread it
   through `CreateTask`/`PatchTask`/`getTaskTx`, the API, and the dashboard (`web/`).
 - **New event kind:** emit via `insertEvent(...)` and handle it in `web/app.js` `evText`/`describeText`.
-  Current kinds (17 total): `task.created`, `task.claimed`, `task.reclaimed`, `task.status`,
+  Current kinds (21 total): `task.created`, `task.claimed`, `task.reclaimed`, `task.status`,
   `task.assign`, `task.patched`, `task.deleted`, `task.dep_added`, `task.dep_removed`,
   `task.labeled`, `task.unlabeled`, `comment.added`, `comment.deleted`, `project.created`,
-  `project.archived`, `project.unarchived`, `project.deleted`.
+  `project.archived`, `project.unarchived`, `project.patched`, `project.deleted`,
+  `category.created`, `category.archived`, `category.unarchived`. Events with no project ref
+  (the `category.*` kinds) need explicit `evText`/`describeText` cases — the default branch
+  renders a literal "null" ref.
 
 ## Risks and Gaps
 
 - **Migration runner is now exercised** — Phase 0 added `runMigrations` (ADR-010); Phase 2's first
-  step (`ALTER TABLE projects ADD COLUMN archived_at TEXT`, `currentSchemaVersion = 2`) proves the
-  additive-column path end-to-end. A DB *newer* than the binary is still accepted silently today.
+  step (`ALTER TABLE projects ADD COLUMN archived_at TEXT`) proved the
+  additive-column path end-to-end, and v3 (`claimed_at`) and v4 (categories/stable IDs/vault
+  binding, `currentSchemaVersion = 4`) followed it. A DB *newer* than the binary is **no longer
+  accepted silently** — `OpenStore` refuses it with a clear "upgrade am" error (Phase O).
 - **Single-writer** caps write throughput; fine for a personal board, unproven at scale.
 - ~~**500s leak raw error strings**~~ — **fixed (Phase D1)**; 500s now return a generic `{"error":"internal"}` body; detail is logged server-side only.
 - **No request size/time limits** beyond a 1 MiB body cap and `ReadHeaderTimeout`.

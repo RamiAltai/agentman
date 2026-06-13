@@ -104,8 +104,11 @@ the server. Their security-relevant properties:
   `AGENTMAN_URL` (`/api/projects`) via `isServerRunning` and aborts with "stop `am serve` before
   importing". This avoids replacing a live WAL DB out from under a running process and corrupting it.
 - **Candidate validation.** Before replacing anything, import runs `PRAGMA integrity_check` /
-  `foreign_key_check`, requires the five core tables, and rejects a `schema_version` newer than
-  `currentSchemaVersion` — so a garbage or future-schema file is refused, not imported.
+  `foreign_key_check`, requires the five core tables (the v1 baseline set — later tables are
+  recreated by migrations on open, so old snapshots stay importable), and rejects a
+  `schema_version` newer than `currentSchemaVersion` — so a garbage or future-schema file is
+  refused, not imported. `OpenStore` applies the same version ceiling at open time (Phase O), so
+  an older binary refuses a too-new DB instead of operating on it.
 
 ## Existing Controls
 

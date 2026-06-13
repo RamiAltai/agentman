@@ -155,6 +155,27 @@ This feature was requested after the original roadmap was written and has shippe
   - 2 new event kinds (`task.dep_added`, `task.dep_removed`; total now 14); +24 tests (now 91).
   → ADR-020, `data-model.md`, `backend.md`, `frontend.md`, `CHANGELOG.md`.
 
+## Phase O — agentic_brain foundation (shipped, beyond original roadmap)
+
+The first phase of the agentic_brain integration train (requirements R1/R2/R3/R8 in
+`agentman_requirements.md`, outside this repo). Tracked in `REVIEW.md` alongside Phases J–N.
+
+- [x] **O1 · Category layer + stable IDs + vault binding + migration v4** — _L_ — **shipped (Phase O)**
+  - New `categories` layer above projects (`instance → category → project → task`); `am
+    categories` / `am category new|archive|unarchive`; `-c` / `AGENTMAN_CATEGORY` scope on
+    `am ls`/`am next`/`am wait --ready`; `?category=` on `/api/tasks` + `/api/projects`;
+    archived-category cascade (hidden by default, inspectable when scoped, writes blocked with
+    `400 category_archived`).
+  - Immutable stable ids `amc_`/`amp_` (+16 hex, crypto/rand) on categories/projects;
+    `am project edit` (`--slug` rename, `--vault-id`/`--vault-path` binding) +
+    `PATCH /api/projects/{slug}`.
+  - Migration **v4** (`currentSchemaVersion = 4`): seeds default category `general`, attaches
+    existing projects, backfills uids; zero data loss; pre-v4 snapshots stay importable;
+    `OpenStore` rejects a DB with a newer `schema_version` than the binary supports.
+  - 4 new event kinds (total 21); +30 tests (now 174).
+  → ADR-025, `data-model.md`, `backend.md`, `CHANGELOG.md`. Phases **P** (task metadata),
+  **Q** (scoping enforcement), **R** (category dashboard), **S** (scope tokens) follow.
+
 ## Phase G — Security posture (deferred by design)
 
 agentman is loopback-only with no auth; the bind **is** the access control, hardened by the
@@ -170,9 +191,11 @@ and only matter if the network bind ever widens. (`architecture/security.md`)
 
 ### Suggested order
 
-Phases A, B (except the ongoing B3 process), C, D, E, F, H, and I are **complete**. **G** stays
-parked unless the access model changes. For newer work, see `REVIEW.md` Phases J–N: Phase J
+Phases A, B (except the ongoing B3 process), C, D, E, F, H, I, and O are **complete**. **G** stays
+parked unless the access model changes. For newer work, see `REVIEW.md` Phases J–O: Phase J
 (correctness & hygiene), Phase K (stale-claim recovery — `am ls --stale`,
 `am claim --steal-stale`), Phase L (agent work loop — `am next`, `am wait`, bulk
-`status`/`assign`), and Phase M (findability — `am ls --grep`/`--label`, `am label`) have
-shipped; release binaries remain proposed.
+`status`/`assign`), Phase M (findability — `am ls --grep`/`--label`, `am label`), and Phase O
+(agentic_brain foundation — categories, stable IDs, vault binding, migration v4) have
+shipped; release binaries remain proposed, and the agentic_brain train continues with Phases
+P (task metadata), Q (scoping enforcement), R (category dashboard), and S (scope tokens).

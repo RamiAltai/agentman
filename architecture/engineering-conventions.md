@@ -19,12 +19,20 @@ convention is loose, it's called out.
 - HTTP handlers: `handleX` (e.g. `handleClaim`). Routes registered in `Server.Handler()`.
 - Store methods: exported PascalCase domain verbs (`CreateTask`, `ClaimTask`, `ListEvents`).
 - CLI verb implementations: `cmdX` (`cmdClaim`, `cmdNew`); dispatched in `main.go`.
-- Sentinel errors: `ErrNotFound`, `ErrConflict`, `ErrValidation`, `ErrProjectArchived` (→ HTTP 400 `project_archived`); typed `*ConflictError{Assignee}`; typed `*BlockedError{OpenPrereqs []int64}` (→ HTTP 409 `{"error":"blocked","open_prereqs":[…]}`); typed `*NotStaleError{Assignee}` (→ HTTP 409 `{"error":"not_stale","assignee":…}`).
+- Short flags canonicalize in `canonFlag` (`cli.go`): `-p` → project, `-c` → **category**, `-s` →
+  status, `-a` → assign, `-l` → label. One carve-out: `am show <id> -c` keeps meaning
+  `--comments` — `main.go` rewrites `-c → --comments` for the `show` verb only
+  (`rewriteShowComments`, before `parse()`).
+- Sentinel errors: `ErrNotFound`, `ErrConflict`, `ErrValidation`, `ErrProjectArchived` (→ HTTP 400 `project_archived`), `ErrCategoryArchived` (→ HTTP 400 `category_archived`); typed `*ConflictError{Assignee}`; typed `*BlockedError{OpenPrereqs []int64}` (→ HTTP 409 `{"error":"blocked","open_prereqs":[…]}`); typed `*NotStaleError{Assignee}` (→ HTTP 409 `{"error":"not_stale","assignee":…}`).
 - Event kinds: dotted `noun.verb` strings — `task.created`, `task.claimed`, `task.reclaimed`,
   `task.status`, `task.assign`, `task.patched`, `task.deleted`, `task.dep_added`,
   `task.dep_removed`, `task.labeled`, `task.unlabeled`, `comment.added`, `comment.deleted`,
-  `project.created`, `project.archived`, `project.unarchived`, `project.deleted` (17 total).
-- Env vars: `AGENTMAN_*` (`AGENTMAN_URL/PROJECT/AGENT/AGENT_FILE/DB/PORT/NO_UPDATE_CHECK/LOG`).
+  `project.created`, `project.archived`, `project.unarchived`, `project.patched`,
+  `project.deleted`, `category.created`, `category.archived`, `category.unarchived` (21 total).
+- Stable IDs: `newUID(prefix)` — prefix + 16 lowercase hex chars from `crypto/rand`; `amc_` for
+  categories, `amp_` for projects. Immutable after creation; insert paths retry on a uid UNIQUE
+  collision via `isUniqueErr`.
+- Env vars: `AGENTMAN_*` (`AGENTMAN_URL/PROJECT/CATEGORY/AGENT/AGENT_FILE/DB/PORT/NO_UPDATE_CHECK/LOG`).
 
 ## API Conventions
 
@@ -75,7 +83,8 @@ convention is loose, it's called out.
   sensible defaults (`defaultDBPath` → `~/.agentman/agentman.db`, port `8787`). Flags override
   env where both exist. Add new config as an `AGENTMAN_*` env var and/or a flag, default-off /
   backward-compatible.
-- Env vars: `AGENTMAN_URL`, `AGENTMAN_PROJECT`, `AGENTMAN_AGENT`, `AGENTMAN_AGENT_FILE`,
+- Env vars: `AGENTMAN_URL`, `AGENTMAN_PROJECT`, `AGENTMAN_CATEGORY` (default category scope for
+  `ls`/`next`/`wait --ready`/`project new`), `AGENTMAN_AGENT`, `AGENTMAN_AGENT_FILE`,
   `AGENTMAN_DB`, `AGENTMAN_PORT`, `AGENTMAN_NO_UPDATE_CHECK`, `AGENTMAN_LOG`.
 
 ## Testing
@@ -83,7 +92,7 @@ convention is loose, it's called out.
 - `go test -race ./cmd/am/` (or `go test ./...`); table-driven tests (see `cmd/am/update_test.go`).
   Coverage spans pure logic, the store, HTTP, migrations, offline DB tooling, CLI verbs + exit codes,
   SSE streaming/reconnect, `am wait`, identity, and the dashboard XSS-sink guard — 10 test files,
-  144 tests.
+  174 tests.
 - **`osExit` testability var** — `cli.go` declares `var osExit = os.Exit`; `fail()` calls `osExit`
   rather than `os.Exit` directly. Tests in `cli_test.go` replace it via `captureExit(t, fn)`,
   which substitutes a panic-based stub so exit codes can be asserted without terminating the process.

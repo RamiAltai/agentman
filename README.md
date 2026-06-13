@@ -24,8 +24,9 @@ you (browser) ◄──SSE────┘        sole writer · broadcasts every
 - **Real-time.** Every change streams to the dashboard over SSE — no refresh.
 - **Zero ops.** A single static binary (pure-Go SQLite, no cgo), localhost, no auth, no
   database server. Back up = copy one file (or `am db export` for a consistent snapshot).
-- **Multi-project & multi-agent.** Group tasks into projects; atomic task claims so two
-  agents never grab the same ticket.
+- **Multi-project & multi-agent.** Group tasks into projects and projects into **categories**
+  (`instance → category → project → task`); atomic task claims so two agents never grab the
+  same ticket.
 - **Polished dashboard.** A responsive kanban board with drag-and-drop status changes, a
   collapsible/resizable live activity feed, and keyboard shortcuts.
 
@@ -68,12 +69,17 @@ terminal (or let your agents do it):
 
 ```sh
 am init bugfix              # set this session's identity → e.g. bugfix_060626_4821
-am project new web "Web"    # create a project
+am project new web "Web" -c general   # create a project (every DB starts with a "general" category)
 id=$(am new "fix login" -p web)   # create a task, get its id
 am claim "$id"             # take it (atomic; exit 4 if already taken)
 am note "$id" "on it"      # comment
 am status "$id" done       # todo | doing | blocked | done
 ```
+
+Projects live inside **categories** (`am category new work "Work"`, then
+`am project new pentest-x -c work`); a fresh database always has the default category
+`general`, and `-c` (or `AGENTMAN_CATEGORY`) also scopes `am ls`, `am next`, and
+`am wait --ready` to one category.
 
 Everything you do on the dashboard flows through the same API the agents use, so human and
 agent actions both show up live.
@@ -139,7 +145,8 @@ am claim <id>         # take it (exit 4 = already claimed or blocked by prereqs)
 am dep add <id> <prereq>   # add a prerequisite   am dep rm <id> <prereq>
 am show <id> -c       # detail + depends on/blocks + comments  am note <id> "msg"
 am status <id> done   # todo|doing|blocked|done  am new "title" -p <proj>
-am projects --all     # list projects (incl. archived)
+am projects --all     # list projects (incl. archived)   am categories --all  # list categories
+am project new <slug> [name] -c <category>   # create a project (category required)
 am project archive <slug>   # hide a project    am project unarchive <slug>
 Output is terse text (add --json to parse). Silence = success.
 ```
@@ -164,13 +171,13 @@ Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting 
 
 | Command | What it does |
 |---|---|
-| `am ls [--mine] [--status S] [-p P] [--all] [--ready] [--blocked] [--stale D] [--grep TEXT] [--label L]` | list tasks (hides done; `--ready` = todo with no open prereqs; `--blocked` = ≥1 open prereq; `--stale D` = assigned, not done, no activity for D — Go duration, e.g. `30m`, `48h`; `--grep` = substring match on title or body, ASCII-case-insensitive; `--label`/`-l` = tasks carrying that label) |
-| `am show <id> [-c]` | task detail + `depends on:` / `blocks:` lines; comments with `-c` |
-| `am new "title" [--body B] [-p P] [--priority N]` | create a task; prints the new id |
+| `am ls [--mine] [--status S] [-p P] [-c CAT] [--all] [--ready] [--blocked] [--stale D] [--grep TEXT] [--label L]` | list tasks (hides done; `-c` = category scope; `--ready` = todo with no open prereqs; `--blocked` = ≥1 open prereq; `--stale D` = assigned, not done, no activity for D — Go duration, e.g. `30m`, `48h`; `--grep` = substring match on title or body, ASCII-case-insensitive; `--label`/`-l` = tasks carrying that label) |
+| `am show <id> [-c]` | task detail + `depends on:` / `blocks:` lines; comments with `-c` (for `show` only, `-c` means comments, not category) |
+| `am new "title" [--body B] [-p P] [--priority N]` | create a task; prints the new id (no `-c` — the project determines the category) |
 | `am claim <id> [--steal-stale D]` | atomic: assign me + → doing (exit 4 if already taken **or** has open prereqs); `--steal-stale D` takes over a claim idle for ≥ D (exit 4 with `not stale yet` if still fresh) |
-| `am next [-p P]` | atomic pick + claim of the best ready task (priority, then FIFO); prints its id; exit 3 if nothing is ready |
+| `am next [-p P] [-c CAT]` | atomic pick + claim of the best ready task (priority, then FIFO); prints its id; exit 3 if nothing is ready |
 | `am wait <id> --done [--timeout D]` | block until the task is done (exit 7 on timeout; default 10m; D is a Go duration or seconds) |
-| `am wait --ready [-p P] [--timeout D]` | block until some ready task exists; prints its id |
+| `am wait --ready [-p P] [-c CAT] [--timeout D]` | block until some ready task exists; prints its id |
 | `am status <id...> <todo\|doing\|blocked\|done>` | change status — several ids at once is fine (blocked → 409 if doing/done and open prereqs) |
 | `am assign <id...> <agent\|me\|->` | reassign one or more tasks (`-` = unassign) |
 | `am note <id> "text"` | add a comment (alias: `comment`) |
@@ -180,9 +187,12 @@ Format: `{tasktype}_{DDMMYY}_{4 digits}` — human-readable and unique. Setting 
 | `am dep add <id> <prereq> [prereq…]` | add one or more prerequisites to a task (same project; rejects cycles) |
 | `am dep rm <id> <prereq>` | remove a prerequisite edge |
 | `am label <id> [+l …] [-l …]` | with no args: print the task's labels; `+foo` (or bare `foo`) adds, `-bar` removes. Labels are lowercased, 1–50 chars of `a-z 0-9 . _ -` |
-| `am projects [--all]` · `am project new <slug> [name]` | list (`--all` includes archived) / create projects |
+| `am projects [--all]` · `am project new <slug> [name] -c <category>` | list (`--all` includes archived) / create projects — category required (`-c` or `AGENTMAN_CATEGORY`; every DB has `general`) |
+| `am project edit <slug> [--slug NEW] [--name N] [--vault-id X] [--vault-path Y]` | rename a project (its stable `uid` never changes) / set the vault binding (`--vault-id=` / `--vault-path=` with an empty value clears it) |
 | `am project archive <slug>` · `am project unarchive <slug>` | soft-archive (hide) / restore a project |
 | `am project rm <slug> --yes` | hard-delete a project **and ALL its tasks/comments** (permanent; `--yes` required) |
+| `am categories [--all]` · `am category new <slug> [name]` | list (`--all` includes archived) / create categories |
+| `am category archive <slug>` · `am category unarchive <slug>` | soft-archive a category (hides its projects/tasks; blocks new tasks/projects under it) / restore it |
 | `am init <tasktype>` · `am whoami` | identity |
 | `am serve [--port 8787] [--db PATH] [--log]` | run the dashboard + API |
 | `am db export [path] [--db PATH]` | write a consistent DB snapshot (prints the path) |
@@ -201,20 +211,28 @@ The CLI is a thin client over this (also what the dashboard uses). `X-Agent` hea
 actor.
 
 ```
-GET    /api/projects                              GET    /api/tasks/{id}          (returns depends_on + blocks)
-POST   /api/projects {slug,name}                 PATCH  /api/tasks/{id} {status?,assignee?,title?,body?,priority?}
-DELETE /api/projects/{slug}                       POST   /api/tasks/{id}/claim    (409 if open prereqs; body {"steal_stale":"<dur>"} = stale takeover, 409 not_stale if fresh)
-                                                  POST   /api/tasks/next         {project?} atomic pick+claim of the best ready task (404 if none)
-POST   /api/projects/{slug}/archive              POST   /api/projects/{slug}/unarchive
-GET    /api/tasks?project=&status=&assignee=     POST   /api/tasks/{id}/comments {body}
-       &ready=true|&blocked=true|&stale=<dur>    DELETE /api/tasks/{id}/comments/{cid}
-       |&q=<text>|&label=<l>                     POST   /api/tasks/{id}/deps {depends_on:<id-or-ref>}
-POST   /api/tasks {project,title,...}            DELETE /api/tasks/{id}/deps/{depId}
-DELETE /api/tasks/{id}                           POST   /api/tasks/{id}/labels {label}
-                                                 DELETE /api/tasks/{id}/labels/{label}
+GET    /api/categories?archived=true             GET    /api/tasks/{id}          (returns depends_on + blocks)
+POST   /api/categories {slug,name?}              PATCH  /api/tasks/{id} {status?,assignee?,title?,body?,priority?}
+POST   /api/categories/{slug}/archive            POST   /api/tasks/{id}/claim    (409 if open prereqs; body {"steal_stale":"<dur>"} = stale takeover, 409 not_stale if fresh)
+POST   /api/categories/{slug}/unarchive          POST   /api/tasks/next         {project?,category?} atomic pick+claim of the best ready task (404 if none)
+GET    /api/projects?category=<slug>             POST   /api/tasks/{id}/comments {body}
+POST   /api/projects {slug,name,category?}       DELETE /api/tasks/{id}/comments/{cid}
+PATCH  /api/projects/{slug} {slug?,name?,         POST   /api/tasks/{id}/deps {depends_on:<id-or-ref>}
+       vault_project_id?,vault_path?}            DELETE /api/tasks/{id}/deps/{depId}
+DELETE /api/projects/{slug}                      POST   /api/tasks/{id}/labels {label}
+POST   /api/projects/{slug}/archive              DELETE /api/tasks/{id}/labels/{label}
+POST   /api/projects/{slug}/unarchive
+GET    /api/tasks?project=&category=&status=&assignee=
+       &ready=true|&blocked=true|&stale=<dur>|&q=<text>|&label=<l>
+POST   /api/tasks {project,title,...}            DELETE /api/tasks/{id}
 GET    /api/events?since=|?tail=|?before=        GET    /api/stream  (SSE)
 GET    /api/projects/{slug}/graph               {nodes,edges}; read-only DAG (no events)
 ```
+
+Category and project payloads carry a **stable id** (`uid`: `amc_…` / `amp_…`) that never
+changes across slug renames — bind external systems to it, not the slug. Projects also carry
+optional `vault_project_id` / `vault_path` binding fields. Creating into an archived category
+fails with `400 {"error":"category_archived"}`.
 
 ```sh
 curl -s 127.0.0.1:8787/api/tasks?project=web
@@ -227,6 +245,7 @@ curl -s -H 'X-Agent: claude-1' -X POST 127.0.0.1:8787/api/tasks/13/claim
 |---|---|
 | `AGENTMAN_URL` | server the CLI talks to (default `http://127.0.0.1:8787`) |
 | `AGENTMAN_PROJECT` | default project for `am ls` / `am new` |
+| `AGENTMAN_CATEGORY` | default category scope for `am ls` / `am next` / `am wait --ready` / `am project new` |
 | `AGENTMAN_AGENT` | identity override (else `am init` file) |
 | `AGENTMAN_PORT` / `--port` | server port (default `8787`) |
 | `AGENTMAN_DB` / `--db` | database path (default `~/.agentman/agentman.db`) |

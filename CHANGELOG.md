@@ -11,6 +11,79 @@ fresh `[Unreleased]` section.
 
 ### Added
 
+- **agentic_brain foundation (Phase O)** — the category layer, stable IDs, and vault binding
+  that let agentman plug into the agentic_brain system (requirements R1/R2/R3/R8).
+  - **Categories: a new layer above projects** (`instance → category → project → task`). New
+    `categories` table (`uid`, `slug` unique lowercase, `name`, `archived_at`); every project
+    belongs to exactly one category. CLI: `am categories [--all]` (terse: slug, name,
+    `(archived)`; `--json` includes `uid`), `am category new <slug> [name]` (prints the slug),
+    `am category archive|unarchive <slug>` (silent, idempotent). API: `GET /api/categories`
+    (`?archived=true` includes archived), `POST /api/categories {slug,name?}` (slug trimmed +
+    lowercased server-side, name defaults to slug; dup slug → `409 conflict`),
+    `POST /api/categories/{slug}/archive|unarchive` (200, idempotent — no event on a no-op,
+    mirroring projects). **`-c` is the global category flag** (env fallback `AGENTMAN_CATEGORY`)
+    on `am ls`, `am next`, and `am wait --ready` (`?category=` on `GET /api/tasks` /
+    `GET /api/projects`, `{"category"?}` on `POST /api/tasks/next`; composes with every existing
+    filter). Exception: `am show <id> -c` still means `--comments` — `main.go` rewrites
+    `-c → --comments` for the `show` verb only (`rewriteShowComments`). `am project new` now
+    **requires a category** (`-c <slug>` or `AGENTMAN_CATEGORY`; exit 5 otherwise); `am new`
+    (tasks) gains no `-c` — project slugs stay **globally unique**, so a project fully determines
+    its category. Archiving a category cascades: default views (`GET /api/projects`, unscoped
+    `GET /api/tasks`, the unscoped event feed) hide its projects/tasks/events; an explicit
+    `?category=` keeps an archived category inspectable (hidden, not blocked-from-read); `am next`
+    excludes archived categories unconditionally; creating a task or project under an archived
+    category fails with `400 {"error":"category_archived"}` (new sentinel `ErrCategoryArchived`,
+    CLI exit 5 — **no new exit codes**). `am wait --ready -c` scopes the readiness re-check; the
+    SSE stream stays unscoped for category (no `?category=` on `/api/events`/`/api/stream` yet —
+    Phase R). Dashboard kept working: `POST /api/projects` with no category defaults to `general`
+    server-side, the feed renders the category event kinds, and the project strip reloads on
+    `category.archived`/`category.unarchived`.
+  - **Stable IDs (`amc_`/`amp_` + 16 lowercase hex)** — an immutable, unique, generated `uid` on
+    categories and projects (8 bytes of `crypto/rand`, stdlib only; insert paths retry on the
+    astronomically unlikely UNIQUE collision via `isUniqueErr`). Survives slug renames — the
+    vault's canonical correlation key (a bare `p_` prefix was avoided; the vault owns that
+    namespace). Exposed in all category/project payloads (`am projects --json` /
+    `am categories --json`).
+  - **Vault binding + project edit** — `projects.vault_project_id` / `projects.vault_path`
+    (two optional strings ≤ 500 bytes; agentman stores the binding, the vault owns its meaning).
+    New `PATCH /api/projects/{slug}` (allowed keys: `slug` — validated like create, `409` on dup;
+    `name`; `vault_project_id`; `vault_path`; empty string clears a vault field; `uid`/category
+    never patchable; unknown keys ignored; no-op → 200 with no event) and
+    `am project edit <slug> [--slug NEW] [--name N] [--vault-id X] [--vault-path Y]` (silent
+    success; explicit-empty `--vault-id=` / `--vault-path=` clears; exit 1 when nothing to
+    change). Project payloads now carry `uid`, `category` (slug), `vault_project_id?`,
+    `vault_path?` everywhere (archive/unarchive responses included). **4 new event kinds**:
+    `category.created` / `category.archived` / `category.unarchived` (no `project_id` — rendered
+    explicitly in the feed) and `project.patched` (compact delta like task patches, e.g.
+    `{"slug":["old","new"]}`); total now **21**.
+  - **Schema migration v4** (`currentSchemaVersion` 3 → 4): the `categories` table itself ships
+    in `schema.sql` (`CREATE TABLE IF NOT EXISTS`); the v4 step adds `projects.category_id`
+    (nullable in SQL — SQLite's `ADD COLUMN` can't add a NOT NULL FK — with the NOT NULL
+    invariant app-enforced), `projects.uid` (+ unique index `idx_projects_uid`),
+    `projects.vault_project_id`, `projects.vault_path`, and `idx_projects_category`; seeds the
+    default category **`general`** unconditionally (fresh installs get it too); attaches every
+    existing project to it; and backfills a distinct `amp_` uid per project. Task
+    ids/refs/`claimed_at`/labels untouched. `am db export` snapshots categories automatically
+    (`VACUUM INTO`); `validateImportCandidate` deliberately keeps the v1-baseline required-table
+    set so **pre-v4 snapshots stay importable** (they migrate on the next open).
+  - **`OpenStore` now refuses a too-new DB** — opening a database whose recorded `schema_version`
+    is newer than the binary supports fails with `database schema_version N is newer than
+    supported M — upgrade am`, instead of an older binary silently misbehaving against a newer
+    schema. Same ceiling `validateImportCandidate` already applied to import snapshots.
+  - Tests (+30, now 174): `TestMigrationV4Fresh`, `TestMigrationV4ExistingDB`,
+    `TestOpenStoreRejectsNewerSchema` (migrate); `TestCreateCategory`,
+    `TestArchiveUnarchiveCategory`, `TestCreateProjectWithCategory`, `TestPatchProject`,
+    `TestCategoryArchiveCascade`, `TestListTasksCategoryFilterComposes`,
+    `TestNextTaskCategoryScoping`, `TestCreateTaskArchivedCategory` (store);
+    `TestCategoryEndpoints`, `TestProjectPayloadAndCategoryFilter`, `TestListTasksCategoryParam`,
+    `TestNextEndpointCategoryBody`, `TestPatchProjectEndpoint`,
+    `TestCreateTaskArchivedCategory400` (HTTP); `TestCmdCategoryVerbs`,
+    `TestCmdProjectNewRequiresCategory`, `TestCmdProjectEdit`, `TestCmdLsCategoryWireFormat`,
+    `TestCmdNextCategory`, `TestCmdShowDashCStillPrintsComments`, `TestRewriteShowComments`
+    (CLI); `TestWaitReadyCategoryScoped`, `TestWaitReadyCategoryEnv`,
+    `TestWaitReadyCategoryTimeout` (wait); `TestExportContainsCategories`,
+    `TestImportPreCategorySnapshot`, `TestImportRejectsNewerSchema` (db).
+
 - **Findability (Phase M)** — search and labels, so a grown board stays navigable.
   - **Search: `am ls --grep <text>`** (`GET /api/tasks?q=<text>`) — substring match on **title OR
     body** via SQL `LIKE … ESCAPE '\'`; the wildcards `%`/`_` (and `\`) in the query are escaped, so

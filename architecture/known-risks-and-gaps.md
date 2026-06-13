@@ -7,11 +7,15 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 - **Schema-migration runner: forward-only, no rollback path** (was High → now Low). The forward-only
   runner that reads/bumps `meta.schema_version` (ADR-010) is now exercised end-to-end: Phase 2 shipped
-  the first real step (`ALTER TABLE projects ADD COLUMN archived_at TEXT` at `version: 2`) and
-  Phase K the second (`ALTER TABLE tasks ADD COLUMN claimed_at TEXT` at `version: 3`,
-  `currentSchemaVersion = 3`), each applied with its version bump in one tx and covered by tests. Residual:
-  no down-migrations; a DB recorded at a version newer than the binary is accepted leniently (its
-  unknown steps are simply skipped, no error). → `data-model.md`, `decision-records.md` ADR-010.
+  the first real step (`ALTER TABLE projects ADD COLUMN archived_at TEXT` at `version: 2`),
+  Phase K the second (`ALTER TABLE tasks ADD COLUMN claimed_at TEXT` at `version: 3`), and
+  Phase O the third (`version: 4` — `projects.category_id`/`uid`/vault columns, `general` seed,
+  uid backfill; `currentSchemaVersion = 4`), each applied with its version bump in one tx and
+  covered by tests. Residual:
+  no down-migrations. The too-new-DB leniency is **resolved (Phase O)**: `OpenStore` now refuses a
+  DB recorded at a version newer than the binary supports (clear "upgrade am" error), the same
+  ceiling `validateImportCandidate` applies to snapshots. → `data-model.md`,
+  `decision-records.md` ADR-010/ADR-025.
 - **Single-writer throughput ceiling** (Low for stated scope). `SetMaxOpenConns(1)` serializes all
   writes; correct and simple, but caps write concurrency. → ADR-003.
 - **Module boundaries are by convention only** (Medium, maintainability). One flat `main` package
@@ -49,6 +53,12 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   Residual (Low) from earlier: the live SSE broadcast (`hub.Broadcast`) is not archive-filtered —
   an event on a project archived after the SSE connection was opened can flash transiently in the
   feed until the next `ListEvents` reload filters it out. → `data-model.md`.
+- **Category events are invisible to project-scoped SSE subscribers** (Low, deliberate for
+  Phase O). The `category.*` event kinds carry a NULL `project_id`, so they reach **unscoped**
+  subscribers only — a `?project=`-scoped stream filters them out. Likewise `/api/events` and
+  `/api/stream` have no `?category=` filter yet. Both are revisited in Phase R (category
+  dashboard + scoped feed); until then `am wait --ready -c` deliberately streams unscoped and
+  re-checks via the category-scoped REST call (chattier but correct). → ADR-025.
 - **Identity collisions in one directory** (Low). Two agents in the same working dir share the
   per-dir identity unless one sets `AGENTMAN_AGENT`. → ADR-008.
 - **Update bootstrap** (Low). A machine must do one manual `go install …@latest` to get a binary
@@ -97,7 +107,7 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 ## Testing Gaps
 
-- Coverage now spans store/server/migrate/db/cli/sse/identity/wait/web tests (10 files, 144 tests,
+- Coverage now spans store/server/migrate/db/cli/sse/identity/wait/web tests (10 files, 174 tests,
   `-race`-clean): the **atomic claim** (race, `-race`-clean), events cursor, store CRUD/validation,
   validation→status mapping, the Host/CSRF/CSP guards, project archive/unarchive (store round-trip
   + idempotency and the HTTP endpoints incl. 404), the v2 migration (adds `archived_at` +
@@ -155,6 +165,20 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   `TestTaskLabelsTableExistsOnReopenedDB`, `TestLabelEndpoints`), plus the CLI surface
   (`TestCmdLsGrepWireFormat`, `TestCmdLabelAddRemove`, `TestCmdLabelPrintsLabels`,
   `TestCmdLabelUsage`).
+  Phase O added 30 category/stable-ID/vault/migration tests: the store layer
+  (`TestCreateCategory`, `TestArchiveUnarchiveCategory`, `TestCreateProjectWithCategory`,
+  `TestPatchProject`, `TestCategoryArchiveCascade`, `TestListTasksCategoryFilterComposes`,
+  `TestNextTaskCategoryScoping`, `TestCreateTaskArchivedCategory`), the HTTP surface
+  (`TestCategoryEndpoints`, `TestProjectPayloadAndCategoryFilter`, `TestListTasksCategoryParam`,
+  `TestNextEndpointCategoryBody`, `TestPatchProjectEndpoint`,
+  `TestCreateTaskArchivedCategory400`), the CLI (`TestCmdCategoryVerbs`,
+  `TestCmdProjectNewRequiresCategory`, `TestCmdProjectEdit`, `TestCmdLsCategoryWireFormat`,
+  `TestCmdNextCategory`, `TestCmdShowDashCStillPrintsComments`, `TestRewriteShowComments`),
+  category-scoped wait (`TestWaitReadyCategoryScoped`, `TestWaitReadyCategoryEnv`,
+  `TestWaitReadyCategoryTimeout`), the v4 migration + version ceiling (`TestMigrationV4Fresh`,
+  `TestMigrationV4ExistingDB`, `TestOpenStoreRejectsNewerSchema`), and db export/import
+  (`TestExportContainsCategories`, `TestImportPreCategorySnapshot`,
+  `TestImportRejectsNewerSchema`).
   **Still untested:** behavioral dashboard JS — the "Manage projects" modal, the delete confirm
   flows (task/comment/project), the feed pagination button, the dependency section UI (prereq chips,
   add-prereq dropdown, blocks list), the **graph overlay** (layout, pan/zoom, transitive highlight,

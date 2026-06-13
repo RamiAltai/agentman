@@ -22,7 +22,7 @@ broadcast → dashboard**. Confirmed via `cmd/am/main.go`, `cmd/am/server.go`, `
 | `cmd/am/hub.go` | SSE subscriber hub (broadcast/fan-out) | `Hub`, `subscriber` |
 | `cmd/am/store.go` | All SQLite access; types; atomic claim; events | `Store` + domain structs |
 | `cmd/am/db.go` | `am db export`/`import`/`prune` (offline snapshot/restore/retention) | `cmdDB`, `exportDB`, `importDB`, `pruneEvents` |
-| `cmd/am/schema.sql` | DB schema (embedded) | `meta/projects/tasks/task_deps/task_labels/comments/events` |
+| `cmd/am/schema.sql` | DB schema (embedded) | `meta/categories/projects/tasks/task_deps/task_labels/comments/events` |
 | `cmd/am/client.go` | CLI HTTP client; HTTP-status → exit-code mapping | `Client`, `doOrFail`, `exitCodeFor` |
 | `cmd/am/cli.go` | CLI verb parsing + terse/JSON formatters | `cmd*`, `parse`, `fail` |
 | `cmd/am/wait.go` | `am wait` (SSE-driven blocking waits, exit 7 on timeout) | `cmdWait`, `waiter`, `readSSEFrame` |
@@ -70,15 +70,21 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   `AGENTMAN_LOG`), `requestLogger` wraps the entire chain outermost (so guard 403s are also
   logged); it captures the status code via `statusRecorder` (which also proxies `http.Flusher`
   to keep SSE working) and logs `METHOD PATH STATUS LATENCY ACTOR` per request.
-  Routes: `GET/POST /api/projects` (`GET …?archived=true` includes archived),
+  Routes: `GET/POST /api/categories` (`GET …?archived=true` includes archived),
+  `POST /api/categories/{slug}/archive`, `POST /api/categories/{slug}/unarchive`,
+  `GET/POST /api/projects` (`GET …?archived=true` includes archived; `?category=<slug>` scopes;
+  POST takes optional `category`, defaulting to `general`),
+  `PATCH /api/projects/{slug}` (slug/name/vault binding; `uid`/category never patchable),
   `POST /api/projects/{slug}/archive`, `POST /api/projects/{slug}/unarchive`,
   `DELETE /api/projects/{slug}` (hard-delete + cascade),
-  `GET/POST /api/tasks` (`?ready=true` / `?blocked=true` filter by prereq state; `?stale=<dur>`
+  `GET/POST /api/tasks` (`?category=<slug>` scopes by category; `?ready=true` / `?blocked=true`
+  filter by prereq state; `?stale=<dur>`
   filters to assigned, not-done tasks with no activity for ≥ dur; `?q=<text>` substring search on
   title OR body; `?label=<l>` exact label match),
   `GET/PATCH /api/tasks/{id}` (GET returns `depends_on`/`blocks`),
   `DELETE /api/tasks/{id}` (hard-delete + cascade to comments + dep edges),
-  `POST /api/tasks/next` (atomic pick+claim of the best ready task; 404 if none),
+  `POST /api/tasks/next` (atomic pick+claim of the best ready task, optional
+  `{"project"?,"category"?}` scope; 404 if none),
   `POST /api/tasks/{id}/claim` (body `{"steal_stale":"<dur>"}` = stale-claim takeover, 409
   `not_stale` if still fresh), `POST /api/tasks/{id}/comments`,
   `DELETE /api/tasks/{id}/comments/{cid}`,
@@ -95,7 +101,8 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
 - **SSE hub** — `cmd/am/hub.go`: best-effort fan-out; buffered per-subscriber channels; a
   `project.created` event reaches all subscribers regardless of filter.
 - **Data layer** — `cmd/am/store.go`: opens SQLite with `SetMaxOpenConns(1)` (single writer),
-  WAL via DSN pragmas; all queries parameterized; atomic claim (+ the stale-claim takeover
+  WAL via DSN pragmas; refuses a DB whose `schema_version` is newer than the binary supports
+  (Phase O); all queries parameterized; atomic claim (+ the stale-claim takeover
   `StealStaleClaim` and the pick+claim `NextTask`, the same conditional-UPDATE trick); event
   insertion helper.
   Hard-delete methods: `DeleteTask`, `DeleteComment`, `DeleteProject` (each inserts `*.deleted`
@@ -103,6 +110,12 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
 - **CLI** — `cmd/am/cli.go` + `cmd/am/client.go`: verb parsing, terse output, exit-code mapping.
   Includes `project archive`/`project unarchive <slug>` and `projects --all` (lists archived,
   marked `(archived)`); `db export`/`db import`/`db prune` are handled offline in `cmd/am/db.go`.
+  Categories (Phase O): `am categories [--all]`, `am category new <slug> [name]`,
+  `am category archive|unarchive <slug>`; `am project new <slug> [name] -c <category>` (category
+  required — flag or `AGENTMAN_CATEGORY`); `am project edit <slug> [--slug NEW] [--name N]
+  [--vault-id X] [--vault-path Y]` (vault binding; explicit-empty clears); `-c <cat>` scopes
+  `am ls`, `am next`, and `am wait --ready` (`am show <id> -c` still means `--comments` — `main.go
+  rewriteShowComments` rewrites it for `show` only).
   Hard-delete verbs: `am rm <id>` (silent success, exit 3 if not found); `am project rm <slug> --yes`
   (requires `--yes`; cascade-deletes project + all tasks/comments). `am db prune (--before <date> |
   --keep <N>) [--yes]` — offline events-only retention.
@@ -114,9 +127,10 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   prereq ids. Stale-claim recovery: `am ls --stale <dur>` lists assigned, not-done tasks with no
   activity for ≥ dur (Go duration syntax, e.g. `30m`, `48h`); `am claim <id> --steal-stale <dur>`
   atomically takes over a stale claim (exit 4 with `not stale yet` if the claim is still fresh).
-  Agent work loop: `am next [-p P]` atomically picks + claims the best ready task via
+  Agent work loop: `am next [-p P] [-c CAT]` atomically picks + claims the best ready task via
   `POST /api/tasks/next` (prints the claimed id; exit 3 if none); `am wait <id> --done` /
-  `am wait --ready [-p P]` block until the condition holds (SSE-driven, in `cmd/am/wait.go`;
+  `am wait --ready [-p P] [-c CAT]` block until the condition holds (SSE-driven, in
+  `cmd/am/wait.go`;
   exit 7 on timeout, default 10m); `am status <id...> <st>` and `am assign <id...> <who>` accept
   multiple ids (client-side loop, one event per task; exit = first failure's code).
   Findability: `am ls --grep TEXT` (substring search over title + body, ASCII-case-insensitive)
@@ -139,7 +153,10 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   (`CreateTask` → `ErrProjectArchived` → HTTP 400).
   Board cards show a **🔒 Blocked** tag (`nopen > 0`) or **✓ Ready** tag (`nprereq > 0 && nopen == 0`),
   and an amber **⏳ stale** chip on `doing` cards with an assignee and no activity for 30+ minutes.
-  The feed renders `task.reclaimed` (stale-claim takeover) as "X reclaimed #N from Y".
+  The feed renders `task.reclaimed` (stale-claim takeover) as "X reclaimed #N from Y", and the
+  project-less `category.created/archived/unarchived` events with explicit cases (the default
+  branch would render a literal "null" ref); the project strip reloads on
+  `category.archived`/`category.unarchived` so the archive cascade shows live.
   The task modal has a **Dependencies** section: "Depends on" chips with a ✕ remove button, an
   "Add prerequisite…" dropdown of same-project tasks, and a read-only "Blocks" list. A hard-block
   409 surfaces the blocking prereq ids and reverts the UI.

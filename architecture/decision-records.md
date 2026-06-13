@@ -93,9 +93,11 @@ without evidence.
   `schema.sql`. Each step applies its change **and** bumps `meta.schema_version` in one tx;
   integer-ordered; no new dependency. `schemaMigrations` is **empty at v1** (foundation only).
 - Rationale: enables additive schema evolution + import version checks without a migration library.
-- Consequences: forward-only (no down-migrations); a DB at a **newer** version than the binary is
-  currently accepted silently (to be gated by the Phase 1 import check / a future `cur>target`
-  guard); an unparseable `schema_version` defaults to 1, so migration steps must stay idempotent.
+- Consequences: forward-only (no down-migrations); a DB at a **newer** version than the binary was
+  originally accepted silently — **closed in Phase O** (ADR-025): `OpenStore` now refuses to open a
+  DB whose recorded `schema_version` exceeds `currentSchemaVersion`, the same ceiling
+  `validateImportCandidate` applies to import snapshots; an unparseable `schema_version` defaults
+  to 1, so migration steps must stay idempotent.
 - Evidence: `cmd/am/store.go` (`runMigrations`/`readSchemaVersion`/`schemaMigrations`, `OpenStore`);
   `cmd/am/migrate_test.go`.
 
@@ -615,6 +617,85 @@ without evidence.
   (`handleAddLabel`, `handleRemoveLabel`, `?q=`/`?label=` in `handleListTasks`); `cmd/am/cli.go`
   (`cmdLabel`, `--grep`/`--label` in `cmdLs`); `cmd/am/web/app.js` (search box, label chips +
   filter, modal Labels section); tests listed in the Phase M CHANGELOG entry.
+
+### ADR-025: Category layer + stable IDs + vault binding — `amc_`/`amp_` crypto/rand uids, nullable FK with app-enforced NOT NULL, globally-unique slugs, `-c` flag with a `show` carve-out, open-time version ceiling (Phase O)
+- Status: Active
+- Context: The agentic_brain integration (requirements R1/R2/R3/R8) needs a **category** layer
+  above projects (one instance, one DB, agents scoped down later), **stable IDs** the vault can
+  bind to across slug renames, **vault binding metadata** on projects, and a migration that
+  carries every existing DB forward with zero data loss. This is Phase O ("Foundation") of that
+  train; scoping enforcement (Phase Q), the category dashboard (Phase R), and scope tokens
+  (Phase S) build on it, with task metadata (Phase P) in parallel.
+- Decision:
+  1. **Stable-ID format: `amc_`/`amp_` + 16 lowercase hex** (`newUID` — 8 bytes of `crypto/rand`,
+     stdlib only; no ULID dependency). Immutable after creation; survives slug renames; the
+     vault's canonical correlation key. A bare `p_` prefix was avoided because the vault's own
+     project IDs use that namespace and sit next to these in the same binding fields. Insert
+     paths retry up to 3 attempts on a uid UNIQUE collision (`isUniqueErr`); the v4 migration
+     backfill assigns per-row without retry (collision odds ~2⁻⁶⁴).
+  2. **`projects.category_id` is nullable in SQL — NOT NULL by app invariant.** A deliberate
+     deviation from the requirement's "NOT NULL FK": SQLite's `ALTER TABLE ADD COLUMN` cannot add
+     a NOT NULL column without a constant default, which is wrong for an FK. The invariant is
+     enforced in the app instead: `CreateProject` always sets it, the v4 migration backfills all
+     NULLs to `general`, and nothing can clear it (`category_id` is not patchable). UNIQUE is
+     likewise not allowed in `ADD COLUMN`, hence the `idx_projects_uid` unique index for
+     `projects.uid`.
+  3. **Project slugs stay globally unique** (no per-category namespacing). Task refs like `web-3`
+     and `AGENTMAN_PROJECT` keep working unchanged, and `am new` needs no `-c` — a slug names
+     exactly one project across the instance, so a project fully determines its category.
+  4. **`-c` becomes the global category flag** (`canonFlag c → category`; env fallback
+     `AGENTMAN_CATEGORY`) — with one carve-out: `am show <id> -c` is the documented comments
+     toggle, so `main.go` rewrites `-c → --comments` for the `show` verb only
+     (`rewriteShowComments`, run before `parse()`). Chosen over a per-verb alias table to keep
+     `canonFlag` simple.
+  5. **Archived-category cascade mirrors the archived-project rules.** Default views
+     (`GET /api/projects`, unscoped `GET /api/tasks`, the unscoped event feed) require both
+     `p.archived_at IS NULL` AND `c.archived_at IS NULL`; an explicit `?category=` drops the
+     category-archived condition so the scope stays inspectable (hidden, not blocked-from-read);
+     `next` excludes archived categories unconditionally; writes are blocked — task/project
+     creation under an archived category → `ErrCategoryArchived` →
+     `400 {"error":"category_archived"}` → CLI exit 5 (**no new exit codes**).
+  6. **Dashboard default-category compatibility:** `POST /api/projects` with an empty category
+     maps to `general` server-side rather than 400, so the existing dashboard (and any script
+     posting `{slug,name}`) keeps working without a UI change. The v4 migration seeds `general`
+     **unconditionally**, so fresh installs have it too.
+  7. **`am wait --ready -c` streams unscoped:** `/api/stream` has no `?category=` yet (Phase R);
+     the unscoped stream just triggers the category-scoped REST re-check (the ADR-023 pattern —
+     event payloads are never trusted as state). Slightly chattier (re-checks on out-of-scope
+     events) but correct.
+  8. **Open-time schema-version ceiling:** `OpenStore` refuses a DB whose recorded
+     `schema_version` is newer than `currentSchemaVersion` ("database schema_version N is newer
+     than supported M — upgrade am") — migrations only run forward, so an older binary would
+     otherwise operate on (and corrupt or silently hide) too-new data. Mirrors the ceiling
+     `validateImportCandidate` already applies to import snapshots (closes the ADR-010 residual).
+  9. **Old snapshots stay importable by design:** `validateImportCandidate`'s required-table set
+     is pinned to the **v1 baseline** (no `categories`/`task_deps`/`task_labels`) — later tables
+     are created by `schema.sql`/migrations on the next `OpenStore`, so pre-v4 snapshots import
+     and migrate cleanly.
+- New event kinds: `category.created` / `category.archived` / `category.unarchived` (these carry
+  **no `project_id`**, so they reach unscoped SSE subscribers only and need explicit feed-render
+  cases — the default branch would print a literal "null" ref) and `project.patched` (compact
+  delta, modeled on task patches). Catalog 17 → **21**.
+- Rationale: one instance with a category layer beats one-instance-per-domain (single dashboard,
+  scoped agents later); crypto/rand hex keeps the stdlib-only invariant; the nullable-FK deviation
+  is the only way to ship the column through SQLite's ALTER TABLE while the app preserves the
+  semantic invariant; global slug uniqueness protects every existing ref and env contract; the
+  show-verb rewrite preserves a documented CLI surface at near-zero complexity.
+- Consequences: category moves are unsupported (`category_id` not patchable — revisit when
+  needed); the `-c` rewrite means `show` can never grow a category filter under that letter;
+  category events are invisible to project-scoped SSE subscribers until Phase R; `am project new`
+  is no longer zero-config (requires `-c` or `AGENTMAN_CATEGORY`, though `general` always
+  exists).
+- Evidence: `cmd/am/store.go` (migration v4, `newUID`, `isUniqueErr`, `CreateCategory`,
+  `ListCategories`, `ArchiveCategory`/`UnarchiveCategory`, `CreateProject`, `PatchProject`,
+  `getProjectTx`, `TaskFilter.Category`, `NextTask`, the cascade WHERE clauses, the `OpenStore`
+  ceiling); `cmd/am/schema.sql` (`categories` table; projects CREATE TABLE frozen as the v1
+  baseline); `cmd/am/server.go` (category routes, `PATCH /api/projects/{slug}`,
+  `ErrCategoryArchived` → 400); `cmd/am/cli.go` (`canonFlag`, `categoryFor`, `cmdCategories`,
+  `cmdCategory`, `project new`/`edit`); `cmd/am/main.go` (`rewriteShowComments`);
+  `cmd/am/wait.go` (category-scoped `checkReady`); `cmd/am/db.go` (v1-baseline comment);
+  `cmd/am/web/app.js` (category feed cases, project-strip reload); the 30 Phase O tests listed
+  in the CHANGELOG entry.
 
 ## Inferred Decisions
 

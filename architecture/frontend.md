@@ -56,7 +56,11 @@ All built imperatively in `app.js` (no component framework):
 - **Activity feed** — `feedItem`, `evText`, `evKind`: color-coded events with clickable `#refs`.
   Event kinds include the project lifecycle: `project.created`, `project.archived`,
   `project.unarchived` (render via `evText`/`describeText`; `evKind` colors them as generic "other"),
-  and the new delete kinds: `task.deleted`, `comment.deleted`, `project.deleted`. A
+  the category lifecycle: `category.created`, `category.archived`, `category.unarchived` —
+  these carry **no project/task ref** (NULL `project_id`), so they have explicit cases in both
+  `evText` and `describeText` ("who archived category slug"; the default branch would render a
+  literal "null" ref). `project.patched` deliberately falls through to the default rendering (it
+  has a project ref). The delete kinds: `task.deleted`, `comment.deleted`, `project.deleted`. A
   `task.reclaimed` event (stale-claim takeover) renders as *"X reclaimed #N from Y"* (the previous
   assignee comes from `data.assignee[0]`) and is colored like a claim (`evKind` maps it to
   `"claimed"`). `task.labeled` / `task.unlabeled` events render as *"X labeled #N +l"* /
@@ -70,7 +74,8 @@ All built imperatively in `app.js` (no component framework):
   replaced by a `"— start of activity —"` end-marker. All DOM via `el()` (no `innerHTML`).
 - **Detail modal** — `renderModal`, plus `openNew` (new task) and `openNewProject`: one reused
   `#sheet` element; auto-growing title `<textarea>`; status/assignee/priority controls; comments;
-  history. The modal includes a **Delete task** button (inline two-step confirm — see below) and
+  history. `openNewProject` still POSTs `{slug,name}` only — the server defaults the category to
+  `general` (Phase O kept the dashboard category-unaware by design; the category UI is Phase R). The modal includes a **Delete task** button (inline two-step confirm — see below) and
   each comment has a **× delete** button (also two-step). The modal also has a **Dependencies**
   section (`depsSection`):
   - **"Depends on"** — one chip per prerequisite showing a status dot, `project-ref` (clickable
@@ -166,7 +171,9 @@ re-fetches and re-renders (`onEvent`). The graph overlay uses its own debounced 
   `/api/events?tail=50` (same `qstr` rule). `onEvent` handles the three delete kinds:
   `task.deleted` removes the card from `tasks` map and closes the modal if it was open;
   `comment.deleted` refreshes the open modal; `project.deleted` drops the slug from `selected` and
-  reloads the board/feed. For `task.dep_added` and `task.dep_removed`, `onEvent` refreshes the
+  reloads the board/feed; `category.archived`/`category.unarchived` (like `project.created` and
+  `project.unarchived`) trigger `loadProjects()` so the project strip reflects the archive
+  cascade live. For `task.dep_added` and `task.dep_removed`, `onEvent` refreshes the
   open modal if either the task or the referenced prereq is currently open (so both sides of the
   edge see the update), then triggers the debounced board reload.
 - Same-origin only; no CORS, no auth token (the API is unauthenticated).

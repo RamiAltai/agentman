@@ -47,6 +47,17 @@ Evidence:
 
 - Multi-project boards; tasks with status (`todo/doing/blocked/done`), priority (`0–3`),
   assignee, comments. Evidence: `cmd/am/schema.sql`.
+- **Category layer** (Phase O): projects are grouped into categories — the hierarchy is
+  `instance → category → project → task → comment`. One `am serve` instance and one DB cover
+  everything; `-c <cat>` / `AGENTMAN_CATEGORY` scope `am ls`/`am next`/`am wait --ready`, and
+  archiving a category hides everything under it (creation into it is blocked). Built for the
+  agentic_brain integration, where agents will later be confined to a category. Evidence:
+  `cmd/am/store.go` (`Category`, migration v4), `cmd/am/cli.go`, `cmd/am/server.go`.
+- **Stable IDs + vault binding** (Phase O): categories and projects carry an immutable `uid`
+  (`amc_`/`amp_` + 16 hex) that survives slug renames (`am project edit --slug`), and projects
+  can store `vault_project_id`/`vault_path` pointers back to the agentic_brain vault
+  (`am project edit --vault-id/--vault-path`, `PATCH /api/projects/{slug}`). Evidence:
+  `cmd/am/store.go` (`newUID`, `PatchProject`).
 - **Atomic task claim** so two agents never grab the same ticket — conditional
   `UPDATE … RETURNING` in `cmd/am/store.go` `ClaimTask`.
 - **Stale-claim recovery** so a crashed agent doesn't hold a task forever: `am ls --stale <dur>`
@@ -94,8 +105,13 @@ Evidence:
 
 ## Domain Concepts
 
-- **Project** — a named board (`slug`, `name`) grouping tasks. Can be archived (hidden from
-  default views, reversible) via `archived_at`.
+- **Category** — the layer above projects (`instance → category → project → task`): `slug`
+  (unique, lowercase), `name`, a stable `uid` (`amc_…`), and the same reversible soft-archive as
+  projects — with a cascade that hides everything underneath. Every project belongs to exactly
+  one category (the default is `general`).
+- **Project** — a named board (`slug` — globally unique across categories, `name`, a stable
+  `uid` (`amp_…`), optional `vault_project_id`/`vault_path` binding) grouping tasks. Can be
+  archived (hidden from default views, reversible) via `archived_at`.
 - **Task** — a ticket. Has a global `id` (`#42`, the cheap wire ref) **and** a per-project `ref`
   (`web-3`, human-friendly). Status + priority + optional assignee.
 - **Comment** — a threaded note on a task.
@@ -124,5 +140,7 @@ Inferred (Confidence: Medium–High) from `README.md` "Security" and the localho
 - **Intended scale.** No stated target for concurrent agents / task volume. The single-writer
   SQLite design (`SetMaxOpenConns(1)`) implies modest scale, but this is not documented.
 - **Roadmap.** Near-term gap-closing work is now tracked in `ROADMAP.md` (repo root). Labels and
-  search shipped in Phase M; longer-term ideas (auth, remote access, due dates, prebuilt binaries)
-  remain discussion-only — treat those as unconfirmed.
+  search shipped in Phase M; the agentic_brain foundation (categories, stable IDs, vault binding)
+  shipped in Phase O, with task metadata (P), scoping enforcement (Q), the category dashboard (R),
+  and scope tokens (S) to follow; longer-term ideas (auth, remote access, due dates, prebuilt
+  binaries) remain discussion-only — treat those as unconfirmed.

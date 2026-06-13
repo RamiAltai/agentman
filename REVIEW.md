@@ -131,6 +131,28 @@ In rough priority order:
 - [ ] N1 Goreleaser release binaries; `am update` downloads binary
 - [ ] N2 Server-side auto-prune (`--retain`) replacing manual-only compaction
 
+### Phase O — agentic_brain foundation — **DONE (2026-06-13)**
+
+First phase of the agentic_brain integration train (see `agentman_requirements.md`, outside
+this repo): categories, stable IDs, vault binding, migration v4. Satisfies requirements
+**R1 + R2 + R3 + R8**.
+
+- [x] O1 Category layer (R1) — `categories` table, `am categories`/`am category new|archive|
+  unarchive`, `-c` + `AGENTMAN_CATEGORY` on `ls`/`next`/`wait --ready`, `?category=` filters,
+  archived-category cascade (`400 category_archived` on writes)
+- [x] O2 Stable IDs (R2) — immutable `amc_`/`amp_` uids on categories/projects (crypto/rand,
+  16 hex); slugs renameable via `am project edit --slug` without breaking the correlation key
+- [x] O3 Vault binding (R3) — `vault_project_id`/`vault_path` on projects;
+  `am project edit --vault-id/--vault-path` + `PATCH /api/projects/{slug}`
+- [x] O4 Migration v4 (R8) — seeds default category `general`, attaches existing projects,
+  backfills uids; zero data loss (task ids/refs/`claimed_at`/labels untouched); pre-v4 snapshots
+  stay importable; `OpenStore` now rejects a too-new `schema_version`
+  - 4 new event kinds (`category.created/archived/unarchived`, `project.patched`; total 21);
+    +30 tests (now 174). → ADR-025, `CHANGELOG.md`.
+  - Next in the train: **Phase P** task metadata (`meta` k=v + meta-filtered `next`/`wait`, R7),
+    **Phase Q** scoping enforcement (identity scope, exit 8, proposal-inbox carve-out, R4),
+    **Phase R** category dashboard + scoped feed (R6), **Phase S** scope tokens (R5).
+
 ### Later / if demand appears
 - Due dates + `--due-before` filter; webhooks on event kinds (Slack/CI triggers);
   MCP server mode (`am mcp` exposing the board as MCP tools — natural fit for the
