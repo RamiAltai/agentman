@@ -11,6 +11,37 @@ fresh `[Unreleased]` section.
 
 ### Added
 
+- **Dashboard dark/light theme toggle** — the embedded dashboard, previously dark-only, now ships a
+  light theme alongside the dark default and a header control to switch between them. Frontend-only
+  (`cmd/am/web/`): no Go API, schema, event-kind, error-code, or CLI change.
+  - **Theme toggle button** — a ghost icon button (`#themeToggle`) in the header `.actions` row,
+    immediately before the **Graph** button, shows the theme you'd switch TO (`☀` in dark mode, `☾`
+    in light mode). `aria-label`/`title` read "Switch to light/dark theme" and `aria-pressed`
+    reflects whether light is active. **No keyboard shortcut** (the `a`/`n`/`g`/`/` shortcuts are
+    unchanged).
+  - **Default-to-system-then-persist** — on first load the dashboard follows the OS
+    `prefers-color-scheme`; once the user clicks the toggle their explicit choice is saved to the new
+    `localStorage` key **`am.theme`** (`"light"`/`"dark"`; unset = follow the system) and survives
+    reloads. While no explicit choice is stored the dashboard live-follows OS theme changes (e.g.
+    macOS auto night switch) without a reload.
+  - **No flash of the wrong theme** — a tiny inline `<head>` IIFE in `index.html` reads
+    `localStorage["am.theme"]` (falling back to `prefers-color-scheme`, then `"dark"` on any error)
+    and sets `data-theme` on `<html>` before the stylesheet loads. The `color-scheme` meta tag is now
+    `content="dark light"` so native form controls and scrollbars render correctly in both themes.
+  - **Light palette across all surfaces** — board, columns, cards, header, tabs, search, the task
+    modal, manage-projects list, dependency tags/chips, activity feed, modal/feed/graph backdrops,
+    and the dependency-graph overlay (nodes, edges, detail panel, legend). Implemented as a single
+    `:root[data-theme="light"]{…}` token-override block over the dark `:root` default; ~20
+    previously-inline color literals were tokenized into new CSS custom properties (dark keeps their
+    exact prior values, so there is **no visual change in dark mode**). `app.js` 1986 → 2023 lines,
+    `app.css` 657 → 729 lines, `index.html` 71 → 87 lines.
+  - Tests (+1, now 257): `cmd/am/web_test.go` — `TestDashboardThemeAssets` asserts `app.css` ships
+    the `:root[data-theme="light"]` override block and `index.html` carries both the inline
+    `am.theme` FOUC-guard script and the `#themeToggle` button (the source-level no-JS-runner pattern
+    of `TestDashboardNoXSSSinks`).
+  - → ADR-030, `frontend.md`, `docs/reference.md`, `README.md`, `project-overview.md`,
+    `engineering-conventions.md`, `backend.md`, `contribution-guide.md`.
+
 - **Scope tokens (Phase S)** — the final phase of the agentic_brain integration train turns Phase
   Q's client-asserted scope (accident prevention) into a real **server-enforced** boundary: a token
   is bound server-side to a scope, the server derives the scope from the token, and a config-following

@@ -116,7 +116,8 @@ Evidence:
 - **Per-directory agent identity** that survives the fresh-shell-per-command model agents run in
   (`cmd/am/identity.go`).
 - **Embedded dashboard** (no build step, no npm): kanban board, drag-and-drop status changes,
-  collapsible/resizable activity panel, keyboard shortcuts, responsive. Evidence: `cmd/am/web/`.
+  collapsible/resizable activity panel, keyboard shortcuts, a light/dark theme toggle (system-default,
+  then persisted), responsive. Evidence: `cmd/am/web/`.
 - **Multi-select project filter** on the dashboard: pick any number of project tabs to scope the
   board/feed at once ("All" clears the selection). Evidence: `cmd/am/web/app.js` `toggleProject`.
 - **DB export/import**: `am db export` writes a consistent snapshot (`VACUUM INTO`), and

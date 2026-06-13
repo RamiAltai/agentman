@@ -29,6 +29,9 @@ live kanban board served at `http://127.0.0.1:8787`.
 - **Activity feed** you can **collapse** or **drag-resize** (an overlay drawer on small screens);
   task `#refs` in the feed are clickable.
 - **Responsive** from desktop down to mobile — columns stack and the panel overlays.
+- **Light & dark themes** — a header sun/moon button (before **Graph**) toggles between them. First
+  load follows your OS appearance (`prefers-color-scheme`); once you pick a theme it persists across
+  reloads (stored in the browser). No keyboard shortcut.
 - **Keyboard:** `n` new task · `a` toggle the activity panel · `/` focus search · `g` toggle the
   dependency graph · `Enter`/`Space` open a focused card · `[` / `]` move a focused card between
   statuses · `Esc` close a dialog.

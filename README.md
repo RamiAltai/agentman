@@ -86,7 +86,7 @@ directory knows who it is — run it once per session and forget it.
   last 30 minutes. Click in to drill down to a project board.
 - **Drag-and-drop boards** — move cards between columns; the change persists and broadcasts.
 - **Live activity feed** — a collapsible stream of every claim, comment, and status change as it
-  lands. Plus a per-project dependency graph, search, and label filters.
+  lands. Plus a per-project dependency graph, search, label filters, and a light/dark theme toggle.
 
 Open any card for the full ticket — status, assignee, priority, prerequisites, comments, and history:
 
