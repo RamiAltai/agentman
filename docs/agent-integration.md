@@ -88,7 +88,8 @@ Choose the project with `-p <slug>` (or set AGENTMAN_PROJECT) and the category s
 `-c <slug>` (or set AGENTMAN_CATEGORY — scopes ls/next/wait --ready and is the default for
 `project new`). Exception: `am show <id> -c` means --comments, not category. Output is terse
 text — add `--json` to parse. Silence = success. Exit codes: 0 ok · 3 not found · 4 already
-claimed or blocked by prereqs · 5 invalid · 6 server down · 7 wait timed out · 8 out of scope.
+claimed or blocked by prereqs · 5 invalid · 6 server down · 7 wait timed out · 8 out of scope ·
+9 bad token (invalid or revoked).
 
 **Scoped identity:** `am init <tasktype> -c CAT [-p PROJ]` confines this agent to a category (or one
 project). Out-of-scope mutations and named reads (`am claim`/`status`/`edit`/`show <id>` of a task
@@ -99,6 +100,18 @@ for asking another scope's owner to do something. (`AGENTMAN_SCOPE` overrides th
 `X-Agent-Scope` is the wire header — a client-asserted label, accident prevention, not auth.)
 **After upgrading:** a pre-Phase-Q identity file is read as **unscoped** — re-run `am init -c …` to
 gain a scope.
+
+**Scope tokens (the human mints, the agent uses):** `X-Agent-Scope` alone is a client-asserted label.
+To make the scope server-enforced, a human (an **unscoped** operator) mints a token for the agent:
+`tok=$(am token new --scope work)` (or `work/api` for one project). That prints the token once on
+stdout, stores it in this directory's identity, and from then on the agent's CLI sends it as
+`Authorization: Bearer` on every request — the server derives the scope from the token (it **wins
+over** any header), so a config-following agent that holds only its own token cannot act as another
+scope. The agent never mints its own token (minting requires an unscoped caller — a scoped agent gets
+exit 8). `am whoami` shows `token: set` (never the value). If a token is **invalid or revoked**, every
+command fails with **exit 9 (bad token)** — distinct from exit 8 (out of scope); treat it as "ask the
+human for a fresh token", not "loop again". The human manages tokens with `am token ls` / `am token
+revoke <id>`. `AGENTMAN_TOKEN` overrides the file's token.
 
 **The work loop:** `am next` is the pickup verb — it atomically picks AND claims the
 highest-priority ready task (FIFO within a priority), so two agents calling it concurrently

@@ -40,7 +40,7 @@ via `//go:embed`, so a running/old binary serves stale assets. Hard-refresh the 
 ## Running Tests
 
 ```sh
-go test -race ./cmd/am/                     # run all tests with the race detector (239 tests)
+go test -race ./cmd/am/                     # run all tests with the race detector (256 tests)
 go test ./...                               # equivalent short form
 go test -run TestUpdateAvailable -v ./cmd/am/
 ```
@@ -65,7 +65,10 @@ Tests live next to the code in `cmd/am/` (11 test files):
   cascade, and fresh-table existence on reopen; and scope (Phase Q): `taskScope`/`projectCategory`
   + `created_by` default (`TestTaskScopeAndProjectCategory`) and the scoped+meta `NextTask` race
   (`TestNextTaskRaceScopedCategoryMeta`); and category stats (Phase R): `TestListCategoriesCounts`
-  (`ListCategoriesWithStats` — non-archived-only counts, recently-active non-human agents).
+  (`ListCategoriesWithStats` — non-archived-only counts, recently-active non-human agents); and
+  scope tokens (Phase S): `TestCreateToken_HashNotPlaintext` (hash != plaintext, `ListTokens` carries
+  no hash/plaintext), `TestResolveToken` (resolve/unknown/revoked → `ErrInvalidToken`),
+  `TestCreateToken_ScopeValidation` (unknown/cross-category/archived rejected), `TestRevokeToken`.
 - `server_test.go` — HTTP status mapping (404 / 400 / lost-claim 409), the Host/CSRF guards and
   security headers, the archive/unarchive endpoints, HTTP 400 on task creation into an archived
   project (`TestCreateTaskIntoArchivedProject400`), `TestWriteErrHidesInternalDetail` (500 returns
@@ -81,9 +84,13 @@ Tests live next to the code in `cmd/am/` (11 test files):
   `TestScopeStealStale`, the proposals carve-out cases `TestScopeProposalsCarveOut`/`…Configurable`/
   `…MissingProjectInert`/`…WrongCategoryNoCarveOut`/`…Squat`, `TestScopeMutationSweep`,
   `TestScopeProjectScopedAgent`, `TestScopeReads`, `TestScopeHeaderValidation`,
-  `TestScopeProjectCategoryEndpoints`), and the Phase R `?category=` feed filter
+  `TestScopeProjectCategoryEndpoints`), the Phase R `?category=` feed filter
   (`TestEventsCategoryFilter` — one category's task events only, excludes `category.*` and the
-  other category, all of `?since=`/`?tail=`/`?before=`, unknown category → 404).
+  other category, all of `?since=`/`?tail=`/`?before=`, unknown category → 404), and the Phase S
+  scope-token surface (`TestTokenAdmin_RequiresUnscoped` — mint/list/revoke 403 for any scope,
+  `TestTokenScopeOverridesHeader`, `TestInvalidTokenRejected` — 401 incl. a DELETE-bogus-token-is-401
+  guard, `TestNoTokenPathUnchanged`, `TestTokenScopeMatrix`, `TestCreateTokenResponse` — plaintext
+  once, never in `ls`).
 - `migrate_test.go` — the forward-only migration runner (apply + version bump, skip ≤ current,
   idempotency, rollback), the v2 `archived_at` / v3 `claimed_at` columns, the v4
   category/stable-ID/vault migration (`TestMigrationV4Fresh`, `TestMigrationV4ExistingDB`), the v5
@@ -92,8 +99,9 @@ Tests live next to the code in `cmd/am/` (11 test files):
   (`TestOpenStoreRejectsNewerSchema`).
 - `db_test.go` — `am db` export/import (roundtrip + perms, backup creation, garbage rejection,
   server-liveness probe), prune (`TestPruneEventsKeep`, `TestPruneEventsBefore`,
-  `TestPruneEventsBeforeSameDayBoundary`), and Phase O (`TestExportContainsCategories`,
-  `TestImportPreCategorySnapshot`, `TestImportRejectsNewerSchema`).
+  `TestPruneEventsBeforeSameDayBoundary`), Phase O (`TestExportContainsCategories`,
+  `TestImportPreCategorySnapshot`, `TestImportRejectsNewerSchema`), and Phase S
+  `TestExportImportWithTokens` (a DB with a token round-trips; the token still resolves after import).
 - `cli_test.go` — CLI command-path + exit-code tests (Phase E1). Constructs a `Client` directly
   against an `httptest` server. `captureStdout` captures os.Stdout via a pipe; `captureExit` stubs
   the `osExit` var (see "Test Seams" below) to intercept exit codes as panics. Covers: `cmdNew`
@@ -112,8 +120,12 @@ Tests live next to the code in `cmd/am/` (11 test files):
   fold into one PATCH, `TestCmdNextMetaWireFormat`, `TestCmdLsMetaWireFormat`,
   `TestCmdShowPrintsMeta`); the Phase Q exit-8 surface (`TestExitCodeForOutOfScope`,
   `TestCmdClaimOutOfScopeExit8`, `TestCmdNextOutOfScopeExit8`, `TestClientSendsScopeHeader`,
-  `TestCmdStatusBulkOutOfScope` — per-id 403 line + continue, 404-before-403 → exit 3); and pure
-  formatter/parse table tests.
+  `TestCmdStatusBulkOutOfScope` — per-id 403 line + continue, 404-before-403 → exit 3); the Phase S
+  scope-token surface (`TestCmdTokenNewWritesIdentity` — merges the token into the identity file,
+  plaintext on stdout line 1; `TestCmdTokenNewRequiresScope` — exit 5; `TestWhoamiPrintsTokenSet`;
+  `TestClientSendsBearerNotScope` — `Authorization: Bearer` sent, `X-Agent-Scope` dropped;
+  `TestExitCodeForUnauthorized` — `exitCodeFor(401)==9`; `TestDoOrFailUnauthorized` — 401 → exit 9);
+  and pure formatter/parse table tests.
 - `sse_test.go` — SSE streaming + reconnect (Phase E2). `TestSSEDeliversLiveEvent` opens
   `/api/stream`, creates a task, and asserts the `task.created` event arrives live.
   `TestSSEReplayOnReconnect` reconnects with `Last-Event-ID` and verifies gap-replay with

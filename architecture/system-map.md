@@ -22,11 +22,11 @@ broadcast → dashboard**. Confirmed via `cmd/am/main.go`, `cmd/am/server.go`, `
 | `cmd/am/hub.go` | SSE subscriber hub (broadcast/fan-out) | `Hub`, `subscriber` |
 | `cmd/am/store.go` | All SQLite access; types; atomic claim; events | `Store` + domain structs |
 | `cmd/am/db.go` | `am db export`/`import`/`prune` (offline snapshot/restore/retention) | `cmdDB`, `exportDB`, `importDB`, `pruneEvents` |
-| `cmd/am/schema.sql` | DB schema (embedded) | `meta/categories/projects/tasks/task_deps/task_labels/task_meta/comments/events` |
+| `cmd/am/schema.sql` | DB schema (embedded) | `meta/categories/projects/tasks/task_deps/task_labels/task_meta/tokens/comments/events` |
 | `cmd/am/client.go` | CLI HTTP client; HTTP-status → exit-code mapping | `Client`, `doOrFail`, `exitCodeFor` |
 | `cmd/am/cli.go` | CLI verb parsing + terse/JSON formatters | `cmd*`, `parse`, `fail` |
 | `cmd/am/wait.go` | `am wait` (SSE-driven blocking waits, exit 7 on timeout) | `cmdWait`, `waiter`, `readSSEFrame` |
-| `cmd/am/identity.go` | Per-directory agent identity + scope (`am init`/`am whoami`) | `resolveIdentity`, `resolveAgent`, `resolveScope`, `identityRecord`, `identityFile` |
+| `cmd/am/identity.go` | Per-directory agent identity + scope + token (`am init`/`am whoami`) | `resolveIdentity`, `resolveAgent`, `resolveScope`, `resolveToken`, `identityRecord` (`{agent,scope,token}`), `identityFile` |
 | `cmd/am/version.go` | Version reporting (`am version`) | `version()`, `injectedVersion` (ldflags) |
 | `cmd/am/update.go` | `am update` + startup update check | `cmdUpdate`, `checkForUpdate` |
 | `cmd/am/*_test.go` | Tests: `update/store/server/migrate/db/cli/sse/hub/identity/wait/web_test` | claim race, HTTP guards, migrations, deletes, CLI/exit codes, SSE replay + category scope, hub fan-out, identity, waits/timeouts, XSS guard |
@@ -63,11 +63,17 @@ Unknown/absent: no `internal/`, `pkg/`, `Makefile`, `Dockerfile`, or `.gorelease
 every SSE subscriber (open dashboards) receives it → exit code mapped from HTTP status via
 `client.go exitCodeFor` (the single source, used by `doOrFail` and the bulk `status`/`assign` loop).
 
-**Scope flow (Phase Q):** the CLI resolves a scope from the identity file or `AGENTMAN_SCOPE`
-(`resolveScope`) and sends it as `X-Agent-Scope`. On the server, `scopeOf(r)` is the **sole** reader
-of the header (the Phase S scope-token swap point); each handler runs a `check*`/`narrowScope`
-helper before touching the store. `am next` merges the scope into the `NextFilter` *inside* the
-atomic pick+claim. Denials are logged (`denyScope`) and never broadcast.
+**Scope flow (Phase Q + Phase S tokens):** the CLI resolves a scope from the identity file or
+`AGENTMAN_SCOPE` (`resolveScope`) and a token from the file or `AGENTMAN_TOKEN` (`resolveToken`).
+**When a token is present the CLI sends `Authorization: Bearer <token>` and STOPS sending
+`X-Agent-Scope`** (`client.go do()`); otherwise it sends the scope header. On the server,
+`(s *Server) scopeOf(r)` is the **sole** reader of request scope: a bearer token WINS — it resolves
+to the token's server-bound scope (`store.ResolveToken`) and ignores any header; an invalid/revoked
+token → `ErrInvalidToken` → `401 unauthorized` → CLI exit 9 (never a silent fallthrough). With no
+token the `X-Agent-Scope` header is the scope. Each handler then runs a `check*`/`narrowScope` helper
+before touching the store. `am next` merges the scope into the `NextFilter` *inside* the atomic
+pick+claim. Token mint/revoke is unscoped-only (`tokenAdminGuard`) and emits **no event**; denials
+are logged (`denyScope`) and never broadcast.
 
 **Human action on the dashboard:** identical path — the browser calls the same JSON API; its
 own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
@@ -119,7 +125,11 @@ identity scope.
   and excludes category-level NULL-project events; unknown category → 404),
   `GET /api/stream` (SSE; same `?project=`/`?category=` scoping of the live stream + gap-replay,
   resolved once at Subscribe; `project.created` delivered regardless; unknown category ignored
-  silently), and `/` → `http.FileServer` over `go:embed web`.
+  silently),
+  `POST /api/tokens` (mint a scope-bound bearer token — `201` with the plaintext once),
+  `GET /api/tokens` (list — never plaintext/hash), `POST /api/tokens/{id}/revoke` (revoke) — all
+  three **require an unscoped caller** (`tokenAdminGuard`; Phase S), and `/` → `http.FileServer` over
+  `go:embed web`.
   All three DELETE routes return `200 {"status":"deleted"}`; `ErrNotFound` → 404.
   (Uses Go 1.22+ method+pattern ServeMux, e.g. `"GET /api/tasks/{id}"`.)
 - **SSE hub** — `cmd/am/hub.go`: best-effort fan-out; buffered per-subscriber channels; a
@@ -151,6 +161,13 @@ identity scope.
   file (JSON when scoped, legacy bare-id plain text when not); `am whoami` prints a `scope:` line
   when scoped; the resolved scope (`AGENTMAN_SCOPE` overrides the file) rides as `X-Agent-Scope` on
   every request and yields exit 8 on any `403 out_of_scope`.
+  Scope tokens (Phase S): `am token new --scope <cat[/proj]>` mints a scope-bound bearer token (the
+  human runs this, unscoped), prints the plaintext on stdout line 1 and **merges** it into the
+  identity file's `token` field (preserving agent/scope); `am token ls [--json]` lists tokens
+  (id/scope/created/[revoked], never the plaintext/hash); `am token revoke <id>` revokes one. The CLI
+  then sends `Authorization: Bearer <token>` (and drops `X-Agent-Scope`) when a token is present
+  (file or `AGENTMAN_TOKEN`); `am whoami` adds a `token: set` line; an invalid/revoked token → exit 9
+  (`cmdToken`/`storeToken` in `cli.go`; `resolveToken` in `identity.go`).
   Hard-delete verbs: `am rm <id>` (silent success, exit 3 if not found); `am project rm <slug> --yes`
   (requires `--yes`; cascade-deletes project + all tasks/comments). `am db prune (--before <date> |
   --keep <N>) [--yes]` — offline events-only retention.
@@ -223,13 +240,16 @@ identity scope.
 - **Go module proxy** (`proxy.golang.org`) — queried at `am serve` startup for the latest version
   (`cmd/am/update.go checkForUpdate`). Network-optional.
 - **Standard library only** otherwise: `net/http`, `database/sql`, `encoding/json`, `embed`,
-  `os/exec` (for `am update`), `crypto/sha1` (identity file key).
+  `os/exec` (for `am update`), `crypto/sha1` (identity file key), `crypto/rand` (uids + token
+  plaintext) + `crypto/sha256` (token hashing, Phase S).
 
 ## Data Stores
 
 - **SQLite file** — default `~/.agentman/agentman.db` (`cmd/am/main.go defaultDBPath`, overridable
   via `--db` / `AGENTMAN_DB`). WAL mode (`*.db-wal`, `*.db-shm` sidecars).
 - **Identity files** — `~/.agentman/agents/<sha1(cwd)>` (`cmd/am/identity.go`), one per working dir.
+  JSON `{agent, scope?, token?}` when scoped/tokenized; the optional `token` (Phase S) is the agent's
+  plaintext bearer credential (scope-sensitive — a reader of the file can act as that scope).
 
 ## Dependency Direction
 

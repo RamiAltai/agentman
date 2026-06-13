@@ -245,7 +245,37 @@ this repo). Tracked in `REVIEW.md` alongside Phases J–Q.
     +8 tests (now 239). → ADR-028, `frontend.md`, `backend.md`, `data-model.md`, `system-map.md`,
     `README.md`, `CHANGELOG.md`.
   - **After Phase R the integration-blocking set (O + P + Q) plus the human dashboard is DONE.**
-    Only the train's **Phase S** (scope tokens, R5) and the NICE-to-have items remain.
+    Only the train's **Phase S** (scope tokens, R5, shipped below) and the NICE-to-have items remain.
+
+## Phase S — Scope tokens (shipped, beyond original roadmap)
+
+The fifth and **final** phase of the agentic_brain train (requirement R5, SHOULD, in
+`agentman_requirements.md`, outside this repo). Tracked in `REVIEW.md` alongside Phases J–R.
+
+- [x] **S1 · Scope tokens: server-enforced scope boundary** — _L_ — **shipped (Phase S)**
+  - `am token new --scope <cat[/proj]>` mints a scope-bound bearer token (unscoped caller only),
+    prints the plaintext once on stdout, and merges it into this directory's identity file;
+    `am token ls [--json]` / `am token revoke <id>`; `am whoami` adds `token: set`. The CLI sends
+    `Authorization: Bearer <tok>` and **drops** `X-Agent-Scope` when a token is present;
+    `AGENTMAN_TOKEN` overrides the file.
+  - `(s *Server) scopeOf(r)` resolves a bearer token to its server-bound scope in the **single**
+    resolution point — **token scope wins over the header**; `POST/GET /api/tokens` +
+    `POST /api/tokens/{id}/revoke` require an **unscoped** caller (`tokenAdminGuard`,
+    mint-requires-unscoped); an invalid/revoked token → `401 {"error":"unauthorized"}` (new
+    `ErrInvalidToken`) → **new CLI exit code 9** (distinct from 8: a bad credential hard-fails).
+  - New `tokens` table via `CREATE TABLE IF NOT EXISTS` (no migration; `currentSchemaVersion` stays
+    **5**); only the **sha256 hash** is stored (plaintext `amt_`+32 hex shown once, never persisted/
+    logged/listed); `am db export` carries hashes non-replayably; the v1-baseline import set is
+    unchanged so pre-Phase-S snapshots stay importable.
+  - No new event kind (token mint/revoke emits nothing; catalog stays 21); +17 tests (now 256).
+    Honesty note: loopback-only — not auth against an arbitrary local process (a filesystem read of
+    the identity file = token possession). → ADR-029, `security.md`, `data-model.md`, `backend.md`,
+    `system-map.md`, `README.md`, `docs/agent-integration.md`, `engineering-conventions.md`,
+    `known-risks-and-gaps.md`, `project-overview.md`, `CHANGELOG.md`.
+  - **The agentic_brain integration train is now COMPLETE** — every MUST + SHOULD requirement R1–R8 is
+    shipped (O+P+Q+R+S). Only the NICE items remain unbuilt (webhook with egress filter, copyable
+    `vault_path` in the dashboard, scoped `am db export -c`), alongside the parked **Phase N**
+    (release binaries / auto-prune) and **Phase G** (remote/multi-user auth+TLS).
 
 ## Phase G — Security posture (deferred by design)
 
@@ -270,7 +300,10 @@ stays parked unless the access model changes. For newer work, see `REVIEW.md` Ph
 (agentic_brain foundation — categories, stable IDs, vault binding, migration v4), Phase P
 (task metadata — `--meta` k=v pairs + presence-filtered `next`/`wait`), Phase Q (scoped agent
 identity & enforcement — `am init -c`, `X-Agent-Scope`, exit 8, proposals carve-out, migration v5),
-and Phase R (category dashboard + scoped feed — category-home + drill-down, hash routing,
-`?category=` on `/api/events`+`/api/stream`) have shipped. With Phase R the integration-blocking set
-(O + P + Q) plus the human dashboard is complete; only the agentic_brain train's **Phase S** (scope
-tokens) and the NICE items (release binaries, server-side auto-prune) remain.
+Phase R (category dashboard + scoped feed — category-home + drill-down, hash routing,
+`?category=` on `/api/events`+`/api/stream`), and Phase S (scope tokens — `am token`,
+`Authorization: Bearer`, token-scope-wins, mint-requires-unscoped, exit 9) have shipped. **With
+Phase S the entire agentic_brain train (O+P+Q+R+S) is COMPLETE — every MUST+SHOULD requirement R1–R8
+is shipped.** Only the NICE items remain unbuilt (webhook with egress filter, copyable `vault_path`
+in the dashboard, scoped `am db export -c`), alongside the parked Phase N (release binaries,
+server-side auto-prune) and Phase G (remote/multi-user auth+TLS).

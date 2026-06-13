@@ -976,6 +976,84 @@ without evidence.
   listed in the CHANGELOG entry (`hub_test.go`, `TestEventsCategoryFilter`,
   `TestSSECategoryScopedStream`, `TestSSECategoryReconnectReplay`, `TestListCategoriesCounts`).
 
+### ADR-029: Scope tokens — token-scope-wins in the single `scopeOf` resolution point, sha256-hash-not-plaintext storage, mint-requires-unscoped, exit-9/401 for bad tokens, no token event kind (Phase S)
+- Status: Active
+- Context: The agentic_brain integration (requirement R5, SHOULD) needs Phase Q's **client-asserted**
+  scope (`X-Agent-Scope`, accident prevention only — any caller can forge or omit it, ADR-027) to
+  become a **server-enforced** boundary: a credential the server binds to a scope, so a
+  config-following agent that holds only its own token cannot act as another scope. This is the
+  **fifth and final** phase of the train ADR-025 opened (after P metadata, Q scoping, R dashboard).
+  Non-goals (R9, unchanged): no TLS, no users, no rate limiting; the bind never leaves `127.0.0.1`.
+- Decision (the seven choices):
+  1. **`scopeOf` becomes a method `(s *Server) scopeOf(r)`** so it can reach the store to resolve
+     tokens while remaining the **SINGLE** reader of request scope (the ADR-027 swap-point realized).
+     No handler reads `Authorization` or `X-Agent-Scope` directly. **Precedence: a bearer token WINS**
+     — its server-side bound scope is authoritative and any `X-Agent-Scope` header is ignored; absent
+     a token the header is the scope; absent both is the zero (unscoped) Scope. A `bearerToken(r)`
+     helper extracts the token from `Authorization: Bearer <tok>` (case-insensitive scheme per
+     RFC 7235), not a bespoke header.
+  2. **Invalid/revoked token → new sentinel `ErrInvalidToken` ("unauthorized") → HTTP 401 → CLI exit
+     9.** `ResolveToken` NEVER returns a zero (allow-everything) Scope on a miss — that would silently
+     grant the unscoped boundary to a bad credential. **Exit 9 is distinct from exit 8 (out of scope)
+     on purpose:** a bad credential must **hard-fail**, not be swallowed as a per-id scope-skip inside
+     a bulk verb's loop. `exitCodeFor(401) == 9`; `writeErr` maps `ErrInvalidToken` →
+     `401 {"error":"unauthorized"}`.
+  3. **sha256 hash stored, plaintext never.** The plaintext token is `amt_` + 32 lowercase hex
+     (16 bytes of `crypto/rand`, `newToken`); only `hashToken(plaintext)` (hex sha256) is stored
+     (`token_hash`, UNIQUE). The plaintext is shown **once** at mint and never persisted, logged,
+     listed, or printed by `whoami`. Possessing the stored hash does not let one authenticate — the
+     server hashes the **presented** plaintext to compare, so a hash cannot be replayed as a
+     credential. The token id is `tk_` + 16 hex (`newUID`).
+  4. **`tokens` table via `CREATE TABLE IF NOT EXISTS`, no migration, `currentSchemaVersion` stays 5.**
+     A brand-new empty table has nothing to backfill, so a migration step would only add risk — the
+     `task_deps`/`task_labels`/`task_meta` precedent. Columns: `id`, `token_hash`, `category`,
+     `project` (NULL = category-wide), `created_at`, `revoked_at` (NULL = active); plus
+     `idx_tokens_hash`.
+  5. **Mint requires UNSCOPED (the boundary crux).** The three token-admin endpoints
+     (`POST/GET /api/tokens`, `POST /api/tokens/{id}/revoke`) refuse ANY request carrying a scope —
+     whether an `X-Agent-Scope` header OR a (valid) bearer token — via the shared
+     `(s *Server) tokenAdminGuard(w, r)` helper (`if !sc.IsZero() → denyScope`, the
+     `handleCreateCategory` precedent). Only a fully unscoped caller (the human at the CLI/dashboard)
+     administers tokens, so a confined agent can never mint a token for another scope. A bad bearer
+     token still 401s at the guard rather than being mistaken for "unscoped".
+  6. **DB export carries token hashes, deliberately un-scrubbed.** `exportDB` uses `VACUUM INTO`
+     (a whole-file snapshot), so the `tokens` table rides along — acceptable precisely because only
+     non-replayable sha256 hashes are stored (see choice 3). `validateImportCandidate`'s required-table
+     set stays the v1 baseline (`projects, tasks, comments, events, meta`); `tokens` is NOT added —
+     same treatment as `task_labels`/`task_meta`/`categories`, so a pre-Phase-S snapshot still imports
+     and the table is created by `schema.sql` on the next `OpenStore`.
+  7. **Validate scope at mint.** `CreateToken` rejects a token that can never match anything: the
+     category must exist and be non-archived (`ErrNotFound`/`ErrCategoryArchived`); a named project
+     must exist AND belong to that category (cross-category bind → `ErrValidation` → 400).
+- New error / kinds / schema: **new `ErrInvalidToken` → 401, new CLI exit 9.** **No new event kind**
+  — token mint/revoke deliberately emits nothing (the catalog stays **21 kinds**); audit token
+  activity via `am serve --log` (the out_of_scope and request logs cover it). Keeping credential admin
+  out of the unprunable activity feed avoids leaking token existence. **No schema migration**
+  (`currentSchemaVersion` stays **5**). New CLI env `AGENTMAN_TOKEN`; identity-file `token` field.
+- Rationale: making `scopeOf` the one place token-vs-header precedence is decided keeps every handler
+  untouched (the swap-point ADR-027 reserved); storing hashes not plaintext makes a stolen DB inert
+  as a credential; mint-requires-unscoped is the structural property that confines an agent (it cannot
+  escalate by minting); a distinct exit 9 keeps a bad credential from being silently tolerated by the
+  bulk-verb scope-skip semantics.
+- Consequences / residuals (accepted — see `known-risks-and-gaps.md`): this is **loopback-only with
+  no users** — a process that can read an identity file holds the token and can act as that scope, so
+  Phase S is **not** protection against arbitrary filesystem read; it upgrades R4's caveat from "any
+  header" to "a server-minted, scope-bound, revocable credential" but does **not** fully close it.
+  Revocation is immediate (`ResolveToken` checks `revoked_at` every request) but coarse — no
+  expiry/rotation (matches the SHOULD scope). Token-hash lookup is not constant-time (a non-issue at
+  loopback scale; constant-time over a DB lookup is infeasible). `am init` after a `token new` could
+  overwrite the token field (re-mintable, accepted). The full remote/multi-user auth+TLS project
+  (Phase G) stays parked.
+- Evidence: `cmd/am/store.go` (`Token`/`Token.Scope`, `ErrInvalidToken`, `CreateToken`/`ListTokens`/
+  `RevokeToken`/`ResolveToken`, `newToken`/`hashToken`); `cmd/am/schema.sql` (`tokens` +
+  `idx_tokens_hash`); `cmd/am/server.go` (`(s *Server) scopeOf`/`bearerToken`, `tokenAdminGuard`,
+  `handleCreateToken`/`handleListTokens`/`handleRevokeToken`, the `/api/tokens` routes,
+  `ErrInvalidToken` → 401 in `writeErr`); `cmd/am/client.go` (`token` field, `Authorization: Bearer`
+  send + `X-Agent-Scope` drop, `exitCodeFor(401)==9`, `doOrFail` 9 case); `cmd/am/identity.go`
+  (`identityRecord.Token`, `resolveToken`, `AGENTMAN_TOKEN`, `whoami` `token: set`); `cmd/am/cli.go`
+  (`cmdToken`, `storeToken`); the 17 Phase S tests across `store_test.go`/`server_test.go`/
+  `cli_test.go`/`db_test.go` (listed in the CHANGELOG entry).
+
 ## Inferred Decisions
 
 ### IADR-001: SSE chosen over WebSockets
