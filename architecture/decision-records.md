@@ -615,7 +615,7 @@ without evidence.
   `TaskFilter.Query/Label`); `cmd/am/schema.sql` (`task_labels`); `cmd/am/server.go`
   (`handleAddLabel`, `handleRemoveLabel`, `?q=`/`?label=` in `handleListTasks`); `cmd/am/cli.go`
   (`cmdLabel`, `--grep`/`--label` in `cmdLs`); `cmd/am/web/app.js` (search box, label chips +
-  filter, modal Labels section); tests listed in the Phase M CHANGELOG entry.
+  filter, modal Labels section); Phase M tests.
 
 ### ADR-025: Category layer + stable IDs + vault binding — `amc_`/`amp_` crypto/rand uids, nullable FK with app-enforced NOT NULL, globally-unique slugs, `-c` flag with a `show` carve-out, open-time version ceiling (Phase O)
 - Status: Active
@@ -693,8 +693,7 @@ without evidence.
   `ErrCategoryArchived` → 400); `cmd/am/cli.go` (`canonFlag`, `categoryFor`, `cmdCategories`,
   `cmdCategory`, `project new`/`edit`); `cmd/am/main.go` (`rewriteShowComments`);
   `cmd/am/wait.go` (category-scoped `checkReady`); `cmd/am/db.go` (v1-baseline comment);
-  `cmd/am/web/app.js` (category feed cases, project-strip reload); the 30 Phase O tests listed
-  in the CHANGELOG entry.
+  `cmd/am/web/app.js` (category feed cases, project-strip reload); the 30 Phase O tests.
 
 ### ADR-026: Task metadata — `task_meta` join table, key-presence filters, repeatable-flag CLI parser, empty-value removal, delta reuse with no new event kinds, `NextFilter` refactor (Phase P)
 - Status: Active
@@ -766,7 +765,7 @@ without evidence.
   (`meta` in create/patch bodies, `?meta_key=`, `meta_key` in `handleNext`); `cmd/am/cli.go`
   (`multiFlags`, `parseMetaFlags`, `metaKeyArg`, `cmdShow` meta line); `cmd/am/wait.go`
   (`checkReady` metaKey); `cmd/am/web/app.js` (modal Meta section, `task.patched` feed suffix);
-  the 25 Phase P tests listed in the CHANGELOG entry.
+  the 25 Phase P tests.
 
 ### ADR-027: Scoped agent identity & enforcement — client-asserted `X-Agent-Scope`, one `scopeOf` resolution point, hybrid read policy, proposals carve-out by (category, project) pair, `tasks.created_by` via migration v5, denials log-only (Phase Q)
 - Status: Active
@@ -866,8 +865,7 @@ without evidence.
   (`identityRecord`, `resolveIdentity`/`resolveScope`, scoped `cmdInit`, `cmdWhoami` scope line);
   `cmd/am/client.go` (`Client.scope`, the `X-Agent-Scope` send, `exitCodeFor` 403 → 8);
   `cmd/am/wait.go` (`waiter.scope`, the 403 → exit 8 re-checks); `cmd/am/main.go` (`--proposals` /
-  `AGENTMAN_PROPOSALS`, `usage()` scope/exit-8 lines); the 32 Phase Q tests listed in the CHANGELOG
-  entry.
+  `AGENTMAN_PROPOSALS`, `usage()` scope/exit-8 lines); the 32 Phase Q tests.
 
 ### ADR-028: Category dashboard + scoped feed — hub category fan-out resolved at Subscribe, `?category=` feed/stream filtering excluding category-level events, category stats folded into `/api/categories`, dashboard hash routing with overview-as-landing (Phase R)
 - Status: Active
@@ -966,7 +964,7 @@ without evidence.
   `cmd/am/web/{index.html,app.css,app.js}` (`#overview`/`#breadcrumb`, `route`/`navigate`/
   `applyView`/`loadOverview`/`renderOverview`/`catCard`/`allCard`/`setBreadcrumb`, `viewParams`/
   `projectsInView`, the per-view stream re-open and debounced count refresh); the 8 Phase R tests
-  listed in the CHANGELOG entry (`hub_test.go`, `TestEventsCategoryFilter`,
+  (`hub_test.go`, `TestEventsCategoryFilter`,
   `TestSSECategoryScopedStream`, `TestSSECategoryReconnectReplay`, `TestListCategoriesCounts`).
 
 ### ADR-029: Scope tokens — token-scope-wins in the single `scopeOf` resolution point, sha256-hash-not-plaintext storage, mint-requires-unscoped, exit-9/401 for bad tokens, no token event kind (Phase S)
@@ -1043,7 +1041,7 @@ without evidence.
   send + `X-Agent-Scope` drop, `exitCodeFor(401)==9`, `doOrFail` 9 case); `cmd/am/identity.go`
   (`identityRecord.Token`, `resolveToken`, `AGENTMAN_TOKEN`, `whoami` `token: set`); `cmd/am/cli.go`
   (`cmdToken`, `storeToken`); the 17 Phase S tests across `store_test.go`/`server_test.go`/
-  `cli_test.go`/`db_test.go` (listed in the CHANGELOG entry).
+  `cli_test.go`/`db_test.go`.
 
 ### ADR-030: Dashboard dark/light theme — dark stays the `:root` default, light is one `[data-theme="light"]` token override, inline FOUC head-script, default-to-system-then-persist via `localStorage["am.theme"]`
 - Status: Active

@@ -217,7 +217,7 @@ the server. Their security-relevant properties:
 
 ## Security Gaps
 
-(Current gaps only. Resolved items live in the CHANGELOG.)
+(Current gaps only. Resolved items live in git history.)
 
 1. No authentication; authorization is **loopback-scoped** (by design, but blocks any non-loopback
    use). Scope tokens confine a token-following agent server-side but are not auth against an

@@ -189,4 +189,4 @@ Inferred (Confidence: Medium–High) from `README.md` "Security" and the localho
 - **Intended scale.** No stated target for concurrent agents / task volume. The single-writer
   SQLite design (`SetMaxOpenConns(1)`) implies modest scale, but this is not documented.
 - **Roadmap.** Open and future work is tracked in `ROADMAP.md` (repo root); shipped history lives
-  in `CHANGELOG.md`.
+  in git.

@@ -1,6 +1,6 @@
 # Roadmap
 
-Open and future work only. Shipped history lives in [`CHANGELOG.md`](CHANGELOG.md).
+Open and future work only; see git history for shipped changes.
 
 Effort key: **S** ≈ a few lines + a test · **M** ≈ a focused change across 2–3 files ·
 **L** ≈ a feature or new surface. Cross-references point to
