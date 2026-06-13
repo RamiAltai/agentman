@@ -75,7 +75,9 @@ guard test in `cmd/am/web_test.go`. No Go API/store/CLI code was modified.
   because `patch()`'s success path would refresh the modal and wipe the inline error
   / in-progress inputs. The SSE `task.patched` echo re-renders the section from
   server truth on its own.
-- Validation error surfaces as: `meta keys are 1-50 chars of a-z 0-9 . _ -`.
+- Validation error surfaces as: `meta key must be 1-50 chars of a-z 0-9 . _ - and value ≤500 chars`
+  (the store returns `ErrValidation` for both a bad key and an over-long value, so the
+  message now names both cases instead of only the key charset/length).
 
 ### Gap 7 — Release a task from the GUI (one click)
 - The task modal's delete row gains a **Release** button (shown only when the task

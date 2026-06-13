@@ -498,7 +498,8 @@ function clearLabelFilter() {
 // project/category scope, search, and label filter because loadBoard() folds them
 // all into the ?-query — so they survive SSE-driven reloads automatically.
 
-let filterPanelTimer = null; // local debounce for the panel's text inputs (NOT searchTimer)
+let filterMineTimer = null; // debounce for the assignee box (NOT searchTimer)
+let filterMetaTimer = null; // debounce for the meta-key box (separate so the boxes don't cancel each other)
 let filterOutsideClickWired = false;
 
 function activeFilterCount() {
@@ -529,14 +530,14 @@ function renderFilterPanel() {
 
   const mineBox = el("input", { class: "field", value: filterMine, placeholder: "assignee", "aria-label": "Filter by assignee" });
   mineBox.oninput = () => {
-    clearTimeout(filterPanelTimer);
-    filterPanelTimer = setTimeout(() => { filterMine = mineBox.value.trim(); applyFilters(); }, 250);
+    clearTimeout(filterMineTimer);
+    filterMineTimer = setTimeout(() => { filterMine = mineBox.value.trim(); applyFilters(); }, 250);
   };
   const mineBtn = el("button", { class: "iconbtn filter-mine-btn", title: "Show tasks assigned to me", onclick: () => { filterMine = "human"; mineBox.value = "human"; applyFilters(); } }, "Mine");
   const metaBox = el("input", { class: "field", value: filterMetaKey, placeholder: "meta key", "aria-label": "Filter by meta key" });
   metaBox.oninput = () => {
-    clearTimeout(filterPanelTimer);
-    filterPanelTimer = setTimeout(() => { filterMetaKey = metaBox.value.trim(); applyFilters(); }, 250);
+    clearTimeout(filterMetaTimer);
+    filterMetaTimer = setTimeout(() => { filterMetaKey = metaBox.value.trim(); applyFilters(); }, 250);
   };
   panel.append(el("div", { class: "filter-section" },
     el("label", { class: "lbl" }, el("span", {}, "Assignee"), el("div", { class: "filter-mine-row" }, mineBox, mineBtn)),
@@ -671,7 +672,7 @@ function patch(id, body) {
 // inline error and the in-progress add inputs. The SSE task.patched echo triggers
 // refreshModal anyway, so the section re-renders from server truth on its own.
 function patchMeta(id, key, value) { return api("PATCH", "/api/tasks/" + id, { meta: { [key]: value } }); }
-function metaErrMsg(e) { return e.message === "validation" ? "meta keys are 1-50 chars of a-z 0-9 . _ -" : e.message; }
+function metaErrMsg(e) { return e.message === "validation" ? "meta key must be 1-50 chars of a-z 0-9 . _ - and value ≤500 chars" : e.message; }
 
 function label(text, node) { return el("label", { class: "lbl" }, el("span", {}, text), node); }
 
