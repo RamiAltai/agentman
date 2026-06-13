@@ -119,12 +119,24 @@ lexically.
   takeover and its data names the previous assignee and the `stale_for` window;
   `task.labeled`/`task.unlabeled` carry `{"label": l}`; `project.patched` carries a compact
   delta like task patches (e.g. `{"slug":["old","new"]}`); the `category.*` kinds carry `{slug}`
-  and have a **NULL `project_id`** (they reach unscoped SSE subscribers only — project-scoped
-  subscribers filter on project id; Phase R revisits).
+  and have a **NULL `project_id`** — they reach unscoped SSE subscribers (a `?project=`- or
+  `?category=`-scoped stream filters them out). Phase R made this deliberate: a `?category=` feed/
+  stream shows only work happening *inside* the category (its projects' events), while these
+  instance-wide category-level events belong to the All/overview feed.
 - **`events.data`** — compact JSON delta, e.g. `{"status":["todo","doing"]}`. Since Phase P a
   `task.patched` delta may carry a `"meta"` sub-object (`{"meta":{"k":[old,new]}}`, `null` =
   absent) and `task.created` data may carry `"meta":{k:v}` — same kinds, richer payloads (no new
   event kinds were added; the catalog stays at 21).
+
+**Derived (no schema change), Phase R:** `GET /api/categories` now returns a `CategoryStat` per
+category — the stored `Category` plus two **computed** rollups (`ListCategoriesWithStats`, no new
+columns): `counts` (`{todo, doing, blocked, done}`) summed over the category's **non-archived**
+projects' tasks (`LEFT JOIN projects … archived_at IS NULL LEFT JOIN tasks … GROUP BY category`),
+and `active_agents` — distinct non-human actors on **task-bearing** events
+(`events.task_id IS NOT NULL AND events.actor != 'human' AND events.created_at > <now-30m>`, joined
+project→category, ordered). The `task_id IS NOT NULL` predicate makes `comment.added` count as
+activity while category/project admin events (NULL `task_id`) do not; the literal `human` is
+excluded. These read straight off `tasks`/`events` — no denormalized counter is stored.
 
 ### Indexes
 
@@ -191,7 +203,13 @@ the dependent or the prerequisite. **Events are never deleted** (append-only).
   - **Activity feed** — `ListEvents` and `RecentEvents` similarly LEFT JOIN projects and exclude
     events whose project is archived (`p.archived_at IS NULL`) when no `project=` filter is
     present; an explicit `?project=<slug>` still returns that project's events. The SSE replay
-    path (`handleStream` → `ListEvents`) inherits this filter automatically.
+    path (`handleStream` → `ListEvents`) inherits this filter automatically. Since Phase R the feed
+    readers also take a **`?category=<slug>`** lens (`c.id=?`, resolved via `categoryID`; unknown →
+    404) that scopes the feed to the category's projects' events and **intentionally excludes
+    category-level (NULL `project_id`) events**; the SSE stream applies the same scope as an
+    in-memory project-id-set membership check resolved once at Subscribe (`ProjectIDsInCategory`),
+    with `project.created` always delivered. This is the human dashboard's category drill-down lens
+    — an unscoped query-param choice, not the agent identity scope of Phase Q.
   - **Task creation** — `CreateTask` checks the target project's `archived_at` before the insert
     transaction; if the project is archived it returns the sentinel `ErrProjectArchived`, mapped
     to HTTP 400 `{"error":"project_archived"}` by `writeErr`. The CLI prints `project_archived`

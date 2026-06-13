@@ -221,7 +221,31 @@ outside this repo). Tracked in `REVIEW.md` alongside Phases J–P.
     `X-Agent-Scope` is client-asserted (accident prevention, not auth; Phase S scope tokens upgrade
     it). +32 tests (now 231).
   → ADR-027, `data-model.md`, `backend.md`, `security.md`, `known-risks-and-gaps.md`, `CHANGELOG.md`.
-    Next in the train: **Phase R** category dashboard + scoped feed (R6), **Phase S** scope tokens (R5).
+    Next in the train: **Phase R** category dashboard + scoped feed (R6, shipped below), **Phase S**
+    scope tokens (R5).
+
+## Phase R — Category dashboard + scoped feed (shipped, beyond original roadmap)
+
+The fourth phase of the agentic_brain train (requirement R6 in `agentman_requirements.md`, outside
+this repo). Tracked in `REVIEW.md` alongside Phases J–Q.
+
+- [x] **R1 · Category-home dashboard + `?category=` feed/stream** — _L_ — **shipped (Phase R)**
+  - The human dashboard opens to a **category-home** overview (cards per category showing task
+    counts + recently-active agents), drills into a single category's board, and keeps an **"All"**
+    cross-category board — driven by linkable URL hashes (`#/`, `#/all`, `#/cat/<slug>`) with a
+    "← Categories" breadcrumb and per-view SSE re-scoping. `GET /api/categories` is augmented to a
+    `CategoryStat` (counts over non-archived projects + active agents in a 30-min window).
+  - `GET /api/events` and `GET /api/stream` gain an unscoped **`?category=`** lens scoping to the
+    category's projects' events and **excluding** instance-wide category-level (NULL-project)
+    events; the hub resolves the category's project-id set once at Subscribe (`ProjectIDsInCategory`/
+    `subFilter`) so `Broadcast` stays in-memory, preserving the `project.created` carve-out. Unknown
+    category → 404 on `/api/events`, ignored silently on `/api/stream`.
+  - No new event kinds (catalog stays 21), no new error/exit codes, no schema change
+    (`currentSchemaVersion` stays 5), no migration; `am wait`'s stream left deliberately unscoped.
+    +8 tests (now 239). → ADR-028, `frontend.md`, `backend.md`, `data-model.md`, `system-map.md`,
+    `README.md`, `CHANGELOG.md`.
+  - **After Phase R the integration-blocking set (O + P + Q) plus the human dashboard is DONE.**
+    Only the train's **Phase S** (scope tokens, R5) and the NICE-to-have items remain.
 
 ## Phase G — Security posture (deferred by design)
 
@@ -244,7 +268,9 @@ stays parked unless the access model changes. For newer work, see `REVIEW.md` Ph
 `am claim --steal-stale`), Phase L (agent work loop — `am next`, `am wait`, bulk
 `status`/`assign`), Phase M (findability — `am ls --grep`/`--label`, `am label`), Phase O
 (agentic_brain foundation — categories, stable IDs, vault binding, migration v4), Phase P
-(task metadata — `--meta` k=v pairs + presence-filtered `next`/`wait`), and Phase Q (scoped agent
-identity & enforcement — `am init -c`, `X-Agent-Scope`, exit 8, proposals carve-out, migration v5)
-have shipped; release binaries remain proposed, and the agentic_brain train continues with Phases R
-(category dashboard) and S (scope tokens).
+(task metadata — `--meta` k=v pairs + presence-filtered `next`/`wait`), Phase Q (scoped agent
+identity & enforcement — `am init -c`, `X-Agent-Scope`, exit 8, proposals carve-out, migration v5),
+and Phase R (category dashboard + scoped feed — category-home + drill-down, hash routing,
+`?category=` on `/api/events`+`/api/stream`) have shipped. With Phase R the integration-blocking set
+(O + P + Q) plus the human dashboard is complete; only the agentic_brain train's **Phase S** (scope
+tokens) and the NICE items (release binaries, server-side auto-prune) remain.

@@ -29,7 +29,7 @@ broadcast → dashboard**. Confirmed via `cmd/am/main.go`, `cmd/am/server.go`, `
 | `cmd/am/identity.go` | Per-directory agent identity + scope (`am init`/`am whoami`) | `resolveIdentity`, `resolveAgent`, `resolveScope`, `identityRecord`, `identityFile` |
 | `cmd/am/version.go` | Version reporting (`am version`) | `version()`, `injectedVersion` (ldflags) |
 | `cmd/am/update.go` | `am update` + startup update check | `cmdUpdate`, `checkForUpdate` |
-| `cmd/am/*_test.go` | Tests: `update/store/server/migrate/db/cli/sse/identity/wait/web_test` | claim race, HTTP guards, migrations, deletes, CLI/exit codes, SSE replay, identity, waits/timeouts, XSS guard |
+| `cmd/am/*_test.go` | Tests: `update/store/server/migrate/db/cli/sse/hub/identity/wait/web_test` | claim race, HTTP guards, migrations, deletes, CLI/exit codes, SSE replay + category scope, hub fan-out, identity, waits/timeouts, XSS guard |
 | `.github/workflows/ci.yml` | CI: build/vet/gofmt/test(-race)/JS-check/govulncheck on push + PR | — |
 | `cmd/am/web/` | Embedded dashboard: `index.html`, `app.css`, `app.js` | Vanilla, no build step |
 | `.github/workflows/ci.yml` | GitHub Actions CI — build/vet/gofmt/test(-race)/JS-syntax/govulncheck | Runs on push to `main` and on PRs |
@@ -72,6 +72,13 @@ atomic pick+claim. Denials are logged (`denyScope`) and never broadcast.
 **Human action on the dashboard:** identical path — the browser calls the same JSON API; its
 own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
 
+**Dashboard view flow (Phase R):** the URL hash selects the view. On load / `hashchange`,
+`route()` → `applyView` loads the right data (`#/` → `GET /api/categories` → overview cards;
+`#/all`/`#/cat/<slug>` → board + feed) and **re-opens** `GET /api/stream` with the view's scope
+(`?category=` for a category board, `?project=` for a single selected project, unfiltered for All/
+overview). The dashboard sends **no `X-Agent-Scope`** — category view is a query-param lens, not an
+identity scope.
+
 ## Major Modules
 
 - **HTTP API + routing** — `cmd/am/server.go` `Handler()`. The middleware chain is
@@ -79,7 +86,9 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   `AGENTMAN_LOG`), `requestLogger` wraps the entire chain outermost (so guard 403s are also
   logged); it captures the status code via `statusRecorder` (which also proxies `http.Flusher`
   to keep SSE working) and logs `METHOD PATH STATUS LATENCY ACTOR` per request.
-  Routes: `GET/POST /api/categories` (`GET …?archived=true` includes archived),
+  Routes: `GET/POST /api/categories` (`GET …?archived=true` includes archived; `GET` returns a
+  `CategoryStat` per category — `Category` + computed `counts` over non-archived projects +
+  `active_agents` in a 30-min window, for the dashboard's category-home view),
   `POST /api/categories/{slug}/archive`, `POST /api/categories/{slug}/unarchive`,
   `GET/POST /api/projects` (`GET …?archived=true` includes archived; `?category=<slug>` scopes;
   POST takes optional `category`, defaulting to `general`),
@@ -105,17 +114,28 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   `DELETE /api/tasks/{id}/labels/{label}` (detach a label; idempotent),
   `GET /api/projects/{slug}/graph` (read-only DAG: all tasks as nodes + dep edges; 404 on missing
   project; no events emitted),
-  `GET /api/events` (`?since=` ascending / `?tail=` newest-first / `?before=` backward cursor),
-  `GET /api/stream`, and `/` → `http.FileServer` over `go:embed web`.
+  `GET /api/events` (`?since=` ascending / `?tail=` newest-first / `?before=` backward cursor;
+  `?project=` and/or `?category=` scope — a `?category=` lens shows the category's projects' events
+  and excludes category-level NULL-project events; unknown category → 404),
+  `GET /api/stream` (SSE; same `?project=`/`?category=` scoping of the live stream + gap-replay,
+  resolved once at Subscribe; `project.created` delivered regardless; unknown category ignored
+  silently), and `/` → `http.FileServer` over `go:embed web`.
   All three DELETE routes return `200 {"status":"deleted"}`; `ErrNotFound` → 404.
   (Uses Go 1.22+ method+pattern ServeMux, e.g. `"GET /api/tasks/{id}"`.)
 - **SSE hub** — `cmd/am/hub.go`: best-effort fan-out; buffered per-subscriber channels; a
-  `project.created` event reaches all subscribers regardless of filter.
+  `project.created` event reaches all subscribers regardless of filter. A subscription's scope is a
+  `subFilter{projectID, categoryID, projectIDs}` (Phase R); a `?category=` stream resolves the
+  category's project-id set **once** at Subscribe (`ProjectIDsInCategory`) so `Broadcast` is a pure
+  in-memory membership check (no per-event DB hits) — cross-category and category-level
+  (NULL-project) events are dropped.
 - **Data layer** — `cmd/am/store.go`: opens SQLite with `SetMaxOpenConns(1)` (single writer),
   WAL via DSN pragmas; refuses a DB whose `schema_version` is newer than the binary supports
   (Phase O); all queries parameterized; atomic claim (+ the stale-claim takeover
   `StealStaleClaim` and the pick+claim `NextTask`, the same conditional-UPDATE trick); event
-  insertion helper.
+  insertion helper. Phase R adds `ListCategoriesWithStats` (counts + active-agents rollups for the
+  dashboard's category home), `ProjectIDsInCategory` (the hub's Subscribe-time set), and a
+  `category` parameter on `ListEvents`/`ListEventsBefore`/`RecentEvents` (the `?category=` feed
+  lens, excluding NULL-project events).
   Hard-delete methods: `DeleteTask`, `DeleteComment`, `DeleteProject` (each inserts `*.deleted`
   event in the same tx before the DELETE, then commits; cascade via FK).
 - **CLI** — `cmd/am/cli.go` + `cmd/am/client.go`: verb parsing, terse output, exit-code mapping.
@@ -160,6 +180,14 @@ own SSE connection then receives the broadcast (`cmd/am/web/app.js`).
   → exit 5; `--done --meta` → usage error); `am show <id>` prints a sorted `meta: k=v …` line
   when meta exists.
 - **Dashboard** — `cmd/am/web/app.js`: vanilla SPA; SSE consumer; board/modal/feed rendering.
+  **Hash routing** (Phase R): `route()` maps `#/` → category-home overview (the landing view),
+  `#/all` → cross-category board, `#/cat/<slug>` → a single category's board. The overview
+  (`loadOverview`/`renderOverview`/`catCard`/`allCard`, in `#overview`) renders a card per category
+  with count chips + active-agent avatars (from `GET /api/categories`'s `CategoryStat`) and an
+  "All" card; cards drill in via the hash. A header `#breadcrumb` ("← Categories" + view name)
+  shows on the board views. A category board scopes its tabs (`projectsInView`), board, feed, and
+  stream by `?category=` via `viewParams()`; the stream is re-opened on every view change, and the
+  overview's counts refresh debounced on `task.*`/`project.*`/`category.*` events.
   Includes a `⋯` "Manage projects" button in the tab bar that opens a modal (`openManageProjects`/
   `renderManageList`) listing all projects (active + archived via `GET /api/projects?archived=true`),
   with Archive/Unarchive buttons and a **Delete project** button (inline two-step confirm, calls

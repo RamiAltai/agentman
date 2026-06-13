@@ -30,11 +30,14 @@ does **not** stop a malicious local process. **Phase S (scope tokens) is the upg
 turns the asserted scope into a verified credential. `scopeOf(r)` in `server.go` is the single
 reader of the header, so Phase S swaps the scope's source there without touching handlers.
 
-**Known coverage gaps in Phase Q (deliberate, closed later):**
-- `GET /api/events` and `GET /api/stream` are **not** scope-filtered — a scoped agent can still
-  read the global activity feed (Phase R closes this with a category-scoped feed).
+**Known coverage gaps in Phase Q (deliberate):**
+- `GET /api/events` and `GET /api/stream` are **not** narrowed by `X-Agent-Scope` — a scoped agent
+  can still read the global activity feed. Phase R added an *unscoped* `?category=` lens for the
+  human dashboard's category drill-down (a query-param choice, not an identity scope); the agent
+  `am wait` stream stays unscoped by design.
 - `GET /api/projects` and `GET /api/categories` list endpoints are **not** narrowed — board
-  metadata (slugs/names) is visible to any scope; task *data* is the enforcement point this phase.
+  metadata (slugs/names) is visible to any scope; task *data* is the enforcement point (Phase R
+  kept `/api/categories` unscoped on purpose — it serves the unscoped human dashboard).
 - An explicit unknown `?project=` for a scoped agent returns 403 (not 404/empty) — the server
   cannot prove it in-scope, so it fails loud (mild existence ambiguity, accepted).
 
@@ -167,7 +170,8 @@ the server. Their security-relevant properties:
 8. **Scope is client-asserted** (Phase Q) — `X-Agent-Scope` confines a config-following agent but
    is not a boundary against crafted HTTP (any caller can forge or omit it). Phase S scope tokens
    are the fix. Residual reads: `/api/events`, `/api/stream`, `GET /api/projects`,
-   `GET /api/categories` are not scope-filtered yet (Phase R) — see Authorization above.
+   `GET /api/categories` are not narrowed by `X-Agent-Scope` (Phase R added an unscoped
+   `?category=` lens for the human dashboard, not an identity scope) — see Authorization above.
 
 ## Secure Implementation Checklist
 

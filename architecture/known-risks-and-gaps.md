@@ -54,12 +54,26 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   Residual (Low) from earlier: the live SSE broadcast (`hub.Broadcast`) is not archive-filtered —
   an event on a project archived after the SSE connection was opened can flash transiently in the
   feed until the next `ListEvents` reload filters it out. → `data-model.md`.
-- **Category events are invisible to project-scoped SSE subscribers** (Low, deliberate for
-  Phase O). The `category.*` event kinds carry a NULL `project_id`, so they reach **unscoped**
-  subscribers only — a `?project=`-scoped stream filters them out. Likewise `/api/events` and
-  `/api/stream` have no `?category=` filter yet. Both are revisited in Phase R (category
-  dashboard + scoped feed); until then `am wait --ready -c` deliberately streams unscoped and
-  re-checks via the category-scoped REST call (chattier but correct). → ADR-025.
+- **Category events are invisible to project-/category-scoped SSE subscribers** (Low, deliberate).
+  The `category.*` event kinds carry a NULL `project_id`, so they reach **unscoped** subscribers
+  only — a `?project=`- or `?category=`-scoped stream filters them out. Phase R made this a
+  **deliberate semantic**: `/api/events` and `/api/stream` now take a `?category=` lens (closing
+  the "revisit in Phase R" note), and that lens intentionally excludes category-level NULL-project
+  events — a category drill-down shows work *inside* the category; the instance-wide `category.*`
+  events live on the All/overview feed. `am wait --ready -c` still deliberately streams unscoped
+  and re-checks via the category-scoped REST call (chattier but correct — the wait stream was left
+  unchanged). → ADR-025, ADR-028.
+- **Hub category-stream post-open project staleness window** (Low, by design; Phase R). A
+  `?category=` SSE subscription resolves the category's project-id set **once** at Subscribe
+  (`ProjectIDsInCategory`) so `Broadcast` stays a pure in-memory check; a project created *after*
+  that subscription opens is not in the set, so its task events don't stream until the dashboard
+  re-opens the stream (which it does on every view change). The `project.created` carve-out still
+  surfaces the new project itself, and the REST snapshot is authoritative. Accepted to keep
+  `Broadcast` DB-free. → ADR-028, `hub.go`.
+- **Overview count-refresh debounce can fire after navigating away** (Low, cosmetic; Phase R). On
+  the category-home overview, `onEvent` debounces a `loadOverview()` (250 ms) on task/project/
+  category events; the debounced callback **re-checks `view === "overview"` at fire time** so it
+  never writes to the now-hidden `#overview`. Harmless either way. → `frontend.md`.
 - **Identity collisions in one directory** (Low). Two agents in the same working dir share the
   per-dir identity unless one sets `AGENTMAN_AGENT`. → ADR-008.
 - **Update bootstrap** (Low). A machine must do one manual `go install …@latest` to get a binary
@@ -108,13 +122,17 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   confines a *config-following* agent (accident prevention); any local caller can forge or omit it.
   **Phase S (scope tokens)** turns it into a verified credential — `scopeOf(r)` is the single swap
   point. → `security.md`, ADR-027.
-- **`/api/events` + `/api/stream` are not scope-filtered** (Low, deliberate). A scoped agent can
-  still read the global activity feed; the SSE stream stays unscoped, so `am wait` re-checks via the
-  scoped REST call (chattier but correct — no hot-spin, no false release). Closed by **Phase R**
-  (category-scoped feed). Same residual the Phase O `category.*` events note already tracks.
-- **`GET /api/projects` / `GET /api/categories` lists are not narrowed** (Low, deliberate). Board
-  *metadata* (slugs/names) is visible to any scope; task *data* is the enforcement point this phase.
-  Phase R revisits.
+- **`/api/events` + `/api/stream` are not narrowed by `X-Agent-Scope`** (Low, deliberate). A
+  scoped agent can still read the global activity feed; the SSE stream stays unscoped against the
+  identity scope, so `am wait` re-checks via the scoped REST call (chattier but correct — no
+  hot-spin, no false release). **Phase R closed the dashboard side** by adding an *unscoped*
+  `?category=` query-param lens to both endpoints (a human's category drill-down, not an identity
+  scope); the agent `am wait` stream remains intentionally unscoped. → ADR-028.
+- **`GET /api/projects` / `GET /api/categories` lists are not narrowed by scope** (Low,
+  deliberate). Board *metadata* (slugs/names) is visible to any scope; task *data* is the
+  enforcement point. Phase R **kept these unscoped on purpose** — `/api/categories` even gained
+  per-category stats for the unscoped human dashboard (category view is a query-param lens, not an
+  identity scope). → ADR-028.
 - **Unknown explicit `?project=` for a scoped agent returns 403, not 404/empty** (Low, by design).
   The server cannot prove an unknown slug in-scope, so it fails loud — mild existence ambiguity
   accepted in exchange for a fail-loud default. Same for a project-scoped agent creating into an
@@ -154,8 +172,8 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 ## Testing Gaps
 
-- Coverage now spans store/server/migrate/db/cli/sse/identity/wait/web tests (10 files, 231 tests,
-  `-race`-clean): the **atomic claim** (race, `-race`-clean), events cursor, store CRUD/validation,
+- Coverage now spans store/server/migrate/db/cli/sse/hub/identity/wait/web tests (11 files, 239
+  tests, `-race`-clean): the **atomic claim** (race, `-race`-clean), events cursor, store CRUD/validation,
   validation→status mapping, the Host/CSRF/CSP guards, project archive/unarchive (store round-trip
   + idempotency and the HTTP endpoints incl. 404), the v2 migration (adds `archived_at` +
   apply/bump/idempotency/rollback), DB export/import (roundtrip+perms, backup creation, garbage
@@ -252,11 +270,21 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   `TestLegacyPlainIdentityUnscoped`, `TestScopeEnvOverride`, `TestWhoamiPrintsScope`,
   `TestParseScope`), and scoped waits (`TestWaitReadyScopedTimeout`, `TestWaitReadyScopedReleased`,
   `TestWaitReadyExplicitOutOfScopeExit8`).
+  Phase R added 8 category-dashboard/scoped-feed tests: category stats
+  (`TestListCategoriesCounts` in `store_test.go`), the `?category=` feed filter
+  (`TestEventsCategoryFilter` in `server_test.go`), the category-scoped SSE stream + reconnect
+  (`TestSSECategoryScopedStream`, `TestSSECategoryReconnectReplay` in `sse_test.go`), and the new
+  `hub_test.go` unit tests of the in-memory fan-out (`TestHubCategoryScopedBroadcast`,
+  `TestHubProjectScopedBroadcast`, `TestHubUnscopedBroadcast`, `TestHubBroadcastNilNoPanic`). The
+  dashboard **rendering** (overview cards, hash routing, breadcrumb, per-view stream re-open, live
+  count refresh) stays in the behavioral-JS gap below — the server surface those views ride on is
+  the part that is Go-tested.
   **Still untested:** behavioral dashboard JS — the "Manage projects" modal, the delete confirm
   flows (task/comment/project), the feed pagination button, the dependency section UI (prereq chips,
   add-prereq dropdown, blocks list), the **graph overlay** (layout, pan/zoom, transitive highlight,
   detail panel, live refresh), the search box and label chips/Labels section (Phase M), the
-  read-only modal Meta section (Phase P),
+  read-only modal Meta section (Phase P), the **category overview + hash routing** (overview cards,
+  drill-down, breadcrumb/back, per-view stream re-open, debounced count refresh — Phase R),
   and other client-side logic — because the project deliberately
   adopts **no JS test runner** (preserves the no-npm/single-binary ethos; ADR-018). The
   `web_test.go` sink guard mitigates XSS regressions at the source level; the dependency UI and

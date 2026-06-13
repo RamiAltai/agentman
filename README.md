@@ -88,8 +88,16 @@ agent actions both show up live.
 
 The embedded web UI (no build step, no npm) is a live kanban board:
 
-- **Columns** — Todo / In Progress / Blocked / Done, with per-project tabs and counts.
-  Click multiple project tabs to **filter across several at once**; **All** clears the filter.
+- **Category home (landing view)** — opens to a grid of **category cards**, each showing the
+  category's task counts (todo / doing / blocked / done) and the agents active in it in the last
+  30 minutes. Click a card to **drill into that category's board**; an **"All" card** opens the
+  cross-category board. Views are linkable and the **browser back button works** — the URL hash
+  is `#/` (home), `#/all` (cross-category board), or `#/cat/<slug>` (one category). A
+  **"← Categories"** breadcrumb returns to the home view.
+- **Columns** — Todo / In Progress / Blocked / Done, with per-project tabs and counts. In a
+  category board the tabs show only that category's projects; in the **All** view they show every
+  project. Click multiple project tabs to **filter across several at once**; the **All** tab
+  clears the within-view filter.
 - **Drag a card** between columns to change its status; click a card to open a wide,
   **resizable** ticket with description, comments, and full history.
 - **Activity feed** you can **collapse** or **drag-resize** (it becomes an overlay drawer on
@@ -227,6 +235,7 @@ label, not authentication (see [Security](#security)).
 
 ```
 GET    /api/categories?archived=true             GET    /api/tasks/{id}          (returns depends_on + blocks)
+       (+ per-category counts & active_agents)
 POST   /api/categories {slug,name?}              PATCH  /api/tasks/{id} {status?,assignee?,title?,body?,priority?,meta?}
 POST   /api/categories/{slug}/archive            POST   /api/tasks/{id}/claim    (409 if open prereqs; body {"steal_stale":"<dur>"} = stale takeover, 409 not_stale if fresh)
 POST   /api/categories/{slug}/unarchive          POST   /api/tasks/next         {project?,category?,meta_key?} atomic pick+claim of the best ready task (404 if none)
@@ -241,6 +250,7 @@ GET    /api/tasks?project=&category=&status=&assignee=
        &ready=true|&blocked=true|&stale=<dur>|&q=<text>|&label=<l>|&meta_key=<k>
 POST   /api/tasks {project,title,meta?,...}      DELETE /api/tasks/{id}
 GET    /api/events?since=|?tail=|?before=        GET    /api/stream  (SSE)
+       [&project=][&category=]                          [?project=|?category= scope]
 GET    /api/projects/{slug}/graph               {nodes,edges}; read-only DAG (no events)
 ```
 
@@ -248,6 +258,14 @@ Category and project payloads carry a **stable id** (`uid`: `amc_…` / `amp_…
 changes across slug renames — bind external systems to it, not the slug. Projects also carry
 optional `vault_project_id` / `vault_path` binding fields. Creating into an archived category
 fails with `400 {"error":"category_archived"}`.
+
+`GET /api/categories` returns each category augmented with `counts` (todo/doing/blocked/done over
+its non-archived projects) and `active_agents` (non-human actors active in the last 30 minutes) —
+what the dashboard's category-home view renders. `GET /api/events` and `GET /api/stream` accept a
+`?category=<slug>` lens that scopes the feed/stream to that category's projects' events (it
+excludes instance-wide category-level events; an unknown category is 404 on `/api/events`, ignored
+on the stream). This is an unscoped query-param choice — distinct from the agent `X-Agent-Scope`
+identity scope.
 
 Tasks carry optional free-form **metadata** (`"meta": {"k":"v", …}`): keys are normalized like
 labels (lowercase, 1–50 chars of `a-z 0-9 . _ -`), values are opaque strings up to 500 bytes.

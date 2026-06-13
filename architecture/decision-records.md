@@ -875,6 +875,107 @@ without evidence.
   `AGENTMAN_PROPOSALS`, `usage()` scope/exit-8 lines); the 32 Phase Q tests listed in the CHANGELOG
   entry.
 
+### ADR-028: Category dashboard + scoped feed — hub category fan-out resolved at Subscribe, `?category=` feed/stream filtering excluding category-level events, category stats folded into `/api/categories`, dashboard hash routing with overview-as-landing (Phase R)
+- Status: Active
+- Context: The agentic_brain integration (requirement R6) needs a **human** view organized by
+  category — a category-home landing page showing where work is happening, drill-down into a
+  single category's board, and a feed/stream that can be scoped to one category. This is the
+  fourth phase of the train ADR-025 opened (after Phase P task metadata, Phase Q scoping
+  enforcement); only Phase S (scope tokens, R5) remains after it. The Phase Q residual that
+  `/api/events` and `/api/stream` were not category-filterable (and the Phase O note that
+  `category.*` events would be "revisited in Phase R") are both closed here. Unlike the agent
+  scope of Phase Q, the dashboard is **unscoped** — a human sees everything; "category view" is a
+  query-param lens, not an identity scope (no `X-Agent-Scope` is sent).
+- Decision:
+  1. **Hub category fan-out resolved at Subscribe into a project-ID set, not per-event.** A
+     category subscription resolves the category's projects **once** when the stream opens
+     (`ProjectIDsInCategory` → `map[int64]bool`, carried in the hub's new `subFilter`/`subscriber`
+     fields), so `Broadcast` stays a pure in-memory membership check with **no per-event DB hits**
+     — the R9 SSE contract that the hub remains non-blocking and in-memory (the IADR-001 SSE
+     design). A category-scoped subscriber receives an event only when its `ProjectID` is in the
+     resolved set; cross-category and **category-level (ProjectID==0) events are dropped**.
+  2. **`project.created` carve-out preserved through the category branch.** A brand-new project's
+     `project.created` reaches every subscriber regardless of scope (the pre-existing carve-out, so
+     a new tab can appear live even on a category-scoped dashboard). This is the one event that
+     bypasses the membership check.
+  3. **Post-open project staleness window accepted.** A project created *after* a category stream
+     subscribes is not in that subscriber's resolved project-ID set, so its task events won't stream
+     until the dashboard re-opens the stream (which it does on every view change). The REST snapshot
+     remains the source of truth, and the `project.created` carve-out still surfaces the new project
+     itself. Re-resolving the set per event (or invalidating on `project.created`) was rejected as
+     re-introducing DB work into `Broadcast` for a window the dashboard already closes on navigation.
+     Documented in `hub.go`.
+  4. **`?category=` feed/stream filtering EXCLUDES category-level (NULL-project) events by design.**
+     On `GET /api/events` (all of `?since=`/`?tail=`/`?before=`) and `GET /api/stream`, a category
+     scope matches only events whose project lives in the category (`c.id=?` in the SQL; the
+     in-memory set check on the stream). The category's own `category.*` events (NULL `project_id`)
+     are **instance-wide admin events that belong to the All/overview feed**, not a single
+     category's drill-down. Composes with `?project=` (ANDed). `RecentEvents` was refactored to
+     compose its WHERE clause from a `[]string` slice (it now joins up to three conditions —
+     project, category, archived-cascade); `ListEvents`/`ListEventsBefore` kept the incremental
+     `q +=` style (their archived-cascade branch is mutually exclusive with the project/category
+     branches).
+  5. **Unknown-category divergence: `/api/events` 404s, `/api/stream` falls back silently.** An
+     unknown category on the REST feed flows through the `categoryID` `ErrNotFound` sentinel →
+     `404 not_found` (a one-shot lookup should fail loudly, like an unknown project on
+     `/api/tasks`). On the long-lived SSE stream an unknown category is **ignored silently** (the
+     subscriber sees the unfiltered stream) — matching the endpoint's existing unknown-`project`
+     swallow; a best-effort stream should not be torn down over a stale slug.
+  6. **Category counts + `active_agents` folded into `GET /api/categories`, always present.** The
+     overview needs them on first paint; a separate endpoint would add a round-trip and a
+     partial-render flash. `ListCategoriesWithStats` runs two queries merged in Go: `counts`
+     (`{todo, doing, blocked, done}`) sum only the category's **non-archived** projects' tasks (an
+     archived project's tasks are excluded even when `?archived=true` lists the category), and
+     `active_agents` are the distinct non-human actors on **task-bearing** events
+     (`task_id IS NOT NULL AND actor != 'human'`) within a **30-minute** window, sorted. The
+     `task_id IS NOT NULL` predicate makes `comment.added` count as activity while category/project
+     admin churn does not; excluding the literal `human` keeps the signal to autonomous agents. No
+     opt-in flag and **no scope enforcement** (the dashboard is unscoped).
+  7. **Dashboard hash routing with the category overview as the landing view.** Views are linkable
+     and the browser back button works, with `route()` as the single hash→state mapper: `#/` →
+     overview (category home, the landing view and empty-hash default), `#/all` → the cross-category
+     board (the original behavior), `#/cat/<slug>` → a single category's board. A view change resets
+     the within-view project selection and re-opens the SSE stream with the new scope. The overview
+     keeps one global, unfiltered recent-activity feed; the category board scopes board/feed/stream
+     via `?category=` (or `?project=` when one project is selected). All new DOM is built with
+     `el()`/`textContent` (no `innerHTML`), so the existing `TestDashboardNoXSSSinks` guard covers it.
+  8. **No-JS-runner verification stands (ADR-018).** The server surface (the `?category=` filtering,
+     the augmented `/api/categories` payload, the hub fan-out) is covered by Go tests
+     (`server_test.go`, `sse_test.go`, the new `hub_test.go`, `store_test.go`); the rendering
+     (overview cards, hash routing, breadcrumb, per-view stream re-open) relies on
+     preview/smoke + the source-level XSS-sink guard, consistent with the deliberate no-JS-runner
+     decision (no npm/jsdom). The hub's membership logic was pulled into direct unit tests
+     (`hub_test.go`) precisely because it is the load-bearing in-memory invariant.
+- New error / kinds / schema: **none.** No new event kinds (catalog stays **21**), no new error
+  codes, no new exit codes, no schema change (`currentSchemaVersion` stays **5**), no migration.
+  `am wait`/`wait.go` is unchanged — the wait stream still deliberately does not narrow on a
+  category scope (the category-scoped REST re-check is the authority, ADR-023); adding `?category=`
+  to the wait stream was judged non-trivial and skipped per the map's "only if trivial" condition.
+- Rationale: resolving the category fan-out once keeps `Broadcast` a pure in-memory check (the SSE
+  hub's defining property); the NULL-project exclusion keeps a drill-down showing work *inside* the
+  category while instance-wide admin events stay on the overview; folding stats into the existing
+  list endpoint avoids a first-paint flash; hash routing is the minimal linkable/back-button
+  mechanism with no router library; the unscoped dashboard matches the human operator's role.
+- Consequences (accepted residuals — see `known-risks-and-gaps.md`): the **post-open project
+  staleness window** on a category stream (closed on view change; REST is authoritative); a
+  **cosmetic overview-count-debounce** can fire after navigating away — guarded by a re-check of
+  `view` at fire time so it never writes to the now-hidden `#overview`; the overview's `counts`
+  derivation is covered by `TestListCategoriesCounts` but the rendering is not behaviorally tested
+  (no JS runner); the `/api/events`+`/api/stream` Phase Q residual is now **closed for the
+  dashboard** via `?category=`, but `am wait`'s SSE stream still streams unscoped by design.
+- Evidence: `cmd/am/hub.go` (`subFilter`, `subscriber.categoryID`/`projectIDs`, the Subscribe-time
+  resolution, the `Broadcast` membership check + `project.created` carve-out + post-open-window
+  comment); `cmd/am/store.go` (`CategoryStat`, `ListCategoriesWithStats`, `ProjectIDsInCategory`,
+  the `category` parameter + NULL-project-exclusion comments on `ListEvents`/`ListEventsBefore`/
+  `RecentEvents`, the `RecentEvents` `[]string` WHERE refactor); `cmd/am/server.go`
+  (`handleListCategories` → `ListCategoriesWithStats`, the `?category=` plumbing in `handleEvents`,
+  the resolve-once + silent-fallback in `handleStream`, `Subscribe(subFilter{…})`);
+  `cmd/am/web/{index.html,app.css,app.js}` (`#overview`/`#breadcrumb`, `route`/`navigate`/
+  `applyView`/`loadOverview`/`renderOverview`/`catCard`/`allCard`/`setBreadcrumb`, `viewParams`/
+  `projectsInView`, the per-view stream re-open and debounced count refresh); the 8 Phase R tests
+  listed in the CHANGELOG entry (`hub_test.go`, `TestEventsCategoryFilter`,
+  `TestSSECategoryScopedStream`, `TestSSECategoryReconnectReplay`, `TestListCategoriesCounts`).
+
 ## Inferred Decisions
 
 ### IADR-001: SSE chosen over WebSockets

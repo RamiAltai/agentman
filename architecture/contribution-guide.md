@@ -40,12 +40,12 @@ via `//go:embed`, so a running/old binary serves stale assets. Hard-refresh the 
 ## Running Tests
 
 ```sh
-go test -race ./cmd/am/                     # run all tests with the race detector (231 tests)
+go test -race ./cmd/am/                     # run all tests with the race detector (239 tests)
 go test ./...                               # equivalent short form
 go test -run TestUpdateAvailable -v ./cmd/am/
 ```
 
-Tests live next to the code in `cmd/am/` (10 test files):
+Tests live next to the code in `cmd/am/` (11 test files):
 
 - `update_test.go` — version-comparison logic.
 - `store_test.go` — CRUD + validation, the atomic claim race (exactly one winner), archive/unarchive
@@ -64,7 +64,8 @@ Tests live next to the code in `cmd/am/` (10 test files):
   the distinct-winners race), the `MetaKey` list filter, list rows returning meta, delete
   cascade, and fresh-table existence on reopen; and scope (Phase Q): `taskScope`/`projectCategory`
   + `created_by` default (`TestTaskScopeAndProjectCategory`) and the scoped+meta `NextTask` race
-  (`TestNextTaskRaceScopedCategoryMeta`).
+  (`TestNextTaskRaceScopedCategoryMeta`); and category stats (Phase R): `TestListCategoriesCounts`
+  (`ListCategoriesWithStats` — non-archived-only counts, recently-active non-human agents).
 - `server_test.go` — HTTP status mapping (404 / 400 / lost-claim 409), the Host/CSRF guards and
   security headers, the archive/unarchive endpoints, HTTP 400 on task creation into an archived
   project (`TestCreateTaskIntoArchivedProject400`), `TestWriteErrHidesInternalDetail` (500 returns
@@ -80,7 +81,9 @@ Tests live next to the code in `cmd/am/` (10 test files):
   `TestScopeStealStale`, the proposals carve-out cases `TestScopeProposalsCarveOut`/`…Configurable`/
   `…MissingProjectInert`/`…WrongCategoryNoCarveOut`/`…Squat`, `TestScopeMutationSweep`,
   `TestScopeProjectScopedAgent`, `TestScopeReads`, `TestScopeHeaderValidation`,
-  `TestScopeProjectCategoryEndpoints`).
+  `TestScopeProjectCategoryEndpoints`), and the Phase R `?category=` feed filter
+  (`TestEventsCategoryFilter` — one category's task events only, excludes `category.*` and the
+  other category, all of `?since=`/`?tail=`/`?before=`, unknown category → 404).
 - `migrate_test.go` — the forward-only migration runner (apply + version bump, skip ≤ current,
   idempotency, rollback), the v2 `archived_at` / v3 `claimed_at` columns, the v4
   category/stable-ID/vault migration (`TestMigrationV4Fresh`, `TestMigrationV4ExistingDB`), the v5
@@ -114,7 +117,13 @@ Tests live next to the code in `cmd/am/` (10 test files):
 - `sse_test.go` — SSE streaming + reconnect (Phase E2). `TestSSEDeliversLiveEvent` opens
   `/api/stream`, creates a task, and asserts the `task.created` event arrives live.
   `TestSSEReplayOnReconnect` reconnects with `Last-Event-ID` and verifies gap-replay with
-  dedupe (every replayed id strictly greater than the resume cursor).
+  dedupe (every replayed id strictly greater than the resume cursor). Phase R added
+  `TestSSECategoryScopedStream` (category-scoped delivery + the `project.created` carve-out) and
+  `TestSSECategoryReconnectReplay` (a category-scoped reconnect replays only that category's gap).
+- `hub_test.go` — direct hub fan-out unit tests (Phase R): `TestHubCategoryScopedBroadcast`
+  (in-category delivered, out-of-category + category-level NULL-project dropped, `project.created`
+  delivered regardless), `TestHubProjectScopedBroadcast`, `TestHubUnscopedBroadcast`,
+  `TestHubBroadcastNilNoPanic`.
 - `identity_test.go` — identity (Phase E3). `cmdInit`→`resolveAgent` roundtrip, `AGENTMAN_AGENT`
   env override wins, `sanitizeType` table, `newIdentity` format. Uses the `AGENTMAN_AGENT_FILE` env
   seam so the real `~/.agentman` is never written. Phase Q added scoped-identity tests

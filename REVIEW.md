@@ -194,8 +194,32 @@ it server-side. Satisfies requirement **R4**.
   - Denials log-only (no new event kind; catalog stays 21); `X-Agent-Scope` is client-asserted
     (accident prevention, not auth — Phase S scope tokens upgrade it); +32 tests (now 231).
     → ADR-027, `CHANGELOG.md`.
-  - Next in the train: **Phase R** category dashboard + scoped feed (R6), **Phase S** scope
-    tokens (R5).
+  - Next in the train: **Phase R** category dashboard + scoped feed (R6, shipped below), **Phase S**
+    scope tokens (R5).
+
+### Phase R — Category dashboard + scoped feed — **DONE (2026-06-13)**
+
+Fourth phase of the agentic_brain train: a human view organized by category, plus a category lens on
+the event feed/stream. Satisfies requirement **R6**.
+
+- [x] R1 Category-home dashboard — overview cards per category (task counts + recently-active
+  agents from the augmented `GET /api/categories` `CategoryStat`), an "All" card, and drill-down
+  into a single category's board; **hash routing** (`#/`, `#/all`, `#/cat/<slug>`) so views are
+  linkable and the browser back button works, with a "← Categories" breadcrumb
+- [x] R2 Scoped feed/stream — `?category=<slug>` on `GET /api/events` (all of `?since=`/`?tail=`/
+  `?before=`; unknown → 404) and `GET /api/stream` (live + gap-replay; unknown ignored silently),
+  scoping to the category's projects' events and **excluding** instance-wide category-level
+  (NULL-project) events; the hub resolves the category's project-id set once at Subscribe
+  (`ProjectIDsInCategory`/`subFilter`) so `Broadcast` stays in-memory, preserving the
+  `project.created` carve-out
+  - No new event kinds (catalog stays 21), no new error/exit codes, no schema change
+    (`currentSchemaVersion` stays 5); the dashboard is **unscoped** (category view is a query-param
+    lens, not an `X-Agent-Scope` identity scope); `am wait`'s stream left deliberately unscoped.
+    +8 tests (now 239). → ADR-028, `frontend.md`, `backend.md`, `data-model.md`, `system-map.md`,
+    `README.md`, `known-risks-and-gaps.md`, `CHANGELOG.md`.
+  - **The integration-blocking set (O + P + Q) plus the human dashboard is now DONE.** Only the
+    train's **Phase S** (scope tokens, SHOULD, R5) and the NICE-to-have items (Phase N release
+    binaries / auto-prune, and the "Later / if demand appears" list) remain.
 
 ### Later / if demand appears
 - Due dates + `--due-before` filter; webhooks on event kinds (Slack/CI triggers);

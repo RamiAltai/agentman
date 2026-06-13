@@ -14,7 +14,7 @@
 Routes are registered in one place — `Server.Handler()` (`cmd/am/server.go`):
 
 ```
-GET   /api/categories               handleListCategories    ?archived=true includes archived
+GET   /api/categories               handleListCategories    ?archived=true includes archived; each element is a CategoryStat (Category + counts{todo,doing,blocked,done} over non-archived projects + active_agents in a 30-min window); always present, no scope enforcement
 POST  /api/categories               handleCreateCategory    {slug,name?} (slug trimmed + lowercased; name defaults to slug; dup slug → 409)
 POST  /api/categories/{slug}/archive   handleArchiveCategory   idempotent (no event on no-op)
 POST  /api/categories/{slug}/unarchive handleUnarchiveCategory idempotent (no event on no-op)
@@ -34,8 +34,8 @@ POST  /api/tasks/{id}/deps          handleAddDep            {depends_on: <id-or-
 DELETE /api/tasks/{id}/deps/{depId} handleRemoveDep         remove prerequisite edge
 POST  /api/tasks/{id}/labels        handleAddLabel          {label}  attach a label (idempotent; normalized)
 DELETE /api/tasks/{id}/labels/{label} handleRemoveLabel     detach a label (idempotent no-op if absent)
-GET   /api/events                   handleEvents            ?since=  | ?tail=  | ?before=  | ?project=  (no project ⇒ hides archived-project events)
-GET   /api/stream                   handleStream            text/event-stream (SSE)
+GET   /api/events                   handleEvents            ?since=  | ?tail=  | ?before=  | ?project=  | ?category=  (no project ⇒ hides archived-project events; ?category= scopes to the category's projects and EXCLUDES category-level NULL-project events; unknown category → 404)
+GET   /api/stream                   handleStream            text/event-stream (SSE); ?project= or ?category= scopes the live stream + gap-replay (same NULL-project exclusion; project.created delivered regardless; unknown category ignored silently → unfiltered)
 DELETE /api/tasks/{id}              handleDeleteTask        hard-delete task + comments + dep edges (cascade); 200 {"status":"deleted"}
 DELETE /api/tasks/{id}/comments/{cid} handleDeleteComment  hard-delete one comment; 200 {"status":"deleted"}
 DELETE /api/projects/{slug}         handleDeleteProject     hard-delete project + tasks + comments (cascade); 200 {"status":"deleted"}
@@ -76,9 +76,12 @@ header is unscoped and passes everything). Out-of-scope → `ErrOutOfScope` → 
   no proposals carve-out).
 - **`POST /api/categories`, archive/unarchive** — 403 for ANY scoped agent (the category layer is
   above every scope).
-- **Untouched:** `GET /api/events`, `GET /api/stream`, `GET /api/projects`, `GET /api/categories`
-  (list endpoints stay unfiltered; the task layer is the enforcement point this phase — Phase R
-  residual, see `known-risks-and-gaps.md`).
+- **Untouched by scope enforcement:** `GET /api/events`, `GET /api/stream`, `GET /api/projects`,
+  `GET /api/categories` (list endpoints stay unfiltered against `X-Agent-Scope`; the task layer is
+  the enforcement point). Phase R added an **unscoped** `?category=` *lens* to `/api/events` +
+  `/api/stream` for the human dashboard — a query-param choice, not an identity scope — which
+  closes the dashboard side of the Phase Q feed/stream residual; the agent SSE stream (`am wait`)
+  still streams unscoped by design. See `known-risks-and-gaps.md`.
 
 The proposals carve-out project is `Server.proposals` (a `Scope`), set from `--proposals CAT/PROJ` /
 `AGENTMAN_PROPOSALS` (default `meta/proposals`; `NewServer` defaults to `{meta, proposals}`). The
@@ -118,7 +121,8 @@ large latency (inherent).
 
 Lives in `cmd/am/store.go` (there is no separate "service" layer — the store *is* the domain
 logic). Each mutating method returns `(result, *Event, error)`; the handler broadcasts the event.
-Key methods: `CreateCategory`, `ListCategories`, `ArchiveCategory`, `UnarchiveCategory`,
+Key methods: `CreateCategory`, `ListCategories`, `ListCategoriesWithStats` (Phase R),
+`ProjectIDsInCategory` (Phase R), `ArchiveCategory`, `UnarchiveCategory`,
 `CreateProject(slug, name, category)`, `ListProjects(includeArchived bool, category string)`,
 `PatchProject`, `ArchiveProject`,
 `UnarchiveProject`, `DeleteProject`, `ListTasks`, `GetTask`, `CreateTask`, `PatchTask`,
@@ -145,13 +149,20 @@ slug → 404; archived → 400), defaults an empty category to `general` (keeps 
 patchable, unknown keys ignored, no-op → success with no event, otherwise one `project.patched`
 event with a compact delta.
 `ListEvents`/`RecentEvents` use `LEFT JOIN projects p … LEFT JOIN categories c` and,
-when no explicit `project=` filter is supplied, exclude events whose project OR category is
-archived via `(events.project_id IS NULL OR (p.archived_at IS NULL AND c.archived_at IS NULL))`
-— mirroring `ListTasks`. An explicit
-`?project=<slug>` filter still returns that project's events. `ListEventsBefore(before, project,
-limit)` applies the same archived filter and returns events with `id < before`,
-newest-first (default limit 40, cap 200) — used by the `?before=` cursor branch in `handleEvents`
-for backward pagination. `TaskFilter.Category` (`?category=`) composes with every other task
+when no explicit `project=`/`category=` filter is supplied, exclude events whose project OR
+category is archived via `(events.project_id IS NULL OR (p.archived_at IS NULL AND c.archived_at IS
+NULL))` — mirroring `ListTasks`. An explicit
+`?project=<slug>` filter still returns that project's events. Since Phase R all three event
+readers take a **`category`** parameter — `ListEvents(since, project, category, limit)`,
+`ListEventsBefore(before, project, category, limit)`, `RecentEvents(project, category, limit)`. A
+`?category=<slug>` resolves to `c.id=?` (via `categoryID`; unknown slug → `ErrNotFound` → 404),
+matching only events whose project lives in the category and thereby **intentionally excluding
+category-level (NULL `project_id`) events** — those belong to the All/overview feed, not a single
+category's drill-down. `category` composes with `project` (ANDed). `RecentEvents` was refactored to
+build its WHERE clause from a `[]string` slice (like `ListProjects`) since it now joins up to three
+conditions; `ListEvents`/`ListEventsBefore` kept the incremental `q +=` style.
+`ListEventsBefore` is used by the `?before=` cursor branch in `handleEvents` for backward
+pagination (default limit 40, cap 200). `TaskFilter.Category` (`?category=`) composes with every other task
 filter; with a category scope but no project scope, `ListTasks` still hides archived *projects*
 but keeps the (possibly archived) category itself inspectable — same rule as the explicit-project
 case.
@@ -265,7 +276,9 @@ See `data-model.md` for the schema.
 
 ## Models and Schemas
 
-Go structs in `cmd/am/store.go`: `Category`, `Project`, `Task`, `Comment`, `Event`, `TaskFilter`,
+Go structs in `cmd/am/store.go`: `Category`, **`CategoryStat`** (Phase R — `Category` plus
+`Counts map[string]int` and `ActiveAgents []string`, returned by `ListCategoriesWithStats`),
+`Project`, `Task`, `Comment`, `Event`, `TaskFilter`,
 `NextFilter`, `CreateTaskInput`, plus **`Scope`** (Phase Q — `{Category, Project}` with
 `IsZero`/`String` and the package-level `parseScope`). SQL schema in `cmd/am/schema.sql` (embedded
 via `//go:embed schema.sql`).
@@ -308,7 +321,15 @@ trusted). No per-resource authorization. See `security.md` (ADR-002/ADR-011 in `
 
 No job queue. Long-lived goroutines only:
 - **SSE connections** — one goroutine per `handleStream` request, with a 15s heartbeat ticker;
-  cleaned up on `r.Context().Done()` (`cmd/am/server.go`, `cmd/am/hub.go`).
+  cleaned up on `r.Context().Done()` (`cmd/am/server.go`, `cmd/am/hub.go`). Subscription scope is
+  carried in a `subFilter{projectID, categoryID, projectIDs}` (Phase R): a `?category=` stream
+  resolves the category's project-id set **once** at Subscribe time (`ProjectIDsInCategory`), so
+  `Hub.Broadcast` stays a pure in-memory membership check (no per-event DB hits). A category-scoped
+  subscriber receives an event only when its `ProjectID` is in the set; cross-category and
+  category-level (`ProjectID==0`) events are dropped — except `project.created`, which reaches every
+  subscriber regardless of scope (so new tabs appear live). A project created *after* a subscription
+  opens is not in that set until the stream is re-opened (the dashboard re-opens on view change; the
+  REST snapshot is authoritative) — an accepted post-open staleness window, documented in `hub.go`.
 - **Startup update check** — `checkForUpdate()` fires a single background goroutine (4s timeout,
   silent on error) (`cmd/am/update.go`).
 - **Graceful shutdown** — SIGINT/SIGTERM → cancel base context (unblocks SSE) → `Shutdown(3s)` →
@@ -359,7 +380,7 @@ per request after completion: `METHOD PATH STATUS LATENCY ACTOR` (actor = `X-Age
 
 ## Testing
 
-There are ten test files (run `go test -race ./cmd/am/`; 231 tests, all green):
+There are eleven test files (run `go test -race ./cmd/am/`; 239 tests, all green):
 - `cmd/am/update_test.go` — version-comparison logic.
 - `cmd/am/store_test.go` — atomic-claim race (concurrent, `-race`-clean), events-cursor monotonicity,
   store CRUD + validation (`ErrValidation`), project archive/unarchive round-trip + idempotency,
@@ -387,7 +408,12 @@ There are ten test files (run `go test -race ./cmd/am/`; 231 tests, all green):
   and scope (Phase Q): `TestTaskScopeAndProjectCategory` (`taskScope`/`projectCategory`,
   `created_by` default, `ErrNotFound`), `TestNextTaskRaceScopedCategoryMeta` (N workers, a
   Category+MetaKey filter, out-of-scope + keyless decoys at higher priority → distinct in-scope
-  meta-carrying winners).
+  meta-carrying winners), and category stats (Phase R): `TestListCategoriesCounts`
+  (`ListCategoriesWithStats` — counts sum only non-archived projects' tasks, re-asserted after
+  archiving a project mid-test; `active_agents` lists distinct non-human actors in the 30-min
+  window, counts a commenter, excludes `human`, omits an agent whose only event is backdated out of
+  the window). Existing `ListEvents`/`ListEventsBefore`/`RecentEvents` callers updated for the new
+  `category` parameter.
 - `cmd/am/server_test.go` — validation→status mapping (400/404/409), `hostGuard`, `csrfGuard`,
   `securityHeaders`, `listenAddr` loopback regression, archive/unarchive endpoints + 404,
   hard-delete HTTP endpoints (`TestDeleteTaskEndpoint`, `TestDeleteProjectEndpoint`,
@@ -411,7 +437,10 @@ There are ten test files (run `go test -race ./cmd/am/`; 231 tests, all green):
   `TestScopeProposalsSquat`, `TestScopeMutationSweep` (every mutating verb, 403 out-of-scope vs
   success in-scope), `TestScopeProjectScopedAgent`, `TestScopeReads` (named 403 / narrowing /
   proposals / graph), `TestScopeHeaderValidation` (400s + unknown-slug scope),
-  `TestScopeProjectCategoryEndpoints`
+  `TestScopeProjectCategoryEndpoints`,
+  and Phase R: `TestEventsCategoryFilter` (one category's task events only; excludes `category.*`
+  and the other category; covers `?since=`/`?tail=`/`?before=`; unknown category → 404; helpers
+  `mustCreateProjectIn`/`eventKinds`)
   (via `net/http/httptest`).
 - `cmd/am/migrate_test.go` — migration runner (apply/skip/idempotent/rollback), incl. the v2 step
   that adds `projects.archived_at`, the v3 step that adds `tasks.claimed_at`
@@ -471,7 +500,14 @@ There are ten test files (run `go test -race ./cmd/am/`; 231 tests, all green):
   subscribes to `/api/stream`, creates a task, and asserts the `task.created` event arrives live.
   `TestSSEReplayOnReconnect` reconnects with `Last-Event-ID` and asserts that events created while
   disconnected are replayed and deduplicated (every replayed id is strictly greater than the resume
-  cursor).
+  cursor). Phase R added `TestSSECategoryScopedStream` (a task in category B does not reach an
+  `acat` subscriber; a task in A does; a `project.created` in B still reaches the `acat` subscriber
+  via the carve-out; a `bcat` subscriber sees B not A) and `TestSSECategoryReconnectReplay` (a
+  category-scoped reconnect replays only that category's gap events; helper `openStream`).
+- `cmd/am/hub_test.go` (new, Phase R) — direct hub unit tests of the in-memory fan-out:
+  `TestHubCategoryScopedBroadcast` (in-category delivered, out-of-category dropped, category-level
+  NULL-project dropped, `project.created` delivered regardless), `TestHubProjectScopedBroadcast`,
+  `TestHubUnscopedBroadcast`, `TestHubBroadcastNilNoPanic`.
 - `cmd/am/identity_test.go` — identity (Phase E3). `cmdInit`→`resolveAgent` roundtrip,
   `AGENTMAN_AGENT` env override wins, `sanitizeType` table, `newIdentity` format. Isolates via the
   `AGENTMAN_AGENT_FILE` env seam so the real `~/.agentman` is never written. Phase Q added
@@ -495,7 +531,9 @@ findability tests (8 store, 2 server, 4 CLI — listed above) brought it to **14
 category/stable-ID/vault/migration tests (8 store, 6 server, 7 CLI, 3 wait, 3 db, 3 migrate —
 listed above) brought it to **174**; Phase P's 25 task-metadata tests (11 store, 4 server,
 4 wait, 6 CLI — listed above) brought it to **199**; Phase Q's 32 scope/enforcement tests
-(2 store, 13 server, 5 CLI, 3 wait, 7 identity, 2 migrate — listed above) bring it to **231**.
+(2 store, 13 server, 5 CLI, 3 wait, 7 identity, 2 migrate — listed above) brought it to **231**;
+Phase R's 8 category-dashboard/scoped-feed tests (1 store, 1 server, 2 sse, 4 hub — listed above)
+bring it to **239**.
 
 SSE streaming/reconnect, CLI verbs, exit-code mapping, and identity are now covered. The
 dashboard has a source-level XSS-sink guard but **no behavioral JS tests** — the project

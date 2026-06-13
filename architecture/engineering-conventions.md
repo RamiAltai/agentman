@@ -74,6 +74,11 @@ convention is loose, it's called out.
 - **Always parameterize** (`?`); never concatenate caller input into SQL.
 - A mutation and its `events` row must be in **one `*sql.Tx`**; **broadcast only after commit**
   (`hub.Broadcast(ev)` in the handler, not the store).
+- **The SSE hub stays DB-free.** `hub.Broadcast` is a pure in-memory check — any per-subscriber
+  scope must be resolved into a plain value/set **once at Subscribe time**, not looked up per event.
+  Phase R's `?category=` stream follows this: the handler resolves the category's project-id set
+  (`ProjectIDsInCategory`) into the `subFilter` before subscribing, so `Broadcast` only does a map
+  membership test (accepting a small post-open staleness window over re-querying per event).
 - Timestamps via SQL `strftime('%Y-%m-%dT%H:%M:%fZ','now')` (UTC ISO-8601 TEXT); set `updated_at`
   explicitly in every `UPDATE`.
 - Represent SQL NULLs with the `nullStr`/`nullable`/`nullableID` helpers.
@@ -124,8 +129,8 @@ convention is loose, it's called out.
 
 - `go test -race ./cmd/am/` (or `go test ./...`); table-driven tests (see `cmd/am/update_test.go`).
   Coverage spans pure logic, the store, HTTP, migrations, offline DB tooling, CLI verbs + exit codes,
-  scope enforcement, SSE streaming/reconnect, `am wait`, identity, and the dashboard XSS-sink guard
-  — 10 test files, 231 tests.
+  scope enforcement, SSE streaming/reconnect (incl. category-scoped) + direct hub fan-out unit
+  tests, `am wait`, identity, and the dashboard XSS-sink guard — 11 test files, 239 tests.
 - **`osExit` testability var** — `cli.go` declares `var osExit = os.Exit`; `fail()` calls `osExit`
   rather than `os.Exit` directly. Tests in `cli_test.go` replace it via `captureExit(t, fn)`,
   which substitutes a panic-based stub so exit codes can be asserted without terminating the process.

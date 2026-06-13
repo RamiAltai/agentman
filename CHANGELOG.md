@@ -11,6 +11,78 @@ fresh `[Unreleased]` section.
 
 ### Added
 
+- **Category dashboard + scoped feed (Phase R)** — the human dashboard gains a category-home
+  landing view and a per-category drill-down, and the event feed/stream gain a `?category=` lens
+  (agentic_brain requirement R6). After this phase the integration-blocking set (O+P+Q) plus the
+  human dashboard is complete; only Phase S (scope tokens) and the NICE-to-have items remain.
+  - **`GET /api/categories` payload augmented** to a `CategoryStat` per element: the existing
+    `Category` fields plus two always-present rollups (no opt-in flag) — `counts`
+    (`{todo, doing, blocked, done}` summed over the category's **non-archived** projects; an
+    archived project's tasks are excluded even when `?archived=true` lists the category itself)
+    and `active_agents` (distinct non-human actors whose recent events touched a task in the
+    category within the last **30 minutes**, sorted; the predicate is `task_id IS NOT NULL AND
+    actor != 'human'`, so `comment.added` counts as activity while category/project admin events
+    and the literal actor `human` do not). `?archived=true` still toggles whether archived
+    categories appear; **no scope enforcement** (the dashboard is unscoped). Backed by the new
+    store method `ListCategoriesWithStats(includeArchived, window)` (two queries merged in Go).
+  - **`?category=<slug>` on `GET /api/events`** (all three access modes: `?since=`, `?tail=`,
+    `?before=`) scopes the feed to the events of the category's projects and **intentionally
+    EXCLUDES the category's own category-level events** (those have a NULL `project_id` — they
+    belong to the All/overview feed, not a single category's drill-down). Composes with `?project=`
+    (ANDed). An **unknown category returns 404** (`not_found`) — it flows through the `categoryID`
+    `ErrNotFound` sentinel like an unknown project on `/api/tasks`. `RecentEvents`/`ListEvents`/
+    `ListEventsBefore` gained the `category` parameter; `RecentEvents` was refactored to compose
+    its WHERE clause from a `[]string` slice (like `ListProjects`).
+  - **`?category=<slug>` on `GET /api/stream`** (SSE) scopes the live stream and the gap-replay to
+    the category's projects, with the same NULL-project exclusion. The project-ID set is resolved
+    **once at Subscribe time** (new store method `ProjectIDsInCategory`, threaded through the hub's
+    new `subFilter`) so `Broadcast` stays a pure in-memory membership check with no per-event DB
+    hits. **Exception:** `project.created` is delivered to every subscriber regardless of scope
+    (the existing carve-out, so a new project's tab can appear live). An **unknown category is
+    ignored silently** (the subscriber falls back to the unfiltered stream) — matching the
+    endpoint's existing unknown-`project` swallow, and deliberately differing from `/api/events`
+    (a stream is long-lived and best-effort; a REST query is a one-shot lookup).
+  - **Dashboard category-home overview is the new landing view.** Cards per category showing the
+    name, four count chips (reusing the status swatch colors), and an active-agents avatar row
+    (initials); an **"All" card** opens the cross-category board. Card click (or Enter/Space)
+    drills into the category board. **Hash routing** makes views linkable and the browser back
+    button work, with `route()` as the single hash→state mapper: `#/` → overview (the landing
+    view, also the empty-hash default), `#/all` → the cross-category board (the original board
+    behavior), `#/cat/<slug>` → a single category's board (drill-down).
+  - **Category board (drill-down):** the project tabs render only that category's projects; the
+    "All" tab spans the category's projects; the board, feed, and live stream are all scoped via
+    `?category=` (or `?project=` when one project is selected within the category). A header
+    **breadcrumb** with a "← Categories" back button and the current view's name appears on the
+    board views (hidden on the overview). The overview keeps **one global, unfiltered**
+    recent-activity feed (the existing `#feed` aside) — not per-card mini-feeds.
+  - **Live updates:** the overview's category counts refresh (debounced 250 ms) on any
+    `task.*`/`project.*`/`category.*` event; the SSE stream is re-opened with the new `?category=`
+    scope on every view change. The dashboard sends **no scope header** — a human sees everything;
+    the category view is a query-param lens, not an identity scope. Existing board features
+    (drag-drop, modal, dependency graph, keyboard shortcuts, stale badges, search, label chips,
+    meta section) are unchanged; they still mount inside `#board`. New `index.html` `#overview`
+    section + header `#breadcrumb`; `app.js` 1820 → 1986 lines, `app.css` 612 → 657 lines.
+  - **No new event kinds** (catalog stays **21**), no new error codes, no new exit codes, no
+    schema change (`currentSchemaVersion` stays **5**), no migration. `am wait`/`wait.go` and the
+    `am` CLI surface are unchanged — the wait stream still deliberately does not narrow (the
+    category-scoped REST re-check remains the authority; ADR-023).
+  - Tests (+8, now 239): `cmd/am/store_test.go` — `TestListCategoriesCounts` (counts sum only
+    non-archived projects' tasks; `active_agents` lists distinct non-human actors in the window,
+    counts a commenter, excludes `human`, omits a backdated-only agent; existing
+    `ListEvents`/`ListEventsBefore`/`RecentEvents` callers updated for the new `category`
+    parameter). `cmd/am/server_test.go` — `TestEventsCategoryFilter` (one category's task events
+    only; excludes `category.*` and the other category; covers `?since=`/`?tail=`/`?before=`;
+    unknown category → 404; helpers `mustCreateProjectIn`/`eventKinds`). `cmd/am/sse_test.go` —
+    `TestSSECategoryScopedStream` (out-of-category dropped, in-category delivered, `project.created`
+    carve-out preserved) and `TestSSECategoryReconnectReplay` (a category-scoped reconnect replays
+    only that category's gap; helper `openStream`). `cmd/am/hub_test.go` (new) — direct hub unit
+    tests `TestHubCategoryScopedBroadcast`, `TestHubProjectScopedBroadcast`,
+    `TestHubUnscopedBroadcast`, `TestHubBroadcastNilNoPanic`. `cmd/am/web_test.go`
+    `TestDashboardNoXSSSinks` runs automatically over the new `app.js`/`index.html` (all new DOM
+    via `el()`/`textContent`).
+  - → ADR-028, `frontend.md`, `backend.md`, `data-model.md`, `system-map.md`, `README.md`,
+    `known-risks-and-gaps.md`.
+
 - **Scoped agent identity & enforcement (Phase Q)** — agents can be confined to a category
   (default) or a single project (tighter); the server enforces the scope on every mutation and on
   named reads (agentic_brain requirement R4).

@@ -63,6 +63,14 @@ Evidence:
   phase); `tasks.created_by` (migration v5) backs the "comment on your own proposal" carve-out.
   Built for agentic_brain requirement R4. Evidence: `cmd/am/server.go` (`scopeOf`, `check*`,
   `narrowScope`), `cmd/am/identity.go`, `cmd/am/store.go` (`Scope`, migration v5).
+- **Category dashboard + scoped feed** (Phase R): the human dashboard opens to a **category-home**
+  view (cards per category with task counts + recently-active agents), drills into a single
+  category's board, and exposes an **"All"** cross-category view — driven by linkable URL hashes
+  (`#/`, `#/all`, `#/cat/<slug>`). `GET /api/categories` carries the count/active-agent rollups, and
+  `GET /api/events` + `GET /api/stream` gain an unscoped `?category=` lens (a human's drill-down
+  choice, not the agent identity scope). Built for agentic_brain requirement R6. Evidence:
+  `cmd/am/web/app.js` (`route`/`loadOverview`/`viewParams`), `cmd/am/server.go`, `cmd/am/store.go`
+  (`ListCategoriesWithStats`, `ProjectIDsInCategory`), `cmd/am/hub.go` (`subFilter`).
 - **Stable IDs + vault binding** (Phase O): categories and projects carry an immutable `uid`
   (`amc_`/`amp_` + 16 hex) that survives slug renames (`am project edit --slug`), and projects
   can store `vault_project_id`/`vault_path` pointers back to the agentic_brain vault
@@ -161,6 +169,8 @@ Inferred (Confidence: Medium–High) from `README.md` "Security" and the localho
   SQLite design (`SetMaxOpenConns(1)`) implies modest scale, but this is not documented.
 - **Roadmap.** Near-term gap-closing work is now tracked in `ROADMAP.md` (repo root). Labels and
   search shipped in Phase M; the agentic_brain foundation (categories, stable IDs, vault binding)
-  shipped in Phase O, task metadata in Phase P, and scoped agent identity & enforcement in Phase Q,
-  with the category dashboard (R) and scope tokens (S) to follow; longer-term ideas (auth, remote
-  access, due dates, prebuilt binaries) remain discussion-only — treat those as unconfirmed.
+  shipped in Phase O, task metadata in Phase P, scoped agent identity & enforcement in Phase Q, and
+  the category dashboard + scoped feed in Phase R — after which the integration-blocking set
+  (O+P+Q) plus the human dashboard is complete and only **scope tokens (Phase S)** remains in the
+  train; longer-term ideas (auth, remote access, due dates, prebuilt binaries) remain
+  discussion-only — treat those as unconfirmed.

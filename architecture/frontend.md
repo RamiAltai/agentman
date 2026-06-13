@@ -1,7 +1,7 @@
 # Frontend Architecture
 
 There **is** a frontend: a small single-page dashboard in `cmd/am/web/`
-(`index.html` 69 lines, `app.css` 612 lines, `app.js` 1820 lines), embedded into the binary via
+(`index.html` 71 lines, `app.css` 657 lines, `app.js` 1986 lines), embedded into the binary via
 `//go:embed web` (`cmd/am/server.go`) and served at `/`. It is the human-facing view; agents do
 not use it.
 
@@ -16,16 +16,45 @@ dependency-graph overlay.
 
 ## Routing
 
-No client-side router. It's a single page; "navigation" is toggling project tabs on/off
-(`toggleProject`), opening/closing a modal, and opening/closing the graph overlay. The filter is
-**multi-select** — several projects can be active at once, and "All" clears the selection. No
-URL/history manipulation except the implicit single document.
+**Hash routing** (Phase R). It's a single page, but top-level views are now driven by the URL hash
+so they are **linkable and the browser back button works**. `route()` is the single hash→state
+mapper (called on load and on `hashchange`):
+- `#/` → **overview** (the category home, the landing view; also the empty-hash default)
+- `#/all` → the **cross-category board** (the original board behavior)
+- `#/cat/<slug>` → a **single category's board** (drill-down)
+
+`navigate(hash)` sets `location.hash` (or calls `route()` directly when the hash is unchanged);
+`applyView(next, cat)` updates the `view`/`activeCategory` module state, toggles
+`body.view-overview`, sets the breadcrumb, loads the right data (overview cards vs. board), and
+**re-opens the SSE stream with the new scope**. Within a board view, project tabs are still
+**multi-select** — several projects can be active at once, and the "All" tab clears the within-view
+selection (`toggleProject`); a view change resets that selection. Opening/closing the modal and the
+graph overlay is not part of the hash route.
 
 ## Pages and Components
 
 All built imperatively in `app.js` (no component framework):
+- **Category overview (home)** — `loadOverview`, `renderOverview`, `catCard`, `allCard` (Phase R):
+  the landing view (`#/`), rendered into the `#overview` section. `loadOverview` fetches
+  `GET /api/categories` (now a `CategoryStat[]` carrying `counts` + `active_agents`) into the
+  module-level `categories`, then renders a `.cat-grid` of cards. Each `catCard` shows the category
+  name, four `.count-chip` count chips (one per status, reusing the `ST` status-swatch colors), and
+  an `.active-agents` avatar row (up to 6 initials via `initials()`, then a `+N` overflow; "no
+  active agents" when empty). An **"All" card** (`allCard`, `.cat-card-all`, dashed) shows the
+  total open count and opens the cross-category board. Cards are `role="link"`/`tabindex=0` and
+  drill in on click or Enter/Space (`navigate("#/cat/<slug>")` / `navigate("#/all")`). The
+  overview keeps **one global, unfiltered** recent-activity feed (the existing `#feed` aside) — not
+  per-card mini-feeds. `body.view-overview` (set by `applyView`) is what hides the project tabs and
+  `#board` and shows `#overview`.
+- **Header breadcrumb / back** — `setBreadcrumb`: fills the header `#breadcrumb` element on the
+  board views with a **"← Categories"** back button (`navigate("#/")`) plus the current view's name
+  (the category's `name` for `#/cat/<slug>`, "All" for `#/all`). Hidden on the overview
+  (`body.view-overview .breadcrumb { display:none }`), which is the root.
 - **Header / tabs** — `renderTabs`, `tab()`: project tabs with open-count badges + an "All" tab + a
-  "＋" new-project button + a "⋯" **Manage projects** button (after the ＋). Clicking "⋯" calls
+  "＋" new-project button + a "⋯" **Manage projects** button (after the ＋). In a **category board**
+  the tabs render only that category's projects (`projectsInView` filters `projects` by
+  `p.category === activeCategory`) and the "All" tab spans the category's projects; in the `#/all`
+  view it spans every project. Clicking "⋯" calls
   `openManageProjects`, which opens the reused `#sheet` modal (same focus-trap / Esc-to-close
   infrastructure as the task modal). Inside, `renderManageList` fetches all projects including
   archived ones via `GET /api/projects?archived=true` and builds a list with `el()` (no
@@ -77,7 +106,8 @@ All built imperatively in `app.js` (no component framework):
 - **Detail modal** — `renderModal`, plus `openNew` (new task) and `openNewProject`: one reused
   `#sheet` element; auto-growing title `<textarea>`; status/assignee/priority controls; comments;
   history. `openNewProject` still POSTs `{slug,name}` only — the server defaults the category to
-  `general` (Phase O kept the dashboard category-unaware by design; the category UI is Phase R). The modal includes a **Delete task** button (inline two-step confirm — see below) and
+  `general` (Phase O kept the project-creation form category-unaware by design; the Phase R category
+  UI is the read-side overview/drill-down, not a category picker on the create form). The modal includes a **Delete task** button (inline two-step confirm — see below) and
   each comment has a **× delete** button (also two-step). The modal also has a **Dependencies**
   section (`depsSection`):
   - **"Depends on"** — one chip per prerequisite showing a status dot, `project-ref` (clickable
@@ -150,7 +180,12 @@ All built imperatively in `app.js` (no component framework):
 ## State Management
 
 Module-level mutable variables in `app.js` (no store/framework):
-`projects` (array), `selected` (`Set<slug>` of active project filters, empty=all), `tasks`
+`view` (`"overview"` | `"all"` | `"category"`, Phase R — the current top-level view, driven by the
+URL hash), `activeCategory` (category slug when `view === "category"`), `categories`
+(`CategoryStat[]` for the overview — counts + active_agents), `overviewTimer` (debounce handle for
+the live overview count refresh),
+`projects` (array), `selected` (`Set<slug>` of active project filters within the current view,
+empty=all), `tasks`
 (`Map<id,task>`), `cursor` (highest seen `events.id` for SSE `since=`), `es` (EventSource),
 `openTaskId`, `dragId`, `lastFocus`, `feedOldest` (lowest event id currently in `#feedList`; `0`
 if none loaded), `feedPaginated` (`true` once the user has paginated; disables `trimFeed` cap),
@@ -169,12 +204,23 @@ re-fetches and re-renders (`onEvent`). The graph overlay uses its own debounced 
 
 - **`api(method, path, body)`** — `fetch` wrapper; always sends `X-Agent: human`; throws on non-2xx
   with the server's `error` field.
-- **SSE** — `connect()` opens `EventSource('/api/stream?since=<cursor>')`, with `&project=<slug>`
-  appended by `qstr()` **only when exactly one project is selected** (`selected.size === 1`); for 0
-  or 2+ selected it streams/loads everything and `renderBoard()` filters client-side
-  (`selected.has(t.project)`). `onmessage` → `onEvent`; `onerror` → close + reconnect with
-  exponential backoff (1s→10s) and a "reconnecting…" status. `loadFeed()` bootstraps from
-  `/api/events?tail=50` (same `qstr` rule). `onEvent` handles the three delete kinds:
+- **Scope params** — `viewParams()` (Phase R) is the single source of the scope query for board,
+  feed, and stream calls: a single selected project always wins (`?project=`); otherwise a
+  **category view** scopes to its category (`?category=<activeCategory>`); the `#/all` view and the
+  overview's global feed are unscoped. `qstr()` and `loadOlderActivity` both apply it.
+- **SSE** — `connect()` opens `EventSource('/api/stream?since=<cursor>')`, with `&project=<slug>` OR
+  `&category=<slug>` appended by `qstr()` per `viewParams()` (single project → `project`; otherwise
+  a category board → `category`; `#/all`/overview → unfiltered, filtered client-side via
+  `selected.has(t.project)`). The stream is **re-opened on every view change** (`applyView` calls
+  `connect()` after loading), so the live scope always matches the view. `onmessage` → `onEvent`;
+  `onerror` → close + reconnect with exponential backoff (1s→10s) and a "reconnecting…" status.
+  `loadFeed()` bootstraps from `/api/events?tail=50` (same `qstr` rule). On the **overview**,
+  `onEvent` keeps the global feed live and, on any `task.*`/`project.*`/`category.*` event,
+  **debounce-refreshes (250 ms) the category cards** via `loadOverview()` — the debounced callback
+  re-checks `view === "overview"` at fire time so navigating away before it elapses never writes to
+  the now-hidden `#overview`. `onEvent` also reloads the project strip on `category.created` (in
+  addition to the existing `project.created`/`project.unarchived`/`category.archived`/
+  `category.unarchived`) so a new category appears live. `onEvent` handles the three delete kinds:
   `task.deleted` removes the card from `tasks` map and closes the modal if it was open;
   `comment.deleted` refreshes the open modal; `project.deleted` drops the slug from `selected` and
   reloads the board/feed; `category.archived`/`category.unarchived` (like `project.created` and
@@ -195,7 +241,11 @@ The board uses `justify-content: safe center` on `#board` so columns are centere
 screens. The `safe` keyword falls back to `flex-start` when columns overflow their container, so
 horizontal scrolling on narrow screens never clips the leftmost column. New CSS classes support the
 Manage-projects modal: `.proj-list`, `.proj-row`, `.badge-archived`, `.btn-archive` (and
-`.btn-archive.unarchive`). The card chips use `.tag-blocked` / `.tag-ready` / `.tag-stale`
+`.btn-archive.unarchive`). The Phase R category overview adds `.cat-grid`, `.cat-card`
+(`.cat-card-all` for the dashed "All" card), `.cat-name`/`.cat-sub`, `.count-chips`/`.count-chip`
+(with a color `.swatch`), and `.active-agents`/`.active-agent-avatar`/`.no-agents`/`.more-agents`;
+the header breadcrumb uses `.breadcrumb`/`.crumb-back`/`.crumb-current`. `#overview` is hidden by
+default and shown via `body.view-overview #overview` (which also hides `#board` and `#tabs`). The card chips use `.tag-blocked` / `.tag-ready` / `.tag-stale`
 (amber pill for the ⏳ stale badge). The modal's Meta section uses `.meta-row` / `.meta-key` /
 `.meta-val` (tones match `.dep-status`; monospace value). The graph overlay is styled via `.graph-overlay`, `.graph-shell`,
 `.graph-header`, `.graph-body`, `.graph-svg`, `.graph-detail`, `.graph-legend`, and assorted
@@ -243,10 +293,14 @@ build before it ships.
 **Remaining gap:** behavioral dashboard JS — the "Manage projects" modal, the delete confirm flows
 (task/comment/project), the feed pagination button, the dependency section (prereq chips, add-prereq
 dropdown, blocks list), the graph overlay (layout, pan/zoom, transitive highlight, detail panel,
-live refresh), multi-select filter logic, and SSE reconciliation paths — is not automatically
-tested. XSS safety of all these surfaces is guarded by `TestDashboardNoXSSSinks`. All frontend
-behavior in these docs is from source reading and manual verification. (Gap; see
-`known-risks-and-gaps.md`.)
+live refresh), the **category overview + hash routing** (overview cards, drill-down, breadcrumb/back,
+per-view stream re-open, live count refresh — Phase R), multi-select filter logic, and SSE
+reconciliation paths — is not automatically tested. The **server** surface those views ride on is
+covered by Go tests (the `?category=` feed/stream filtering and the augmented `/api/categories`
+payload — `server_test.go`, `sse_test.go`, `hub_test.go`, `store_test.go`); the **rendering** relies
+on preview/smoke + the XSS-sink guard. XSS safety of all these surfaces is guarded by
+`TestDashboardNoXSSSinks`. All frontend behavior in these docs is from source reading and manual
+verification. (Gap; see `known-risks-and-gaps.md`.)
 
 ## Where to Add New Features
 
@@ -256,13 +310,16 @@ behavior in these docs is from source reading and manual verification. (Gap; see
 - New card field → extend `card()` + `renderModal()`. New event type → `evKind`/`evText`/
   `describeText`. New board affordance → `renderBoard()`/`moveTask()`. Graph overlay changes →
   `computeGraphLayout`, `renderGraph`, `renderGraphDetail`; SVG elements via `svg()` helper.
+- New **top-level view** → add a hash case to `route()` and a branch in `applyView`; new
+  scope-aware data call → route it through `viewParams()` so `?project=`/`?category=` stay
+  consistent across board/feed/stream.
 
 ## Risks and Gaps
 
 - **Native HTML5 drag-and-drop doesn't fire on touch** → mobile relies on the status dropdown /
   `[ ]` keys (documented fallback in code comments).
 - **Full board re-render per event batch** (debounced) — fine at small scale, O(n) at large scale.
-- Single 1820-line `app.js`, no module split, no minification. Behavioral JS logic is not
+- Single 1986-line `app.js`, no module split, no minification. Behavioral JS logic is not
   automatically tested (deliberate no-JS-runner decision); XSS-sink safety is enforced by the
   `TestDashboardNoXSSSinks` Go guard. The delete confirm flows, feed pagination, dependency UI,
   and the graph overlay are still untested at the behavioral level.
