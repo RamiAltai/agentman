@@ -46,7 +46,7 @@ func cmdWait(c *Client, a Args) {
 
 	// Client.http has a 10s Timeout that would kill a long SSE read; the wait
 	// uses its own un-timed http.Client and is bounded by ctx instead.
-	w := &waiter{base: c.base, agent: c.agent, hc: &http.Client{}, ctx: ctx}
+	w := &waiter{base: c.base, agent: c.agent, scope: c.scope, hc: &http.Client{}, ctx: ctx}
 	project := projectFor(a)
 	category := categoryFor(a) // scopes --ready only; ignored under --done like -p
 
@@ -151,6 +151,7 @@ func waitPrint(a Args, t *Task, ready bool) {
 type waiter struct {
 	base  string
 	agent string
+	scope string // sent as X-Agent-Scope; scopes the REST re-checks, never the stream
 	hc    *http.Client
 	ctx   context.Context
 }
@@ -174,6 +175,9 @@ func (w *waiter) request(path string) *http.Response {
 	}
 	if w.agent != "" {
 		req.Header.Set("X-Agent", w.agent)
+	}
+	if w.scope != "" {
+		req.Header.Set("X-Agent-Scope", w.scope)
 	}
 	resp, err := w.hc.Do(req)
 	if err != nil {
@@ -204,6 +208,8 @@ func (w *waiter) checkDone(id string) (*Task, bool) {
 	switch {
 	case st == 404:
 		fail(3, "wait: #%s not found", id)
+	case st == 403:
+		fail(8, "wait: #%s %s", id, apiErr(data, "out of scope"))
 	case st < 200 || st >= 300:
 		fail(1, "wait: %s", apiErr(data, "error "+strconv.Itoa(st)))
 	}
@@ -227,6 +233,9 @@ func (w *waiter) checkReady(project, category, metaKey string) (*Task, bool) {
 		qs.Set("meta_key", metaKey)
 	}
 	st, data := w.get("/api/tasks?" + qs.Encode())
+	if st == 403 { // explicit -p/-c outside the agent's scope
+		fail(8, "wait: %s", apiErr(data, "out of scope"))
+	}
 	if st < 200 || st >= 300 {
 		fail(1, "wait: %s", apiErr(data, "error "+strconv.Itoa(st)))
 	}

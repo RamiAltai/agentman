@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"os"
@@ -12,12 +13,17 @@ import (
 )
 
 // Identity resolution for the CLI, in priority order:
-//  1. AGENTMAN_AGENT env (explicit override; wins, e.g. for parallel agents in one dir)
+//  1. AGENTMAN_AGENT / AGENTMAN_SCOPE env (explicit overrides; win, e.g. for
+//     parallel agents in one dir)
 //  2. a per-working-directory file written by `am init` (survives across the
 //     fresh shells the agent harness spawns, since env does not)
 //
 // This lets an agent run `am init <tasktype>` once at the start of a session and
 // then use `am` normally — no need to repeat its identity on every command.
+//
+// File format: a scoped init writes JSON {"agent":"...","scope":"cat[/proj]"};
+// an unscoped init keeps the legacy bare-id plain text, and any pre-Phase-Q
+// plain-text file is read as an unscoped identity (R8 compatibility).
 
 func identityFile() string {
 	if f := os.Getenv("AGENTMAN_AGENT_FILE"); f != "" {
@@ -35,14 +41,40 @@ func identityFile() string {
 	return filepath.Join(home, ".agentman", "agents", hex.EncodeToString(sum[:])[:12])
 }
 
-func resolveAgent() string {
-	if a := strings.TrimSpace(os.Getenv("AGENTMAN_AGENT")); a != "" {
-		return a
-	}
+// identityRecord is the JSON identity-file shape used when a scope is set.
+type identityRecord struct {
+	Agent string `json:"agent"`
+	Scope string `json:"scope,omitempty"`
+}
+
+// resolveIdentity returns the agent id and scope ("", "" when unset), each
+// independently overridable by env (AGENTMAN_AGENT / AGENTMAN_SCOPE).
+func resolveIdentity() (agent, scope string) {
 	if b, err := os.ReadFile(identityFile()); err == nil {
-		return strings.TrimSpace(string(b))
+		var rec identityRecord
+		if json.Unmarshal(b, &rec) == nil && rec.Agent != "" {
+			agent, scope = rec.Agent, rec.Scope
+		} else {
+			agent = strings.TrimSpace(string(b)) // legacy plain text = unscoped
+		}
 	}
-	return ""
+	if a := strings.TrimSpace(os.Getenv("AGENTMAN_AGENT")); a != "" {
+		agent = a
+	}
+	if s := strings.TrimSpace(os.Getenv("AGENTMAN_SCOPE")); s != "" {
+		scope = s
+	}
+	return agent, scope
+}
+
+func resolveAgent() string {
+	a, _ := resolveIdentity()
+	return a
+}
+
+func resolveScope() string {
+	_, s := resolveIdentity()
+	return s
 }
 
 // newIdentity builds a human-readable id like "bugfix_050626_4821".
@@ -70,23 +102,48 @@ func sanitizeType(s string) string {
 	return strings.Trim(b.String(), "-")
 }
 
-// cmdInit generates an identity for this working directory and persists it.
+// cmdInit generates an identity for this working directory and persists it,
+// optionally scoped: `am init <tasktype> [-c CAT [-p PROJ]]`. Scope is
+// validated locally (parseScope) — no server round-trip; an unknown slug just
+// yields an empty world plus 403s on mutations.
 func cmdInit(a Args) {
+	cat, proj := a.flag("category"), a.flag("project")
+	if proj != "" && cat == "" {
+		fail(5, "init: -p requires -c (scope is category[/project])")
+	}
 	id := newIdentity(a.at(0))
+	data := []byte(id) // unscoped: legacy bare id
+	if cat != "" {
+		raw := cat
+		if proj != "" {
+			raw += "/" + proj
+		}
+		sc, err := parseScope(raw)
+		if err != nil {
+			fail(5, "init: bad scope %q (want category[/project], no spaces)", raw)
+		}
+		data, err = json.Marshal(identityRecord{Agent: id, Scope: sc.String()})
+		if err != nil {
+			fail(1, "init: %v", err)
+		}
+	}
 	f := identityFile()
 	if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
 		fail(1, "init: %v", err)
 	}
-	if err := os.WriteFile(f, []byte(id), 0o644); err != nil {
+	if err := os.WriteFile(f, data, 0o644); err != nil {
 		fail(1, "init: %v", err)
 	}
 	fmt.Println(id) // print only the id, so `id=$(am init bugfix)` works
 }
 
 func cmdWhoami() {
-	a := resolveAgent()
+	a, scope := resolveIdentity()
 	if a == "" {
 		fail(5, "no identity yet — run: am init <tasktype>   (e.g. am init bugfix)")
 	}
-	fmt.Println(a)
+	fmt.Println(a) // id stays line 1, so `am whoami | head -1` keeps working
+	if scope != "" {
+		fmt.Println("scope: " + scope)
+	}
 }

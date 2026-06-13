@@ -116,6 +116,18 @@ func runServe(argv []string) {
 	}
 
 	srv := NewServer(store)
+	// The proposals carve-out project: --proposals flag, then AGENTMAN_PROPOSALS
+	// env, default meta/proposals. Both segments are required — a bare category
+	// would turn the carve-out into a category-wide hole.
+	prop := envOr("AGENTMAN_PROPOSALS", "meta/proposals")
+	if v := a.flag("proposals"); v != "" {
+		prop = v
+	}
+	psc, err := parseScope(prop)
+	if err != nil || psc.Project == "" {
+		fail(1, "agentman: bad proposals project %q (want category/project)", prop)
+	}
+	srv.proposals = psc
 	if a.has("log") || envOr("AGENTMAN_LOG", "") != "" {
 		srv.logRequests = true
 		log.Printf("agentman: request logging enabled")
@@ -181,10 +193,10 @@ func defaultDBPath() string {
 func usage() {
 	fmt.Print(`agentman (am) — a tiny ticketing board for agents
 
-  am serve [--port 8787] [--db PATH] [--log]   run the dashboard + API
+  am serve [--port 8787] [--db PATH] [--log] [--proposals CAT/PROJ]   run the dashboard + API
 
-  am init <tasktype>                     set this session's identity (e.g. bugfix_050626_4821)
-  am whoami                              print the current identity
+  am init <tasktype> [-c CAT [-p PROJ]]  set this session's identity, optionally scoped to a category or project
+  am whoami                              print the current identity (+ scope when set)
 
   am ls [--mine] [--status S] [-p P] [-c CAT] [--all] [--ready] [--blocked] [--stale DUR] [--grep TEXT] [--label L] [--meta KEY]   list tasks (hides done)
   am show <id> [-c]                            task detail (+comments +deps)
@@ -218,9 +230,14 @@ func usage() {
   am db prune [--db PATH] (--before YYYY-MM-DD | --keep N) [--yes]  delete old events rows
 
 Identity: run 'am init <tasktype>' once per session (or set AGENTMAN_AGENT).
+Scope: 'am init <tasktype> -c CAT [-p PROJ]' confines this identity — out-of-scope
+     mutations/reads are rejected (exit 8); creating tasks in the proposals
+     project (default meta/proposals) is allowed from any scope.
 Env: AGENTMAN_URL (default http://127.0.0.1:8787), AGENTMAN_PROJECT (default project),
-     AGENTMAN_CATEGORY (default category scope for ls/next/wait/project new).
+     AGENTMAN_CATEGORY (default category scope for ls/next/wait/project new),
+     AGENTMAN_SCOPE (override the identity file's scope, e.g. work or work/api),
+     AGENTMAN_PROPOSALS (serve: the carve-out project, default meta/proposals).
      Add --json to any read to parse output.
-Exit codes: 0 ok · 3 not found · 4 already claimed · 5 invalid · 6 server down · 7 timed out.
+Exit codes: 0 ok · 3 not found · 4 already claimed · 5 invalid · 6 server down · 7 timed out · 8 out of scope.
 `)
 }

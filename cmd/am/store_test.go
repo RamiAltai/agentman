@@ -3215,3 +3215,126 @@ func TestTaskMetaTableExistsOnReopenedDB(t *testing.T) {
 		t.Fatalf("schema_version = %d, want %d (meta needs no migration)", v, currentSchemaVersion)
 	}
 }
+
+// ===================== Phase Q: scope plumbing =====================
+
+func TestTaskScopeAndProjectCategory(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateCategory("work", ""); err != nil {
+		t.Fatalf("CreateCategory: %v", err)
+	}
+	if _, _, err := st.CreateProject("wproj", "W", "work"); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	tk, _, err := st.CreateTask(CreateTaskInput{Project: "wproj", Title: "scoped", Actor: "agent-a"})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	cat, proj, createdBy, err := st.taskScope(tk.ID)
+	if err != nil {
+		t.Fatalf("taskScope: %v", err)
+	}
+	if cat != "work" || proj != "wproj" || createdBy != "agent-a" {
+		t.Fatalf("taskScope = %q/%q/%q, want work/wproj/agent-a", cat, proj, createdBy)
+	}
+	if _, _, _, err := st.taskScope(99999); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("taskScope(missing) err = %v, want ErrNotFound", err)
+	}
+
+	// CreateTask without an actor records the actorOr default.
+	anon, _, err := st.CreateTask(CreateTaskInput{Project: "wproj", Title: "anon"})
+	if err != nil {
+		t.Fatalf("CreateTask anon: %v", err)
+	}
+	if _, _, createdBy, _ = st.taskScope(anon.ID); createdBy != "anon" {
+		t.Fatalf("created_by without actor = %q, want anon", createdBy)
+	}
+	// GetTask surfaces created_by.
+	got, err := st.GetTask(tk.ID)
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if got.CreatedBy != "agent-a" {
+		t.Fatalf("GetTask CreatedBy = %q, want agent-a", got.CreatedBy)
+	}
+
+	if cat, err := st.projectCategory("wproj"); err != nil || cat != "work" {
+		t.Fatalf("projectCategory(wproj) = %q, %v; want work", cat, err)
+	}
+	if _, err := st.projectCategory("nosuch"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("projectCategory(nosuch) err = %v, want ErrNotFound", err)
+	}
+}
+
+// Scoped extension of TestNextTaskRaceDistinctWinners: N workers all asking
+// for {Category: personal, MetaKey: auto} must win DISTINCT tasks that are
+// both in-category and meta-carrying, never an out-of-scope or keyless decoy
+// — the scope rides inside the atomic pick+claim.
+func TestNextTaskRaceScopedCategoryMeta(t *testing.T) {
+	st := openTestStore(t)
+	for _, c := range []string{"personal", "work"} {
+		if _, _, err := st.CreateCategory(c, ""); err != nil {
+			t.Fatalf("CreateCategory %s: %v", c, err)
+		}
+	}
+	if _, _, err := st.CreateProject("pproj", "P", "personal"); err != nil {
+		t.Fatalf("CreateProject pproj: %v", err)
+	}
+	if _, _, err := st.CreateProject("wproj", "W", "work"); err != nil {
+		t.Fatalf("CreateProject wproj: %v", err)
+	}
+
+	const n = 4
+	// Decoys that would all win on priority if scope/meta leaked out of the
+	// candidate predicate: out-of-scope carriers and in-scope keyless tasks.
+	for i := 0; i < n; i++ {
+		if _, _, err := st.CreateTask(CreateTaskInput{Project: "wproj", Title: fmt.Sprintf("work carrier %d", i),
+			Priority: 0, Meta: map[string]string{"auto": "x"}}); err != nil {
+			t.Fatalf("CreateTask work carrier: %v", err)
+		}
+		nextTaskMk(t, st, "pproj", fmt.Sprintf("personal keyless %d", i), 0, "")
+	}
+	carriers := map[int64]bool{}
+	for i := 0; i < n+2; i++ {
+		tk, _, err := st.CreateTask(CreateTaskInput{Project: "pproj", Title: fmt.Sprintf("personal carrier %d", i),
+			Priority: 2, Meta: map[string]string{"auto": "x"}})
+		if err != nil {
+			t.Fatalf("CreateTask personal carrier: %v", err)
+		}
+		carriers[tk.ID] = true
+	}
+
+	type result struct {
+		task *Task
+		err  error
+	}
+	results := make([]result, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			tk, _, err := st.NextTask(NextFilter{Category: "personal", MetaKey: "auto"}, fmt.Sprintf("agent-%d", i))
+			results[i] = result{task: tk, err: err}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	seen := map[int64]bool{}
+	for i, r := range results {
+		if r.err != nil {
+			t.Fatalf("agent-%d: %v", i, r.err)
+		}
+		if !carriers[r.task.ID] {
+			t.Fatalf("agent-%d won #%d (%s) — outside the scoped carrier set", i, r.task.ID, r.task.Title)
+		}
+		if seen[r.task.ID] {
+			t.Fatalf("task #%d claimed twice", r.task.ID)
+		}
+		seen[r.task.ID] = true
+	}
+}

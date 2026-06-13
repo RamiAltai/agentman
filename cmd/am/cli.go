@@ -333,6 +333,8 @@ func cmdClaim(c *Client, a Args) {
 		fail(4, "claim: #%s held by %s", id, e.Assignee)
 	case st == 400:
 		fail(5, "claim: %s", apiErr(data, "invalid request"))
+	case st == 403:
+		fail(8, "claim: #%s out of scope", id)
 	default:
 		fail(1, "claim: %s", apiErr(data, "error"))
 	}
@@ -375,6 +377,10 @@ func cmdNext(c *Client, a Args) {
 		fail(3, "next: no ready task")
 	case st == 400:
 		fail(5, "next: %s", apiErr(data, "invalid request"))
+	case st == 403:
+		// An explicit -p/-c outside the agent's scope (the unfiltered form
+		// never 403s — the server narrows it silently).
+		fail(8, "next: %s", apiErr(data, "out of scope"))
 	default:
 		fail(1, "next: %s", apiErr(data, "error"))
 	}

@@ -216,8 +216,8 @@ func uidRe(prefix string) *regexp.Regexp {
 
 func TestMigrationV4Fresh(t *testing.T) {
 	st := openTestStore(t)
-	if v, _ := readSchemaVersion(st.db); v != 4 {
-		t.Fatalf("schema_version = %d, want 4", v)
+	if v, _ := readSchemaVersion(st.db); v != currentSchemaVersion {
+		t.Fatalf("schema_version = %d, want %d", v, currentSchemaVersion)
 	}
 	// categories table exists, seeded with the default "general" category.
 	var uid, name string
@@ -286,13 +286,13 @@ func TestMigrationV4ExistingDB(t *testing.T) {
 	}
 	db.Close()
 
-	// OpenStore runs migration v4.
+	// OpenStore runs migration v4 (and everything after it).
 	st, err := OpenStore(dbPath)
 	if err != nil {
 		t.Fatalf("OpenStore on v3 DB: %v", err)
 	}
-	if v, _ := readSchemaVersion(st.db); v != 4 {
-		t.Fatalf("schema_version after migrate = %d, want 4", v)
+	if v, _ := readSchemaVersion(st.db); v != currentSchemaVersion {
+		t.Fatalf("schema_version after migrate = %d, want %d", v, currentSchemaVersion)
 	}
 	// Both projects landed in general with distinct amp_ uids.
 	rows, err := st.db.Query(`SELECT p.slug, p.uid, c.slug FROM projects p
@@ -347,7 +347,96 @@ func TestMigrationV4ExistingDB(t *testing.T) {
 	if alphaUID != uids["alpha"] {
 		t.Fatalf("alpha uid changed on reopen: %q → %q", uids["alpha"], alphaUID)
 	}
-	if v, _ := readSchemaVersion(st2.db); v != 4 {
-		t.Fatalf("schema_version after reopen = %d, want 4", v)
+	if v, _ := readSchemaVersion(st2.db); v != currentSchemaVersion {
+		t.Fatalf("schema_version after reopen = %d, want %d", v, currentSchemaVersion)
+	}
+}
+
+func TestMigrationV5Fresh(t *testing.T) {
+	st := openTestStore(t)
+	if v, _ := readSchemaVersion(st.db); v != 5 {
+		t.Fatalf("schema_version = %d, want 5", v)
+	}
+	// created_by column exists (probe pattern from the V2/V3 tests).
+	if _, err := st.db.Exec("UPDATE tasks SET created_by=NULL WHERE 1=0"); err != nil {
+		t.Fatalf("tasks.created_by column missing after migration: %v", err)
+	}
+}
+
+func TestMigrationV5ExistingDB(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "v4.db")
+
+	// Hand-build a v4 DB: seed schema.sql, then apply ONLY v2-v4 (the first
+	// three entries of schemaMigrations — v5 must not have run yet).
+	if schemaMigrations[0].version != 2 || schemaMigrations[1].version != 3 || schemaMigrations[2].version != 4 {
+		t.Fatalf("schemaMigrations layout changed; first three steps = v%d, v%d, v%d, want v2, v3, v4",
+			schemaMigrations[0].version, schemaMigrations[1].version, schemaMigrations[2].version)
+	}
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"+
+		"&_pragma=foreign_keys(1)&_pragma=synchronous(1)", dbPath)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(schemaSQL); err != nil {
+		t.Fatalf("seed schema: %v", err)
+	}
+	if err := runMigrations(db, 4, schemaMigrations[:3]); err != nil {
+		t.Fatalf("migrate to v4: %v", err)
+	}
+	if v, _ := readSchemaVersion(db); v != 4 {
+		t.Fatalf("hand-built DB version = %d, want 4", v)
+	}
+	// Seed v4-era data: one project, a task WITH a task.created event (the
+	// backfill source) and a task WITHOUT one (events pruned).
+	if _, err := db.Exec("INSERT INTO projects(slug,name,category_id,uid) VALUES('web','web',(SELECT id FROM categories WHERE slug='general'),'amp_0000000000000001')"); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	for _, title := range []string{"with-event", "pruned"} {
+		if _, err := db.Exec(`INSERT INTO tasks(project_id,ref,title)
+		       SELECT id, (SELECT COALESCE(MAX(ref),0)+1 FROM tasks), ? FROM projects WHERE slug='web'`, title); err != nil {
+			t.Fatalf("insert task %s: %v", title, err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO events(project_id,task_id,actor,kind,data)
+	       SELECT t.project_id, t.id, 'bugfix_010101_0001', 'task.created', '{}'
+	       FROM tasks t WHERE t.title='with-event'`); err != nil {
+		t.Fatalf("insert event: %v", err)
+	}
+	db.Close()
+
+	// OpenStore runs migration v5: column added, backfill applied.
+	st, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatalf("OpenStore on v4 DB: %v", err)
+	}
+	if v, _ := readSchemaVersion(st.db); v != 5 {
+		t.Fatalf("schema_version after migrate = %d, want 5", v)
+	}
+	var creator sql.NullString
+	if err := st.db.QueryRow("SELECT created_by FROM tasks WHERE title='with-event'").Scan(&creator); err != nil {
+		t.Fatal(err)
+	}
+	if !creator.Valid || creator.String != "bugfix_010101_0001" {
+		t.Fatalf("created_by backfill = %v, want bugfix_010101_0001", creator)
+	}
+	// The pruned-events task stays NULL — never matches the own-proposal rule.
+	if err := st.db.QueryRow("SELECT created_by FROM tasks WHERE title='pruned'").Scan(&creator); err != nil {
+		t.Fatal(err)
+	}
+	if creator.Valid {
+		t.Fatalf("created_by for pruned-events task = %q, want NULL", creator.String)
+	}
+	st.Close()
+
+	// Reopen — no double-apply (duplicate ALTER would error), version stable.
+	st2, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatalf("reopen OpenStore: %v", err)
+	}
+	defer st2.Close()
+	if v, _ := readSchemaVersion(st2.db); v != 5 {
+		t.Fatalf("schema_version after reopen = %d, want 5", v)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -363,7 +364,7 @@ func TestExportContainsCategories(t *testing.T) {
 
 // TestImportPreCategorySnapshot: a v3-shaped DB (no categories table) passes
 // validation — the required-table set is the v1 baseline on purpose — imports
-// cleanly, and migrates to v4 on the next OpenStore.
+// cleanly, and migrates to the current version on the next OpenStore.
 func TestImportPreCategorySnapshot(t *testing.T) {
 	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
 
@@ -398,14 +399,14 @@ func TestImportPreCategorySnapshot(t *testing.T) {
 		t.Fatalf("importDB: %v", err)
 	}
 
-	// OpenStore migrates the imported DB to v4.
+	// OpenStore migrates the imported DB to the current version.
 	st, err := OpenStore(destDB)
 	if err != nil {
 		t.Fatalf("OpenStore after import: %v", err)
 	}
 	defer st.Close()
-	if v, _ := readSchemaVersion(st.db); v != 4 {
-		t.Fatalf("schema_version after import+open = %d, want 4", v)
+	if v, _ := readSchemaVersion(st.db); v != currentSchemaVersion {
+		t.Fatalf("schema_version after import+open = %d, want %d", v, currentSchemaVersion)
 	}
 	ps, err := st.ListProjects(false, "")
 	if err != nil {
@@ -424,11 +425,12 @@ func TestImportRejectsNewerSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.db.Exec("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','5')"); err != nil {
+	if _, err := st.db.Exec("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?)",
+		strconv.Itoa(currentSchemaVersion+1)); err != nil {
 		t.Fatal(err)
 	}
 	st.Close()
 	if err := validateImportCandidate(srcDB); err == nil {
-		t.Fatal("schema_version 5 snapshot accepted, want rejection")
+		t.Fatalf("schema_version %d snapshot accepted, want rejection", currentSchemaVersion+1)
 	}
 }

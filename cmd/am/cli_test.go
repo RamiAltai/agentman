@@ -1116,3 +1116,132 @@ func TestCmdShowPrintsMeta(t *testing.T) {
 		t.Fatalf("show printed a meta line for a task without meta:\n%s", out)
 	}
 }
+
+// ---------- Phase Q: out-of-scope exit code 8 ----------
+
+func TestExitCodeForOutOfScope(t *testing.T) {
+	if got := exitCodeFor(403); got != 8 {
+		t.Fatalf("exitCodeFor(403) = %d, want 8", got)
+	}
+}
+
+func TestCmdClaimOutOfScopeExit8(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"error":"out_of_scope"}`))
+	}))
+	t.Cleanup(stub.Close)
+	t.Setenv("AGENTMAN_AGENT", "tester")
+	c := &Client{base: stub.URL, agent: "tester", scope: "personal", http: stub.Client()}
+
+	var code int
+	msg := captureStderr(t, func() {
+		code = captureExit(t, func() {
+			cmdClaim(c, parse([]string{"7"}))
+		})
+	})
+	if code != 8 {
+		t.Fatalf("claim 403 exit = %d, want 8", code)
+	}
+	if !strings.Contains(msg, "out of scope") || !strings.Contains(msg, "#7") {
+		t.Fatalf("stderr = %q, want '#7 ... out of scope'", msg)
+	}
+}
+
+func TestCmdNextOutOfScopeExit8(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"error":"out_of_scope"}`))
+	}))
+	t.Cleanup(stub.Close)
+	t.Setenv("AGENTMAN_AGENT", "tester")
+	c := &Client{base: stub.URL, agent: "tester", scope: "personal", http: stub.Client()}
+
+	var code int
+	msg := captureStderr(t, func() {
+		code = captureExit(t, func() {
+			cmdNext(c, parse([]string{"-c", "work"}))
+		})
+	})
+	if code != 8 {
+		t.Fatalf("next 403 exit = %d, want 8", code)
+	}
+	if !strings.Contains(msg, "out_of_scope") {
+		t.Fatalf("stderr = %q, want out_of_scope", msg)
+	}
+}
+
+// Client.do attaches X-Agent-Scope only when a scope is set.
+func TestClientSendsScopeHeader(t *testing.T) {
+	var got string
+	var calls int
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		got = r.Header.Get("X-Agent-Scope")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("[]"))
+	}))
+	t.Cleanup(stub.Close)
+
+	c := &Client{base: stub.URL, agent: "tester", scope: "work/api", http: stub.Client()}
+	captureStdout(t, func() { cmdLs(c, parse([]string{})) })
+	if got != "work/api" {
+		t.Fatalf("X-Agent-Scope = %q, want work/api", got)
+	}
+	c = &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	captureStdout(t, func() { cmdLs(c, parse([]string{})) })
+	if calls != 2 || got != "" {
+		t.Fatalf("unscoped X-Agent-Scope = %q, want absent", got)
+	}
+}
+
+// Bulk status against an enforcing server: the out-of-scope id gets its own
+// stderr line, the rest succeed, exit = first failure's code (8). When a 404
+// comes first, the 3 wins (first-failure ordering).
+func TestCmdStatusBulkOutOfScope(t *testing.T) {
+	ts := newTestServer(t)
+	workID, personalID := scopedBoard(t, ts)
+	personal2 := mustCreateTask(t, ts, "pproj", "second personal")
+
+	c := &Client{base: ts.URL, agent: "agent-p", scope: "personal", http: ts.Client()}
+
+	var code int
+	msg := captureStderr(t, func() {
+		code = captureExit(t, func() {
+			cmdStatus(c, parse([]string{personalID, workID, personal2, "done"}))
+		})
+	})
+	if code != 8 {
+		t.Fatalf("bulk status exit = %d, want 8 (first failure out_of_scope)", code)
+	}
+	if !strings.Contains(msg, "#"+workID) || !strings.Contains(msg, "out_of_scope") {
+		t.Fatalf("stderr = %q, want a line naming #%s out_of_scope", msg, workID)
+	}
+	// The in-scope ids were patched despite the failure in the middle.
+	for _, id := range []string{personalID, personal2} {
+		r := do(t, ts, http.MethodGet, "/api/tasks/"+id, "", nil)
+		var tk Task
+		if err := json.NewDecoder(r.Body).Decode(&tk); err != nil {
+			t.Fatalf("decode task: %v", err)
+		}
+		r.Body.Close()
+		if tk.Status != "done" {
+			t.Fatalf("task #%s status = %q, want done (loop continues past 403)", id, tk.Status)
+		}
+	}
+
+	// 404 before 403: exit code = 3 (first failure), both lines on stderr.
+	msg = captureStderr(t, func() {
+		code = captureExit(t, func() {
+			cmdStatus(c, parse([]string{"99999", workID, "todo"}))
+		})
+	})
+	if code != 3 {
+		t.Fatalf("bulk status (404 first) exit = %d, want 3", code)
+	}
+	if !strings.Contains(msg, "#99999") || !strings.Contains(msg, "#"+workID) {
+		t.Fatalf("stderr = %q, want lines for #99999 and #%s", msg, workID)
+	}
+}

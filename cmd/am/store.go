@@ -27,6 +27,7 @@ var (
 	ErrValidation       = errors.New("validation")
 	ErrProjectArchived  = errors.New("project_archived")
 	ErrCategoryArchived = errors.New("category_archived")
+	ErrOutOfScope       = errors.New("out_of_scope")
 )
 
 // ConflictError carries the current owner of a task that lost a claim race.
@@ -49,6 +50,46 @@ func (e *NotStaleError) Error() string { return "not_stale" }
 var validStatus = map[string]bool{"todo": true, "doing": true, "blocked": true, "done": true}
 
 // ---------- types ----------
+
+// Scope is a client-asserted confinement boundary: a category slug, optionally
+// narrowed to one project. The zero value means unscoped (the human, the
+// dashboard) and passes every check. With no authentication this is accident
+// prevention, not a security boundary (security.md's X-Agent caveat applies).
+type Scope struct {
+	Category string
+	Project  string
+}
+
+func (s Scope) IsZero() bool { return s.Category == "" && s.Project == "" }
+
+// String renders the wire/identity-file form: "cat" or "cat/proj".
+func (s Scope) String() string {
+	if s.Project == "" {
+		return s.Category
+	}
+	return s.Category + "/" + s.Project
+}
+
+// parseScope parses "category" or "category/project". Input is trimmed and
+// lowercased like slugs; empty or whitespace-bearing segments and more than
+// one slash are rejected (wraps ErrValidation → HTTP 400 → CLI exit 5).
+func parseScope(raw string) (Scope, error) {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	parts := strings.Split(raw, "/")
+	if len(parts) > 2 {
+		return Scope{}, fmt.Errorf("%w: scope must be category[/project]", ErrValidation)
+	}
+	for _, seg := range parts {
+		if seg == "" || strings.ContainsAny(seg, " \t") {
+			return Scope{}, fmt.Errorf("%w: scope must be category[/project]", ErrValidation)
+		}
+	}
+	sc := Scope{Category: parts[0]}
+	if len(parts) == 2 {
+		sc.Project = parts[1]
+	}
+	return sc, nil
+}
 
 // Category is the layer above projects (instance → category → project → task).
 type Category struct {
@@ -91,6 +132,7 @@ type Task struct {
 	Body         string            `json:"body,omitempty"`
 	Status       string            `json:"status"`
 	Assignee     string            `json:"assignee"`
+	CreatedBy    string            `json:"created_by,omitempty"`
 	Priority     int               `json:"priority"`
 	NComments    int               `json:"nc"`
 	NPrereqs     int               `json:"nprereq,omitempty"`
@@ -186,7 +228,7 @@ func OpenStore(path string) (*Store, error) {
 // currentSchemaVersion is the version OpenStore migrates to. schema.sql seeds a
 // fresh DB at version 1; runMigrations applies any steps with version > the DB's
 // recorded version to reach this target.
-const currentSchemaVersion = 4
+const currentSchemaVersion = 5
 
 // migration is one forward-only, idempotent step. apply runs inside the same tx
 // that bumps meta.schema_version, so a step + its version bump commit atomically.
@@ -265,6 +307,23 @@ var schemaMigrations = []migration{
 			}
 		}
 		return nil
+	}},
+	// v5: tasks.created_by — who created the task, for the Phase Q proposals
+	// carve-out (a scoped agent may comment on its OWN proposal tickets).
+	// Backfill is best-effort from the durable event log: the first
+	// task.created event's actor is the creator. Tasks whose events were
+	// pruned (`am db prune`) stay NULL — they simply never match the
+	// own-proposal comment rule, which is the safe direction.
+	{version: 5, apply: func(tx *sql.Tx) error {
+		if _, err := tx.Exec("ALTER TABLE tasks ADD COLUMN created_by TEXT"); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`UPDATE tasks SET created_by=(
+		       SELECT e.actor FROM events e
+		       WHERE e.task_id=tasks.id AND e.kind='task.created'
+		       ORDER BY e.id LIMIT 1)
+		     WHERE created_by IS NULL`)
+		return err
 	}},
 }
 
@@ -721,6 +780,11 @@ func getProjectTx(q queryer, id int64) (*Project, error) {
 // patchable — the uid is the immutable correlation key and category moves are
 // out of scope. Unknown keys are ignored; a no-op patch is idempotent success
 // with no event.
+//
+// Scope note: the handler's scope pre-check runs OUTSIDE this transaction,
+// which is sound only because category_id is not patchable (a project never
+// moves between categories) — if a move feature ships, the check must move
+// in-tx.
 func (s *Store) PatchProject(slug string, patch map[string]any, actor string) (*Project, *Event, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -819,6 +883,34 @@ func (s *Store) projectID(slug string) (int64, error) {
 		return 0, ErrNotFound
 	}
 	return id, err
+}
+
+// projectCategory returns the category slug a project belongs to.
+// ErrNotFound for an unknown project slug.
+func (s *Store) projectCategory(slug string) (string, error) {
+	var cat string
+	err := s.db.QueryRow(
+		"SELECT c.slug FROM projects p JOIN categories c ON c.id=p.category_id WHERE p.slug=?",
+		slug).Scan(&cat)
+	if err == sql.ErrNoRows {
+		return "", ErrNotFound
+	}
+	return cat, err
+}
+
+// taskScope returns the category slug, project slug, and creator of a task in
+// one SELECT — everything the server's scope checks need. created_by is empty
+// for pre-v5 tasks whose events were pruned before the backfill.
+// ErrNotFound for an unknown task id.
+func (s *Store) taskScope(id int64) (category, project, createdBy string, err error) {
+	err = s.db.QueryRow(`SELECT c.slug, p.slug, COALESCE(t.created_by,'')
+	       FROM tasks t JOIN projects p ON p.id=t.project_id
+	       JOIN categories c ON c.id=p.category_id WHERE t.id=?`, id).
+		Scan(&category, &project, &createdBy)
+	if err == sql.ErrNoRows {
+		return "", "", "", ErrNotFound
+	}
+	return category, project, createdBy, err
 }
 
 // ---------- tasks ----------
@@ -973,11 +1065,11 @@ func (s *Store) getTaskTx(q queryer, id int64) (*Task, error) {
 	var t Task
 	var assignee sql.NullString
 	err := q.QueryRow(`SELECT t.id,t.project_id,p.slug,t.ref,t.title,t.body,t.status,t.assignee,
-	         t.priority,t.created_at,t.updated_at,COALESCE(t.claimed_at,''),
+	         COALESCE(t.created_by,''),t.priority,t.created_at,t.updated_at,COALESCE(t.claimed_at,''),
 	         (SELECT COUNT(*) FROM comments c WHERE c.task_id=t.id)
 	       FROM tasks t JOIN projects p ON p.id=t.project_id WHERE t.id=?`, id).
 		Scan(&t.ID, &t.ProjectID, &t.Project, &t.Ref, &t.Title, &t.Body, &t.Status,
-			&assignee, &t.Priority, &t.CreatedAt, &t.UpdatedAt, &t.ClaimedAt, &t.NComments)
+			&assignee, &t.CreatedBy, &t.Priority, &t.CreatedAt, &t.UpdatedAt, &t.ClaimedAt, &t.NComments)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -1217,8 +1309,9 @@ func (s *Store) CreateTask(in CreateTaskInput) (*Task, *Event, error) {
 	if err := tx.QueryRow("SELECT COALESCE(MAX(ref),0)+1 FROM tasks WHERE project_id=?", pid).Scan(&ref); err != nil {
 		return nil, nil, err
 	}
-	res, err := tx.Exec(`INSERT INTO tasks(project_id,ref,title,body,priority,assignee)
-	         VALUES(?,?,?,?,?,?)`, pid, ref, in.Title, in.Body, in.Priority, nullStr(in.Assignee))
+	res, err := tx.Exec(`INSERT INTO tasks(project_id,ref,title,body,priority,assignee,created_by)
+	         VALUES(?,?,?,?,?,?,?)`, pid, ref, in.Title, in.Body, in.Priority, nullStr(in.Assignee),
+		actorOr(in.Actor))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1249,6 +1342,11 @@ func (s *Store) CreateTask(in CreateTaskInput) (*Task, *Event, error) {
 }
 
 // PatchTask applies allowed field changes and records a single event.
+//
+// Scope note: the handler's scope pre-check (checkTaskMut) runs OUTSIDE this
+// transaction. That is sound only because a task's project (and a project's
+// category) is immutable today — if a task/project move feature ever ships,
+// the scope check must move inside this tx.
 func (s *Store) PatchTask(id int64, patch map[string]any, actor string) (*Task, *Event, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -1561,6 +1659,11 @@ func (s *Store) StealStaleClaim(id int64, agent string, staleFor time.Duration) 
 // ErrNotFound when nothing qualifies (or a slug does not exist). Tasks
 // pre-assigned to the caller are deliberately skipped (candidates require
 // assignee IS NULL) — claim those with `am claim`.
+//
+// Scope contract (Phase Q): a scoped caller's X-Agent-Scope is merged into f
+// by the handler (narrowScope) BEFORE this runs, so the agent's scope is part
+// of the candidate predicate inside the atomic pick+claim — a scoped agent can
+// never be handed an out-of-scope task, even racing unscoped callers.
 func (s *Store) NextTask(f NextFilter, agent string) (*Task, *Event, error) {
 	if agent == "" {
 		return nil, nil, ErrValidation

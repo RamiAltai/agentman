@@ -484,3 +484,85 @@ func TestWaitMetaUsageErrors(t *testing.T) {
 		t.Fatalf("wait --meta k=v exit = %d, want 5", code)
 	}
 }
+
+// ---------- Phase Q: scoped wait --ready ----------
+
+// newScopedWaitClient mirrors newWaitClient with an X-Agent-Scope.
+func newScopedWaitClient(base, scope string) *Client {
+	return &Client{base: base, agent: "tester", scope: scope, http: &http.Client{Timeout: time.Second}}
+}
+
+// A ready task that exists only OUTSIDE the agent's scope must never release
+// a scoped wait — the unfiltered re-check is narrowed server-side.
+func TestWaitReadyScopedTimeout(t *testing.T) {
+	ts := newTestServer(t)
+	scopedBoard(t, ts) // work task ready in wproj; pproj task ready too
+
+	// Drain the personal board so only out-of-scope ready work remains.
+	r := do(t, ts, http.MethodPost, "/api/tasks/next", "", scoped("drainer", "personal"))
+	r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("drain next = %d, want 200", r.StatusCode)
+	}
+
+	c := newScopedWaitClient(ts.URL, "personal")
+	code := captureExit(t, func() {
+		cmdWait(c, parse([]string{"--ready", "--timeout", "1s"}))
+	})
+	if code != 7 {
+		t.Fatalf("scoped wait --ready exit = %d, want 7 (out-of-scope ready must not release)", code)
+	}
+}
+
+// An in-scope ready task created mid-wait releases the scoped wait with its id.
+func TestWaitReadyScopedReleased(t *testing.T) {
+	ts := newTestServer(t)
+	scopedBoard(t, ts)
+	r := do(t, ts, http.MethodPost, "/api/tasks/next", "", scoped("drainer", "personal"))
+	r.Body.Close()
+
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		createTaskRaw(ts.URL, "pproj", "in-scope ready")
+	}()
+
+	c := newScopedWaitClient(ts.URL, "personal")
+	var code int
+	start := time.Now()
+	out := captureStdout(t, func() {
+		code = captureExit(t, func() {
+			cmdWait(c, parse([]string{"--ready", "--timeout", "10s"}))
+		})
+	})
+	if code != -1 {
+		t.Fatalf("expected normal return (exit 0), got exit %d", code)
+	}
+	// Must have blocked until the in-scope task appeared, not released on the
+	// pre-existing out-of-scope work task.
+	if elapsed := time.Since(start); elapsed < 200*time.Millisecond {
+		t.Fatalf("wait returned after %v — released by an out-of-scope task?", elapsed)
+	}
+	if strings.TrimSpace(out) == "" {
+		t.Fatal("scoped wait --ready printed nothing, want the ready task id")
+	}
+}
+
+// An explicit -c outside the agent's scope is a loud failure: exit 8.
+func TestWaitReadyExplicitOutOfScopeExit8(t *testing.T) {
+	ts := newTestServer(t)
+	scopedBoard(t, ts)
+
+	c := newScopedWaitClient(ts.URL, "personal")
+	var code int
+	msg := captureStderr(t, func() {
+		code = captureExit(t, func() {
+			cmdWait(c, parse([]string{"--ready", "-c", "work", "--timeout", "5s"}))
+		})
+	})
+	if code != 8 {
+		t.Fatalf("wait --ready -c work scoped personal exit = %d, want 8", code)
+	}
+	if !strings.Contains(msg, "out_of_scope") {
+		t.Fatalf("stderr = %q, want out_of_scope", msg)
+	}
+}
