@@ -18,9 +18,10 @@ live kanban board served at `http://127.0.0.1:8787`.
 - **Category home (landing view)** — a grid of **category cards**, each showing the category's
   task counts (todo / doing / blocked / done) and the agents active in it in the last 30 minutes.
   Click a card to **drill into that category's board**; an **"All" card** opens the cross-category
-  board. Views are linkable and the **browser back button works** — the URL hash is `#/` (home),
-  `#/all` (cross-category board), or `#/cat/<slug>` (one category). A **"← Categories"** breadcrumb
-  returns home.
+  board. A dashed **＋ New category** add-card opens a modal (name + auto-derived slug) that creates
+  the category. Views are linkable and the **browser back button works** — the URL hash is `#/`
+  (home), `#/all` (cross-category board), or `#/cat/<slug>` (one category). A **"← Categories"**
+  breadcrumb returns home.
 - **Columns** — Todo / In Progress / Blocked / Done, with per-project tabs and counts. A category
   board shows only that category's projects; the **All** view shows every project. Click multiple
   project tabs to **filter across several at once**; the **All** tab clears the within-view filter.
@@ -35,10 +36,21 @@ live kanban board served at `http://127.0.0.1:8787`.
 - **Keyboard:** `n` new task · `a` toggle the activity panel · `/` focus search · `g` toggle the
   dependency graph · `Enter`/`Space` open a focused card · `[` / `]` move a focused card between
   statuses · `Esc` close a dialog.
-- **Manage projects:** the `⋯` button in the tab bar opens a modal listing all projects, with
-  per-project **Archive** / **Unarchive** and a two-step-confirm **Delete** (removes the project
-  and all its tasks/comments). Archiving hides a project from the tabs, task list, and feed;
-  creating a task into an archived project is blocked.
+- **Manage (categories & projects):** the `⋯` button in the tab bar opens the **Manage** modal with
+  two sections:
+  - **Categories** — every category (including archived ones), each with its open-task count and an
+    **Archive** / **Unarchive** toggle. (There is no category delete — there is no delete API for
+    categories.)
+  - **Projects** — every project, each with an **Edit** button, an **Archive** / **Unarchive**
+    toggle, and a two-step-confirm **Delete** (removes the project and all its tasks/comments).
+    Archiving hides a project from the tabs, task list, and feed; creating a task into an archived
+    project is blocked.
+  - **Edit project** opens a sub-modal to **rename** the project (its name and slug — the rename is
+    safe, the project's stable id is unchanged) and set its **vault binding** (vault project id /
+    vault path).
+- **Create a project with a category:** the **＋** new-project button's modal has a required
+  **Category** picker (defaulting to the category you're currently viewing, else `general`), so a
+  project lands in the right category without the CLI.
 - **Dependencies:** the task modal has a **Dependencies** section — prerequisite chips with status
   dots and ✕ remove buttons, an **"Add prerequisite…"** dropdown of same-project tasks, and a
   read-only **Blocks** list. Cards show a **🔒 Blocked** tag with unfinished prerequisites or a
@@ -53,7 +65,15 @@ live kanban board served at `http://127.0.0.1:8787`.
   title *or* description (server-side via `?q=`, so it survives live SSE reloads). Cards show up to
   3 **label chips** (then a `+N` overflow) — click a chip to filter by that label (a header chip
   with ✕ clears it). The task modal has a **Labels** section.
-- **Task metadata:** the modal shows a read-only **Meta** section of the task's `key=value` pairs.
+- **Board filters:** a header **Filter** button opens a popover with **Ready** / **Blocked** /
+  **Stale** toggles, an **Assignee** field (with a **Mine** shortcut = your `human` actor), and a
+  **Meta key** field, plus **Clear all**. The button shows a count chip while any filter is active.
+  Filters compose with the search box, label filter, and project/category scope and survive live
+  reloads. (Status is not a filter — the four columns already are the status axis.)
+- **Task metadata:** the modal's **Meta** section is editable — each `key=value` pair has a ✕ to
+  remove it, and an add-row (key + value, **Add** or Enter) creates one.
+- **Release a task:** the task modal's **Release** button (shown when a task is claimed or not in
+  Todo) unassigns it and returns it to Todo in one click — the `am drop` equivalent.
 - **Stale claims:** an *In Progress* card with an assignee and no activity for 30+ minutes shows an
   amber **⏳ stale** chip; a takeover (`am claim --steal-stale`) shows as *"X reclaimed #N from Y"*.
 

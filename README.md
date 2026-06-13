@@ -87,6 +87,9 @@ directory knows who it is — run it once per session and forget it.
 - **Drag-and-drop boards** — move cards between columns; the change persists and broadcasts.
 - **Live activity feed** — a collapsible stream of every claim, comment, and status change as it
   lands. Plus a per-project dependency graph, search, label filters, and a light/dark theme toggle.
+- **All from the GUI** — create and archive categories, create/rename/edit projects, filter the
+  board (ready / blocked / stale / assignee / meta), edit task metadata, and release a task back to
+  the pool — no dropping to the CLI.
 
 Open any card for the full ticket — status, assignee, priority, prerequisites, comments, and history:
 

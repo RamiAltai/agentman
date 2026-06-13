@@ -1,7 +1,7 @@
 # Frontend Architecture
 
 There **is** a frontend: a small single-page dashboard in `cmd/am/web/`
-(`index.html` 87 lines, `app.css` 729 lines, `app.js` 2023 lines), embedded into the binary via
+(`index.html` 91 lines, `app.css` 782 lines, `app.js` 2384 lines), embedded into the binary via
 `//go:embed web` (`cmd/am/server.go`) and served at `/`. It is the human-facing view; agents do
 not use it.
 
@@ -42,8 +42,11 @@ All built imperatively in `app.js` (no component framework):
   an `.active-agents` avatar row (up to 6 initials via `initials()`, then a `+N` overflow; "no
   active agents" when empty). An **"All" card** (`allCard`, `.cat-card-all`, dashed) shows the
   total open count and opens the cross-category board. Cards are `role="link"`/`tabindex=0` and
-  drill in on click or Enter/Space (`navigate("#/cat/<slug>")` / `navigate("#/all")`). The
-  overview keeps **one global, unfiltered** recent-activity feed (the existing `#feed` aside) — not
+  drill in on click or Enter/Space (`navigate("#/cat/<slug>")` / `navigate("#/all")`). After the
+  category cards a dashed **＋ New category** add-card (`newCatCard`, `.cat-card-add`,
+  `role="button"`/`tabindex=0`) opens the create-category modal on click or Enter/Space
+  (`openNewCategory`). The overview keeps **one global, unfiltered** recent-activity feed (the
+  existing `#feed` aside) — not
   per-card mini-feeds. `body.view-overview` (set by `applyView`) is what hides the project tabs and
   `#board` and shows `#overview`.
 - **Header breadcrumb / back** — `setBreadcrumb`: fills the header `#breadcrumb` element on the
@@ -51,17 +54,27 @@ All built imperatively in `app.js` (no component framework):
   (the category's `name` for `#/cat/<slug>`, "All" for `#/all`). Hidden on the overview
   (`body.view-overview .breadcrumb { display:none }`), which is the root.
 - **Header / tabs** — `renderTabs`, `tab()`: project tabs with open-count badges + an "All" tab + a
-  "＋" new-project button + a "⋯" **Manage projects** button (after the ＋). In a **category board**
+  "＋" new-project button + a "⋯" **Manage** button (after the ＋; title "Manage", aria-label
+  "Manage categories and projects"). In a **category board**
   the tabs render only that category's projects (`projectsInView` filters `projects` by
   `p.category === activeCategory`) and the "All" tab spans the category's projects; in the `#/all`
   view it spans every project. Clicking "⋯" calls
-  `openManageProjects`, which opens the reused `#sheet` modal (same focus-trap / Esc-to-close
-  infrastructure as the task modal). Inside, `renderManageList` fetches all projects including
-  archived ones via `GET /api/projects?archived=true` and builds a list with `el()` (no
-  `innerHTML`): active projects show an **Archive** button; archived projects show an **Archived**
-  badge and an **Unarchive** button. Both buttons call `POST /api/projects/{slug}/archive|unarchive`
-  via `api()`, then refresh the list. If the just-archived project was selected, the tab bar and
-  board reload automatically.
+  `openManage` (the former `openManageProjects`, kept as a back-compat alias), which opens the reused
+  `#sheet` modal (same focus-trap / Esc-to-close infrastructure as the task modal) with two sections:
+  - **Categories** (`renderManageCategories`) — fetches every category including archived ones via
+    `GET /api/categories?archived=true` and builds a `.cat-manage-list` of `.cat-row`s (mirroring the
+    project list, `el()` only): each row shows name, slug, open-task count, an **Archived** pill when
+    archived, and an Archive/Unarchive toggle that calls
+    `POST /api/categories/{slug}/archive|unarchive` then refreshes `loadProjects()`, the overview
+    (when visible), and the category list in place. There is **no category delete** control (no
+    category-delete API).
+  - **Projects** (`renderManageList`) — fetches all projects including archived ones via
+    `GET /api/projects?archived=true` and builds a list with `el()` (no
+    `innerHTML`): active projects show **Edit** + **Archive**; archived ones show an **Archived**
+    badge + **Edit** + **Unarchive** (plus the two-step **Delete** below). The archive buttons call
+    `POST /api/projects/{slug}/archive|unarchive` via `api()`, then refresh the list. If the
+    just-archived project was selected, the tab bar and board reload automatically. The **Edit**
+    button (`btn-edit-proj`) opens the per-project edit sub-modal (`openEditProject`, see below).
 - **Search + label filter (header)** — a `#searchBox` input in the header `.actions` filters the
   board **server-side** (`?q=` on `GET /api/tasks` — substring match over title *and* body, which
   the client couldn't do since the list payload has no body). Input is **debounced 250 ms**
@@ -70,6 +83,21 @@ All built imperatively in `app.js` (no component framework):
   *not* in the shared `qstr()` used by the feed/SSE), the debounced SSE board reload keeps the
   filter across live refreshes. An active label filter shows a **`#labelFilterChip`** chip next to
   the search box (`setLabelFilter`) with a **✕** clear button (`clearLabelFilter`).
+- **Board filters (header popover)** — a single **Filter** button (`#filterBtn`, in `.actions`)
+  toggles a popover panel (`#filterPanel`, `role="dialog"`) of server-side board filters
+  (`renderFilterPanel`): **Ready** / **Blocked** / **Stale** checkboxes (→ `?ready=true`,
+  `?blocked=true`, `?stale=30m` — `STALE_FILTER`, matching the `STALE_MS` stale-badge threshold), an
+  **Assignee** text input (→ `?assignee=`) with a **Mine** fill-button that sets it to `human` (the
+  fixed `X-Agent` the dashboard sends), and a **Meta key** input (→ `?meta_key=`), plus a **Clear
+  all** reset. The flags + inputs all fold into `loadBoard()`'s query string (state in
+  `filterReady`/`filterBlocked`/`filterStale`/`filterMine`/`filterMetaKey`, again deliberately not in
+  the shared `qstr()`), so they **compose** with the project/category scope, search, and label filter
+  and **survive SSE-driven live reloads** with no `onEvent`/`renderBoard` change. `applyFilters`
+  persists the panel state to the board without closing the panel (so several toggles can be flipped
+  in a row); `renderFilterBadge` keeps a count chip + a `has-filters` highlighted state on the button
+  in sync. The panel closes on **outside click** (a lazily-wired `document` click listener,
+  `filterOutsideClickWired`) and on **Escape** (which returns focus to the button); status is
+  **intentionally not a filter** — the four board columns are the status axis.
 - **Board** — `renderBoard`, `card(t)`: four status columns (`COLS`), priority via card left-border
   + chip, avatar initials, project tag (shown when `selected.size !== 1`, i.e. only when the board
   isn't already scoped to a single project), comment count. Cards now also show a dependency tag in
@@ -103,11 +131,23 @@ All built imperatively in `app.js` (no component framework):
   loaded history is not silently discarded. Trade-off: a long-running tab that paginates can grow
   the feed unbounded until the next page reload. When `?before=` returns no events, the button is
   replaced by a `"— start of activity —"` end-marker. All DOM via `el()` (no `innerHTML`).
-- **Detail modal** — `renderModal`, plus `openNew` (new task) and `openNewProject`: one reused
+- **Detail modal** — `renderModal`, plus `openNew` (new task), `openNewProject`, `openNewCategory`,
+  and `openEditProject`: one reused
   `#sheet` element; auto-growing title `<textarea>`; status/assignee/priority controls; comments;
-  history. `openNewProject` still POSTs `{slug,name}` only — the server defaults the category to
-  `general` (Phase O kept the project-creation form category-unaware by design; the Phase R category
-  UI is the read-side overview/drill-down, not a category picker on the create form). The modal includes a **Delete task** button (inline two-step confirm — see below) and
+  history. **`openNewCategory`** mirrors `openNewProject` (name + auto-derived slug via `slugify`)
+  but POSTs `/api/categories` `{slug,name}`, reloads the overview, and closes; a slug conflict
+  surfaces as *a category with slug "<slug>" already exists*. **`openNewProject`** now has a
+  required **Category** `<select>` populated from `GET /api/categories` (fetched lazily on the board
+  views where the overview hasn't loaded it), defaulting to the current view's category on a
+  category board, else `general` (falling back to the first known category if `general` is absent,
+  or to a single `general` option if the list can't be fetched); the create POST carries
+  `category: csel.value`. (This reverses the Phase O "category-unaware by design" decision —
+  ADR-031, ADR-025; the server-side empty→`general` mapping stays as a compatibility fallback.)
+  **`openEditProject`** edits a project's Name, Slug (a safe **uid-keyed rename**, NOT auto-derived),
+  Vault project id, and Vault path; Save PATCHes `/api/projects/{slug}` with **only the changed
+  fields** (a no-op edit just closes), and on a slug change the selection follows the new slug. Its
+  errors surface as *slug "<slug>" is taken* (conflict) or *check name/slug (no spaces or /)*
+  (validation). The modal includes a **Delete task** button (inline two-step confirm — see below) and
   each comment has a **× delete** button (also two-step). The modal also has a **Dependencies**
   section (`depsSection`):
   - **"Depends on"** — one chip per prerequisite showing a status dot, `project-ref` (clickable
@@ -127,10 +167,20 @@ All built imperatively in `app.js` (no component framework):
   button (`DELETE /api/tasks/{id}/labels/{label}`), plus an **"Add label…" input** that submits on
   **Enter** (`POST /api/tasks/{id}/labels {label}`); a validation 400 shows an inline `.ferr` hint
   ("labels are 1-50 chars of a-z 0-9 . _ -").
-  After Labels comes a **read-only Meta section** (Phase P) — rendered only when the task carries
-  meta: one `.meta-row` per pair (keys sorted; `.meta-key` muted, `.meta-val` monospace), built
-  with `el()`/`textContent` only. Meta pairs are set via the CLI/API (`--meta k=v`), not the
-  dashboard.
+  After Labels comes an **editable Meta section** (`.meta-section`; was read-only through Phase P,
+  made editable in ADR-031): one `.meta-row` per existing pair (keys sorted; `.meta-key` muted,
+  `.meta-val` monospace) each with a **✕ remove** button, plus a `.meta-add-row` of **key** + **value**
+  inputs and an **Add** button (Enter in either input also adds). Both paths go through the
+  `patchMeta(id, key, value)` helper — adding sends `PATCH /api/tasks/{id}` `{meta:{<key>:<value>}}`;
+  removing sends an empty value (`{meta:{<key>:""}}`) which deletes the pair. `patchMeta` uses the
+  **raw `api()`** call rather than the shared `patch()` helper, because `patch()`'s success path
+  refreshes the modal and would wipe the inline error / in-progress add inputs — the SSE
+  `task.patched` echo re-renders the section from server truth on its own. A validation error shows
+  inline (`metaErrMsg`) and now names both cases: *meta key must be 1-50 chars of a-z 0-9 . _ - and
+  value ≤500 chars*. All DOM via `el()`/`textContent`.
+  The modal's delete row also has a **Release** button (`btn-release`, shown only when the task has
+  an assignee or isn't in `todo`): one PATCH of `{assignee:"", status:"todo"}` returns the task to
+  the unclaimed pool (the `am drop` equivalent), pushing **Delete** to the right edge of the row.
 - **Dependency-graph overlay** — `openGraphOverlay` / `closeGraphOverlay` / `renderGraph` /
   `renderGraphDetail`: a full-screen overlay (`#graphOverlay`) that visualises the task dependency
   DAG for a project. Entry points: the **"Graph"** button in the header `.actions` (`#graphBtn`)
@@ -191,7 +241,12 @@ empty=all), `tasks`
 if none loaded), `feedPaginated` (`true` once the user has paginated; disables `trimFeed` cap),
 `loadOlderBtn` (reference to the "Load older" button outside `#feedList`), `filterQ` /
 `filterLabel` (active server-side search/label filters, applied by `loadBoard()`), `searchTimer`
-(the search box's 250 ms input debounce). Graph overlay state:
+(the search box's 250 ms input debounce), and the board-filter popover state
+`filterReady` / `filterBlocked` / `filterStale` (bool toggles) / `filterMine` (assignee string) /
+`filterMetaKey` (meta-key string), all applied by `loadBoard()`, plus their per-input debounce
+timers `filterMineTimer` / `filterMetaTimer` (separate from `searchTimer` so the two boxes don't
+cancel each other) and `filterOutsideClickWired` (lazily wires the panel's outside-click closer
+once). Graph overlay state:
 `graphOpen` (bool), `graphSlug` (slug of the project currently shown), `graphData`
 (`{nodes, edges}` from the last fetch), `graphViewState` / `graphInitialView` (current and
 reset-target `viewBox`), `graphSelectedId` (currently highlighted node id), `graphDragState`,
@@ -259,22 +314,32 @@ gracefully when `localStorage`/`matchMedia` are unavailable.
 The board uses `justify-content: safe center` on `#board` so columns are centered on wide/ultrawide
 screens. The `safe` keyword falls back to `flex-start` when columns overflow their container, so
 horizontal scrolling on narrow screens never clips the leftmost column. New CSS classes support the
-Manage-projects modal: `.proj-list`, `.proj-row`, `.badge-archived`, `.btn-archive` (and
-`.btn-archive.unarchive`). The Phase R category overview adds `.cat-grid`, `.cat-card`
-(`.cat-card-all` for the dashed "All" card), `.cat-name`/`.cat-sub`, `.count-chips`/`.count-chip`
+Manage modal: `.proj-list`, `.proj-row`, `.badge-archived`, `.btn-archive` (and
+`.btn-archive.unarchive`), the per-project `.btn-edit-proj`, and the Categories section's
+`.cat-manage-list` / `.cat-row` (mirroring the project list). The board-filter popover uses
+`.filter-wrap` / `.filter-panel` / `.filter-section` / `.filter-check` / `.filter-mine-row` /
+`.filter-mine-btn` / `.filter-foot` / `.filter-clear`, plus `.iconbtn.has-filters` + `.filter-count`
+on the button. The task modal's **Release** button is `.btn-release` (`margin-right:auto` pushes
+Delete to the row's right edge). The Phase R category overview adds `.cat-grid`, `.cat-card`
+(`.cat-card-all` for the dashed "All" card, `.cat-card-add` for the dashed "＋ New category"
+add-card), `.cat-name`/`.cat-sub`, `.count-chips`/`.count-chip`
 (with a color `.swatch`), and `.active-agents`/`.active-agent-avatar`/`.no-agents`/`.more-agents`;
 the header breadcrumb uses `.breadcrumb`/`.crumb-back`/`.crumb-current`. `#overview` is hidden by
 default and shown via `body.view-overview #overview` (which also hides `#board` and `#tabs`). The card chips use `.tag-blocked` / `.tag-ready` / `.tag-stale`
-(amber pill for the ⏳ stale badge). The modal's Meta section uses `.meta-row` / `.meta-key` /
-`.meta-val` (tones match `.dep-status`; monospace value). The graph overlay is styled via `.graph-overlay`, `.graph-shell`,
+(amber pill for the ⏳ stale badge). The modal's editable Meta section uses `.meta-section` /
+`.meta-row` / `.meta-key` / `.meta-val` (tones match `.dep-status`; monospace value) plus the
+`.meta-add-row` / `.meta-key-add` / `.meta-val-add` / `.meta-add-btn` add-row (the per-row ✕ reuses
+`.dep-rm`). The graph overlay is styled via `.graph-overlay`, `.graph-shell`,
 `.graph-header`, `.graph-body`, `.graph-svg`, `.graph-detail`, `.graph-legend`, and assorted
 `.gnode-*` / `.gedge-*` / `.gd-*` classes for nodes, edges, and the detail panel.
 
 ## Forms
 
 Plain inputs/selects/textareas inside the modal; changes **auto-save** via `onchange` →
-`PATCH`/`POST` (no submit button for edits). New task / new project use a "Create" button with
-inline `.ferr` error text. Slug auto-derives from project name (`slugify`).
+`PATCH`/`POST` (no submit button for edits). New task / new project / new category use a "Create"
+button with inline `.ferr` error text; the new-project modal adds a required Category `<select>`.
+Slug auto-derives from name (`slugify`) for create modals; in **Edit project** the slug is an
+explicit field (NOT auto-derived) and Save sends only the changed fields.
 
 ## UI States
 
@@ -310,9 +375,18 @@ the no-npm/single-binary/no-build-step ethos that is a core project invariant.
 accidental sink assignment fails the build before it ships. `TestDashboardThemeAssets` (ADR-030)
 asserts the dark/light theming stays wired: `app.css` ships the `:root[data-theme="light"]` override
 block and `index.html` carries both the inline `am.theme` FOUC-guard script and the `#themeToggle`
-button.
+button. `TestDashboardParityAffordances` (ADR-031) locks the CLI↔GUI parity affordances in at the
+same level: it reads `app.js`/`index.html`/`app.css` and asserts the create/archive-category,
+project-category-picker, project-edit, board-filter, editable-meta, and release wiring are present
+(markers `openNewCategory`, `newCatCard`, `category: csel.value`, `renderManageCategories`,
+`/api/categories?archived=true`, `openEditProject`, `btn-edit-proj`, `vault_project_id`,
+`#filterBtn`/`#filterPanel`, `filterReady`/`filterBlocked`/`filterStale`/`filterMetaKey`,
+`renderFilterPanel`, `patchMeta`, `meta-add-row`, `btn-release`, and the `.filter-panel`/
+`.meta-add-row`/`.btn-release`/`.cat-card-add`/`.cat-row` CSS classes) — a regression that drops any
+of them fails `go test` before it ships.
 
-**Remaining gap:** behavioral dashboard JS — the "Manage projects" modal, the delete confirm flows
+**Remaining gap:** behavioral dashboard JS — the "Manage" modal (category + project lists, project
+edit), the board-filter popover, the editable Meta section, the Release button, the delete confirm flows
 (task/comment/project), the feed pagination button, the dependency section (prereq chips, add-prereq
 dropdown, blocks list), the graph overlay (layout, pan/zoom, transitive highlight, detail panel,
 live refresh), the **category overview + hash routing** (overview cards, drill-down, breadcrumb/back,
@@ -341,7 +415,7 @@ verification. (Gap; see `known-risks-and-gaps.md`.)
 - **Native HTML5 drag-and-drop doesn't fire on touch** → mobile relies on the status dropdown /
   `[ ]` keys (documented fallback in code comments).
 - **Full board re-render per event batch** (debounced) — fine at small scale, O(n) at large scale.
-- Single 2023-line `app.js`, no module split, no minification. Behavioral JS logic is not
+- Single 2384-line `app.js`, no module split, no minification. Behavioral JS logic is not
   automatically tested (deliberate no-JS-runner decision); XSS-sink safety is enforced by the
   `TestDashboardNoXSSSinks` Go guard. The delete confirm flows, feed pagination, dependency UI,
   and the graph overlay are still untested at the behavioral level.
