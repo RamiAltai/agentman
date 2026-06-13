@@ -395,6 +395,11 @@ select:hover, .field:hover { border-color: var(--line-strong); }
 .tag-label-modal:hover { border-color: rgba(110, 168, 254, .3); }
 .label-add { min-width: 110px; max-width: 150px; padding: 4px 8px; font-size: 12px; }
 
+/* meta rows in the task modal (read-only key=value pairs) */
+.meta-row { display: flex; gap: 8px; align-items: baseline; font-size: 12px; margin-bottom: 4px; }
+.meta-key { color: var(--muted); font-weight: 600; min-width: 90px; }
+.meta-val { color: var(--faint); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+
 /* ===================== dependency section (task modal) ===================== */
 .deps-section { margin: 10px 0 14px; }
 .deps-group { margin-bottom: 10px; }

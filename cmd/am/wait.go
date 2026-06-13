@@ -16,8 +16,8 @@ import (
 
 // cmdWait blocks until a board condition is met, watching the SSE stream:
 //
-//	am wait <id> --done [--timeout D]               until the task's status is done
-//	am wait --ready [-p P] [-c CAT] [--timeout D]   until some ready task exists
+//	am wait <id> --done [--timeout D]                            until the task's status is done
+//	am wait --ready [-p P] [-c CAT] [--meta KEY] [--timeout D]   until some ready task exists in scope
 //
 // Exactly these two conditions. Exit 0 when met (--done prints nothing;
 // --ready prints one ready task id; --json prints the satisfying task JSON);
@@ -27,8 +27,10 @@ import (
 // are never trusted as state.
 func cmdWait(c *Client, a Args) {
 	waitDone, waitReady, id := a.has("done"), a.has("ready"), a.at(0)
-	if waitDone == waitReady || (waitDone && id == "") || (waitReady && id != "") {
-		fail(1, "usage: am wait <id> --done | am wait --ready [-p P] [-c CAT]  [--timeout D]")
+	metaKey := metaKeyArg(a, "wait") // >1 key or key=value → exit 5
+	if waitDone == waitReady || (waitDone && id == "") || (waitReady && id != "") ||
+		(waitDone && metaKey != "") { // --meta scopes --ready only
+		fail(1, "usage: am wait <id> --done | am wait --ready [-p P] [-c CAT] [--meta KEY]  [--timeout D]")
 	}
 
 	timeout := 10 * time.Minute
@@ -59,7 +61,7 @@ func cmdWait(c *Client, a Args) {
 			taskID = t.ID
 			return t, met
 		}
-		return w.checkReady(project, category)
+		return w.checkReady(project, category, metaKey)
 	}
 	if t, met := check(); met {
 		waitPrint(a, t, waitReady)
@@ -210,14 +212,19 @@ func (w *waiter) checkDone(id string) (*Task, bool) {
 	return &t, t.Status == "done"
 }
 
-// checkReady re-evaluates the --ready condition via REST.
-func (w *waiter) checkReady(project, category string) (*Task, bool) {
+// checkReady re-evaluates the --ready condition via REST. Like the category
+// scope, --meta narrows only this re-check, never the SSE stream (ADR-023:
+// event payloads are triggers, not state).
+func (w *waiter) checkReady(project, category, metaKey string) (*Task, bool) {
 	qs := url.Values{"ready": {"true"}, "limit": {"1"}}
 	if project != "" {
 		qs.Set("project", project)
 	}
 	if category != "" {
 		qs.Set("category", category)
+	}
+	if metaKey != "" {
+		qs.Set("meta_key", metaKey)
 	}
 	st, data := w.get("/api/tasks?" + qs.Encode())
 	if st < 200 || st >= 300 {

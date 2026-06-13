@@ -1697,7 +1697,7 @@ func TestNextTaskPicksHighestPriorityReady(t *testing.T) {
 	// Eligible: the p1 winner and a p3 also-ran (the prereq task itself).
 	winner := nextTaskMk(t, st, "web", "winner p1", 1, "")
 
-	tk, ev, err := st.NextTask("", "", "agent-x")
+	tk, ev, err := st.NextTask(NextFilter{}, "agent-x")
 	if err != nil {
 		t.Fatalf("NextTask: %v", err)
 	}
@@ -1729,7 +1729,7 @@ func TestNextTaskFIFOWithinPriority(t *testing.T) {
 	first := nextTaskMk(t, st, "web", "older", 2, "")
 	nextTaskMk(t, st, "web", "newer", 2, "")
 
-	tk, _, err := st.NextTask("", "", "agent-x")
+	tk, _, err := st.NextTask(NextFilter{}, "agent-x")
 	if err != nil {
 		t.Fatalf("NextTask: %v", err)
 	}
@@ -1749,7 +1749,7 @@ func TestNextTaskProjectScoping(t *testing.T) {
 	webTask := nextTaskMk(t, st, "web", "web slow", 3, "")
 
 	// Project scope beats global priority order.
-	tk, _, err := st.NextTask("web", "", "agent-x")
+	tk, _, err := st.NextTask(NextFilter{Project: "web"}, "agent-x")
 	if err != nil {
 		t.Fatalf("NextTask(web): %v", err)
 	}
@@ -1757,7 +1757,7 @@ func TestNextTaskProjectScoping(t *testing.T) {
 		t.Fatalf("NextTask(web) picked #%d, want #%d", tk.ID, webTask)
 	}
 	// No scope: best remaining across all projects.
-	tk2, _, err := st.NextTask("", "", "agent-y")
+	tk2, _, err := st.NextTask(NextFilter{}, "agent-y")
 	if err != nil {
 		t.Fatalf("NextTask(\"\"): %v", err)
 	}
@@ -1765,7 +1765,7 @@ func TestNextTaskProjectScoping(t *testing.T) {
 		t.Fatalf("NextTask(\"\") picked #%d, want #%d", tk2.ID, apiTask)
 	}
 	// Bad slug → ErrNotFound.
-	if _, _, err := st.NextTask("nosuch", "", "agent-z"); !errors.Is(err, ErrNotFound) {
+	if _, _, err := st.NextTask(NextFilter{Project: "nosuch"}, "agent-z"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("NextTask(nosuch) err = %v, want ErrNotFound", err)
 	}
 }
@@ -1778,7 +1778,7 @@ func TestNextTaskNoneReady(t *testing.T) {
 	// Only an assigned todo task — not a candidate.
 	nextTaskMk(t, st, "web", "taken", 0, "someone-else")
 
-	if _, _, err := st.NextTask("", "", "agent-x"); !errors.Is(err, ErrNotFound) {
+	if _, _, err := st.NextTask(NextFilter{}, "agent-x"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("NextTask err = %v, want ErrNotFound", err)
 	}
 	var n int
@@ -1811,7 +1811,7 @@ func TestNextTaskRaceDistinctWinners(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			tk, _, err := st.NextTask("", "", fmt.Sprintf("agent-%d", i))
+			tk, _, err := st.NextTask(NextFilter{}, fmt.Sprintf("agent-%d", i))
 			results[i] = result{task: tk, err: err}
 		}(i)
 	}
@@ -1843,7 +1843,7 @@ func TestNextTaskRaceDistinctWinners(t *testing.T) {
 		go func(i int) {
 			defer wg2.Done()
 			<-start2
-			tk, _, err := st2.NextTask("", "", fmt.Sprintf("agent-%d", i))
+			tk, _, err := st2.NextTask(NextFilter{}, fmt.Sprintf("agent-%d", i))
 			results2[i] = result{task: tk, err: err}
 		}(i)
 	}
@@ -1868,7 +1868,7 @@ func TestNextTaskRaceDistinctWinners(t *testing.T) {
 
 func TestNextTaskEmptyAgentValidation(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.NextTask("", "", ""); !errors.Is(err, ErrValidation) {
+	if _, _, err := st.NextTask(NextFilter{}, ""); !errors.Is(err, ErrValidation) {
 		t.Fatalf("NextTask empty agent err = %v, want ErrValidation", err)
 	}
 }
@@ -2632,7 +2632,7 @@ func TestNextTaskCategoryScoping(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tk, _, err := st.NextTask("", "personal", "agent-a")
+	tk, _, err := st.NextTask(NextFilter{Category: "personal"}, "agent-a")
 	if err != nil {
 		t.Fatalf("NextTask(personal): %v", err)
 	}
@@ -2640,7 +2640,7 @@ func TestNextTaskCategoryScoping(t *testing.T) {
 		t.Fatalf("NextTask(personal) picked #%d, want #%d (never the work task)", tk.ID, p1.ID)
 	}
 	// Sequential pickers get distinct in-scope tasks.
-	tk2, _, err := st.NextTask("", "personal", "agent-b")
+	tk2, _, err := st.NextTask(NextFilter{Category: "personal"}, "agent-b")
 	if err != nil {
 		t.Fatalf("second NextTask(personal): %v", err)
 	}
@@ -2648,11 +2648,11 @@ func TestNextTaskCategoryScoping(t *testing.T) {
 		t.Fatalf("second pick = #%d, want #%d", tk2.ID, p2.ID)
 	}
 	// Scope drained → ErrNotFound even though work still has a ready task.
-	if _, _, err := st.NextTask("", "personal", "agent-c"); !errors.Is(err, ErrNotFound) {
+	if _, _, err := st.NextTask(NextFilter{Category: "personal"}, "agent-c"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("drained scope err = %v, want ErrNotFound", err)
 	}
 	// Bad category slug → ErrNotFound.
-	if _, _, err := st.NextTask("", "nosuch", "agent-d"); !errors.Is(err, ErrNotFound) {
+	if _, _, err := st.NextTask(NextFilter{Category: "nosuch"}, "agent-d"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("bad category err = %v, want ErrNotFound", err)
 	}
 
@@ -2660,7 +2660,7 @@ func TestNextTaskCategoryScoping(t *testing.T) {
 	if _, _, err := st.ArchiveCategory("work", "t"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := st.NextTask("", "", "agent-e"); !errors.Is(err, ErrNotFound) {
+	if _, _, err := st.NextTask(NextFilter{}, "agent-e"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unscoped next with only archived-category work err = %v, want ErrNotFound", err)
 	}
 }
@@ -2678,5 +2678,523 @@ func TestCreateTaskArchivedCategory(t *testing.T) {
 	}
 	if _, _, err := st.CreateTask(CreateTaskInput{Project: "wproj", Title: "nope"}); !errors.Is(err, ErrCategoryArchived) {
 		t.Fatalf("create task under archived category err = %v, want ErrCategoryArchived", err)
+	}
+}
+
+// ===================== Phase P: task meta =====================
+
+func TestTaskMetaCRUD(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create with meta — rows land, task.created data carries them.
+	tk, ev, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "carrier",
+		Meta: map[string]string{"Auto": "packet-7", "owner": "alice"}})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if ev == nil || ev.Kind != "task.created" {
+		t.Fatalf("event = %+v, want task.created", ev)
+	}
+	if !strings.Contains(string(ev.Data), `"meta"`) ||
+		!strings.Contains(string(ev.Data), `"auto":"packet-7"`) {
+		t.Fatalf("task.created data = %s, want meta with normalized auto key", ev.Data)
+	}
+
+	// GetTask returns the pairs (key normalized to lowercase).
+	got, err := st.GetTask(tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Meta) != 2 || got.Meta["auto"] != "packet-7" || got.Meta["owner"] != "alice" {
+		t.Fatalf("GetTask meta = %v, want auto=packet-7 owner=alice", got.Meta)
+	}
+
+	// Patch upsert: overwrite one key, add another — one event.
+	_, ev2, err := st.PatchTask(tk.ID, map[string]any{"meta": map[string]any{"auto": "packet-8", "stage": "review"}}, "alice")
+	if err != nil {
+		t.Fatalf("PatchTask meta: %v", err)
+	}
+	if ev2 == nil || ev2.Kind != "task.patched" {
+		t.Fatalf("patch event = %+v, want task.patched", ev2)
+	}
+	if !strings.Contains(string(ev2.Data), `"auto":["packet-7","packet-8"]`) {
+		t.Fatalf("patch delta = %s, want auto [packet-7,packet-8]", ev2.Data)
+	}
+	if !strings.Contains(string(ev2.Data), `"stage":[null,"review"]`) {
+		t.Fatalf("patch delta = %s, want stage [null,review]", ev2.Data)
+	}
+	got, err = st.GetTask(tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Meta) != 3 || got.Meta["auto"] != "packet-8" || got.Meta["stage"] != "review" {
+		t.Fatalf("meta after upsert = %v", got.Meta)
+	}
+
+	// Removal via empty value, delta records [old, nil].
+	_, ev3, err := st.PatchTask(tk.ID, map[string]any{"meta": map[string]any{"stage": ""}}, "alice")
+	if err != nil {
+		t.Fatalf("PatchTask remove: %v", err)
+	}
+	if ev3 == nil || !strings.Contains(string(ev3.Data), `"stage":["review",null]`) {
+		t.Fatalf("remove delta = %+v, want stage [review,null]", ev3)
+	}
+	got, err = st.GetTask(tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got.Meta["stage"]; ok {
+		t.Fatalf("meta after removal = %v, stage should be gone", got.Meta)
+	}
+
+	// Removing an absent key is a silent no-op (idempotent, no event).
+	_, ev4, err := st.PatchTask(tk.ID, map[string]any{"meta": map[string]any{"ghost": ""}}, "alice")
+	if err != nil {
+		t.Fatalf("absent-key removal: %v", err)
+	}
+	if ev4 != nil {
+		t.Fatalf("absent-key removal event = %+v, want nil", ev4)
+	}
+}
+
+func TestTaskMetaValidation(t *testing.T) {
+	// Key normalization shares the label rules but has its own error text.
+	keyCases := []struct {
+		in   string
+		want string // "" = expect ErrValidation
+	}{
+		{"Auto", "auto"}, // uppercase normalized
+		{"a b", ""},
+		{"k=v", ""},
+		{"", ""},
+		{strings.Repeat("a", 51), ""},
+		{strings.Repeat("a", 50), strings.Repeat("a", 50)}, // boundary ok
+	}
+	for _, c := range keyCases {
+		got, err := normalizeMetaKey(c.in)
+		if c.want == "" {
+			if !errors.Is(err, ErrValidation) {
+				t.Errorf("normalizeMetaKey(%q) err = %v, want ErrValidation", c.in, err)
+			}
+			continue
+		}
+		if err != nil || got != c.want {
+			t.Errorf("normalizeMetaKey(%q) = %q, %v, want %q", c.in, got, err, c.want)
+		}
+	}
+
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
+		t.Fatal(err)
+	}
+	// Oversized value at create.
+	if _, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "t",
+		Meta: map[string]string{"k": strings.Repeat("v", maxTitleLen+1)}}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("501-byte meta value err = %v, want ErrValidation", err)
+	}
+	// Empty value at create (removal has no meaning there).
+	if _, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "t",
+		Meta: map[string]string{"k": ""}}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("empty meta value at create err = %v, want ErrValidation", err)
+	}
+
+	tk, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "patchee"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Non-string patch value.
+	if _, _, err := st.PatchTask(tk.ID, map[string]any{"meta": map[string]any{"k": 42.0}}, "a"); !errors.Is(err, ErrValidation) {
+		t.Fatalf("non-string meta value err = %v, want ErrValidation", err)
+	}
+	// Non-object meta.
+	if _, _, err := st.PatchTask(tk.ID, map[string]any{"meta": "nope"}, "a"); !errors.Is(err, ErrValidation) {
+		t.Fatalf("non-object meta err = %v, want ErrValidation", err)
+	}
+	// '=' in key via patch.
+	if _, _, err := st.PatchTask(tk.ID, map[string]any{"meta": map[string]any{"k=v": "x"}}, "a"); !errors.Is(err, ErrValidation) {
+		t.Fatalf("'=' in key err = %v, want ErrValidation", err)
+	}
+	// Oversized value via patch.
+	if _, _, err := st.PatchTask(tk.ID, map[string]any{"meta": map[string]any{"k": strings.Repeat("v", maxTitleLen+1)}}, "a"); !errors.Is(err, ErrValidation) {
+		t.Fatalf("501-byte patch value err = %v, want ErrValidation", err)
+	}
+}
+
+func TestPatchTaskMetaAtomicOneEvent(t *testing.T) {
+	st, t1, _, _ := setupDepFixture(t)
+
+	// One call, two keys → exactly ONE task.patched carrying both.
+	_, ev, err := st.PatchTask(t1, map[string]any{"meta": map[string]any{"auto": "x", "owner": "alice"}}, "alice")
+	if err != nil {
+		t.Fatalf("PatchTask: %v", err)
+	}
+	if ev == nil || ev.Kind != "task.patched" {
+		t.Fatalf("event = %+v, want task.patched", ev)
+	}
+	if !strings.Contains(string(ev.Data), `"auto":[null,"x"]`) ||
+		!strings.Contains(string(ev.Data), `"owner":[null,"alice"]`) {
+		t.Fatalf("delta = %s, want both keys", ev.Data)
+	}
+	var n int
+	st.db.QueryRow("SELECT COUNT(*) FROM events WHERE kind='task.patched' AND task_id=?", t1).Scan(&n)
+	if n != 1 {
+		t.Fatalf("task.patched events = %d, want 1", n)
+	}
+
+	// Second-key validation failure rolls back the first key too (all-or-nothing).
+	st2, ta, _, _ := setupDepFixture(t)
+	if _, _, err := st2.PatchTask(ta, map[string]any{"meta": map[string]any{"a1": "ok", "bad key": "y"}}, "alice"); !errors.Is(err, ErrValidation) {
+		t.Fatalf("invalid second key err = %v, want ErrValidation", err)
+	}
+	var rows int
+	st2.db.QueryRow("SELECT COUNT(*) FROM task_meta WHERE task_id=?", ta).Scan(&rows)
+	if rows != 0 {
+		t.Fatalf("task_meta rows after failed patch = %d, want 0 (tx rollback)", rows)
+	}
+	st2.db.QueryRow("SELECT COUNT(*) FROM events WHERE kind='task.patched' AND task_id=?", ta).Scan(&rows)
+	if rows != 0 {
+		t.Fatalf("events after failed patch = %d, want 0", rows)
+	}
+}
+
+func TestPatchTaskMetaNoOpNoEvent(t *testing.T) {
+	st, t1, _, _ := setupDepFixture(t)
+	if _, _, err := st.PatchTask(t1, map[string]any{"meta": map[string]any{"auto": "x"}}, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	// Same key, same value — idempotent success, no event.
+	_, ev, err := st.PatchTask(t1, map[string]any{"meta": map[string]any{"auto": "x"}}, "alice")
+	if err != nil {
+		t.Fatalf("no-op patch: %v", err)
+	}
+	if ev != nil {
+		t.Fatalf("no-op patch event = %+v, want nil", ev)
+	}
+}
+
+func TestMetaOnlyPatchDoesNotBumpUpdatedAt(t *testing.T) {
+	st, t1, _, _ := setupDepFixture(t)
+	before, err := st.GetTask(t1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.PatchTask(t1, map[string]any{"meta": map[string]any{"auto": "x"}}, "alice"); err != nil {
+		t.Fatalf("meta patch: %v", err)
+	}
+	if _, _, err := st.PatchTask(t1, map[string]any{"meta": map[string]any{"auto": ""}}, "alice"); err != nil {
+		t.Fatalf("meta removal: %v", err)
+	}
+	after, err := st.GetTask(t1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.UpdatedAt != before.UpdatedAt {
+		t.Fatalf("updated_at changed %q → %q; meta edits must not refresh a stale claim", before.UpdatedAt, after.UpdatedAt)
+	}
+
+	// A mixed patch (field + meta) still bumps. Sleep past the millisecond
+	// resolution of strftime('%f') so the bump is observable.
+	time.Sleep(10 * time.Millisecond)
+	if _, _, err := st.PatchTask(t1, map[string]any{"priority": 1, "meta": map[string]any{"auto": "y"}}, "alice"); err != nil {
+		t.Fatalf("mixed patch: %v", err)
+	}
+	mixed, err := st.GetTask(t1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mixed.UpdatedAt == before.UpdatedAt {
+		t.Fatal("mixed field+meta patch did not bump updated_at")
+	}
+}
+
+// metaTaskMk creates a task carrying meta for the filter/next tests.
+func metaTaskMk(t *testing.T, st *Store, project, title string, priority int, meta map[string]string) int64 {
+	t.Helper()
+	tk, _, err := st.CreateTask(CreateTaskInput{Project: project, Title: title, Priority: priority, Meta: meta})
+	if err != nil {
+		t.Fatalf("CreateTask %s: %v", title, err)
+	}
+	return tk.ID
+}
+
+func TestNextTaskMetaFilter(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateCategory("work", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateProject("wproj", "", "work"); err != nil {
+		t.Fatal(err)
+	}
+
+	// An ordinary task outranks every carrier — the meta scope must skip it.
+	nextTaskMk(t, st, "web", "urgent plain", 0, "")
+	auto := map[string]string{"auto": "1"}
+	older := metaTaskMk(t, st, "web", "carrier p2 older", 2, auto)
+	metaTaskMk(t, st, "web", "carrier p2 newer", 2, auto)
+	urgent := metaTaskMk(t, st, "web", "carrier p1", 1, auto)
+	// A blocked carrier (open prereq) is never picked, even at p0.
+	prereq := nextTaskMk(t, st, "web", "prereq", 3, "")
+	blocked := metaTaskMk(t, st, "web", "carrier p0 blocked", 0, auto)
+	if _, err := st.AddDep(blocked, prereq, "alice"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Priority first among carriers…
+	tk, _, err := st.NextTask(NextFilter{MetaKey: "auto"}, "agent-a")
+	if err != nil {
+		t.Fatalf("NextTask(meta auto): %v", err)
+	}
+	if tk.ID != urgent {
+		t.Fatalf("picked #%d (%s), want carrier p1 #%d", tk.ID, tk.Title, urgent)
+	}
+	// …then FIFO within a priority.
+	tk2, _, err := st.NextTask(NextFilter{MetaKey: "auto"}, "agent-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tk2.ID != older {
+		t.Fatalf("picked #%d, want FIFO carrier #%d", tk2.ID, older)
+	}
+
+	// Composes with Category: the only carrier in "work" wins; "web"'s don't leak in.
+	wTask := metaTaskMk(t, st, "wproj", "work carrier", 3, auto)
+	tk3, _, err := st.NextTask(NextFilter{Category: "work", MetaKey: "auto"}, "agent-c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tk3.ID != wTask {
+		t.Fatalf("category+meta picked #%d, want #%d", tk3.ID, wTask)
+	}
+
+	// Drain the remaining unblocked carrier…
+	if tk4, _, err := st.NextTask(NextFilter{MetaKey: "auto"}, "agent-d"); err != nil || tk4.Title != "carrier p2 newer" {
+		t.Fatalf("drain pick = %+v, %v; want carrier p2 newer", tk4, err)
+	}
+	// …then only the blocked carrier is left → ErrNotFound (the plain ready
+	// task never counts).
+	if _, _, err := st.NextTask(NextFilter{MetaKey: "auto"}, "agent-d"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("exhausted carriers err = %v, want ErrNotFound", err)
+	}
+	// Bad key → ErrValidation.
+	if _, _, err := st.NextTask(NextFilter{MetaKey: "no spaces"}, "agent-e"); !errors.Is(err, ErrValidation) {
+		t.Fatalf("bad meta key err = %v, want ErrValidation", err)
+	}
+}
+
+func TestNextTaskMetaRaceDistinctWinners(t *testing.T) {
+	// N callers race for M<N carrier tasks while ordinary ready tasks abound:
+	// exactly M succeed, each with a DISTINCT carrier; the rest miss.
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
+		t.Fatal(err)
+	}
+	const n, m = 4, 2
+	for i := 0; i < n; i++ {
+		nextTaskMk(t, st, "web", fmt.Sprintf("plain %d", i), 0, "") // decoys, better priority
+	}
+	carriers := map[int64]bool{}
+	for i := 0; i < m; i++ {
+		carriers[metaTaskMk(t, st, "web", fmt.Sprintf("carrier %d", i), 2, map[string]string{"auto": "1"})] = true
+	}
+
+	type result struct {
+		task *Task
+		err  error
+	}
+	results := make([]result, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			tk, _, err := st.NextTask(NextFilter{MetaKey: "auto"}, fmt.Sprintf("agent-%d", i))
+			results[i] = result{task: tk, err: err}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	winners, misses := 0, 0
+	seen := map[int64]bool{}
+	for i, r := range results {
+		switch {
+		case r.err == nil:
+			winners++
+			if seen[r.task.ID] {
+				t.Fatalf("carrier #%d claimed twice", r.task.ID)
+			}
+			seen[r.task.ID] = true
+			if !carriers[r.task.ID] {
+				t.Fatalf("agent-%d won #%d (%s), which does not carry the key", i, r.task.ID, r.task.Title)
+			}
+		case errors.Is(r.err, ErrNotFound):
+			misses++
+		default:
+			t.Fatalf("agent-%d: unexpected error %v", i, r.err)
+		}
+	}
+	if winners != m || misses != n-m {
+		t.Fatalf("winners=%d misses=%d, want %d and %d", winners, misses, m, n-m)
+	}
+}
+
+func TestListTasksMetaKeyFilter(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateCategory("work", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateProject("wproj", "", "work"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Presence, not value: two tasks, same key, different values — both match.
+	a := metaTaskMk(t, st, "web", "a", 2, map[string]string{"auto": "one"})
+	b := metaTaskMk(t, st, "web", "b", 2, map[string]string{"auto": "two"})
+	plain := nextTaskMk(t, st, "web", "plain", 2, "")
+	w := metaTaskMk(t, st, "wproj", "w", 2, map[string]string{"auto": "three"})
+
+	got, err := st.ListTasks(TaskFilter{MetaKey: "auto"})
+	if err != nil {
+		t.Fatalf("ListTasks meta: %v", err)
+	}
+	ids := map[int64]bool{}
+	for _, tk := range got {
+		ids[tk.ID] = true
+	}
+	if len(got) != 3 || !ids[a] || !ids[b] || !ids[w] || ids[plain] {
+		t.Fatalf("MetaKey auto = %v, want {a,b,w}", ids)
+	}
+
+	// Composes with Category.
+	got, err = st.ListTasks(TaskFilter{MetaKey: "auto", Category: "work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != w {
+		t.Fatalf("MetaKey+Category = %+v, want only w", got)
+	}
+
+	// Composes with Ready (block one carrier behind an open prereq).
+	if _, err := st.AddDep(a, plain, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.ListTasks(TaskFilter{MetaKey: "auto", Ready: true, Project: "web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != b {
+		t.Fatalf("MetaKey+Ready = %+v, want only b", got)
+	}
+
+	// Composes with Status.
+	if _, _, err := st.PatchTask(b, map[string]any{"status": "done"}, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.ListTasks(TaskFilter{MetaKey: "auto", Status: "done"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != b {
+		t.Fatalf("MetaKey+Status = %+v, want only b", got)
+	}
+
+	// Filter input is normalized; invalid keys → ErrValidation.
+	if got, err = st.ListTasks(TaskFilter{MetaKey: "AUTO"}); err != nil || len(got) != 3 {
+		t.Fatalf("MetaKey AUTO = %d tasks, %v; want 3 (normalized)", len(got), err)
+	}
+	if _, err := st.ListTasks(TaskFilter{MetaKey: "no spaces"}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("invalid meta key err = %v, want ErrValidation", err)
+	}
+}
+
+func TestListTasksReturnsMeta(t *testing.T) {
+	st, t1, t2, _ := setupDepFixture(t)
+	// Values with ',' and '=' must survive the stitch (the reason meta is NOT
+	// fetched via GROUP_CONCAT like labels).
+	gnarly := "a=b,c=d, trailing"
+	if _, _, err := st.PatchTask(t1, map[string]any{"meta": map[string]any{"auto": gnarly, "owner": "alice"}}, "a"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.ListTasks(TaskFilter{Project: "web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seen1, seen2 bool
+	for _, tk := range got {
+		switch tk.ID {
+		case t1:
+			seen1 = true
+			if len(tk.Meta) != 2 || tk.Meta["auto"] != gnarly || tk.Meta["owner"] != "alice" {
+				t.Fatalf("t1 meta = %v, want auto=%q owner=alice", tk.Meta, gnarly)
+			}
+		case t2:
+			seen2 = true
+			if len(tk.Meta) != 0 {
+				t.Fatalf("t2 meta = %v, want empty", tk.Meta)
+			}
+		}
+	}
+	if !seen1 || !seen2 {
+		t.Fatalf("list missing fixture tasks (seen1=%v seen2=%v)", seen1, seen2)
+	}
+}
+
+func TestDeleteTaskCascadesMeta(t *testing.T) {
+	st, t1, _, _ := setupDepFixture(t)
+	if _, _, err := st.PatchTask(t1, map[string]any{"meta": map[string]any{"auto": "x"}}, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DeleteTask(t1, "alice"); err != nil {
+		t.Fatalf("DeleteTask: %v", err)
+	}
+	var count int
+	st.db.QueryRow("SELECT COUNT(*) FROM task_meta WHERE task_id=?", t1).Scan(&count)
+	if count != 0 {
+		t.Fatalf("task_meta rows survived task deletion, count=%d", count)
+	}
+}
+
+func TestTaskMetaTableExistsOnReopenedDB(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "fresh.db")
+	st, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatalf("first OpenStore: %v", err)
+	}
+	// Simulate a pre-Phase-P DB: drop the table, then reopen.
+	if _, err := st.db.Exec("DROP TABLE task_meta"); err != nil {
+		t.Fatalf("drop task_meta: %v", err)
+	}
+	st.Close()
+
+	// Reopen — task_meta must come back (CREATE TABLE IF NOT EXISTS path),
+	// with no migration step and no version bump.
+	st2, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatalf("second OpenStore: %v", err)
+	}
+	defer st2.Close()
+
+	var count int
+	if err := st2.db.QueryRow("SELECT COUNT(*) FROM task_meta").Scan(&count); err != nil {
+		t.Fatalf("task_meta table missing after reopen: %v", err)
+	}
+	v, err := readSchemaVersion(st2.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != currentSchemaVersion {
+		t.Fatalf("schema_version = %d, want %d (meta needs no migration)", v, currentSchemaVersion)
 	}
 }

@@ -83,26 +83,27 @@ type DepRef struct {
 }
 
 type Task struct {
-	ID           int64     `json:"id"`
-	ProjectID    int64     `json:"project_id"`
-	Project      string    `json:"project"` // slug
-	Ref          int64     `json:"ref"`
-	Title        string    `json:"title"`
-	Body         string    `json:"body,omitempty"`
-	Status       string    `json:"status"`
-	Assignee     string    `json:"assignee"`
-	Priority     int       `json:"priority"`
-	NComments    int       `json:"nc"`
-	NPrereqs     int       `json:"nprereq,omitempty"`
-	NOpenPrereqs int       `json:"nopen,omitempty"`
-	CreatedAt    string    `json:"created_at"`
-	UpdatedAt    string    `json:"updated_at"`
-	ClaimedAt    string    `json:"claimed_at,omitempty"`
-	Labels       []string  `json:"labels,omitempty"`
-	Comments     []Comment `json:"comments,omitempty"`
-	Events       []Event   `json:"events,omitempty"`
-	DependsOn    []DepRef  `json:"depends_on,omitempty"`
-	Blocks       []DepRef  `json:"blocks,omitempty"`
+	ID           int64             `json:"id"`
+	ProjectID    int64             `json:"project_id"`
+	Project      string            `json:"project"` // slug
+	Ref          int64             `json:"ref"`
+	Title        string            `json:"title"`
+	Body         string            `json:"body,omitempty"`
+	Status       string            `json:"status"`
+	Assignee     string            `json:"assignee"`
+	Priority     int               `json:"priority"`
+	NComments    int               `json:"nc"`
+	NPrereqs     int               `json:"nprereq,omitempty"`
+	NOpenPrereqs int               `json:"nopen,omitempty"`
+	CreatedAt    string            `json:"created_at"`
+	UpdatedAt    string            `json:"updated_at"`
+	ClaimedAt    string            `json:"claimed_at,omitempty"`
+	Labels       []string          `json:"labels,omitempty"`
+	Meta         map[string]string `json:"meta,omitempty"`
+	Comments     []Comment         `json:"comments,omitempty"`
+	Events       []Event           `json:"events,omitempty"`
+	DependsOn    []DepRef          `json:"depends_on,omitempty"`
+	Blocks       []DepRef          `json:"blocks,omitempty"`
 }
 
 type Comment struct {
@@ -130,10 +131,20 @@ type TaskFilter struct {
 	Assignee string
 	Query    string // substring match on title OR body (LIKE, ASCII-case-insensitive)
 	Label    string // tasks carrying this label (normalized before matching)
+	MetaKey  string // tasks carrying this meta key (presence, not value; normalized)
 	Limit    int
 	Ready    bool          // todo tasks with no open prereqs
 	Blocked  bool          // tasks with ≥1 open prereq
 	Stale    time.Duration // >0: assigned, not-done tasks with no activity since the cutoff
+}
+
+// NextFilter scopes NextTask (the atomic pick+claim). Each field composes with
+// the others; Phase Q adds more dimensions here rather than widening the
+// signature again.
+type NextFilter struct {
+	Project  string
+	Category string
+	MetaKey  string // only tasks carrying this meta key (presence, not value)
 }
 
 // ---------- store ----------
@@ -861,6 +872,14 @@ func (s *Store) ListTasks(f TaskFilter) ([]Task, error) {
 		where = append(where, "EXISTS (SELECT 1 FROM task_labels tl WHERE tl.task_id=t.id AND tl.label=?)")
 		args = append(args, l)
 	}
+	if f.MetaKey != "" {
+		k, err := normalizeMetaKey(f.MetaKey)
+		if err != nil {
+			return nil, err
+		}
+		where = append(where, "EXISTS (SELECT 1 FROM task_meta m WHERE m.task_id=t.id AND m.key=?)")
+		args = append(args, k)
+	}
 	// open-prereq subquery reused for both Blocked and Ready filters.
 	const openPrereqExpr = `EXISTS (SELECT 1 FROM task_deps d JOIN tasks pt ON pt.id=d.depends_on_id WHERE d.task_id=t.id AND pt.status!='done')`
 	if f.Blocked {
@@ -910,7 +929,44 @@ func (s *Store) ListTasks(f TaskFilter) ([]Task, error) {
 		}
 		out = append(out, t)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Stitch meta with one follow-up SELECT. Values are opaque (may contain
+	// ',' or '='), so the GROUP_CONCAT trick used for labels is unsafe here.
+	if len(out) > 0 {
+		idx := make(map[int64]int, len(out))
+		ph := make([]string, len(out))
+		margs := make([]any, len(out))
+		for i := range out {
+			idx[out[i].ID] = i
+			ph[i] = "?"
+			margs[i] = out[i].ID
+		}
+		mrows, err := s.db.Query(
+			"SELECT task_id, key, value FROM task_meta WHERE task_id IN ("+strings.Join(ph, ",")+")", margs...)
+		if err != nil {
+			return nil, err
+		}
+		defer mrows.Close()
+		for mrows.Next() {
+			var tid int64
+			var k, v string
+			if err := mrows.Scan(&tid, &k, &v); err != nil {
+				return nil, err
+			}
+			i := idx[tid]
+			if out[i].Meta == nil {
+				out[i].Meta = map[string]string{}
+			}
+			out[i].Meta[k] = v
+		}
+		if err := mrows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 func (s *Store) getTaskTx(q queryer, id int64) (*Task, error) {
@@ -1025,6 +1081,26 @@ func (s *Store) GetTask(id int64) (*Task, error) {
 		return nil, err
 	}
 
+	// Populate Meta (the map is unordered; JSON output sorts keys on marshal).
+	mrows, err := s.db.Query("SELECT key, value FROM task_meta WHERE task_id=? ORDER BY key", id)
+	if err != nil {
+		return nil, err
+	}
+	defer mrows.Close()
+	for mrows.Next() {
+		var k, v string
+		if err := mrows.Scan(&k, &v); err != nil {
+			return nil, err
+		}
+		if t.Meta == nil {
+			t.Meta = map[string]string{}
+		}
+		t.Meta[k] = v
+	}
+	if err := mrows.Err(); err != nil {
+		return nil, err
+	}
+
 	// Also populate the terse counts for the full task view.
 	if err := s.db.QueryRow(`SELECT
 	       COALESCE((SELECT COUNT(*) FROM task_deps d WHERE d.task_id=?),0),
@@ -1062,6 +1138,18 @@ func normalizeLabel(s string) (string, error) {
 	return s, nil
 }
 
+// normalizeMetaKey trims, lowercases, and validates a meta key. Keys are the
+// filterable unit, so they reuse the label rules (labelRe, maxLabelLen) — the
+// charset excludes '=' and space, keeping the CLI's key=value tokens
+// unambiguous. Values stay opaque (any bytes, capped at maxTitleLen).
+func normalizeMetaKey(s string) (string, error) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if len(s) < 1 || len(s) > maxLabelLen || !labelRe.MatchString(s) {
+		return "", fmt.Errorf("%w: meta key must be 1-50 chars of a-z 0-9 . _ -", ErrValidation)
+	}
+	return s, nil
+}
+
 type CreateTaskInput struct {
 	Project  string
 	Title    string
@@ -1069,6 +1157,7 @@ type CreateTaskInput struct {
 	Priority int
 	Assignee string
 	Actor    string
+	Meta     map[string]string // initial key→value pairs; empty values are invalid here
 }
 
 func (s *Store) CreateTask(in CreateTaskInput) (*Task, *Event, error) {
@@ -1078,6 +1167,20 @@ func (s *Store) CreateTask(in CreateTaskInput) (*Task, *Event, error) {
 	if len(in.Title) > maxTitleLen || len(in.Body) > maxBodyLen ||
 		in.Priority < minPriority || in.Priority > maxPriority {
 		return nil, nil, ErrValidation
+	}
+	// Validate every meta pair up front (all-or-nothing): keys normalized like
+	// labels; values opaque but non-empty (removal has no meaning at create)
+	// and capped like titles (they render onto board cards and SSE payloads).
+	meta := make(map[string]string, len(in.Meta))
+	for k, v := range in.Meta {
+		nk, err := normalizeMetaKey(k)
+		if err != nil {
+			return nil, nil, err
+		}
+		if v == "" || len(v) > maxTitleLen {
+			return nil, nil, fmt.Errorf("%w: meta value must be 1-%d bytes", ErrValidation, maxTitleLen)
+		}
+		meta[nk] = v
 	}
 	pid, err := s.projectID(in.Project)
 	if err != nil {
@@ -1115,8 +1218,21 @@ func (s *Store) CreateTask(in CreateTaskInput) (*Task, *Event, error) {
 		return nil, nil, err
 	}
 	id, _ := res.LastInsertId()
-	ev, err := insertEvent(tx, pid, id, actorOr(in.Actor), "task.created",
-		map[string]any{"title": in.Title})
+	evData := map[string]any{"title": in.Title}
+	if len(meta) > 0 {
+		keys := make([]string, 0, len(meta))
+		for k := range meta {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if _, err := tx.Exec("INSERT INTO task_meta(task_id,key,value) VALUES(?,?,?)", id, k, meta[k]); err != nil {
+				return nil, nil, err
+			}
+		}
+		evData["meta"] = meta
+	}
+	ev, err := insertEvent(tx, pid, id, actorOr(in.Actor), "task.created", evData)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1214,14 +1330,42 @@ func (s *Store) PatchTask(id int64, patch map[string]any, actor string) (*Task, 
 			delta["priority"] = []any{cur.Priority, pr}
 		}
 	}
+	metaChanged := false
+	if v, ok := patch["meta"]; ok {
+		mm, ok := v.(map[string]any)
+		if !ok {
+			return nil, nil, fmt.Errorf("%w: meta must be an object of string values", ErrValidation)
+		}
+		meta := make(map[string]string, len(mm))
+		for k, raw := range mm {
+			sv, ok := raw.(string)
+			if !ok {
+				return nil, nil, fmt.Errorf("%w: meta values must be strings", ErrValidation)
+			}
+			meta[k] = sv
+		}
+		var metaDelta map[string]any
+		metaDelta, metaChanged, err = applyMetaTx(tx, id, meta)
+		if err != nil {
+			return nil, nil, err
+		}
+		if metaChanged {
+			delta["meta"] = metaDelta
+		}
+	}
 
-	if len(sets) == 0 { // no-op: idempotent success, no event
+	if len(sets) == 0 && !metaChanged { // no-op: idempotent success, no event
 		return cur, nil, tx.Commit()
 	}
-	sets = append(sets, "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')")
-	args = append(args, id)
-	if _, err := tx.Exec("UPDATE tasks SET "+strings.Join(sets, ",")+" WHERE id=?", args...); err != nil {
-		return nil, nil, err
+	// Meta-only patches deliberately skip the updated_at bump: meta is metadata
+	// like labels, and refreshing the activity timestamp would keep a stale
+	// claim alive (the AddLabel/dep-edge precedent, ADR-024).
+	if len(sets) > 0 {
+		sets = append(sets, "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')")
+		args = append(args, id)
+		if _, err := tx.Exec("UPDATE tasks SET "+strings.Join(sets, ",")+" WHERE id=?", args...); err != nil {
+			return nil, nil, err
+		}
 	}
 	kind := "task.patched"
 	if statusChanged {
@@ -1408,31 +1552,42 @@ func (s *Store) StealStaleClaim(id int64, agent string, staleFor time.Duration) 
 
 // NextTask atomically picks and claims the best ready task: status todo,
 // unassigned, no open prerequisites, in a non-archived project AND non-archived
-// category — optionally scoped to a project and/or category slug. Returns
+// category — optionally scoped by f (project/category slug, meta key). Returns
 // ErrNotFound when nothing qualifies (or a slug does not exist). Tasks
 // pre-assigned to the caller are deliberately skipped (candidates require
 // assignee IS NULL) — claim those with `am claim`.
-func (s *Store) NextTask(project, category, agent string) (*Task, *Event, error) {
+func (s *Store) NextTask(f NextFilter, agent string) (*Task, *Event, error) {
 	if agent == "" {
 		return nil, nil, ErrValidation
 	}
 	scope := ""
 	args := []any{agent}
-	if project != "" {
-		pid, err := s.projectID(project)
+	if f.Project != "" {
+		pid, err := s.projectID(f.Project)
 		if err != nil {
 			return nil, nil, err // ErrNotFound for a bad slug
 		}
 		scope += " AND t.project_id=?"
 		args = append(args, pid)
 	}
-	if category != "" {
-		cid, err := s.categoryID(category)
+	if f.Category != "" {
+		cid, err := s.categoryID(f.Category)
 		if err != nil {
 			return nil, nil, err // ErrNotFound for a bad slug
 		}
 		scope += " AND p.category_id=?"
 		args = append(args, cid)
+	}
+	if f.MetaKey != "" {
+		k, err := normalizeMetaKey(f.MetaKey)
+		if err != nil {
+			return nil, nil, err
+		}
+		// Must stay textually equivalent to ListTasks' MetaKey predicate — the
+		// wait/next invariant: a task that releases `am wait --ready --meta K`
+		// must be pickable by `am next --meta K`. Phase Q extends scope here.
+		scope += " AND EXISTS (SELECT 1 FROM task_meta m WHERE m.task_id=t.id AND m.key=?)"
+		args = append(args, k)
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -1726,6 +1881,57 @@ func (s *Store) RemoveLabel(taskID int64, label, actor string) (*Event, error) {
 		return nil, err
 	}
 	return ev, tx.Commit()
+}
+
+// ---------- meta ----------
+
+// applyMetaTx upserts/deletes task_meta rows for taskID inside tx, walking
+// keys in sorted order so event payloads and failure points are deterministic.
+// An empty value removes the key (absent key = silent no-op); any validation
+// error aborts the caller's tx, so a multi-key patch is all-or-nothing. The
+// returned delta maps key → [old, new] (nil = absent) for keys that changed.
+func applyMetaTx(tx *sql.Tx, taskID int64, meta map[string]string) (map[string]any, bool, error) {
+	keys := make([]string, 0, len(meta))
+	for k := range meta {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	delta := map[string]any{}
+	for _, rawK := range keys {
+		k, err := normalizeMetaKey(rawK)
+		if err != nil {
+			return nil, false, err
+		}
+		var old sql.NullString
+		err = tx.QueryRow("SELECT value FROM task_meta WHERE task_id=? AND key=?", taskID, k).Scan(&old)
+		if err != nil && err != sql.ErrNoRows {
+			return nil, false, err
+		}
+		v := meta[rawK]
+		if v == "" { // empty value = remove the key
+			if !old.Valid {
+				continue // already absent — silent no-op
+			}
+			if _, err := tx.Exec("DELETE FROM task_meta WHERE task_id=? AND key=?", taskID, k); err != nil {
+				return nil, false, err
+			}
+			delta[k] = []any{old.String, nil}
+			continue
+		}
+		// Values are opaque but capped like titles (board cards, SSE payloads).
+		if len(v) > maxTitleLen {
+			return nil, false, fmt.Errorf("%w: meta value must be 1-%d bytes", ErrValidation, maxTitleLen)
+		}
+		if old.Valid && old.String == v {
+			continue // unchanged
+		}
+		if _, err := tx.Exec(`INSERT INTO task_meta(task_id,key,value) VALUES(?,?,?)
+		       ON CONFLICT(task_id,key) DO UPDATE SET value=excluded.value`, taskID, k, v); err != nil {
+			return nil, false, err
+		}
+		delta[k] = []any{nullable(old.String), v}
+	}
+	return delta, len(delta) > 0, nil
 }
 
 // wouldCycle reports whether adding an edge taskID→dependsOnID would introduce

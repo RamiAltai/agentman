@@ -65,6 +65,17 @@ CREATE TABLE IF NOT EXISTS task_labels (
 );
 CREATE INDEX IF NOT EXISTS idx_task_labels_label ON task_labels(label);
 
+-- task_meta: key→value pairs on tasks (values are opaque; key PRESENCE is the
+-- filterable unit). Like task_labels there is no separate catalog — a key
+-- exists iff some task carries it.
+CREATE TABLE IF NOT EXISTS task_meta (
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  key     TEXT NOT NULL,
+  value   TEXT NOT NULL,
+  PRIMARY KEY (task_id, key)
+);
+CREATE INDEX IF NOT EXISTS idx_task_meta_key ON task_meta(key);
+
 -- comments: discussion thread on a task.
 CREATE TABLE IF NOT EXISTS comments (
   id         INTEGER PRIMARY KEY,

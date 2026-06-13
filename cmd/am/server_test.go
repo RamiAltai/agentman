@@ -1430,3 +1430,212 @@ func TestCreateTaskArchivedCategory400(t *testing.T) {
 		t.Fatalf("error body = %v, want category_archived", body)
 	}
 }
+
+// ---------- Phase P: task meta over HTTP ----------
+
+func TestCreateTaskWithMeta(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+
+	r := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"web","title":"carrier","meta":{"Auto":"packet-7","owner":"alice"}}`,
+		map[string]string{"X-Agent": "agent-a", "Content-Type": "application/json"})
+	if r.StatusCode != http.StatusCreated {
+		r.Body.Close()
+		t.Fatalf("POST with meta = %d, want 201", r.StatusCode)
+	}
+	var tk Task
+	if err := json.NewDecoder(r.Body).Decode(&tk); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	r.Body.Close()
+
+	// GET returns the normalized pairs.
+	r = do(t, ts, http.MethodGet, "/api/tasks/"+strconv.FormatInt(tk.ID, 10), "", nil)
+	var got Task
+	if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	r.Body.Close()
+	if len(got.Meta) != 2 || got.Meta["auto"] != "packet-7" || got.Meta["owner"] != "alice" {
+		t.Fatalf("meta = %v, want auto=packet-7 owner=alice", got.Meta)
+	}
+
+	// The task.created event data carries the meta.
+	r = do(t, ts, http.MethodGet, "/api/events?since=0", "", nil)
+	var feed struct {
+		Events []Event `json:"events"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&feed); err != nil {
+		t.Fatalf("decode events: %v", err)
+	}
+	r.Body.Close()
+	var found bool
+	for _, ev := range feed.Events {
+		if ev.Kind == "task.created" && strings.Contains(string(ev.Data), `"auto":"packet-7"`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("no task.created event carrying the meta")
+	}
+
+	// Bad key → 400.
+	r = do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"web","title":"bad","meta":{"no spaces":"x"}}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	if r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad meta key create = %d, want 400", r.StatusCode)
+	}
+}
+
+func TestPatchTaskMetaEndpoint(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+	id := mustCreateTask(t, ts, "web", "patch me")
+
+	// PATCH two keys → 200, ONE task.patched event with both.
+	r := do(t, ts, http.MethodPatch, "/api/tasks/"+id, `{"meta":{"auto":"x","owner":"alice"}}`,
+		map[string]string{"X-Agent": "agent-a", "Content-Type": "application/json"})
+	r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH meta = %d, want 200", r.StatusCode)
+	}
+
+	// Removal via empty value.
+	r = do(t, ts, http.MethodPatch, "/api/tasks/"+id, `{"meta":{"owner":""}}`,
+		map[string]string{"X-Agent": "agent-a", "Content-Type": "application/json"})
+	r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH meta removal = %d, want 200", r.StatusCode)
+	}
+	r = do(t, ts, http.MethodGet, "/api/tasks/"+id, "", nil)
+	var tk Task
+	if err := json.NewDecoder(r.Body).Decode(&tk); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	r.Body.Close()
+	if len(tk.Meta) != 1 || tk.Meta["auto"] != "x" {
+		t.Fatalf("meta after removal = %v, want only auto=x", tk.Meta)
+	}
+
+	// Bad key → 400.
+	r = do(t, ts, http.MethodPatch, "/api/tasks/"+id, `{"meta":{"k=v":"x"}}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	if r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad meta key patch = %d, want 400", r.StatusCode)
+	}
+
+	// Exactly two task.patched events (set + removal), the first carrying both keys.
+	r = do(t, ts, http.MethodGet, "/api/events?since=0", "", nil)
+	var feed struct {
+		Events []Event `json:"events"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&feed); err != nil {
+		t.Fatalf("decode events: %v", err)
+	}
+	r.Body.Close()
+	var patched []Event
+	for _, ev := range feed.Events {
+		if ev.Kind == "task.patched" {
+			patched = append(patched, ev)
+		}
+	}
+	if len(patched) != 2 {
+		t.Fatalf("task.patched events = %d, want 2", len(patched))
+	}
+	if !strings.Contains(string(patched[0].Data), `"auto":[null,"x"]`) ||
+		!strings.Contains(string(patched[0].Data), `"owner":[null,"alice"]`) {
+		t.Fatalf("first patch delta = %s, want both keys in one event", patched[0].Data)
+	}
+	if !strings.Contains(string(patched[1].Data), `"owner":["alice",null]`) {
+		t.Fatalf("removal delta = %s, want owner [alice,null]", patched[1].Data)
+	}
+}
+
+func TestNextEndpointMetaBody(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+	// The plain task is more urgent — a meta-scoped next must skip it.
+	r := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"web","title":"urgent plain","priority":0}`,
+		map[string]string{"Content-Type": "application/json"})
+	r.Body.Close()
+	rc := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"web","title":"carrier","meta":{"auto":"1"}}`,
+		map[string]string{"Content-Type": "application/json"})
+	var carrier Task
+	if err := json.NewDecoder(rc.Body).Decode(&carrier); err != nil {
+		t.Fatalf("decode carrier: %v", err)
+	}
+	rc.Body.Close()
+
+	rn := do(t, ts, http.MethodPost, "/api/tasks/next", `{"meta_key":"auto"}`,
+		map[string]string{"X-Agent": "agent-a", "Content-Type": "application/json"})
+	if rn.StatusCode != http.StatusOK {
+		rn.Body.Close()
+		t.Fatalf("meta next = %d, want 200", rn.StatusCode)
+	}
+	var tk Task
+	if err := json.NewDecoder(rn.Body).Decode(&tk); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	rn.Body.Close()
+	if tk.ID != carrier.ID {
+		t.Fatalf("meta next picked #%d, want carrier #%d", tk.ID, carrier.ID)
+	}
+
+	// No carriers left → 404 (the plain ready task never counts).
+	rn = do(t, ts, http.MethodPost, "/api/tasks/next", `{"meta_key":"auto"}`,
+		map[string]string{"X-Agent": "agent-b", "Content-Type": "application/json"})
+	rn.Body.Close()
+	if rn.StatusCode != http.StatusNotFound {
+		t.Fatalf("exhausted meta next = %d, want 404", rn.StatusCode)
+	}
+
+	// Bad key → 400.
+	rn = do(t, ts, http.MethodPost, "/api/tasks/next", `{"meta_key":"no spaces"}`,
+		map[string]string{"X-Agent": "agent-c", "Content-Type": "application/json"})
+	rn.Body.Close()
+	if rn.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad meta key next = %d, want 400", rn.StatusCode)
+	}
+}
+
+func TestListTasksMetaKeyParam(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+	mustCreateTask(t, ts, "web", "plain")
+	r := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"web","title":"carrier","meta":{"auto":"1"}}`,
+		map[string]string{"Content-Type": "application/json"})
+	var carrier Task
+	if err := json.NewDecoder(r.Body).Decode(&carrier); err != nil {
+		t.Fatalf("decode carrier: %v", err)
+	}
+	r.Body.Close()
+
+	// ?meta_key=auto&ready=true — this IS the query `am wait --ready --meta`
+	// re-checks against; presence-only, composed with ready.
+	r = do(t, ts, http.MethodGet, "/api/tasks?meta_key=auto&ready=true", "", nil)
+	var tasks []Task
+	if err := json.NewDecoder(r.Body).Decode(&tasks); err != nil {
+		t.Fatalf("decode tasks: %v", err)
+	}
+	r.Body.Close()
+	if len(tasks) != 1 || tasks[0].ID != carrier.ID {
+		t.Fatalf("?meta_key=auto&ready=true = %+v, want only the carrier", tasks)
+	}
+	if tasks[0].Meta["auto"] != "1" {
+		t.Fatalf("list meta = %v, want auto=1 stitched in", tasks[0].Meta)
+	}
+
+	// Bad key → 400.
+	r = do(t, ts, http.MethodGet, "/api/tasks?meta_key=no%20spaces", "", nil)
+	r.Body.Close()
+	if r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad meta_key = %d, want 400", r.StatusCode)
+	}
+}

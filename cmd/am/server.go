@@ -292,7 +292,8 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		Category: q.Get("category"),
 		Status:   q.Get("status"),
 		Assignee: q.Get("assignee"),
-		Label:    q.Get("label"), // store validates/normalizes
+		Label:    q.Get("label"),    // store validates/normalizes
+		MetaKey:  q.Get("meta_key"), // store validates/normalizes
 		Limit:    atoiDefault(q.Get("limit"), 0),
 		Ready:    q.Get("ready") == "true",
 		Blocked:  q.Get("blocked") == "true",
@@ -425,11 +426,12 @@ func (s *Server) handleRemoveLabel(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Project  string `json:"project"`
-		Title    string `json:"title"`
-		Body     string `json:"body"`
-		Assignee string `json:"assignee"`
-		Priority *int   `json:"priority"`
+		Project  string            `json:"project"`
+		Title    string            `json:"title"`
+		Body     string            `json:"body"`
+		Assignee string            `json:"assignee"`
+		Priority *int              `json:"priority"`
+		Meta     map[string]string `json:"meta"`
 	}
 	if err := decode(r, &in); err != nil {
 		writeErr(w, ErrValidation)
@@ -441,7 +443,7 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	}
 	t, ev, err := s.store.CreateTask(CreateTaskInput{
 		Project: in.Project, Title: in.Title, Body: in.Body,
-		Priority: pr, Assignee: in.Assignee, Actor: actorOf(r),
+		Priority: pr, Assignee: in.Assignee, Actor: actorOf(r), Meta: in.Meta,
 	})
 	if err != nil {
 		writeErr(w, err)
@@ -528,12 +530,13 @@ func (s *Server) handleNext(w http.ResponseWriter, r *http.Request) {
 		Project  string `json:"project"`
 		Category string `json:"category"`
 		Assignee string `json:"assignee"`
+		MetaKey  string `json:"meta_key"`
 	}
 	_ = decode(r, &in)
 	if in.Assignee != "" {
 		agent = in.Assignee
 	}
-	t, ev, err := s.store.NextTask(in.Project, in.Category, agent)
+	t, ev, err := s.store.NextTask(NextFilter{Project: in.Project, Category: in.Category, MetaKey: in.MetaKey}, agent)
 	if err != nil {
 		writeErr(w, err)
 		return

@@ -907,3 +907,212 @@ func TestRewriteShowComments(t *testing.T) {
 		t.Fatalf("rewriteShowComments = %v", got)
 	}
 }
+
+// ---------- Phase P: --meta flag tests ----------
+
+func TestParseMultiFlag(t *testing.T) {
+	// Repeated --meta collects every occurrence, in order, including the = form.
+	a := parse([]string{"--meta", "a=1", "--meta=b=2", "--meta", "c=3"})
+	got := a.all("meta")
+	if len(got) != 3 || got[0] != "a=1" || got[1] != "b=2" || got[2] != "c=3" {
+		t.Fatalf("all(meta) = %v, want [a=1 b=2 c=3]", got)
+	}
+	if a.flag("meta") != "" {
+		t.Fatalf("flag(meta) = %q, want empty (meta is multi, not single)", a.flag("meta"))
+	}
+	// Single-value flags are still last-wins.
+	a = parse([]string{"--body", "first", "--body", "second"})
+	if a.flag("body") != "second" {
+		t.Fatalf("repeated --body = %q, want last-wins second", a.flag("body"))
+	}
+	// No --meta → empty slice.
+	if got := parse([]string{"x"}).all("meta"); len(got) != 0 {
+		t.Fatalf("all(meta) with no flags = %v, want empty", got)
+	}
+}
+
+func TestCmdNewMetaWireFormat(t *testing.T) {
+	var posts int
+	var body string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		posts++
+		b, _ := io.ReadAll(r.Body)
+		body = string(b)
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte(`{"id":1}`))
+	}))
+	t.Cleanup(stub.Close)
+	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+
+	captureStdout(t, func() {
+		cmdNew(c, parse([]string{"title", "-p", "web", "--meta", "a=1", "--meta", "b=2"}))
+	})
+	if posts != 1 {
+		t.Fatalf("POST count = %d, want 1 (all meta in one request)", posts)
+	}
+	var sent struct {
+		Meta map[string]string `json:"meta"`
+	}
+	if err := json.Unmarshal([]byte(body), &sent); err != nil {
+		t.Fatalf("unmarshal body %q: %v", body, err)
+	}
+	if len(sent.Meta) != 2 || sent.Meta["a"] != "1" || sent.Meta["b"] != "2" {
+		t.Fatalf("body meta = %v, want {a:1 b:2}", sent.Meta)
+	}
+
+	// Missing '=' and empty value are usage errors (exit 5) — before any request.
+	posts = 0
+	code := captureExit(t, func() {
+		captureStderr(t, func() { cmdNew(c, parse([]string{"t", "-p", "web", "--meta", "bare"})) })
+	})
+	if code != 5 || posts != 0 {
+		t.Fatalf("--meta bare exit = %d posts = %d, want 5 and 0", code, posts)
+	}
+	code = captureExit(t, func() {
+		captureStderr(t, func() { cmdNew(c, parse([]string{"t", "-p", "web", "--meta", "k="})) })
+	})
+	if code != 5 || posts != 0 {
+		t.Fatalf("--meta k= on new exit = %d posts = %d, want 5 and 0", code, posts)
+	}
+}
+
+func TestCmdEditMetaSinglePatch(t *testing.T) {
+	var patches int
+	var body string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPatch {
+			patches++
+			b, _ := io.ReadAll(r.Body)
+			body = string(b)
+		}
+		w.Write([]byte(`{"id":1}`))
+	}))
+	t.Cleanup(stub.Close)
+	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+
+	// Two sets and one removal — the dispatcher's atomic auto+packet flip —
+	// must ride in exactly ONE PATCH.
+	cmdEdit(c, parse([]string{"1", "--meta", "auto=packet-8", "--meta", "stage=review", "--meta", "old="}))
+	if patches != 1 {
+		t.Fatalf("PATCH count = %d, want 1", patches)
+	}
+	var sent struct {
+		Meta map[string]string `json:"meta"`
+	}
+	if err := json.Unmarshal([]byte(body), &sent); err != nil {
+		t.Fatalf("unmarshal body %q: %v", body, err)
+	}
+	if len(sent.Meta) != 3 || sent.Meta["auto"] != "packet-8" ||
+		sent.Meta["stage"] != "review" || sent.Meta["old"] != "" {
+		t.Fatalf("patch meta = %v, want auto/stage set and old:\"\" removal", sent.Meta)
+	}
+
+	// Values may contain '=' — split happens at the FIRST one.
+	cmdEdit(c, parse([]string{"1", "--meta", "expr=a=b"}))
+	if !strings.Contains(body, `"expr":"a=b"`) {
+		t.Fatalf("body = %q, want expr=a=b (split at first =)", body)
+	}
+
+	// --meta alone is a change; no flags at all still errors.
+	code := captureExit(t, func() {
+		captureStderr(t, func() { cmdEdit(c, parse([]string{"1"})) })
+	})
+	if code != 1 {
+		t.Fatalf("edit with nothing exit = %d, want 1", code)
+	}
+}
+
+func TestCmdNextMetaWireFormat(t *testing.T) {
+	var body string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		b, _ := io.ReadAll(r.Body)
+		body = string(b)
+		w.Write([]byte(`{"id":7}`))
+	}))
+	t.Cleanup(stub.Close)
+	t.Setenv("AGENTMAN_AGENT", "tester")
+	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+
+	out := captureStdout(t, func() { cmdNext(c, parse([]string{"--meta", "auto"})) })
+	if !strings.Contains(body, `"meta_key":"auto"`) {
+		t.Fatalf("next body = %q, want meta_key auto", body)
+	}
+	if strings.TrimSpace(out) != "7" {
+		t.Fatalf("next stdout = %q, want 7", out)
+	}
+
+	// key=value and repeated keys are usage errors for the filter form.
+	code := captureExit(t, func() {
+		captureStderr(t, func() { cmdNext(c, parse([]string{"--meta", "auto=1"})) })
+	})
+	if code != 5 {
+		t.Fatalf("next --meta k=v exit = %d, want 5", code)
+	}
+	code = captureExit(t, func() {
+		captureStderr(t, func() { cmdNext(c, parse([]string{"--meta", "a", "--meta", "b"})) })
+	})
+	if code != 5 {
+		t.Fatalf("next with two --meta exit = %d, want 5", code)
+	}
+}
+
+func TestCmdLsMetaWireFormat(t *testing.T) {
+	var lsQuery string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		lsQuery = r.URL.RawQuery
+		w.Write([]byte("[]"))
+	}))
+	t.Cleanup(stub.Close)
+	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+
+	captureStdout(t, func() { cmdLs(c, parse([]string{"--meta", "auto"})) })
+	if !strings.Contains(lsQuery, "meta_key=auto") {
+		t.Fatalf("ls query = %q, want meta_key=auto", lsQuery)
+	}
+
+	code := captureExit(t, func() {
+		captureStderr(t, func() { cmdLs(c, parse([]string{"--meta", "auto=1"})) })
+	})
+	if code != 5 {
+		t.Fatalf("ls --meta k=v exit = %d, want 5", code)
+	}
+	code = captureExit(t, func() {
+		captureStderr(t, func() { cmdLs(c, parse([]string{"--meta", "a", "--meta", "b"})) })
+	})
+	if code != 5 {
+		t.Fatalf("ls with two --meta exit = %d, want 5", code)
+	}
+}
+
+func TestCmdShowPrintsMeta(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+	r := do(t, ts, http.MethodPost, "/api/tasks",
+		`{"project":"web","title":"carrier","meta":{"owner":"alice","auto":"packet-7"}}`,
+		map[string]string{"Content-Type": "application/json"})
+	var tk Task
+	if err := json.NewDecoder(r.Body).Decode(&tk); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	r.Body.Close()
+
+	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	out := captureStdout(t, func() {
+		cmdShow(c, parse([]string{strconv.FormatInt(tk.ID, 10)}))
+	})
+	// One line, keys sorted.
+	if !strings.Contains(out, "meta: auto=packet-7 owner=alice") {
+		t.Fatalf("show output missing sorted meta line:\n%s", out)
+	}
+
+	// No meta → no meta line.
+	plain := mustCreateTask(t, ts, "web", "plain")
+	out = captureStdout(t, func() { cmdShow(c, parse([]string{plain})) })
+	if strings.Contains(out, "meta:") {
+		t.Fatalf("show printed a meta line for a task without meta:\n%s", out)
+	}
+}

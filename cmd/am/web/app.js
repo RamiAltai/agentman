@@ -534,6 +534,18 @@ function renderModal(t) {
   labelsDiv.append(labelBox);
   s.append(labelsDiv, labelErr);
 
+  // ---- Meta section (read-only; pairs are set via the CLI/API) ----
+  const tMeta = t.meta || {};
+  const metaKeys = Object.keys(tMeta).sort();
+  if (metaKeys.length) {
+    s.append(el("h3", {}, "Meta"));
+    for (const k of metaKeys) {
+      s.append(el("div", { class: "meta-row" },
+        el("span", { class: "meta-key" }, k),
+        el("span", { class: "meta-val" }, tMeta[k])));
+    }
+  }
+
   s.append(el("h3", {}, "Comments" + (t.comments && t.comments.length ? " (" + t.comments.length + ")" : "")));
   const cl = el("div", { class: "comments" });
   if (!t.comments || !t.comments.length) cl.append(el("div", { class: "feed-empty" }, "No comments yet"));
@@ -920,7 +932,10 @@ function evText(ev) {
     case "task.reclaimed": span.append(who, " reclaimed ", ref, " from ", String((d.assignee || [])[0] || "—")); break;
     case "task.status": span.append(who, " moved ", ref, " → ", String(last(d.status))); break;
     case "task.assign": span.append(who, " assigned ", ref, " → ", String(last(d.assignee) || "—")); break;
-    case "task.patched": span.append(who, " edited ", ref); break;
+    case "task.patched":
+      span.append(who, " edited ", ref);
+      if (d.meta) span.append(" (meta: " + Object.keys(d.meta).sort().join(", ") + ")");
+      break;
     case "comment.added": span.append(who, " commented on ", ref); break;
     case "project.created": span.append(who, " created project ", el("b", {}, d.slug || "")); break;
     case "project.archived": span.append(who, " archived project ", el("b", {}, d.slug || "")); break;
@@ -952,7 +967,7 @@ function describeText(ev) {
     case "task.reclaimed": return `${who} reclaimed ${t} from ${(d.assignee || [])[0] || "—"}`;
     case "task.status": return `${who} moved ${t} → ${last(d.status)}`;
     case "task.assign": return `${who} assigned ${t} → ${last(d.assignee) || "—"}`;
-    case "task.patched": return `${who} edited ${t}`;
+    case "task.patched": return `${who} edited ${t}` + (d.meta ? ` (meta: ${Object.keys(d.meta).sort().join(", ")})` : "");
     case "comment.added": return `${who} commented on ${t}`;
     case "project.created": return `${who} created project ${d.slug || ""}`;
     case "project.archived": return `${who} archived project ${d.slug || ""}`;

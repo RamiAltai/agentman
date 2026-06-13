@@ -186,16 +186,16 @@ func usage() {
   am init <tasktype>                     set this session's identity (e.g. bugfix_050626_4821)
   am whoami                              print the current identity
 
-  am ls [--mine] [--status S] [-p P] [-c CAT] [--all] [--ready] [--blocked] [--stale DUR] [--grep TEXT] [--label L]   list tasks (hides done)
+  am ls [--mine] [--status S] [-p P] [-c CAT] [--all] [--ready] [--blocked] [--stale DUR] [--grep TEXT] [--label L] [--meta KEY]   list tasks (hides done)
   am show <id> [-c]                            task detail (+comments +deps)
-  am new "title" [--body B] [-p P] [--priority N]   create, prints id
+  am new "title" [--body B] [-p P] [--priority N] [--meta k=v]...   create, prints id
   am claim <id> [--steal-stale DUR]           assign me + ->doing (atomic; DUR is Go syntax, e.g. 30m, 48h)
-  am next [-p P] [-c CAT]                     atomically pick + claim the best ready task (prints id; exit 3 if none)
-  am wait <id> --done | am wait --ready [-p P] [-c CAT] [--timeout D]   block until done / a ready task exists (exit 7 on timeout)
+  am next [-p P] [-c CAT] [--meta KEY]        atomically pick + claim the best ready task (prints id; exit 3 if none)
+  am wait <id> --done | am wait --ready [-p P] [-c CAT] [--meta KEY] [--timeout D]   block until done / a ready task exists (exit 7 on timeout)
   am status <id...> <todo|doing|blocked|done> change status (multiple ids allowed)
   am assign <id...> <agent|me|->              reassign ("-" = unassign; multiple ids allowed)
   am note <id> "text"                         add a comment
-  am edit <id> [--title T] [--body B] [--priority N]
+  am edit <id> [--title T] [--body B] [--priority N] [--meta k=v]...   (--meta is repeatable; --meta k= removes the key)
   am drop <id>                                release back to todo
   am rm <id>                                  hard-delete a task (permanent)
   am dep add <id> <prereq> [prereq…]          add prerequisite(s) to a task

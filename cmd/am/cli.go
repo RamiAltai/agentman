@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -20,14 +21,21 @@ var osExit = os.Exit
 // value flag.
 var boolFlags = map[string]bool{"json": true, "mine": true, "all": true, "comments": true, "yes": true, "log": true, "ready": true, "blocked": true, "done": true}
 
+// Repeatable value flags: every occurrence is collected (in order) into
+// Args.multi instead of last-wins Args.flags. A flag is multi OR single,
+// never both, and (like boolFlags) registration is global across verbs.
+var multiFlags = map[string]bool{"meta": true}
+
 type Args struct {
 	pos   []string
 	flags map[string]string
 	bools map[string]bool
+	multi map[string][]string
 }
 
-func (a Args) flag(k string) string { return a.flags[k] }
-func (a Args) has(k string) bool    { return a.bools[k] }
+func (a Args) flag(k string) string  { return a.flags[k] }
+func (a Args) has(k string) bool     { return a.bools[k] }
+func (a Args) all(k string) []string { return a.multi[k] }
 func (a Args) at(i int) string {
 	if i < len(a.pos) {
 		return a.pos[i]
@@ -38,17 +46,29 @@ func (a Args) at(i int) string {
 // parse splits argv into positionals, value flags, and boolean flags in any
 // order, so `am new "title" --body x` and `am new --body x "title"` both work.
 func parse(argv []string) Args {
-	a := Args{flags: map[string]string{}, bools: map[string]bool{}}
+	a := Args{flags: map[string]string{}, bools: map[string]bool{}, multi: map[string][]string{}}
 	for i := 0; i < len(argv); i++ {
 		s := argv[i]
 		if len(s) > 1 && s[0] == '-' && s != "-" {
 			key := canonFlag(strings.TrimLeft(s, "-"))
 			if eq := strings.IndexByte(key, '='); eq >= 0 {
-				a.flags[canonFlag(key[:eq])] = key[eq+1:]
+				k := canonFlag(key[:eq])
+				if multiFlags[k] {
+					a.multi[k] = append(a.multi[k], key[eq+1:])
+					continue
+				}
+				a.flags[k] = key[eq+1:]
 				continue
 			}
 			if boolFlags[key] {
 				a.bools[key] = true
+				continue
+			}
+			if multiFlags[key] {
+				if i+1 < len(argv) {
+					a.multi[key] = append(a.multi[key], argv[i+1])
+					i++
+				}
 				continue
 			}
 			if i+1 < len(argv) {
@@ -60,6 +80,42 @@ func parse(argv []string) Args {
 		a.pos = append(a.pos, s)
 	}
 	return a
+}
+
+// parseMetaFlags folds repeated --meta key=value tokens into one map for a
+// single JSON body (the structural atomicity guarantee: one request, one
+// event). Tokens split at the FIRST '=' — values may themselves contain '='.
+// allowEmpty permits `--meta k=` (edit's remove-the-key form); create rejects it.
+func parseMetaFlags(a Args, allowEmpty bool) map[string]any {
+	m := map[string]any{}
+	for _, tok := range a.all("meta") {
+		eq := strings.IndexByte(tok, '=')
+		if eq < 0 {
+			fail(5, "--meta requires key=value")
+		}
+		k, v := tok[:eq], tok[eq+1:]
+		if v == "" && !allowEmpty {
+			fail(5, "--meta %s= is empty (only `am edit` removes keys this way)", k)
+		}
+		m[k] = v
+	}
+	return m
+}
+
+// metaKeyArg extracts the single --meta KEY for the filter verbs (ls/next/
+// wait), where meta scoping is by key presence only.
+func metaKeyArg(a Args, verb string) string {
+	m := a.all("meta")
+	if len(m) == 0 {
+		return ""
+	}
+	if len(m) > 1 {
+		fail(5, "%s: one --meta key only", verb)
+	}
+	if strings.ContainsRune(m[0], '=') {
+		fail(5, "%s --meta takes a key, not key=value", verb)
+	}
+	return m[0]
 }
 
 func canonFlag(k string) string {
@@ -137,6 +193,9 @@ func cmdLs(c *Client, a Args) {
 	if v := a.flag("label"); v != "" {
 		qs.Set("label", v) // server validates/normalizes
 	}
+	if k := metaKeyArg(a, "ls"); k != "" {
+		qs.Set("meta_key", k) // server validates/normalizes
+	}
 	qs.Set("limit", "50")
 
 	data := c.doOrFail("GET", "/api/tasks?"+qs.Encode(), nil)
@@ -171,6 +230,18 @@ func cmdShow(c *Client, a Args) {
 	}
 	if len(t.Labels) > 0 {
 		fmt.Println("labels: " + strings.Join(t.Labels, " "))
+	}
+	if len(t.Meta) > 0 {
+		keys := make([]string, 0, len(t.Meta))
+		for k := range t.Meta {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		parts := make([]string, len(keys))
+		for i, k := range keys {
+			parts[i] = k + "=" + t.Meta[k]
+		}
+		fmt.Println("meta: " + strings.Join(parts, " "))
 	}
 	fmt.Printf("created %s · %d comment%s\n", shortTime(t.CreatedAt), t.NComments, plural(t.NComments))
 	if len(t.DependsOn) > 0 {
@@ -212,6 +283,9 @@ func cmdNew(c *Client, a Args) {
 	}
 	if v := a.flag("assign"); v != "" {
 		body["assignee"] = resolveWho(v)
+	}
+	if m := parseMetaFlags(a, false); len(m) > 0 {
+		body["meta"] = m
 	}
 	data := c.doOrFail("POST", "/api/tasks", body)
 	var t Task
@@ -276,6 +350,9 @@ func cmdNext(c *Client, a Args) {
 	}
 	if cat := categoryFor(a); cat != "" {
 		scope["category"] = cat
+	}
+	if k := metaKeyArg(a, "next"); k != "" {
+		scope["meta_key"] = k
 	}
 	var body any
 	if len(scope) > 0 {
@@ -365,8 +442,13 @@ func cmdEdit(c *Client, a Args) {
 	if v := a.flag("priority"); v != "" {
 		patch["priority"] = atoiOr(v, 2)
 	}
+	// All repeated --meta flags ride in this ONE PATCH (one tx, one event);
+	// `--meta k=` removes the key.
+	if m := parseMetaFlags(a, true); len(m) > 0 {
+		patch["meta"] = m
+	}
 	if len(patch) == 0 {
-		fail(1, "edit: nothing to change (use --title/--body/--priority)")
+		fail(1, "edit: nothing to change (use --title/--body/--priority/--meta)")
 	}
 	c.doOrFail("PATCH", "/api/tasks/"+id, patch)
 }
