@@ -1054,6 +1054,67 @@ without evidence.
   (`cmdToken`, `storeToken`); the 17 Phase S tests across `store_test.go`/`server_test.go`/
   `cli_test.go`/`db_test.go` (listed in the CHANGELOG entry).
 
+### ADR-030: Dashboard dark/light theme — dark stays the `:root` default, light is one `[data-theme="light"]` token override, inline FOUC head-script, default-to-system-then-persist via `localStorage["am.theme"]`
+- Status: Active
+- Context: The dashboard was **dark-only** (`color-scheme: dark`, hard-coded dark tokens + ~20 inline
+  color literals). A light theme was wanted for users on light desktops / bright environments,
+  without a build step, a framework, or a runtime CSS-in-JS layer (the no-npm/no-bundler invariant,
+  IADR / ADR-018). The change is frontend-only (`cmd/am/web/`): no Go, API, schema, event-kind,
+  error-code, or CLI surface is touched.
+- Decision (the four choices):
+  1. **Dark is the bare `:root` default; light is a single `:root[data-theme="light"]{…}` override
+     block.** Theme is selected by one `data-theme` attribute on `<html>`. An unknown or absent
+     `data-theme` renders dark, so any failure path lands on the original look. To make a single
+     override block possible, ~20 previously-inline color literals (backdrops, tag pill
+     backgrounds/borders, the status pulse ring, the `#fff` on-accent text, the scrollbar hover, the
+     graph legend background, the danger-confirm wash) were tokenized into new `--var` custom
+     properties on `:root`; **dark keeps the exact prior literal values**, so dark mode is visually
+     unchanged and only the new light block re-defines them. The `PRIO` JS priority-border palette is
+     deliberately left untouched (out of scope).
+  2. **Inline `<head>` FOUC-prevention script.** A tiny IIFE in `index.html` reads
+     `localStorage["am.theme"]` (falling back to `prefers-color-scheme`, then `"dark"` on any error)
+     and sets `data-theme` **before the stylesheet loads**, so there is no flash of the wrong theme.
+     Applying the theme only from `app.js` after the stylesheet would flash dark-then-light on a
+     light-preference reload. The script is static markup (not `innerHTML`) and contains none of the
+     XSS-sink substrings the `TestDashboardNoXSSSinks` source guard forbids. The `color-scheme` meta
+     is now `content="dark light"` so native form controls and scrollbars render correctly in both.
+  3. **Default-to-system, then persist the explicit choice.** First load follows the OS
+     `prefers-color-scheme`; clicking the toggle writes `"light"`/`"dark"` to `localStorage["am.theme"]`
+     and from then on the dashboard ignores OS changes (the user has spoken). **While no explicit
+     choice is stored** (key unset) the dashboard **live-follows** OS theme changes via a `matchMedia`
+     listener — `initTheme` only re-applies the system theme when `lsGet(THEME_KEY) === null`. Both
+     the inline script (try/catch → `"dark"`) and `app.js` (`lsGet`/`lsSet` swallow exceptions,
+     `matchMedia` wrapped in try/catch with an `addListener` fallback) degrade gracefully when
+     `localStorage`/`matchMedia` are unavailable — the toggle still works for the session.
+  4. **The toggle shows the destination, not the current state, and has no keyboard shortcut.** The
+     `#themeToggle` ghost icon button shows `☀` in dark mode / `☾` in light mode (the theme you'd
+     switch TO); `aria-label`/`title`/`aria-pressed` track the action. No shortcut is bound (the
+     `a`/`n`/`g`/`/` set is unchanged) — a rarely-flipped global preference does not earn a key.
+- New error / kinds / schema: **none.** No new event kind (catalog stays **21**), no schema change
+  (`currentSchemaVersion` stays **5**), no new error or exit code, no API/CLI change. The only new
+  persisted state is the client-side `localStorage` key `am.theme` (alongside `am.feedW` /
+  `am.feedCollapsed`).
+- Rationale: a single token-override block keeps the design system as the one source of color truth
+  (no per-component dark/light branching) and makes "add a theme" mechanically a matter of overriding
+  tokens; tokenizing the stray literals first guarantees dark cannot regress. The inline head-script
+  is the standard zero-dependency FOUC fix and stays within the no-build/no-npm and XSS-safe
+  invariants. Default-to-system honors the user's existing OS preference with zero configuration;
+  persisting only on an explicit click (and live-following the OS until then) is the least-surprising
+  precedence.
+- Consequences / residuals (accepted): the theme is applied without a transition (the global
+  `prefers-reduced-motion: reduce` reset already disables transitions; the swap intentionally adds
+  none). Light-theme color values are hand-tuned, not auto-derived, so a future token added to dark
+  must also be given a light value or it will inherit the dark literal — the
+  `TestDashboardThemeAssets` guard locks in the presence of the override block but not exhaustive
+  per-token coverage (no JS runner, ADR-018). The behavioral JS (toggle click, system-follow,
+  persistence) is verified by source reading + manual check, not automated tests — the documented
+  no-JS-runner gap.
+- Evidence: `cmd/am/web/app.css` (the new `:root` component tokens + the
+  `:root[data-theme="light"]` override block, `.theme-toggle-icon`); `cmd/am/web/index.html` (the
+  inline `data-theme` FOUC IIFE, `color-scheme="dark light"`, the `#themeToggle` button);
+  `cmd/am/web/app.js` (`THEME_KEY`, `applyTheme`/`currentTheme`/`toggleTheme`/`initTheme`, the
+  `matchMedia` follow-only-while-unset listener); `cmd/am/web_test.go` (`TestDashboardThemeAssets`).
+
 ## Inferred Decisions
 
 ### IADR-001: SSE chosen over WebSockets

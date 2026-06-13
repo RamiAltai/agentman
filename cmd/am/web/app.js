@@ -8,6 +8,7 @@ const PRIO_LABEL = ["Urgent", "High", "", ""];
 const PRIO_OPTS = ["0 — Urgent", "1 — High", "2 — Normal", "3 — Low"];
 
 const FEED_W_KEY = "am.feedW", FEED_COLLAPSED_KEY = "am.feedCollapsed";
+const THEME_KEY = "am.theme";
 
 let projects = [];
 let selected = new Set();    // selected project slugs; empty = "All" (within the current view)
@@ -1207,6 +1208,41 @@ function initFeed() {
   });
 }
 
+// ---------- light/dark theme ----------
+// The inline <head> script sets data-theme before paint (FOUC guard); these only
+// react to clicks and live system changes. The toggle shows the theme you'd switch
+// TO: ☾ in light mode, ☀ in dark mode.
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  const btn = $("themeToggle");
+  if (!btn) return;
+  const icon = btn.querySelector(".theme-toggle-icon");
+  if (icon) icon.textContent = theme === "light" ? "☾" : "☀";
+  const label = theme === "light" ? "Switch to dark theme" : "Switch to light theme";
+  btn.setAttribute("aria-label", label);
+  btn.setAttribute("title", label);
+  btn.setAttribute("aria-pressed", String(theme === "light"));
+}
+function currentTheme() { return document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark"; }
+function toggleTheme() {
+  const next = currentTheme() === "light" ? "dark" : "light";
+  applyTheme(next);
+  lsSet(THEME_KEY, next);
+}
+function initTheme() {
+  applyTheme(currentTheme());
+  const btn = $("themeToggle");
+  if (btn) btn.onclick = toggleTheme;
+  // Follow the OS only while the user hasn't made an explicit choice.
+  try {
+    const mq = window.matchMedia("(prefers-color-scheme: light)");
+    const onChange = (e) => { if (lsGet(THEME_KEY) === null) applyTheme(e.matches ? "light" : "dark"); };
+    if (mq.addEventListener) mq.addEventListener("change", onChange);
+    else if (mq.addListener) mq.addListener(onChange);
+  } catch (e) { /* matchMedia unavailable — explicit toggle still works */ }
+}
+
 // ---------- keyboard ----------
 
 function onKey(e) {
@@ -1235,6 +1271,7 @@ $("searchBox").oninput = (e) => {
 $("modal").onclick = (e) => { if (e.target.id === "modal") closeModal(); };
 document.addEventListener("keydown", onKey);
 initFeed();
+initTheme();
 
 window.addEventListener("hashchange", () => { route().catch(() => {}); });
 

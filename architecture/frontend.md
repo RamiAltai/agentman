@@ -1,7 +1,7 @@
 # Frontend Architecture
 
 There **is** a frontend: a small single-page dashboard in `cmd/am/web/`
-(`index.html` 71 lines, `app.css` 657 lines, `app.js` 1986 lines), embedded into the binary via
+(`index.html` 87 lines, `app.css` 729 lines, `app.js` 2023 lines), embedded into the binary via
 `//go:embed web` (`cmd/am/server.go`) and served at `/`. It is the human-facing view; agents do
 not use it.
 
@@ -234,8 +234,27 @@ re-fetches and re-renders (`onEvent`). The graph overlay uses its own debounced 
 
 `app.css` defines a **CSS-variable design system** (`:root` tokens): background/surface levels,
 `--line`, text `--fg`/`--muted`/`--faint`, `--accent`, status colors (`--st-todo/doing/blocked/
-done`), radii, `--feed-w`, `--header-h`. Dark theme only (`color-scheme: dark`). Thin custom
-scrollbars. Status and priority each have a consistent color language across board, cards, and feed.
+done`), radii, `--feed-w`, `--header-h`, plus **component color tokens** (backdrops, tag pill
+backgrounds/borders, the status pulse ring, the `--on-accent` on-accent text, the scrollbar-hover
+color, the graph legend background, the danger-confirm wash) that were factored out of inline
+literals so a single override block can re-theme them. Thin custom scrollbars. Status and priority
+each have a consistent color language across board, cards, and feed.
+
+**Theming — dark default + light override.** The dashboard supports a **dark (default) and a light
+theme**, selected by a single `data-theme` attribute on `<html>`. Dark is the bare `:root`; light is
+**one `:root[data-theme="light"]{…}` block** that re-defines the color tokens — so an unknown or
+absent `data-theme` renders dark, and dark keeps the exact prior literal values (no visual change in
+dark mode). The `color-scheme` meta is `content="dark light"` so native form controls/scrollbars
+render correctly in both. A header **`#themeToggle`** ghost icon button (in `.actions`, before the
+Graph button, styled `.theme-toggle-icon`) flips the theme and shows the theme you'd switch TO (`☀`
+in dark, `☾` in light; `aria-label`/`title`/`aria-pressed` track the action; **no keyboard
+shortcut**). Theme selection is **default-to-system-then-persist** (ADR-030): an inline `<head>`
+script in `index.html` sets `data-theme` from `localStorage["am.theme"]` (else `prefers-color-scheme`,
+else `"dark"`) **before the stylesheet loads** (no flash); `app.js` (`THEME_KEY`, `applyTheme`/
+`currentTheme`/`toggleTheme`/`initTheme`) wires the button and **live-follows the OS** via
+`matchMedia` only while no explicit choice is stored (`lsGet(THEME_KEY) === null`). Clicking persists
+`"light"`/`"dark"` to `localStorage["am.theme"]`. Both the inline script and `app.js` degrade
+gracefully when `localStorage`/`matchMedia` are unavailable.
 
 The board uses `justify-content: safe center` on `#board` so columns are centered on wide/ultrawide
 screens. The `safe` keyword falls back to `flex-start` when columns overflow their container, so
@@ -284,11 +303,14 @@ Deliberately addressed in this codebase (see `decision-records.md` IADR / UX his
 **No JS test runner** — by deliberate decision (Phase E4 / ADR-018). Adding npm/jsdom would break
 the no-npm/single-binary/no-build-step ethos that is a core project invariant.
 
-**XSS-sink guard (Go level):** `cmd/am/web_test.go` `TestDashboardNoXSSSinks` reads the embedded
-`web/app.js` + `web/index.html` via the `webFS` embed.FS at Go test time and asserts that none of
-`.innerHTML`/`.outerHTML`/`.insertAdjacentHTML`/`document.write`/`eval(` appear. This locks in the
-`el()`/`textContent` convention at `go test` time — an accidental sink assignment will fail the
-build before it ships.
+**Source-level asset guards (Go level):** `cmd/am/web_test.go` reads the embedded assets via the
+`webFS` embed.FS at Go test time (no JS runner). `TestDashboardNoXSSSinks` asserts that none of
+`.innerHTML`/`.outerHTML`/`.insertAdjacentHTML`/`document.write`/`eval(` appear in `web/app.js` +
+`web/index.html` — this locks in the `el()`/`textContent` convention at `go test` time, so an
+accidental sink assignment fails the build before it ships. `TestDashboardThemeAssets` (ADR-030)
+asserts the dark/light theming stays wired: `app.css` ships the `:root[data-theme="light"]` override
+block and `index.html` carries both the inline `am.theme` FOUC-guard script and the `#themeToggle`
+button.
 
 **Remaining gap:** behavioral dashboard JS — the "Manage projects" modal, the delete confirm flows
 (task/comment/project), the feed pagination button, the dependency section (prereq chips, add-prereq
@@ -319,7 +341,7 @@ verification. (Gap; see `known-risks-and-gaps.md`.)
 - **Native HTML5 drag-and-drop doesn't fire on touch** → mobile relies on the status dropdown /
   `[ ]` keys (documented fallback in code comments).
 - **Full board re-render per event batch** (debounced) — fine at small scale, O(n) at large scale.
-- Single 1986-line `app.js`, no module split, no minification. Behavioral JS logic is not
+- Single 2023-line `app.js`, no module split, no minification. Behavioral JS logic is not
   automatically tested (deliberate no-JS-runner decision); XSS-sink safety is enforced by the
   `TestDashboardNoXSSSinks` Go guard. The delete confirm flows, feed pagination, dependency UI,
   and the graph overlay are still untested at the behavioral level.

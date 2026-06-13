@@ -322,11 +322,14 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   add-prereq dropdown, blocks list), the **graph overlay** (layout, pan/zoom, transitive highlight,
   detail panel, live refresh), the search box and label chips/Labels section (Phase M), the
   read-only modal Meta section (Phase P), the **category overview + hash routing** (overview cards,
-  drill-down, breadcrumb/back, per-view stream re-open, debounced count refresh — Phase R),
-  and other client-side logic — because the project deliberately
-  adopts **no JS test runner** (preserves the no-npm/single-binary ethos; ADR-018). The
-  `web_test.go` sink guard mitigates XSS regressions at the source level; the dependency UI and
-  the graph overlay are additional un-runner-tested JS covered by that same guard.
+  drill-down, breadcrumb/back, per-view stream re-open, debounced count refresh — Phase R), the
+  **dark/light theme toggle** (toggle click, system-follow while unset, `am.theme` persistence —
+  ADR-030), and other client-side logic — because the project deliberately
+  adopts **no JS test runner** (preserves the no-npm/single-binary ethos; ADR-018). The `web_test.go`
+  source guards mitigate regressions at the source level: `TestDashboardNoXSSSinks` for XSS sinks and
+  `TestDashboardThemeAssets` for the theme-asset wiring (the override block, the FOUC script, the
+  toggle button); the dependency UI and the graph overlay are additional un-runner-tested JS covered
+  by the same guard pattern.
   → `backend.md`, `frontend.md`, `decision-records.md` ADR-018, ADR-021.
 
 ## Documentation Gaps

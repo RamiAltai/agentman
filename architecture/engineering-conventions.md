@@ -153,8 +153,8 @@ convention is loose, it's called out.
   Coverage spans pure logic, the store, HTTP, migrations, offline DB tooling, CLI verbs + exit codes,
   scope enforcement, scope tokens (Phase S — store hash-not-plaintext/resolve/revoke, the unscoped
   mint guard, token-scope-wins, 401→exit-9, export/import round-trip), SSE streaming/reconnect (incl.
-  category-scoped) + direct hub fan-out unit tests, `am wait`, identity, and the dashboard XSS-sink
-  guard — 11 test files, 256 tests.
+  category-scoped) + direct hub fan-out unit tests, `am wait`, identity, and the dashboard source
+  guards (XSS-sink + dark/light theme assets) — 11 test files, 257 tests.
 - **`osExit` testability var** — `cli.go` declares `var osExit = os.Exit`; `fail()` calls `osExit`
   rather than `os.Exit` directly. Tests in `cli_test.go` replace it via `captureExit(t, fn)`,
   which substitutes a panic-based stub so exit codes can be asserted without terminating the process.

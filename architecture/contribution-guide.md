@@ -40,7 +40,7 @@ via `//go:embed`, so a running/old binary serves stale assets. Hard-refresh the 
 ## Running Tests
 
 ```sh
-go test -race ./cmd/am/                     # run all tests with the race detector (256 tests)
+go test -race ./cmd/am/                     # run all tests with the race detector (257 tests)
 go test ./...                               # equivalent short form
 go test -run TestUpdateAvailable -v ./cmd/am/
 ```
@@ -142,9 +142,12 @@ Tests live next to the code in `cmd/am/` (11 test files):
   (`TestInitScopedWritesJSON`, `TestInitScopedCategoryProject`, `TestInitProjectRequiresCategory`,
   `TestLegacyPlainIdentityUnscoped`, `TestScopeEnvOverride`, `TestWhoamiPrintsScope`,
   `TestParseScope`).
-- `web_test.go` — dashboard XSS-sink guard (Phase E4). `TestDashboardNoXSSSinks` reads the embedded
-  `web/app.js` + `web/index.html` via the `webFS` embed.FS and asserts none of `.innerHTML`/
-  `.outerHTML`/`.insertAdjacentHTML`/`document.write`/`eval(` appear.
+- `web_test.go` — dashboard source-level asset guards. `TestDashboardNoXSSSinks` (Phase E4) reads
+  the embedded `web/app.js` + `web/index.html` via the `webFS` embed.FS and asserts none of
+  `.innerHTML`/`.outerHTML`/`.insertAdjacentHTML`/`document.write`/`eval(` appear.
+  `TestDashboardThemeAssets` (ADR-030) asserts the dark/light theme wiring stays present: the
+  `:root[data-theme="light"]` CSS override block, the inline `am.theme` FOUC-guard script, and the
+  `#themeToggle` button.
 - `wait_test.go` — `am wait` (Phase L). Already-satisfied, event-driven (`TestWaitDoneEventArrives`,
   `TestWaitReadyOnPrereqDone`), and cross-project (`TestWaitDoneCrossProject` — `AGENTMAN_PROJECT`
   must not scope the `--done` stream) waits; exit 7 on timeout, exit 3 not-found, exit 6 server

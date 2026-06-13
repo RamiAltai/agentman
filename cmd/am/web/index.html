@@ -3,8 +3,21 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
+  <meta name="color-scheme" content="dark light">
   <title>agentman</title>
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem("am.theme");
+        if (t !== "light" && t !== "dark") {
+          t = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+        }
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {
+        document.documentElement.setAttribute("data-theme", "dark");
+      }
+    })();
+  </script>
   <link rel="stylesheet" href="app.css">
 </head>
 <body>
@@ -17,6 +30,9 @@
     <div class="actions">
       <input id="searchBox" type="search" class="search-input" placeholder="Search… ( / )" aria-label="Search tasks">
       <span id="labelFilterChip" class="label-filter hidden"></span>
+      <button id="themeToggle" class="iconbtn ghost" title="Toggle light/dark theme" aria-label="Toggle color theme">
+        <span class="theme-toggle-icon" aria-hidden="true"></span>
+      </button>
       <button id="graphBtn" class="iconbtn" title="Dependency graph (g)" aria-label="Open dependency graph">Graph</button>
       <button id="newBtn" class="btn-primary" title="New task (n)">+ Task</button>
       <span id="status" class="status" role="status" aria-live="polite">

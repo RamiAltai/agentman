@@ -433,7 +433,7 @@ per request after completion: `METHOD PATH STATUS LATENCY ACTOR` (actor = `X-Age
 
 ## Testing
 
-There are eleven test files (run `go test -race ./cmd/am/`; 256 tests, all green):
+There are eleven test files (run `go test -race ./cmd/am/`; 257 tests, all green):
 - `cmd/am/update_test.go` — version-comparison logic.
 - `cmd/am/store_test.go` — atomic-claim race (concurrent, `-race`-clean), events-cursor monotonicity,
   store CRUD + validation (`ErrValidation`), project archive/unarchive round-trip + idempotency,
@@ -590,10 +590,12 @@ There are eleven test files (run `go test -race ./cmd/am/`; 256 tests, all green
   `TestInitScopedWritesJSON`, `TestInitScopedCategoryProject`, `TestInitProjectRequiresCategory`
   (exit 5), `TestLegacyPlainIdentityUnscoped`, `TestScopeEnvOverride` (`AGENTMAN_SCOPE`),
   `TestWhoamiPrintsScope`, and `TestParseScope` (table incl. `String`/`IsZero`).
-- `cmd/am/web_test.go` — dashboard XSS-sink guard (Phase E4). `TestDashboardNoXSSSinks` reads the
-  embedded `web/app.js` + `web/index.html` via the `webFS` embed.FS and asserts that none of
-  `.innerHTML`/`.outerHTML`/`.insertAdjacentHTML`/`document.write`/`eval(` appear — a source-level
-  regression guard that locks in the `el()`/`textContent` XSS-safe DOM convention.
+- `cmd/am/web_test.go` — dashboard source-level asset guards. `TestDashboardNoXSSSinks` (Phase E4)
+  reads the embedded `web/app.js` + `web/index.html` via the `webFS` embed.FS and asserts that none
+  of `.innerHTML`/`.outerHTML`/`.insertAdjacentHTML`/`document.write`/`eval(` appear — locking in the
+  `el()`/`textContent` XSS-safe DOM convention. `TestDashboardThemeAssets` (ADR-030) asserts the
+  dark/light theming stays wired: `app.css` ships the `:root[data-theme="light"]` override block and
+  `index.html` carries both the inline `am.theme` FOUC-guard script and the `#themeToggle` button.
 
 The +24 dependency tests are spread across existing files: `store_test.go` (cycle/self/cross-project
 rejection, idempotent add/remove, cascade on task delete, `NPrereqs`/`NOpenPrereqs` counts,
