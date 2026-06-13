@@ -4,11 +4,35 @@ const COLS = [["todo", "Todo"], ["doing", "In Progress"], ["blocked", "Blocked"]
 const STALE_MS = 30 * 60 * 1000; // a doing+assigned card with no activity this long gets a stale badge
 const STALE_FILTER = "30m";      // ?stale= duration sent when the Stale board-filter is on (matches STALE_MS)
 const ST = { todo: "var(--st-todo)", doing: "var(--st-doing)", blocked: "var(--st-blocked)", done: "var(--st-done)" };
+const ST_LABEL = { todo: "Todo", doing: "Doing", blocked: "Blocked", done: "Done" };
 const PRIO = ["#f4756b", "#f8b738", "#8b93a4", "#6e7681"]; // 0 urgent .. 3 low
+// Themed priority colors (mirror the --prio-N CSS custom properties, which carry
+// AA-clearing light/dark values). Use these — not the raw PRIO[] hex — anywhere a
+// priority color is painted as text/border (e.g. the graph nodes, detail chip, and
+// legend), so the color adapts per theme. var() resolves in both inline style and
+// SVG presentation attributes (same as ST[]/var(--st-*)).
+const PRIO_VAR = ["var(--prio-0)", "var(--prio-1)", "var(--prio-2)", "var(--prio-3)"];
 const PRIO_LABEL = ["Urgent", "High", "", ""];
+// Always-present rank token for EVERY priority level (text, not color-only). The
+// rank ("P0".."P3") plus the word make priority readable for all four levels;
+// Normal/Low used to render nothing.
+const PRIO_RANK = ["P0", "P1", "P2", "P3"];
+const PRIO_WORD = ["Urgent", "High", "Normal", "Low"];
 const PRIO_OPTS = ["0 — Urgent", "1 — High", "2 — Normal", "3 — Low"];
+// Per-kind feed glyphs (decorative; .ev-text states the event in words). These
+// carry the non-color-only meaning the design asks for.
+const EV_GLYPH = { claimed: "▸", status: "⇄", done: "✓", blocked: "⏸", comment: "💬", other: "•" };
+
+// Reduced-motion guard for JS-driven animation (the one-shot card flash). CSS
+// already disables transitions/animations under reduce; this prevents even
+// scheduling the class toggle so we never churn for nothing.
+function prefersReducedMotion() {
+  try { return window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches; }
+  catch (e) { return false; }
+}
 
 const FEED_W_KEY = "am.feedW", FEED_COLLAPSED_KEY = "am.feedCollapsed";
+const RAIL_COLLAPSED_KEY = "am.railCollapsed";
 const THEME_KEY = "am.theme";
 
 let projects = [];
@@ -17,6 +41,8 @@ let view = "overview";       // "overview" (category home) | "all" (cross-catego
 let activeCategory = "";     // category slug when view==="category"
 let categories = [];         // CategoryStat[] for the overview (counts + active_agents)
 let overviewTimer = null;    // debounce for live overview count refresh
+let railTimer = null;        // debounce for live rail count refresh (projects + categories)
+let pendingProject = "";     // a project slug to auto-select after the next applyView() (see goProject)
 let tasks = new Map();       // id -> task (terse)
 let cursor = 0;              // highest event id seen (SSE since=)
 let es = null, backoff = 1000, refreshTimer = null, openTaskId = null, lastFocus = null, dragId = null;
@@ -58,6 +84,58 @@ function el(tag, props, ...kids) {
     n.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
   }
   return n;
+}
+
+// ---------- loading skeletons + toasts (additive, el()-only) ----------
+
+// boardSkeleton renders placeholder columns/cards into #board before the first
+// real data arrives. renderBoard() replaces it via replaceChildren().
+function boardSkeleton() {
+  const board = $("board");
+  if (!board || board.childElementCount) return; // don't clobber real content
+  board.replaceChildren();
+  for (const [key] of COLS) {
+    const col = el("div", { class: "col skeleton", "aria-hidden": "true" });
+    col.append(el("div", { class: "colhead" }, el("span", { class: "swatch", style: "background:" + ST[key] }), ""));
+    const cards = el("div", { class: "cards" });
+    for (let i = 0; i < 3; i++) {
+      cards.append(el("div", { class: "skel-card" },
+        el("div", { class: "skel-line short" }),
+        el("div", { class: "skel-line title" }),
+        el("div", { class: "skel-line" })));
+    }
+    col.append(cards);
+    board.append(col);
+  }
+}
+
+// feedSkeleton renders placeholder rows into #feedList before the first feed load.
+function feedSkeleton() {
+  const list = $("feedList");
+  if (!list || list.childElementCount) return;
+  list.replaceChildren();
+  for (let i = 0; i < 6; i++) {
+    list.append(el("li", { class: "skel-feed skeleton", "aria-hidden": "true" },
+      el("span", { class: "skel-line", style: "width:10px;height:10px;border-radius:50%" }),
+      el("span", { class: "skel-line" }),
+      el("span", { class: "skel-line short", style: "width:32px" })));
+  }
+}
+
+// showToast surfaces a transient, non-blocking message in a bottom-center
+// aria-live region (a supplement to alert(), not a replacement). Built via el().
+let toastRegion = null;
+function showToast(msg, kind) {
+  if (!toastRegion) {
+    toastRegion = el("div", { class: "toast-region", role: "status", "aria-live": "polite" });
+    document.body.append(toastRegion);
+  }
+  const close = () => { if (toast.parentNode) toast.remove(); };
+  const toast = el("div", { class: "toast" + (kind === "ok" ? " toast-ok" : "") },
+    el("span", { class: "toast-msg" }, String(msg)),
+    el("button", { class: "toast-x", "aria-label": "Dismiss", onclick: close }, "✕"));
+  toastRegion.append(toast);
+  setTimeout(close, 6000);
 }
 
 async function api(method, path, body) {
@@ -117,7 +195,15 @@ function setStatus(text, cls) {
 
 async function loadProjects() {
   projects = await api("GET", "/api/projects");
-  renderTabs();
+  renderRail();
+}
+
+// loadCategories fetches the category list used by the rail tree. loadOverview()
+// also sets `categories` (with active_agents), but the board views never call it,
+// so init() loads them once up front and live events refresh them on a debounce.
+async function loadCategories() {
+  categories = await api("GET", "/api/categories");
+  renderRail();
 }
 
 async function loadBoard() {
@@ -162,29 +248,101 @@ async function loadFeed() {
   }
 }
 
-function renderTabs() {
-  const nav = $("tabs");
-  const inView = projectsInView();
-  const allOpen = inView.reduce((n, p) => n + openCount(p.counts), 0);
-  // In a category board the "All" tab spans that category's projects; in the
-  // "all" view it spans every project.
-  nav.replaceChildren(tab("", "All", allOpen));
-  for (const p of inView) nav.append(tab(p.slug, p.name, openCount(p.counts)));
-  nav.append(el("button", { class: "tab add", onclick: openNewProject, title: "New project", "aria-label": "New project" }, "＋"));
-  nav.append(el("button", { class: "tab add", onclick: openManage, title: "Manage", "aria-label": "Manage categories and projects" }, "⋯"));
-}
-
 function openCount(c) { c = c || {}; return (c.todo || 0) + (c.doing || 0) + (c.blocked || 0); }
 
-function tab(slug, label, open) {
-  const active = slug === "" ? selected.size === 0 : selected.has(slug);
-  const b = el("button", {
-    class: "tab" + (active ? " active" : ""),
-    "aria-pressed": String(active),
-    onclick: () => toggleProject(slug),
-  }, label);
-  if (open) b.append(el("span", { class: "badge" }, String(open)));
-  return b;
+// ---------- left rail (primary navigation) ----------
+//
+// renderRail() rebuilds #railNav from `categories` + `projects` + current nav
+// state every time the view/selection/data changes. The rail replaces the old
+// header tab strip: it carries Overview, All tasks, a category→project tree with
+// open-counts, and the create/manage actions. Built entirely with el().
+
+// railItem builds one navigable row (Overview / All tasks / project / action).
+// glyph is a decorative marker node (or null); count is an open-count badge value.
+function railItem(opts) {
+  const item = el("button", {
+    class: "rail-item" + (opts.cls ? " " + opts.cls : "") + (opts.active ? " active" : ""),
+    "aria-pressed": opts.active ? "true" : null,
+    "aria-current": opts.active ? "true" : null,
+    onclick: opts.onclick,
+    title: opts.title || null,
+  });
+  if (opts.glyph != null) item.append(el("span", { class: "rail-glyph", "aria-hidden": "true" }, opts.glyph));
+  if (opts.dot) item.append(el("span", { class: "rail-dot", "aria-hidden": "true" }));
+  item.append(el("span", { class: "rail-label" }, opts.label));
+  if (opts.count) item.append(el("span", { class: "rail-count" }, String(opts.count)));
+  return item;
+}
+
+function renderRail() {
+  const nav = $("railNav");
+  if (!nav) return;
+  nav.replaceChildren();
+
+  // Top-level destinations.
+  nav.append(railItem({
+    label: "Overview", glyph: "◳", active: view === "overview",
+    onclick: () => { navigate("#/"); closeMobileRail(); },
+  }));
+  const allOpen = projects.reduce((n, p) => n + openCount(p.counts), 0);
+  nav.append(railItem({
+    label: "All tasks", glyph: "▤", count: allOpen,
+    active: view === "all" && selected.size === 0,
+    onclick: () => { navigate("#/all"); closeMobileRail(); },
+  }));
+
+  // Category sections, each with its nested project rows. Uncategorized projects
+  // (a category slug not in `categories`) collect under a synthetic "Other" group
+  // so every project is reachable from the rail.
+  const known = new Set(categories.map((c) => c.slug));
+  const sections = categories.map((c) => ({ slug: c.slug, name: c.name || c.slug, counts: c.counts }));
+  const orphans = projects.filter((p) => !known.has(p.category));
+  if (orphans.length) sections.push({ slug: "", name: "Other", counts: null, orphan: true });
+
+  for (const sec of sections) {
+    const secEl = el("div", { class: "rail-section" });
+    const catActive = view === "category" && activeCategory === sec.slug && selected.size === 0;
+    const catProjects = sec.orphan ? orphans : projects.filter((p) => p.category === sec.slug);
+    const catOpen = sec.counts ? openCount(sec.counts) : catProjects.reduce((n, p) => n + openCount(p.counts), 0);
+
+    // A category label row is itself a destination (opens the category board);
+    // the synthetic "Other" group is a non-clickable header.
+    if (sec.orphan) {
+      const lbl = el("div", { class: "rail-section-label" }, el("span", { class: "rail-cat-name" }, sec.name));
+      if (catOpen) lbl.append(el("span", { class: "rail-count" }, String(catOpen)));
+      secEl.append(lbl);
+    } else {
+      const lbl = el("button", {
+        class: "rail-item rail-cat" + (catActive ? " active" : ""),
+        "aria-current": catActive ? "true" : null,
+        onclick: () => { navigate("#/cat/" + encodeURIComponent(sec.slug)); closeMobileRail(); },
+        title: "Open " + sec.name,
+      },
+        el("span", { class: "rail-glyph", "aria-hidden": "true" }, "▦"),
+        el("span", { class: "rail-label rail-cat-name" }, sec.name));
+      if (catOpen) lbl.append(el("span", { class: "rail-count" }, String(catOpen)));
+      secEl.append(lbl);
+    }
+
+    if (!catProjects.length) {
+      secEl.append(el("div", { class: "rail-empty" }, "No projects"));
+    } else {
+      for (const p of catProjects) {
+        secEl.append(railItem({
+          cls: "rail-project", label: p.name, dot: true, count: openCount(p.counts),
+          active: selected.has(p.slug),
+          onclick: () => { goProject(p); closeMobileRail(); },
+          title: p.name,
+        }));
+      }
+    }
+    nav.append(secEl);
+  }
+
+  // Footer actions.
+  nav.append(el("div", { class: "rail-divider", "aria-hidden": "true" }));
+  nav.append(railItem({ cls: "rail-action", label: "New project", glyph: "＋", onclick: () => { openNewProject(); closeMobileRail(); } }));
+  nav.append(railItem({ cls: "rail-action", label: "Manage", glyph: "⋯", onclick: () => { openManage(); closeMobileRail(); } }));
 }
 
 function renderBoard() {
@@ -231,6 +389,26 @@ function renderBoard() {
     col.append(cards);
     board.append(col);
   }
+  applyFlash();
+}
+
+// applyFlash gives any card touched by a recent live event a single, short
+// "updated" highlight so live moves are noticed without motion spam. Reduced
+// motion suppresses it. The flashIds set is populated in onEvent and consumed
+// here on the next render; the class auto-clears so re-renders don't re-trigger.
+let flashIds = new Set();
+function applyFlash() {
+  if (!flashIds.size) return;
+  if (prefersReducedMotion()) { flashIds.clear(); return; }
+  for (const id of flashIds) {
+    const node = document.querySelector('.card[data-id="' + id + '"]');
+    if (!node) continue;
+    node.classList.remove("is-updated");
+    void node.offsetWidth; // restart the animation if it was mid-flight
+    node.classList.add("is-updated");
+    node.addEventListener("animationend", () => node.classList.remove("is-updated"), { once: true });
+  }
+  flashIds.clear();
 }
 
 function boardEmpty() {
@@ -266,31 +444,47 @@ function card(t) {
       document.querySelectorAll(".col.drag-over").forEach((x) => x.classList.remove("drag-over"));
     },
   });
-  const crow = el("div", { class: "crow" }, el("span", { class: "cid" }, "#" + t.id));
-  if (PRIO_LABEL[t.priority]) crow.append(el("span", { class: "chip-prio" }, PRIO_LABEL[t.priority]));
+  // ROW 1 (head): #id · priority rank (all levels) · status pill.
+  const pr = PRIO_RANK[t.priority] != null ? t.priority : 3;
+  const crow = el("div", { class: "crow" },
+    el("span", { class: "cid" }, "#" + t.id),
+    el("span", { class: "chip-prio p" + pr, title: "Priority: " + PRIO_WORD[pr] }, PRIO_RANK[pr]),
+    el("span", { class: "status-pill st-" + t.status }, ST_LABEL[t.status] || t.status));
   c.append(crow);
+
+  // ROW 2 (title).
   c.append(el("div", { class: "ctitle" }, t.title));
 
+  // ROW 3a (meta primary): assignee · project.
   const foot = el("div", { class: "cfoot" });
   const who = el("span", { class: "who" + (t.assignee ? "" : " unassigned") });
   if (t.assignee) who.append(el("span", { class: "avatar" }, initials(t.assignee)), el("span", { class: "name" }, t.assignee));
   else who.append("Unassigned");
   foot.append(who);
   if (selected.size !== 1) foot.append(el("span", { class: "ptag" }, t.project));
+  c.append(foot);
+
+  // ROW 3b (reserved trouble sub-row): blocked / ready / stale, BEFORE labels so
+  // critical signals never sink beneath decorative chips. Collapses when empty.
+  const trouble = el("div", { class: "ctrouble" });
+  if (t.nopen > 0) trouble.append(el("span", { class: "tag-blocked", title: t.nopen + " open prerequisite(s)" }, "🔒 Blocked " + t.nopen));
+  else if (t.nprereq > 0) trouble.append(el("span", { class: "tag-ready" }, "✓ Ready"));
+  if (t.status === "doing" && t.assignee && Date.now() - Date.parse(t.updated_at) > STALE_MS)
+    trouble.append(el("span", { class: "tag-stale", title: "no activity for 30+ min" }, "⏳ Stale"));
+  c.append(trouble);
+
+  // ROW 3c (tags): label chips · comment count.
+  const tags = el("div", { class: "ctags" });
   const labels = t.labels || [];
   for (const l of labels.slice(0, 3)) {
-    foot.append(el("span", {
+    tags.append(el("span", {
       class: "tag-label", role: "button", tabindex: "0", title: "Filter by " + l,
       onclick: (e) => { e.stopPropagation(); setLabelFilter(l); },
     }, l));
   }
-  if (labels.length > 3) foot.append(el("span", { class: "tag-label" }, "+" + (labels.length - 3)));
-  if (t.nc > 0) foot.append(el("span", { class: "cc" }, "💬 " + t.nc));
-  if (t.nopen > 0) foot.append(el("span", { class: "tag-blocked" }, "🔒 " + t.nopen));
-  else if (t.nprereq > 0) foot.append(el("span", { class: "tag-ready" }, "✓ Ready"));
-  if (t.status === "doing" && t.assignee && Date.now() - Date.parse(t.updated_at) > STALE_MS)
-    foot.append(el("span", { class: "tag-stale", title: "no activity for 30+ min" }, "⏳ stale"));
-  c.append(foot);
+  if (labels.length > 3) tags.append(el("span", { class: "tag-label" }, "+" + (labels.length - 3)));
+  if (t.nc > 0) tags.append(el("span", { class: "cc" }, "💬 " + t.nc));
+  c.append(tags);
   return c;
 }
 
@@ -326,15 +520,36 @@ function moveTask(id, status) {
 
 // ---------- project switching ----------
 
+// goProject navigates to a project's category board and selects ONLY that project.
+// applyView() clears `selected` on a view change, so we stash the slug in the
+// module-scoped `pendingProject` and have applyView() re-select it after clearing.
+// If we're already in the target category view, switch the selection in place.
+async function goProject(p) {
+  const targetHash = p.category ? "#/cat/" + encodeURIComponent(p.category) : "#/all";
+  const sameView = (p.category && view === "category" && activeCategory === p.category) ||
+                   (!p.category && view === "all");
+  if (sameView) {
+    selected = new Set([p.slug]);
+    renderRail();
+    try { await loadBoard(); await loadFeed(); } catch (e) { setStatus("error", "warn"); }
+    connect();
+    return;
+  }
+  pendingProject = p.slug;
+  navigate(targetHash);
+}
+
+// toggleProject toggles a single project in/out of `selected` within the current
+// view (kept for any residual callers; the rail uses goProject for single-select).
 async function toggleProject(slug) {
   if (slug === "") {
     selected.clear();            // "All" clears selection
   } else if (selected.has(slug)) {
-    selected.delete(slug);       // clicking an active tab deselects it
+    selected.delete(slug);       // clicking an active row deselects it
   } else {
-    selected.add(slug);          // clicking an inactive tab adds it
+    selected.add(slug);          // clicking an inactive row adds it
   }
-  renderTabs();
+  renderRail();
   try { await loadBoard(); await loadFeed(); } catch (e) { setStatus("error", "warn"); }
   connect();
 }
@@ -365,14 +580,17 @@ async function applyView(next, cat) {
   view = next;
   activeCategory = cat;
   selected.clear(); // a view change resets the within-view project selection
+  // goProject() stashes a slug here so a rail project-click lands on the project's
+  // category board with that project pre-selected (applyView always clears first).
+  if (pendingProject) { selected.add(pendingProject); pendingProject = ""; }
   document.body.classList.toggle("view-overview", view === "overview");
   setBreadcrumb();
+  renderRail(); // keep the rail's active highlight in sync in every view
   try {
     if (view === "overview") {
       await loadOverview();
       await loadFeed(); // one global, unfiltered recent-activity feed on the overview
     } else {
-      renderTabs();
       await loadBoard();
       await loadFeed();
     }
@@ -382,19 +600,24 @@ async function applyView(next, cat) {
   connect(); // re-open the stream with the new scope (?category= or unfiltered)
 }
 
-// setBreadcrumb fills the header back/breadcrumb element for the current view.
+// setBreadcrumb fills the lean top-bar TITLE (#breadcrumb) with the current scope
+// name. Navigation lives in the rail now, so this is just the scope label:
+// "Overview" / "All tasks" / a category name / the single selected project's name.
 function setBreadcrumb() {
   const bc = $("breadcrumb");
   if (!bc) return;
-  bc.replaceChildren();
-  if (view === "overview") return; // overview is the root; no back element
-  bc.append(el("button", { class: "crumb-back", onclick: () => navigate("#/"), title: "Back to categories" }, "← Categories"));
-  if (view === "category" && activeCategory) {
+  let title = "Overview";
+  if (selected.size === 1) {
+    const slug = [...selected][0];
+    const p = projects.find((x) => x.slug === slug);
+    title = (p && p.name) || slug;
+  } else if (view === "category" && activeCategory) {
     const c = categories.find((x) => x.slug === activeCategory);
-    bc.append(el("span", { class: "crumb-current" }, (c && c.name) || activeCategory));
+    title = (c && c.name) || activeCategory;
   } else if (view === "all") {
-    bc.append(el("span", { class: "crumb-current" }, "All"));
+    title = "All tasks";
   }
+  bc.textContent = title;
 }
 
 // ---------- overview (category home) ----------
@@ -403,6 +626,7 @@ async function loadOverview() {
   categories = await api("GET", "/api/categories");
   renderOverview();
   setBreadcrumb(); // category names are now known
+  renderRail();    // category names + counts are now known
 }
 
 function renderOverview() {
@@ -1303,12 +1527,20 @@ function openEditProject(p) {
 
 function connect() {
   if (es) es.close();
+  setStatus("connecting…", "");
   es = new EventSource("/api/stream" + qstr({ since: cursor }));
   es.onopen = () => { backoff = 1000; setStatus("live", "ok"); };
   es.onmessage = (m) => { let ev; try { ev = JSON.parse(m.data); } catch (e) { return; } onEvent(ev); };
   es.onerror = () => {
     es.close();
-    setStatus("reconnecting…", "warn");
+    // Surface degraded liveness clearly: once backoff has climbed (repeated
+    // failures) or the browser reports offline, show a loud "offline" state in
+    // the reserved error channel; otherwise the transient "reconnecting…" warn.
+    if (backoff >= 8000 || (typeof navigator !== "undefined" && navigator.onLine === false)) {
+      setStatus("offline — retrying…", "err");
+    } else {
+      setStatus("reconnecting…", "warn");
+    }
     // Jitter so multiple open tabs don't reconnect in lockstep.
     setTimeout(connect, backoff + Math.random() * 250);
     backoff = Math.min(backoff * 2, 10000);
@@ -1344,7 +1576,7 @@ function onEvent(ev) {
     const archivedSlug = (ev.data || {}).slug;
     if (selected.has(archivedSlug)) {
       selected.delete(archivedSlug);
-      renderTabs();
+      renderRail();
       loadBoard().catch(() => {});
       loadFeed().catch(() => {});
       connect();
@@ -1364,7 +1596,7 @@ function onEvent(ev) {
     const deletedSlug = (ev.data || {}).slug;
     if (selected.has(deletedSlug)) {
       selected.delete(deletedSlug);
-      renderTabs();
+      renderRail();
       connect();
     }
     loadProjects().catch(() => {});
@@ -1375,14 +1607,44 @@ function onEvent(ev) {
     const depId = (ev.data || {}).depends_on;
     if (openTaskId === ev.task_id || openTaskId === depId) refreshModal();
   }
+  // Mark the touched task so the next board render flashes it once (board views
+  // only — the overview has no cards). Status moves and edits are the signals
+  // worth surfacing; deletes are handled above.
+  if (view !== "overview" && ev.task_id && /^task\./.test(ev.kind) && ev.kind !== "task.deleted") flashIds.add(ev.task_id);
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => loadBoard().catch(() => {}), 250); // debounced reconcile
+  // Keep the rail's open-counts live on the board views: task moves change a
+  // project's (and its category's) open count. Refresh both on the same debounce
+  // cadence as the board reconcile, but lightly — one projects+categories fetch.
+  if (/^(task|project|category)\./.test(ev.kind)) refreshRailCounts();
   if (openTaskId && ev.task_id === openTaskId && ev.kind !== "task.deleted" && ev.kind !== "comment.deleted" && ev.kind !== "task.dep_added" && ev.kind !== "task.dep_removed") refreshModal();
 }
 
+// refreshRailCounts re-fetches projects + categories (their open-counts) and
+// re-renders the rail, debounced so a burst of live events causes one refresh.
+function refreshRailCounts() {
+  clearTimeout(railTimer);
+  railTimer = setTimeout(async () => {
+    if (view === "overview") return; // the overview path already refreshes via loadOverview()
+    try {
+      const [ps, cs] = await Promise.all([
+        api("GET", "/api/projects"),
+        api("GET", "/api/categories"),
+      ]);
+      projects = ps;
+      categories = cs;
+      renderRail();
+    } catch (e) { /* ignore — next event retries */ }
+  }, 300);
+}
+
 function feedItem(ev) {
-  return el("li", { class: "ev k-" + evKind(ev) },
-    el("span", { class: "ev-dot" }),
+  const kind = evKind(ev);
+  // The glyph carries the non-color event-kind cue; it is decorative to screen
+  // readers since .ev-text already states the event in words. The k-<kind> class
+  // (kept) still colors the glyph and would color a legacy .ev-dot.
+  return el("li", { class: "ev k-" + kind },
+    el("span", { class: "ev-icon", "aria-hidden": "true" }, EV_GLYPH[kind] || EV_GLYPH.other),
     evText(ev),
     el("span", { class: "ev-time", title: fullTime(ev.created_at) }, fmtTime(ev.created_at)));
 }
@@ -1564,6 +1826,47 @@ function initFeed() {
   });
 }
 
+// ---------- left rail: collapse (desktop) + off-canvas (mobile) ----------
+//
+// Two behaviors share #railToggle, switched by viewport width (the CSS rail
+// breakpoint is 820px). On desktop the toggle collapses the rail to zero width
+// (persisted in am.railCollapsed, mirroring the feed). On mobile the rail is
+// off-canvas; the toggle (and the header hamburger #railOpen) slide it in/out
+// via body.rail-open, with #railBackdrop closing it.
+
+const RAIL_MOBILE_MAX = 820; // keep in sync with the @media breakpoint in app.css
+function railIsMobile() { return window.innerWidth <= RAIL_MOBILE_MAX; }
+
+function setRailCollapsed(collapsed) {
+  document.body.classList.toggle("rail-collapsed", collapsed);
+  lsSet(RAIL_COLLAPSED_KEY, collapsed ? "1" : "0");
+  const t = $("railToggle");
+  if (t) t.setAttribute("aria-expanded", String(!collapsed));
+}
+
+function openMobileRail() { document.body.classList.add("rail-open"); }
+function closeMobileRail() { document.body.classList.remove("rail-open"); }
+
+function toggleRail() {
+  if (railIsMobile()) {
+    document.body.classList.toggle("rail-open");
+  } else {
+    setRailCollapsed(!document.body.classList.contains("rail-collapsed"));
+  }
+}
+
+function initRail() {
+  // Restore the desktop collapse preference (default: expanded). On mobile the
+  // rail starts off-canvas regardless; the class only affects desktop width.
+  setRailCollapsed(lsGet(RAIL_COLLAPSED_KEY) === "1");
+  const toggle = $("railToggle");
+  if (toggle) toggle.onclick = toggleRail;
+  const opener = $("railOpen");
+  if (opener) opener.onclick = () => { if (railIsMobile()) openMobileRail(); else setRailCollapsed(false); };
+  const backdrop = $("railBackdrop");
+  if (backdrop) backdrop.onclick = closeMobileRail;
+}
+
 // ---------- light/dark theme ----------
 // The inline <head> script sets data-theme before paint (FOUC guard); these only
 // react to clicks and live system changes. The toggle shows the theme you'd switch
@@ -1604,7 +1907,8 @@ function initTheme() {
 function onKey(e) {
   if (e.key === "Escape") {
     if (!$("filterPanel").classList.contains("hidden")) { closeFilterPanel(); $("filterBtn").focus(); return; }
-    if (!$("modal").classList.contains("hidden")) closeModal();
+    if (!$("modal").classList.contains("hidden")) { closeModal(); return; }
+    if (document.body.classList.contains("rail-open")) { closeMobileRail(); return; }
     return;
   }
   trapFocus(e);
@@ -1622,6 +1926,9 @@ function onKey(e) {
 
 $("newBtn").onclick = openNew;
 $("searchBox").oninput = (e) => {
+  // Reflect "is there an active text filter" immediately so the box reads as
+  // part of the filter family (shared accent), even before the debounce fires.
+  e.target.classList.toggle("has-query", !!e.target.value.trim());
   clearTimeout(searchTimer);
   searchTimer = setTimeout(() => {
     filterQ = e.target.value.trim();
@@ -1632,15 +1939,26 @@ $("modal").onclick = (e) => { if (e.target.id === "modal") closeModal(); };
 $("filterBtn").onclick = (e) => { e.stopPropagation(); toggleFilterPanel(); };
 document.addEventListener("keydown", onKey);
 initFeed();
+initRail();
 initTheme();
 
 window.addEventListener("hashchange", () => { route().catch(() => {}); });
 
 (async function init() {
-  // Load projects first (the overview's "All" card and the board tabs both need
-  // them), then let route() apply the view named by the URL hash. route() handles
-  // its own data loads (overview vs board) and opens the stream.
-  try { await loadProjects(); } catch (e) { setStatus("error: " + e.message, "warn"); }
+  // Show loading skeletons immediately so the first paint isn't a blank board /
+  // feed; the real renders replace them via replaceChildren() on data arrival.
+  if (!document.body.classList.contains("view-overview")) boardSkeleton();
+  feedSkeleton();
+  // Load projects + categories first so the rail can render its full tree in any
+  // view (the board views never call loadOverview, which is the other place that
+  // populates `categories`). route() then applies the URL-hash view and opens the
+  // stream; it handles its own board/overview data loads.
+  try {
+    await Promise.all([
+      loadProjects(),
+      loadCategories().catch(() => {}), // rail still works project-only if this fails
+    ]);
+  } catch (e) { setStatus("error: " + e.message, "warn"); }
   route().catch((e) => setStatus("error: " + e.message, "warn"));
 })();
 
@@ -1990,7 +2308,7 @@ function renderGraph() {
     const pos = positions.get(n.id);
     if (!pos) continue;
 
-    const prioColor = PRIO[n.priority] || PRIO[3];
+    const prioColor = PRIO_VAR[n.priority] || PRIO_VAR[3];
     const statusColor = ST[n.status] || "var(--faint)";
     const isDone = n.status === "done";
     const isBlocked = n.nopen > 0;
@@ -2166,7 +2484,7 @@ function renderGraphDetail(node, edges, nodesById) {
   const d = $("graphDetail");
   d.replaceChildren();
 
-  const prioColor = PRIO[node.priority] || PRIO[3];
+  const prioColor = PRIO_VAR[node.priority] || PRIO_VAR[3];
   const statusColor = ST[node.status] || "var(--faint)";
 
   const head = el("div", { class: "gd-head" });
@@ -2175,7 +2493,11 @@ function renderGraphDetail(node, edges, nodesById) {
   d.append(head);
 
   const chips = el("div", { class: "gd-chips" });
-  chips.append(el("span", { class: "gd-chip", style: "background:" + statusColor + "22;color:" + statusColor }, node.status));
+  // statusColor is a var(--st-*) reference, so the old hex-alpha trick
+  // ("…22") produced an invalid value and the soft fill never painted. Mix
+  // the resolved color with transparent to get a real ~14% soft background.
+  chips.append(el("span", { class: "gd-chip",
+    style: "background:color-mix(in srgb, " + statusColor + " 14%, transparent);color:" + statusColor }, node.status));
   chips.append(el("span", { class: "gd-chip", style: "border-color:" + prioColor + ";color:" + prioColor },
     PRIO_LABEL[node.priority] || ("P" + node.priority)));
   if (node.assignee) chips.append(el("span", { class: "gd-chip gd-assignee" }, node.assignee));
@@ -2303,10 +2625,10 @@ function buildGraphLegend() {
   leg.replaceChildren();
 
   const items = [
-    { color: PRIO[0], label: "Urgent" },
-    { color: PRIO[1], label: "High" },
-    { color: PRIO[2], label: "Normal" },
-    { color: PRIO[3], label: "Low" },
+    { color: PRIO_VAR[0], label: "Urgent" },
+    { color: PRIO_VAR[1], label: "High" },
+    { color: PRIO_VAR[2], label: "Normal" },
+    { color: PRIO_VAR[3], label: "Low" },
     { color: "var(--st-done)", label: "Cleared edge", isLine: true },
     { color: "var(--warn)", label: "Blocking edge", isLine: true, dashed: true },
     { color: "var(--st-done)", label: "Done task", isDot: true },
