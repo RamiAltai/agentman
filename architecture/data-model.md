@@ -4,8 +4,8 @@
 
 Storage is a single **SQLite** database (default `~/.agentman/agentman.db`), WAL mode, owned by
 one writer process. Schema is in `cmd/am/schema.sql` (embedded and executed at startup by
-`store.OpenStore`). Nine tables: `meta`, `categories`, `projects`, `tasks`, `task_deps`,
-`task_labels`, `task_meta`, `comments`, `events`.
+`store.OpenStore`). Ten tables: `meta`, `categories`, `projects`, `tasks`, `task_deps`,
+`task_labels`, `task_meta`, `tokens`, `comments`, `events`.
 All timestamps are ISO-8601 UTC **TEXT** (`strftime('%Y-%m-%dT%H:%M:%fZ','now')`), so they sort
 lexically.
 
@@ -20,6 +20,7 @@ lexically.
 | `task_deps` | Prerequisite edges between tasks (many-to-many, same-project only) | `schema.sql`, `store.go DepRef` |
 | `task_labels` | Free-form tags on tasks (many-to-many, label text stored inline — no catalog) | `schema.sql`, `store.go Task.Labels` |
 | `task_meta` | Free-form `key → value` pairs on tasks (values opaque; key PRESENCE is the filterable unit; no catalog) | `schema.sql`, `store.go Task.Meta` |
+| `tokens` | Scope-bound bearer credentials (Phase S): stores only the **sha256 hash** of each token, never the plaintext | `schema.sql`, `store.go Token` |
 | `comments` | Threaded notes on a task | `schema.sql`, `store.go Comment` |
 | `events` | Append-only mutation log = activity feed + SSE backbone + cursor | `schema.sql`, `store.go Event` |
 
@@ -87,6 +88,19 @@ lexically.
   contain `,`/`=`, so the labels `GROUP_CONCAT` trick is unsafe here). Like `task_deps` and
   `task_labels`, the table is added via `CREATE TABLE IF NOT EXISTS` in `schema.sql` — no
   migration-runner step, no version bump (ADR-026).
+- **`tokens` (Phase S, ADR-029)** — scope-bound bearer credentials. Columns: `id` (`tk_<16 hex>`,
+  shown in `ls`/`revoke`), `token_hash` (`sha256(plaintext)` hex, `NOT NULL UNIQUE`), `category`
+  (`NOT NULL` — the bound scope category slug), `project` (NULL = category-wide scope), `created_at`,
+  `revoked_at` (NULL = active). Index `idx_tokens_hash(token_hash)`. **The plaintext token is never
+  stored** — only its sha256 hash is; the plaintext (`amt_` + 32 lowercase hex, 16 bytes of
+  `crypto/rand`) is returned **once** at mint (the `POST /api/tokens` `201` response) and never
+  persisted, logged, listed, or printed by `whoami`, so a stolen DB row cannot be replayed (the server
+  hashes the **presented** plaintext to compare — `ResolveToken`). Like `task_deps`/`task_labels`/
+  `task_meta`, the table is added via `CREATE TABLE IF NOT EXISTS` in `schema.sql` — **no migration
+  step, no version bump (`currentSchemaVersion` stays 5)**. `category`/`project` mirror a `Scope`;
+  `Token.Scope()` reconstructs it. There is no FK from `tokens` to `categories`/`projects` — the
+  bound scope is validated at mint (`CreateToken`: category exists + non-archived, a named project
+  exists and belongs to that category), not by a constraint.
 - **`projects.archived_at`** — TEXT, **NULL = active**; an ISO-8601 UTC timestamp set when the
   project is archived (`store.go ArchiveProject`) and cleared back to NULL on unarchive
   (`UnarchiveProject`). Soft-archive is reversible; default project lists hide archived rows.
@@ -143,7 +157,8 @@ excluded. These read straight off `tasks`/`events` — no denormalized counter i
 `idx_tasks_project_status(project_id,status)`, `idx_tasks_assignee(assignee)`,
 `idx_tasks_updated(updated_at)`, `idx_task_deps_prereq(depends_on_id)`,
 `idx_task_labels_label(label)`, `idx_task_meta_key(key)`, `idx_comments_task(task_id,id)`,
-`idx_events_since(id)`, `idx_projects_uid(uid)` (UNIQUE), `idx_projects_category(category_id)`.
+`idx_events_since(id)`, `idx_projects_uid(uid)` (UNIQUE), `idx_projects_category(category_id)`,
+`idx_tokens_hash(token_hash)`.
 
 ## Relationships
 
@@ -167,7 +182,11 @@ the dependent or the prerequisite. **Events are never deleted** (append-only).
 
 ## Sensitive Data
 
-- **No credentials, secrets, tokens, or PII schema.** There is no user/account table.
+- **No user/account table and no PII schema.** Since Phase S the `tokens` table holds the only
+  credential at rest — and it stores **only the sha256 hash** of each bearer token, never the
+  plaintext, so the row is non-replayable (the server compares `hash(presented_plaintext)`). The
+  token plaintext lives only in the per-directory identity file (or the `AGENTMAN_TOKEN` env), never
+  in the DB. See `security.md`.
 - Free-text fields (`tasks.title`, `tasks.body`, `comments.body`) and `assignee`/`actor` are
   **agent-supplied and untrusted** — they may contain whatever agents write (internal plans, repo
   names, possibly secrets pasted by an agent). They are rendered XSS-safely on the dashboard
@@ -288,8 +307,9 @@ entirely new table (rather than altering an existing one), placing a `CREATE TAB
 in `schema.sql` is sufficient — `OpenStore` runs `schema.sql` on every start, so the new table
 appears in existing DBs automatically. The migration runner is only needed for `ALTER TABLE` on
 existing tables (where `IF NOT EXISTS` can't help). Examples: `task_deps` (Phase H),
-`task_labels` (Phase M, ADR-024), and `task_meta` (Phase P, ADR-026) were all added this way,
-with no `schemaMigrations` step and no `currentSchemaVersion` bump.
+`task_labels` (Phase M, ADR-024), `task_meta` (Phase P, ADR-026), and `tokens` (Phase S, ADR-029)
+were all added this way, with no `schemaMigrations` step and no `currentSchemaVersion` bump
+(it stays **5**).
 
 Backup/restore:
 
@@ -300,9 +320,11 @@ Backup/restore:
   required tables, `schema_version <= currentSchemaVersion`), **refuses while a server is running**,
   backs up the current DB (`0o600`) into the DB's directory, then atomically replaces it
   (`cmd/am/db.go importDB`). The required-table set is **deliberately the v1 baseline** (no
-  `categories`/`task_deps`/`task_labels`) — later tables are created by `schema.sql`/migrations on
-  the next `OpenStore`, so pre-v4 snapshots stay importable and migrate on open. Export needs no
-  special handling for new tables (`VACUUM INTO` snapshots everything, categories included).
+  `categories`/`task_deps`/`task_labels`/`tokens`) — later tables are created by `schema.sql`/
+  migrations on the next `OpenStore`, so pre-v4 (and pre-Phase-S) snapshots stay importable and gain
+  the missing tables on open. Export needs no special handling for new tables (`VACUUM INTO` snapshots
+  everything — categories and the `tokens` table included; the latter is acceptable because token
+  hashes are non-replayable, ADR-029).
 - **`am db prune (--before <YYYY-MM-DD> | --keep <N>) [--db PATH] [--yes]`** — offline maintenance
   (refuses while a server is running, like `am db import`); deletes rows from the **`events` table
   only** (NOT comments/tasks/projects), then runs `VACUUM` (best-effort) to reclaim disk space.
@@ -383,9 +405,18 @@ erDiagram
     text data "JSON delta"
     text created_at
   }
+  tokens {
+    text id PK "tk_<16 hex>"
+    text token_hash UK "sha256(plaintext); plaintext never stored"
+    text category "bound scope category slug"
+    text project "bound scope project slug; NULL = category-wide"
+    text created_at
+    text revoked_at "NULL = active"
+  }
 ```
 
-(`events` is intentionally not FK-linked; shown dashed-conceptually only.)
+(`events` and `tokens` are intentionally not FK-linked; shown standalone. `tokens.category`/
+`project` mirror a `Scope`, validated at mint rather than by a constraint.)
 
 ## Unknowns
 

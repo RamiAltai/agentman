@@ -11,6 +11,77 @@ fresh `[Unreleased]` section.
 
 ### Added
 
+- **Scope tokens (Phase S)** — the final phase of the agentic_brain integration train turns Phase
+  Q's client-asserted scope (accident prevention) into a real **server-enforced** boundary: a token
+  is bound server-side to a scope, the server derives the scope from the token, and a config-following
+  agent that holds only its own token cannot forge another scope's token (agentic_brain requirement
+  R5, SHOULD). No TLS, no users, no rate limiting; the loopback (`127.0.0.1`) bind is unchanged.
+  - **`am token` CLI**: `am token new --scope <category[/project]>` mints a scope-bound bearer token,
+    prints the **plaintext on stdout line 1** (so `tok=$(am token new --scope work)` works) and a
+    one-line hint on stderr, and **merges** the token into this directory's identity file (preserving
+    the existing agent id and scope). No `--scope` → exit 5. `am token ls [--json]` lists tokens as
+    `id  scope  created  [revoked]` (never the plaintext or hash). `am token revoke <id>` revokes a
+    token (silent success; unknown or already-revoked id → exit 3). `am whoami` prints `token: set`
+    when one is configured (never the value).
+  - **New exit code `9` = bad token** (invalid or revoked). Distinct from `8` (out of scope) on
+    purpose: a bad credential must **hard-fail**, not be swallowed as a per-id scope-skip inside a
+    bulk loop. The catalog is now `0/3/4/5/6/7/8/9`; the `usage()` exit-codes line ends `· 8 out of
+    scope · 9 bad token`.
+  - **Token-admin HTTP API** (`Server`): `POST /api/tokens` (mint; body `{"scope":"cat[/proj]"}`;
+    `201 {"id","scope","token","created_at"}` — the **only** response that ever carries the plaintext
+    `token`), `GET /api/tokens` (list `[]Token` — `{id, category, project?, created_at, revoked_at?}`;
+    never `token`/`token_hash`), `POST /api/tokens/{id}/revoke` (`200` with the token metadata; `404`
+    for unknown/already-revoked). **All three require an unscoped caller** (`tokenAdminGuard`): any
+    request carrying a scope — whether an `X-Agent-Scope` header OR a valid bearer token — is refused
+    `403`, so only the human at the CLI/dashboard administers tokens and a confined agent can never
+    mint a token for another scope.
+  - **`401 {"error":"unauthorized"}` on ANY endpoint** for an invalid/revoked bearer token — it is
+    `scopeOf` that surfaces it (new `ErrInvalidToken` sentinel), so every handler inherits it. Maps
+    to CLI **exit 9**.
+  - **Transport / precedence**: the CLI sends `Authorization: Bearer <token>` when a token is present
+    and **stops sending `X-Agent-Scope`** (the server ignores the header when a token is present
+    anyway; dropping it keeps the wire honest about scope provenance). **Token scope overrides the
+    header**: when a bearer token is present, its server-side bound scope is authoritative.
+  - **Identity / env**: the per-directory identity JSON gains an optional `token` field
+    (`{"agent","scope","token"}`); new env override **`AGENTMAN_TOKEN`** (mirrors `AGENTMAN_AGENT`/
+    `AGENTMAN_SCOPE`) overrides the file's token.
+  - **`tokens` table** via `CREATE TABLE IF NOT EXISTS` in `schema.sql` (plus `idx_tokens_hash`).
+    **No migration; `currentSchemaVersion` stays 5** — a fresh table needs no backfill, the
+    `task_deps`/`task_labels`/`task_meta` precedent. Columns: `id` (`tk_<16 hex>`), `token_hash`
+    (sha256 of plaintext, hex, UNIQUE), `category`, `project` (NULL = category-wide), `created_at`,
+    `revoked_at` (NULL = active). **Only the sha256 hash is stored** — the plaintext (`amt_` + 32 hex,
+    16 bytes of `crypto/rand`) is shown once at mint and never persisted, logged, listed, or printed
+    by whoami; a stolen DB row cannot be replayed because the server hashes the presented plaintext to
+    compare. Store methods: `CreateToken` (validates the scope — category exists/non-archived, a named
+    project exists and belongs to that category), `ListTokens`, `RevokeToken`, `ResolveToken` (never
+    returns a zero/allow-everything scope on a miss). `am db export` (`VACUUM INTO`) carries the
+    `tokens` table along — acceptable because the hashes are non-replayable; the required-import-table
+    set stays the v1 baseline, so a pre-Phase-S snapshot still imports.
+  - **No new event kind** — token mint/revoke deliberately emits **no event** (the catalog stays
+    **21 kinds**); audit token activity via `am serve --log`. Keeping credential admin out of the
+    unprunable activity feed avoids leaking token existence.
+  - **Honesty note (residual)**: this is loopback-only with no users — a process that can read an
+    identity file holds that token and can act as that scope. The boundary Phase S provides is precise:
+    *a config-following agent that cannot forge another scope's token is confined to its own scope.*
+    It is **not** protection against arbitrary filesystem read. This upgrades Phase Q's "any header"
+    caveat to "a server-minted, scope-bound, revocable credential" but does not fully close R4's
+    accident-prevention caveat. The full remote/multi-user auth+TLS project (Phase G) stays parked.
+  - **Tests (+17, now 256)**: `cmd/am/store_test.go` — `TestCreateToken_HashNotPlaintext`,
+    `TestResolveToken`, `TestCreateToken_ScopeValidation`, `TestRevokeToken` (helper `seedScopeWorld`).
+    `cmd/am/server_test.go` — `TestTokenAdmin_RequiresUnscoped`, `TestTokenScopeOverridesHeader`,
+    `TestInvalidTokenRejected`, `TestNoTokenPathUnchanged`, `TestTokenScopeMatrix`,
+    `TestCreateTokenResponse` (helpers `mintToken`, `bearer`). `cmd/am/cli_test.go` —
+    `TestCmdTokenNewWritesIdentity`, `TestCmdTokenNewRequiresScope`, `TestWhoamiPrintsTokenSet`,
+    `TestClientSendsBearerNotScope`, `TestExitCodeForUnauthorized`, `TestDoOrFailUnauthorized`.
+    `cmd/am/db_test.go` — `TestExportImportWithTokens` (export→validate→import, token still resolves).
+  - **With Phase S done, the entire agentic_brain train (O foundation, P meta, Q scoping, R dashboard,
+    S tokens) is complete — every MUST+SHOULD requirement R1–R8 is shipped.** Only the NICE items
+    remain unbuilt (webhook with egress filter, copyable `vault_path` in the dashboard, scoped
+    `am db export -c`).
+  - → ADR-029, `security.md`, `data-model.md`, `backend.md`, `system-map.md`, `README.md`,
+    `docs/agent-integration.md`, `engineering-conventions.md`, `known-risks-and-gaps.md`,
+    `project-overview.md`.
+
 - **Category dashboard + scoped feed (Phase R)** — the human dashboard gains a category-home
   landing view and a per-category drill-down, and the event feed/stream gain a `?category=` lens
   (agentic_brain requirement R6). After this phase the integration-blocking set (O+P+Q) plus the

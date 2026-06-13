@@ -434,3 +434,56 @@ func TestImportRejectsNewerSchema(t *testing.T) {
 		t.Fatalf("schema_version %d snapshot accepted, want rejection", currentSchemaVersion+1)
 	}
 }
+
+// TestExportImportWithTokens: a DB carrying tokens round-trips through
+// export/import. The tokens table rides the VACUUM INTO whole-file snapshot
+// (only sha256 hashes travel, never plaintext), and validateImportCandidate is
+// unchanged — its required-table set stays the v1 baseline, so the new table is
+// neither required nor rejected. After import the token still resolves.
+func TestExportImportWithTokens(t *testing.T) {
+	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+
+	srcDB := filepath.Join(t.TempDir(), "src.db")
+	store, err := OpenStore(srcDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.CreateCategory("work", "Work"); err != nil {
+		t.Fatal(err)
+	}
+	plain, _, err := store.CreateToken(Scope{Category: "work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	exportPath := filepath.Join(t.TempDir(), "export.db")
+	if err := exportDB(srcDB, exportPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateImportCandidate(exportPath); err != nil {
+		t.Fatalf("export with tokens rejected: %v", err)
+	}
+
+	destDB := filepath.Join(t.TempDir(), "dest.db")
+	if err := importDB(exportPath, destDB, t.TempDir(), true); err != nil {
+		t.Fatal(err)
+	}
+
+	store2, err := OpenStore(destDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store2.Close()
+	toks, err := store2.ListTokens()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(toks) != 1 || toks[0].Category != "work" {
+		t.Fatalf("imported tokens = %+v, want 1 bound to work", toks)
+	}
+	sc, err := store2.ResolveToken(plain)
+	if err != nil || sc.Category != "work" {
+		t.Fatalf("ResolveToken after import = (%+v, %v), want work", sc, err)
+	}
+}

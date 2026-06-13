@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -1243,5 +1244,134 @@ func TestCmdStatusBulkOutOfScope(t *testing.T) {
 	}
 	if !strings.Contains(msg, "#99999") || !strings.Contains(msg, "#"+workID) {
 		t.Fatalf("stderr = %q, want lines for #99999 and #%s", msg, workID)
+	}
+}
+
+// ---------- Phase S: token CLI ----------
+
+// TestCmdTokenNewWritesIdentity mints a token via `am token new --scope work`,
+// asserts the plaintext lands on stdout, and that the identity file gains the
+// token field (merged, not clobbering agent/scope).
+func TestCmdTokenNewWritesIdentity(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateCategory(t, ts, "work")
+
+	idFile := filepath.Join(t.TempDir(), "id")
+	t.Setenv("AGENTMAN_AGENT_FILE", idFile)
+	t.Setenv("AGENTMAN_AGENT", "")
+	t.Setenv("AGENTMAN_SCOPE", "")
+	t.Setenv("AGENTMAN_TOKEN", "")
+	// Seed an existing scoped identity so we can prove the merge.
+	seed, _ := json.Marshal(identityRecord{Agent: "agent-1", Scope: "work"})
+	if err := os.WriteFile(idFile, seed, 0o644); err != nil {
+		t.Fatalf("seed identity: %v", err)
+	}
+
+	// `am token new` is a human (unscoped) action — minting requires an unscoped
+	// caller — but the identity-file MERGE must still preserve the file's
+	// existing agent/scope (storeToken reads them from the file, not the client).
+	c := &Client{base: ts.URL, agent: "agent-1", http: ts.Client()}
+	out := captureStdout(t, func() {
+		captureStderr(t, func() {
+			cmdToken(c, parse([]string{"new", "--scope", "work"}))
+		})
+	})
+	plain := strings.TrimSpace(out)
+	if !strings.HasPrefix(plain, "amt_") {
+		t.Fatalf("stdout = %q, want amt_ plaintext on line 1", plain)
+	}
+
+	data, err := os.ReadFile(idFile)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var rec identityRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		t.Fatalf("identity not JSON: %v\n%s", err, data)
+	}
+	if rec.Agent != "agent-1" || rec.Scope != "work" {
+		t.Fatalf("identity record = %+v, want agent/scope preserved", rec)
+	}
+	if rec.Token != plain {
+		t.Fatalf("identity token = %q, want %q", rec.Token, plain)
+	}
+}
+
+// TestCmdTokenNewRequiresScope: no --scope → exit 5.
+func TestCmdTokenNewRequiresScope(t *testing.T) {
+	c := &Client{base: "http://127.0.0.1:0", agent: "a", http: &http.Client{}}
+	code := captureExit(t, func() {
+		captureStderr(t, func() { cmdToken(c, parse([]string{"new"})) })
+	})
+	if code != 5 {
+		t.Fatalf("token new without --scope exit = %d, want 5", code)
+	}
+}
+
+// TestWhoamiPrintsTokenSet: whoami prints "token: set", never the value.
+func TestWhoamiPrintsTokenSet(t *testing.T) {
+	idFile := filepath.Join(t.TempDir(), "id")
+	t.Setenv("AGENTMAN_AGENT_FILE", idFile)
+	t.Setenv("AGENTMAN_AGENT", "")
+	t.Setenv("AGENTMAN_SCOPE", "")
+	t.Setenv("AGENTMAN_TOKEN", "")
+	secret := "amt_0123456789abcdef0123456789abcdef"
+	rec, _ := json.Marshal(identityRecord{Agent: "agent-1", Scope: "work", Token: secret})
+	if err := os.WriteFile(idFile, rec, 0o644); err != nil {
+		t.Fatalf("seed identity: %v", err)
+	}
+	out := captureStdout(t, func() { cmdWhoami() })
+	if !strings.Contains(out, "token: set") {
+		t.Fatalf("whoami = %q, want a 'token: set' line", out)
+	}
+	if strings.Contains(out, secret) {
+		t.Fatalf("whoami leaked the token value: %q", out)
+	}
+}
+
+// TestClientSendsBearerNotScope: when a token is set, do() sends Authorization:
+// Bearer and omits X-Agent-Scope.
+func TestClientSendsBearerNotScope(t *testing.T) {
+	var auth, scopeHdr string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth = r.Header.Get("Authorization")
+		scopeHdr = r.Header.Get("X-Agent-Scope")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("[]"))
+	}))
+	t.Cleanup(stub.Close)
+
+	c := &Client{base: stub.URL, agent: "tester", scope: "work", token: "amt_abc", http: stub.Client()}
+	captureStdout(t, func() { cmdLs(c, parse([]string{})) })
+	if auth != "Bearer amt_abc" {
+		t.Fatalf("Authorization = %q, want Bearer amt_abc", auth)
+	}
+	if scopeHdr != "" {
+		t.Fatalf("X-Agent-Scope = %q, want absent when a token is set", scopeHdr)
+	}
+}
+
+// TestExitCodeForUnauthorized: 401 maps to exit 9.
+func TestExitCodeForUnauthorized(t *testing.T) {
+	if got := exitCodeFor(401); got != 9 {
+		t.Fatalf("exitCodeFor(401) = %d, want 9", got)
+	}
+}
+
+// TestDoOrFailUnauthorized: a 401 response makes doOrFail exit 9.
+func TestDoOrFailUnauthorized(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"unauthorized"}`))
+	}))
+	t.Cleanup(stub.Close)
+
+	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	code := captureExit(t, func() {
+		captureStderr(t, func() { c.doOrFail("POST", "/api/tasks/1/claim", nil) })
+	})
+	if code != 9 {
+		t.Fatalf("doOrFail on 401 exit = %d, want 9", code)
 	}
 }

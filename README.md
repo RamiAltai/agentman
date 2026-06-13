@@ -188,6 +188,13 @@ the scope. One carve-out: any agent may file tasks into the **proposals project*
 for a config-following agent, not authentication — see [Security](#security)); a pre-existing
 unscoped identity file keeps working, re-run `am init -c …` to add a scope.
 
+**Scope tokens (server-enforced).** To make the scope a real boundary, a human mints a scope-bound
+**bearer token** with `am token new --scope <cat[/proj]>` (an unscoped operation) — it prints the
+token once and stores it in this directory's identity (`token` field). The agent then sends it as
+`Authorization: Bearer` automatically; its scope **wins over** any header, and an invalid/revoked
+token fails with **exit 9**. `am whoami` shows `token: set` (never the value); `AGENTMAN_TOKEN`
+overrides the file. The board stores only the token's sha256 hash. See [Security](#security).
+
 ## CLI reference
 
 | Command | What it does |
@@ -214,7 +221,8 @@ unscoped identity file keeps working, re-run `am init -c …` to add a scope.
 | `am project rm <slug> --yes` | hard-delete a project **and ALL its tasks/comments** (permanent; `--yes` required) |
 | `am categories [--all]` · `am category new <slug> [name]` | list (`--all` includes archived) / create categories |
 | `am category archive <slug>` · `am category unarchive <slug>` | soft-archive a category (hides its projects/tasks; blocks new tasks/projects under it) / restore it |
-| `am init <tasktype> [-c CAT [-p PROJ]]` · `am whoami` | identity (optionally **scoped** to a category or one project — confines this agent; out-of-scope ops exit 8); `whoami` adds a `scope:` line when scoped |
+| `am init <tasktype> [-c CAT [-p PROJ]]` · `am whoami` | identity (optionally **scoped** to a category or one project — confines this agent; out-of-scope ops exit 8); `whoami` adds a `scope:` line when scoped and a `token: set` line when a token is configured |
+| `am token new --scope <cat[/proj]>` · `am token ls [--json]` · `am token revoke <id>` | **scope tokens** (the human mints, the agent uses): `new` mints a scope-bound bearer token, prints it once on stdout, and stores it in this directory's identity (sent as `Authorization: Bearer` on future requests); `ls` lists tokens (id / scope / created / [revoked], never the value); `revoke` revokes one. Minting requires an **unscoped** caller. An invalid/revoked token → exit 9 |
 | `am serve [--port 8787] [--db PATH] [--log] [--proposals CAT/PROJ]` | run the dashboard + API (`--proposals` = the scope carve-out project any agent may file into; default `meta/proposals`) |
 | `am db export [path] [--db PATH]` | write a consistent DB snapshot (prints the path) |
 | `am db import <path> [--db PATH] [--yes]` | restore a snapshot (stop `am serve` first; backs up current DB) |
@@ -224,14 +232,17 @@ unscoped identity file keeps working, re-run `am init -c …` to add a scope.
 `<id>` accepts a global id (`13`) or a project ref (`web-3`). `--status` accepts a comma
 list. Priority is `0` urgent … `3` low (default `2`). Durations use Go syntax (`30m`, `48h` —
 not `2d`). Add `--json` to any read to parse.
-Exit codes: `0` ok · `3` not found · `4` already claimed, blocked, or not stale yet · `5` invalid · `6` server down · `7` wait timed out · `8` out of scope.
+Exit codes: `0` ok · `3` not found · `4` already claimed, blocked, or not stale yet · `5` invalid · `6` server down · `7` wait timed out · `8` out of scope · `9` bad token (invalid or revoked).
 
 ## HTTP API
 
 The CLI is a thin client over this (also what the dashboard uses). `X-Agent` header sets the
 actor; the optional `X-Agent-Scope` header (`category[/project]`) confines the caller — out-of-scope
-mutations and named reads return `403 {"error":"out_of_scope"}` (CLI exit 8). It is a client-asserted
-label, not authentication (see [Security](#security)).
+mutations and named reads return `403 {"error":"out_of_scope"}` (CLI exit 8). A **scope token**
+(`Authorization: Bearer <tok>`, Phase S) carries a server-bound scope that **wins over**
+`X-Agent-Scope`; an invalid/revoked token → `401 {"error":"unauthorized"}` (CLI exit 9). Scope
+confinement is a loopback-only boundary against a config-following agent, not full authentication
+(see [Security](#security)).
 
 ```
 GET    /api/categories?archived=true             GET    /api/tasks/{id}          (returns depends_on + blocks)
@@ -252,6 +263,9 @@ POST   /api/tasks {project,title,meta?,...}      DELETE /api/tasks/{id}
 GET    /api/events?since=|?tail=|?before=        GET    /api/stream  (SSE)
        [&project=][&category=]                          [?project=|?category= scope]
 GET    /api/projects/{slug}/graph               {nodes,edges}; read-only DAG (no events)
+POST   /api/tokens {scope:"cat[/proj]"}          GET    /api/tokens   (list; never the plaintext/hash)
+       201 {id,scope,token,...} — plaintext once  POST   /api/tokens/{id}/revoke
+       (all three require an UNSCOPED caller — mint-requires-unscoped)
 ```
 
 Category and project payloads carry a **stable id** (`uid`: `amc_…` / `amp_…`) that never
@@ -272,6 +286,14 @@ labels (lowercase, 1–50 chars of `a-z 0-9 . _ -`), values are opaque strings u
 Set pairs on create or PATCH (an empty-string value removes the key); filter by key **presence**
 with `?meta_key=` / the `meta_key` next-body field. Task JSON includes `"meta"` when present.
 
+**Scope tokens** (Phase S) turn the client-asserted `X-Agent-Scope` into a server-enforced boundary.
+A human (an unscoped caller) mints one with `POST /api/tokens {"scope":"cat[/proj]"}`; the `201`
+response carries the plaintext token **once** — it is never returned again, and only its sha256 hash
+is stored, so a stolen DB row cannot be replayed. The agent then sends `Authorization: Bearer <tok>`
+on every request, and the server derives the scope from the token (it wins over any `X-Agent-Scope`
+header). A bad/revoked token → `401`/exit 9. This confines a *config-following* agent that cannot
+forge another scope's token; it is loopback-only, not auth against an arbitrary local process.
+
 ```sh
 curl -s 127.0.0.1:8787/api/tasks?project=web
 curl -s -H 'X-Agent: claude-1' -X POST 127.0.0.1:8787/api/tasks/13/claim
@@ -285,6 +307,7 @@ curl -s -H 'X-Agent: claude-1' -X POST 127.0.0.1:8787/api/tasks/13/claim
 | `AGENTMAN_PROJECT` | default project for `am ls` / `am new` |
 | `AGENTMAN_CATEGORY` | default category scope for `am ls` / `am next` / `am wait --ready` / `am project new` |
 | `AGENTMAN_SCOPE` | override the identity file's confinement scope sent as `X-Agent-Scope` (e.g. `work` or `work/api`) |
+| `AGENTMAN_TOKEN` | override the identity file's bearer token (sent as `Authorization: Bearer`; a token's scope wins over `X-Agent-Scope`) |
 | `AGENTMAN_AGENT` | identity override (else `am init` file) |
 | `AGENTMAN_PROPOSALS` / `--proposals` | (serve) the scope carve-out project any agent may file into (default `meta/proposals`) |
 | `AGENTMAN_PORT` / `--port` | server port (default `8787`) |
@@ -359,9 +382,13 @@ Don't expose the port to untrusted networks. If you need remote/multi-user acces
 behind a reverse proxy with auth, or open an issue.
 
 Agent **scopes** (`X-Agent-Scope`, `am init -c …`) confine a *config-following* agent to its slice
-of the board, but they are **client-asserted labels, not a security boundary** — any local caller
-can forge or omit the header. Treat scope confinement as accident prevention, not access control;
-verified scope tokens are a future step. See `architecture/security.md`.
+of the board. On their own they are **client-asserted labels** — any local caller can forge or omit
+the header. **Scope tokens** (`am token new --scope …`, Phase S) upgrade this: a token is
+server-minted and bound to a scope, its scope **wins over** the header, minting requires an unscoped
+caller, and a bad/revoked token hard-fails (`401`/exit 9) — so a config-following agent that holds
+only its own token **cannot forge another scope's token**. Tokens are stored as sha256 hashes (never
+plaintext). This is still **loopback-only** and **not** authentication against an arbitrary local
+process: a process that can read the identity file holds the token. See `architecture/security.md`.
 
 ## Development
 

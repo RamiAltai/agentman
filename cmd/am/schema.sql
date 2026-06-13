@@ -76,6 +76,23 @@ CREATE TABLE IF NOT EXISTS task_meta (
 );
 CREATE INDEX IF NOT EXISTS idx_task_meta_key ON task_meta(key);
 
+-- tokens: scope-bound bearer credentials (Phase S). A token confines an agent
+-- to one scope server-side: the server derives the scope from the presented
+-- token and ignores the client-asserted X-Agent-Scope header. Only the sha256
+-- HASH of the plaintext is stored — the plaintext (amt_<32 hex>) is shown once
+-- at mint and never persisted, so a stolen DB row cannot be replayed as a
+-- credential. Created via CREATE TABLE IF NOT EXISTS (no migration; the
+-- schema_version stays 5 — a fresh table needs no backfill).
+CREATE TABLE IF NOT EXISTS tokens (
+  id          TEXT PRIMARY KEY,          -- tk_<16 hex>, shown in ls/revoke
+  token_hash  TEXT NOT NULL UNIQUE,      -- sha256(plaintext) hex; plaintext never stored
+  category    TEXT NOT NULL,             -- bound scope category slug
+  project     TEXT,                      -- bound scope project slug (NULL = category-wide)
+  created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  revoked_at  TEXT                       -- NULL = active
+);
+CREATE INDEX IF NOT EXISTS idx_tokens_hash ON tokens(token_hash);
+
 -- comments: discussion thread on a task.
 CREATE TABLE IF NOT EXISTS comments (
   id         INTEGER PRIMARY KEY,

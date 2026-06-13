@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	_ "embed"
 	"encoding/hex"
@@ -28,6 +29,11 @@ var (
 	ErrProjectArchived  = errors.New("project_archived")
 	ErrCategoryArchived = errors.New("category_archived")
 	ErrOutOfScope       = errors.New("out_of_scope")
+	// ErrInvalidToken marks a presented bearer token as unknown or revoked.
+	// It maps to HTTP 401 → CLI exit 9 (a bad credential hard-fails; it is NOT
+	// the exit-8 scope-skip a bulk loop tolerates). Its message is "unauthorized"
+	// so writeErr emits {"error":"unauthorized"}.
+	ErrInvalidToken = errors.New("unauthorized")
 )
 
 // ConflictError carries the current owner of a task that lost a claim race.
@@ -90,6 +96,21 @@ func parseScope(raw string) (Scope, error) {
 	}
 	return sc, nil
 }
+
+// Token is a scope-bound bearer credential (Phase S). It carries only public
+// metadata — the plaintext is shown once at mint and never stored, and the
+// sha256 hash is never exposed (ListTokens never selects it), so a Token is
+// safe to render in ls/JSON.
+type Token struct {
+	ID        string `json:"id"` // tk_<16 hex>
+	Category  string `json:"category"`
+	Project   string `json:"project,omitempty"`
+	CreatedAt string `json:"created_at"`
+	RevokedAt string `json:"revoked_at,omitempty"`
+}
+
+// Scope returns the confinement boundary this token binds to.
+func (t Token) Scope() Scope { return Scope{Category: t.Category, Project: t.Project} }
 
 // Category is the layer above projects (instance → category → project → task).
 type Category struct {
@@ -1026,6 +1047,139 @@ func (s *Store) taskScope(id int64) (category, project, createdBy string, err er
 		return "", "", "", ErrNotFound
 	}
 	return category, project, createdBy, err
+}
+
+// ---------- tokens (Phase S) ----------
+
+// CreateToken mints a scope-bound bearer token. It validates that sc's category
+// exists and is non-archived, and (when sc names a project) that the project
+// exists AND belongs to that category. On success it returns the plaintext
+// ONCE (the only time it ever leaves the process) plus the token's public
+// metadata; the plaintext is never stored — only its sha256 hash is.
+func (s *Store) CreateToken(sc Scope) (plaintext string, t *Token, err error) {
+	if sc.Category == "" {
+		return "", nil, ErrValidation
+	}
+	cid, err := s.categoryID(sc.Category)
+	if err != nil {
+		return "", nil, err // ErrNotFound for a bad slug
+	}
+	var catArchived sql.NullString
+	if err := s.db.QueryRow("SELECT archived_at FROM categories WHERE id=?", cid).Scan(&catArchived); err != nil {
+		return "", nil, err
+	}
+	if catArchived.Valid && catArchived.String != "" {
+		return "", nil, ErrCategoryArchived
+	}
+	if sc.Project != "" {
+		owner, err := s.projectCategory(sc.Project)
+		if err != nil {
+			return "", nil, err // ErrNotFound for an unknown project
+		}
+		if owner != sc.Category {
+			// The project exists but lives in another category — refuse rather
+			// than mint a token that could never match anything.
+			return "", nil, ErrValidation
+		}
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", nil, err
+	}
+	defer tx.Rollback()
+
+	var id string
+	var proj any
+	if sc.Project != "" {
+		proj = sc.Project
+	}
+	for attempt := 0; ; attempt++ {
+		id = newUID("tk_")
+		plaintext = newToken()
+		_, err = tx.Exec("INSERT INTO tokens(id,token_hash,category,project) VALUES(?,?,?,?)",
+			id, hashToken(plaintext), sc.Category, proj)
+		if (isUniqueErr(err, "tokens.id") || isUniqueErr(err, "tokens.token_hash")) && attempt < 2 {
+			continue // astronomically unlikely collision — retry with fresh values
+		}
+		if err != nil {
+			return "", nil, err
+		}
+		break
+	}
+	var tok Token
+	if err := tx.QueryRow(
+		"SELECT id, category, COALESCE(project,''), created_at, COALESCE(revoked_at,'') FROM tokens WHERE id=?", id).
+		Scan(&tok.ID, &tok.Category, &tok.Project, &tok.CreatedAt, &tok.RevokedAt); err != nil {
+		return "", nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", nil, err
+	}
+	return plaintext, &tok, nil
+}
+
+// ListTokens returns all tokens' public metadata, newest last. token_hash is
+// NEVER selected — the hash never leaves the store.
+func (s *Store) ListTokens() ([]Token, error) {
+	rows, err := s.db.Query(
+		"SELECT id, category, COALESCE(project,''), created_at, COALESCE(revoked_at,'') FROM tokens ORDER BY created_at")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Token{}
+	for rows.Next() {
+		var t Token
+		if err := rows.Scan(&t.ID, &t.Category, &t.Project, &t.CreatedAt, &t.RevokedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// RevokeToken marks a token revoked. An unknown id OR an already-revoked token
+// both yield ErrNotFound (a no-op revoke is a 404, never silent success).
+func (s *Store) RevokeToken(id string) (*Token, error) {
+	res, err := s.db.Exec(
+		"UPDATE tokens SET revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND revoked_at IS NULL", id)
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, ErrNotFound
+	}
+	var t Token
+	if err := s.db.QueryRow(
+		"SELECT id, category, COALESCE(project,''), created_at, COALESCE(revoked_at,'') FROM tokens WHERE id=?", id).
+		Scan(&t.ID, &t.Category, &t.Project, &t.CreatedAt, &t.RevokedAt); err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+// ResolveToken maps a presented plaintext token to its bound Scope. An unknown
+// token OR a revoked one yields ErrInvalidToken — NEVER a zero (unscoped) Scope
+// on a miss, which would silently grant the unscoped, allow-everything boundary
+// to a bad credential. This is security-critical: callers rely on the error.
+func (s *Store) ResolveToken(plaintext string) (Scope, error) {
+	var category string
+	var project sql.NullString
+	var revoked sql.NullString
+	err := s.db.QueryRow(
+		"SELECT category, project, revoked_at FROM tokens WHERE token_hash=?", hashToken(plaintext)).
+		Scan(&category, &project, &revoked)
+	if err == sql.ErrNoRows {
+		return Scope{}, ErrInvalidToken
+	}
+	if err != nil {
+		return Scope{}, err
+	}
+	if revoked.Valid && revoked.String != "" {
+		return Scope{}, ErrInvalidToken
+	}
+	return Scope{Category: category, Project: project.String}, nil
 }
 
 // ---------- tasks ----------
@@ -2462,6 +2616,24 @@ func newUID(prefix string) string {
 	var b [8]byte
 	rand.Read(b[:])
 	return prefix + hex.EncodeToString(b[:])
+}
+
+// newToken returns a fresh plaintext bearer token: "amt_" + 32 lowercase hex
+// chars (16 bytes of crypto/rand). The plaintext is the only secret — it is
+// shown to the agent once at mint and never stored. crypto/rand.Read never
+// fails (it fills the buffer or aborts the program).
+func newToken() string {
+	var b [16]byte
+	rand.Read(b[:])
+	return "amt_" + hex.EncodeToString(b[:])
+}
+
+// hashToken returns the hex sha256 of a plaintext token. Only this hash is
+// stored; possessing it does not let one authenticate, since the server hashes
+// the presented plaintext to compare (a hash cannot be presented as a credential).
+func hashToken(plaintext string) string {
+	sum := sha256.Sum256([]byte(plaintext))
+	return hex.EncodeToString(sum[:])
 }
 
 // isUniqueErr reports whether err is a SQLite UNIQUE-constraint failure on the

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -60,6 +61,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/projects/{slug}/graph", s.handleProjectGraph)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.HandleFunc("GET /api/stream", s.handleStream)
+	mux.HandleFunc("POST /api/tokens", s.handleCreateToken)
+	mux.HandleFunc("GET /api/tokens", s.handleListTokens)
+	mux.HandleFunc("POST /api/tokens/{id}/revoke", s.handleRevokeToken)
 
 	sub, _ := fs.Sub(webFS, "web")
 	mux.Handle("/", http.FileServer(http.FS(sub)))
@@ -181,7 +185,7 @@ func (s *Server) handleListCategories(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateCategory(w http.ResponseWriter, r *http.Request) {
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -205,7 +209,7 @@ func (s *Server) handleCreateCategory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleArchiveCategory(w http.ResponseWriter, r *http.Request) {
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -227,7 +231,7 @@ func (s *Server) handleArchiveCategory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUnarchiveCategory(w http.ResponseWriter, r *http.Request) {
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -261,7 +265,7 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePatchProject(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -288,7 +292,7 @@ func (s *Server) handlePatchProject(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleArchiveProject(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -310,7 +314,7 @@ func (s *Server) handleArchiveProject(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleUnarchiveProject(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -331,7 +335,7 @@ func (s *Server) handleUnarchiveProject(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -393,7 +397,7 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		}
 		f.Stale = d
 	}
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -419,7 +423,7 @@ func (s *Server) handleAddDep(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -470,7 +474,7 @@ func (s *Server) handleRemoveDep(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -501,7 +505,7 @@ func (s *Server) handleAddLabel(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -534,7 +538,7 @@ func (s *Server) handleRemoveLabel(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -567,7 +571,7 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, ErrValidation)
 		return
 	}
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -598,7 +602,7 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -621,7 +625,7 @@ func (s *Server) handlePatchTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -652,7 +656,7 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -706,7 +710,7 @@ func (s *Server) handleNext(w http.ResponseWriter, r *http.Request) {
 	if in.Assignee != "" {
 		agent = in.Assignee
 	}
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -736,7 +740,7 @@ func (s *Server) handleComment(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -767,7 +771,7 @@ func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -791,7 +795,7 @@ func (s *Server) handleDeleteComment(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -816,7 +820,7 @@ func (s *Server) handleDeleteComment(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -836,7 +840,7 @@ func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleProjectGraph(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
-	sc, err := scopeOf(r)
+	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -985,6 +989,84 @@ func writeEvent(w io.Writer, e *Event) error {
 	return err
 }
 
+// ---------- token admin (Phase S) ----------
+
+// tokenAdminGuard is the mint-requires-unscoped boundary crux: the three
+// token-admin endpoints are refused for ANY request that carries a scope —
+// whether asserted by an X-Agent-Scope header or derived from a (valid) bearer
+// token. Only a fully unscoped caller (the human at the CLI / dashboard) may
+// administer tokens, so a confined agent can never forge a token for another
+// scope. A bad bearer token still 401s here (scopeOf surfaces ErrInvalidToken)
+// rather than being mistaken for "unscoped". Returns ok=false after writing the
+// error response (mirrors handleCreateCategory's precedent).
+func (s *Server) tokenAdminGuard(w http.ResponseWriter, r *http.Request) (ok bool) {
+	sc, err := s.scopeOf(r)
+	if err != nil {
+		writeErr(w, err) // bad/revoked token → 401
+		return false
+	}
+	if !sc.IsZero() { // any scope (header or token) is refused — 403 → exit 8
+		writeErr(w, denyScope(r, sc))
+		return false
+	}
+	return true
+}
+
+func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
+	if !s.tokenAdminGuard(w, r) {
+		return
+	}
+	var in struct {
+		Scope string `json:"scope"`
+	}
+	if err := decode(r, &in); err != nil {
+		writeErr(w, ErrValidation)
+		return
+	}
+	sc, err := parseScope(in.Scope)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	plaintext, tok, err := s.store.CreateToken(sc)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	// The plaintext token rides this one response and never appears again
+	// (not in ls, not in the DB row, not in any log).
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id":         tok.ID,
+		"scope":      tok.Scope().String(),
+		"token":      plaintext,
+		"created_at": tok.CreatedAt,
+	})
+}
+
+func (s *Server) handleListTokens(w http.ResponseWriter, r *http.Request) {
+	if !s.tokenAdminGuard(w, r) {
+		return
+	}
+	toks, err := s.store.ListTokens()
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toks)
+}
+
+func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
+	if !s.tokenAdminGuard(w, r) {
+		return
+	}
+	tok, err := s.store.RevokeToken(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, tok)
+}
+
 // ---------- helpers ----------
 
 func actorOf(r *http.Request) string {
@@ -996,15 +1078,34 @@ func actorOf(r *http.Request) string {
 
 // ---------- scope enforcement (Phase Q) ----------
 
-// scopeOf is the SOLE reader of the X-Agent-Scope header — Phase S (scope
-// tokens) swaps the scope's source here without touching any handler. An
-// absent header is the zero (unscoped) Scope; a malformed one is a 400.
-func scopeOf(r *http.Request) (Scope, error) {
+// scopeOf is the SOLE reader of request scope — no handler reads the
+// Authorization header or X-Agent-Scope directly. Precedence (Phase S):
+//   - A bearer token WINS: its server-side bound scope is authoritative and any
+//     X-Agent-Scope header is ignored. An unknown/revoked token is ErrInvalidToken
+//     (→ 401 → exit 9), NEVER a silent fallthrough to the header or zero scope.
+//   - With no token, the X-Agent-Scope header is the scope: absent is the zero
+//     (unscoped) Scope; a malformed one is a 400.
+func (s *Server) scopeOf(r *http.Request) (Scope, error) {
+	if tok := bearerToken(r); tok != "" {
+		return s.store.ResolveToken(tok)
+	}
 	raw := r.Header.Get("X-Agent-Scope")
 	if raw == "" {
 		return Scope{}, nil
 	}
 	return parseScope(raw)
+}
+
+// bearerToken extracts the token from an "Authorization: Bearer <tok>" header,
+// or "" when absent. The scheme match is case-insensitive (per RFC 7235); the
+// token value is returned verbatim.
+func bearerToken(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	const prefix = "bearer "
+	if len(h) > len(prefix) && strings.EqualFold(h[:len(prefix)], prefix) {
+		return strings.TrimSpace(h[len(prefix):])
+	}
+	return ""
 }
 
 // scopeAllows reports whether a task in (cat, proj) falls inside sc.
@@ -1252,6 +1353,8 @@ func writeErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrNotFound):
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+	case errors.Is(err, ErrInvalidToken):
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 	case errors.Is(err, ErrOutOfScope):
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "out_of_scope"})
 	case errors.Is(err, ErrValidation):

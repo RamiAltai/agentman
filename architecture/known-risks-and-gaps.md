@@ -118,10 +118,13 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 ## Scope-Enforcement Residuals (Phase Q)
 
-- **Scope is a client-asserted label, not a security boundary** (Medium, by design). `X-Agent-Scope`
-  confines a *config-following* agent (accident prevention); any local caller can forge or omit it.
-  **Phase S (scope tokens)** turns it into a verified credential — `scopeOf(r)` is the single swap
-  point. → `security.md`, ADR-027.
+- **Scope is now token-backed but still loopback-only** (Medium, by design). `X-Agent-Scope` alone is
+  a client-asserted label (forgeable/omittable, accident prevention). **Phase S (scope tokens)**
+  turned it into a server-derived credential — a server-minted, scope-bound bearer token whose scope
+  wins over the header, minted only by an unscoped caller (`tokenAdminGuard`), resolved in the single
+  `scopeOf(r)` point. This confines a *token-following* agent that cannot forge another scope's token
+  (bad token → 401 → exit 9). **Residual**: not auth against an arbitrary local process — see
+  *Scope-Token Residuals* below. → `security.md`, ADR-027, ADR-029.
 - **`/api/events` + `/api/stream` are not narrowed by `X-Agent-Scope`** (Low, deliberate). A
   scoped agent can still read the global activity feed; the SSE stream stays unscoped against the
   identity scope, so `am wait` re-checks via the scoped REST call (chattier but correct — no
@@ -149,6 +152,31 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   `project→category` are immutable today. If a task/project move feature ships, the checks must move
   in-tx (recorded in the `PatchTask`/`PatchProject` scope-note comments). → ADR-027.
 
+## Scope-Token Residuals (Phase S)
+
+- **Filesystem read = token possession** (Medium, by design — the central honesty note). A process
+  that can read the per-directory identity file (`~/.agentman/agents/*`) holds the plaintext token and
+  can act as that scope. The boundary Phase S provides is precise: *a config-following agent that
+  cannot forge another scope's token is confined to its own scope* — it is **not** protection against
+  an attacker with arbitrary filesystem read, and **not** authentication. This upgrades Phase Q's
+  caveat (header → server-minted scope-bound revocable credential) but does **not** fully close R4's
+  accident-prevention framing. Loopback-only mitigates; the full remote/multi-user auth+TLS project
+  (Phase G) stays parked. → `security.md`, ADR-029.
+- **Tokens travel in cleartext over loopback** (Low, by design). No TLS; acceptable only because the
+  bind never leaves `127.0.0.1`. A token is not a network-facing secret. → ADR-029.
+- **DB export carries token hashes** (Low, accepted). `am db export` (`VACUUM INTO`) snapshots the
+  `tokens` table, but only sha256 hashes are stored and the server compares `hash(presented_plaintext)`,
+  so a hash is non-replayable; no scrubbing was added. → `data-model.md`, ADR-029.
+- **Revocation is immediate but coarse** (Low, by design). `ResolveToken` checks `revoked_at` on
+  every request, so a revoked token fails at once, but there is no expiry/rotation (matches the SHOULD
+  scope). → ADR-029.
+- **Token-hash lookup is not constant-time** (Low). `ResolveToken` is a single indexed
+  `WHERE token_hash=?` lookup, not a constant-time compare — a non-issue at loopback scale, and
+  constant-time over a DB lookup is infeasible. → ADR-029.
+- **`am init` can clobber a stored token** (Low, accepted). `am token new` merges into the existing
+  identity record, but a later `am init` rewrites the file and may drop the `token` field; the token
+  is re-mintable, so this is accepted. → `identity.go`, ADR-029.
+
 ## Security Risks
 
 (Full detail in `security.md`.)
@@ -166,13 +194,15 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
     symbol/package scan finds nothing; module-level hit only). Transitive dep via `modernc.org/libc`.
     Clears by upgrading `golang.org/x/sys` to ≥ v0.44.0 if ever desired. Does not affect CI.
 - **Spoofable audit actor** (Low) — `events.actor` comes from the unauthenticated `X-Agent` header.
-- **Scope confinement is client-asserted** (Medium, by design; Phase Q) — `X-Agent-Scope` is not a
-  boundary against crafted HTTP. See *Scope-Enforcement Residuals* above and `security.md`; Phase S
-  scope tokens are the fix.
+- **Scope confinement is token-backed but loopback-only** (Medium, by design; Phase Q + Phase S) —
+  `X-Agent-Scope` alone is not a boundary against crafted HTTP; **Phase S scope tokens** make the
+  scope server-derived for a token-following agent (server-minted, scope-bound, mint-requires-unscoped,
+  bad token → 401/exit 9), but a process that reads the identity file still holds the token. See
+  *Scope-Enforcement Residuals* + *Scope-Token Residuals* above and `security.md`.
 
 ## Testing Gaps
 
-- Coverage now spans store/server/migrate/db/cli/sse/hub/identity/wait/web tests (11 files, 239
+- Coverage now spans store/server/migrate/db/cli/sse/hub/identity/wait/web tests (11 files, 256
   tests, `-race`-clean): the **atomic claim** (race, `-race`-clean), events cursor, store CRUD/validation,
   validation→status mapping, the Host/CSRF/CSP guards, project archive/unarchive (store round-trip
   + idempotency and the HTTP endpoints incl. 404), the v2 migration (adds `archived_at` +
@@ -279,6 +309,14 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   dashboard **rendering** (overview cards, hash routing, breadcrumb, per-view stream re-open, live
   count refresh) stays in the behavioral-JS gap below — the server surface those views ride on is
   the part that is Go-tested.
+  Phase S added 17 scope-token tests: the store layer (`TestCreateToken_HashNotPlaintext`,
+  `TestResolveToken`, `TestCreateToken_ScopeValidation`, `TestRevokeToken`), the HTTP surface
+  (`TestTokenAdmin_RequiresUnscoped`, `TestTokenScopeOverridesHeader`, `TestInvalidTokenRejected` —
+  incl. a DELETE-with-bogus-token-is-401-not-204 security-regression guard, `TestNoTokenPathUnchanged`,
+  `TestTokenScopeMatrix`, `TestCreateTokenResponse`), the CLI (`TestCmdTokenNewWritesIdentity`,
+  `TestCmdTokenNewRequiresScope`, `TestWhoamiPrintsTokenSet`, `TestClientSendsBearerNotScope`,
+  `TestExitCodeForUnauthorized`, `TestDoOrFailUnauthorized`), and export/import round-trip
+  (`TestExportImportWithTokens`).
   **Still untested:** behavioral dashboard JS — the "Manage projects" modal, the delete confirm
   flows (task/comment/project), the feed pagination button, the dependency section UI (prereq chips,
   add-prereq dropdown, blocks list), the **graph overlay** (layout, pan/zoom, transitive highlight,

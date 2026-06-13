@@ -41,19 +41,24 @@ func identityFile() string {
 	return filepath.Join(home, ".agentman", "agents", hex.EncodeToString(sum[:])[:12])
 }
 
-// identityRecord is the JSON identity-file shape used when a scope is set.
+// identityRecord is the JSON identity-file shape used when a scope or token is
+// set. A token (Phase S) is the bearer credential the server binds to a scope;
+// it is stored here so an agent that ran `am token new` keeps sending it on
+// every command without re-supplying it.
 type identityRecord struct {
 	Agent string `json:"agent"`
 	Scope string `json:"scope,omitempty"`
+	Token string `json:"token,omitempty"`
 }
 
-// resolveIdentity returns the agent id and scope ("", "" when unset), each
-// independently overridable by env (AGENTMAN_AGENT / AGENTMAN_SCOPE).
-func resolveIdentity() (agent, scope string) {
+// resolveIdentity returns the agent id, scope, and token ("" when unset), each
+// independently overridable by env (AGENTMAN_AGENT / AGENTMAN_SCOPE /
+// AGENTMAN_TOKEN).
+func resolveIdentity() (agent, scope, token string) {
 	if b, err := os.ReadFile(identityFile()); err == nil {
 		var rec identityRecord
 		if json.Unmarshal(b, &rec) == nil && rec.Agent != "" {
-			agent, scope = rec.Agent, rec.Scope
+			agent, scope, token = rec.Agent, rec.Scope, rec.Token
 		} else {
 			agent = strings.TrimSpace(string(b)) // legacy plain text = unscoped
 		}
@@ -64,17 +69,25 @@ func resolveIdentity() (agent, scope string) {
 	if s := strings.TrimSpace(os.Getenv("AGENTMAN_SCOPE")); s != "" {
 		scope = s
 	}
-	return agent, scope
+	if t := strings.TrimSpace(os.Getenv("AGENTMAN_TOKEN")); t != "" {
+		token = t
+	}
+	return agent, scope, token
 }
 
 func resolveAgent() string {
-	a, _ := resolveIdentity()
+	a, _, _ := resolveIdentity()
 	return a
 }
 
 func resolveScope() string {
-	_, s := resolveIdentity()
+	_, s, _ := resolveIdentity()
 	return s
+}
+
+func resolveToken() string {
+	_, _, t := resolveIdentity()
+	return t
 }
 
 // newIdentity builds a human-readable id like "bugfix_050626_4821".
@@ -138,12 +151,16 @@ func cmdInit(a Args) {
 }
 
 func cmdWhoami() {
-	a, scope := resolveIdentity()
+	a, scope, token := resolveIdentity()
 	if a == "" {
 		fail(5, "no identity yet — run: am init <tasktype>   (e.g. am init bugfix)")
 	}
 	fmt.Println(a) // id stays line 1, so `am whoami | head -1` keeps working
 	if scope != "" {
 		fmt.Println("scope: " + scope)
+	}
+	if token != "" {
+		// Never print the token value — its presence is all the human needs.
+		fmt.Println("token: set")
 	}
 }

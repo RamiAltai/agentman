@@ -40,16 +40,36 @@ DELETE /api/tasks/{id}              handleDeleteTask        hard-delete task + c
 DELETE /api/tasks/{id}/comments/{cid} handleDeleteComment  hard-delete one comment; 200 {"status":"deleted"}
 DELETE /api/projects/{slug}         handleDeleteProject     hard-delete project + tasks + comments (cascade); 200 {"status":"deleted"}
 GET   /api/projects/{slug}/graph    handleProjectGraph      {nodes:[]Task, edges:[]GraphEdge{from,to}}; 404 on missing project; read-only (no events)
+POST  /api/tokens                   handleCreateToken       {scope:"cat[/proj]"} mint a scope-bound bearer token; 201 {id,scope,token,created_at} — the ONLY response carrying the plaintext token; requires an UNSCOPED caller (tokenAdminGuard → 403 if scoped); scope validated (unknown cat/proj → 404, cross-category bind/archived cat → 400)
+GET   /api/tokens                   handleListTokens        []Token {id,category,project?,created_at,revoked_at?}; never token/token_hash; requires unscoped
+POST  /api/tokens/{id}/revoke       handleRevokeToken       200 with the token metadata; 404 unknown/already-revoked; requires unscoped
 /                                   http.FileServer(embed)  serves cmd/am/web/
 ```
+
+**Token-admin guard (Phase S / ADR-029).** The three `/api/tokens` routes share
+`(s *Server) tokenAdminGuard(w, r)`: it runs `scopeOf(r)` and refuses **any** request carrying a scope
+— whether an `X-Agent-Scope` header OR a valid bearer token — with `denyScope` → `403`. Only a fully
+unscoped caller (the human at the CLI/dashboard) administers tokens, so a confined agent can never
+mint a token for another scope (the boundary crux). A bad/revoked bearer token still 401s here
+(`scopeOf` surfaces `ErrInvalidToken`) rather than being mistaken for "unscoped". It mirrors the
+`handleCreateCategory` `if !sc.IsZero() → denyScope` precedent. An invalid/revoked bearer token →
+`ErrInvalidToken` → `401 {"error":"unauthorized"}` on **any** endpoint (every handler inherits it
+through `scopeOf`) → CLI **exit 9**.
 
 `{id}` accepts a global id (`13`) or a project ref (`web-3`), resolved by `store.resolveTaskID`.
 Responses are JSON via `writeJSON`; errors via `writeErr`.
 
-**Scope enforcement (Phase Q / ADR-027).** Every handler that mutates or names a resource runs a
-scope pre-check derived from the `X-Agent-Scope` header (`scopeOf(r)` — the sole reader; an absent
-header is unscoped and passes everything). Out-of-scope → `ErrOutOfScope` → `403
-{"error":"out_of_scope"}` → CLI exit 8. The per-route picture:
+**Scope enforcement (Phase Q / ADR-027; tokens Phase S / ADR-029).** Every handler that mutates or
+names a resource runs a scope pre-check via `(s *Server) scopeOf(r)` — the **sole** reader of request
+scope; no handler reads `Authorization` or `X-Agent-Scope` directly. **Precedence (Phase S):** a
+bearer token WINS — `scopeOf` resolves `Authorization: Bearer <tok>` (`bearerToken`, case-insensitive
+per RFC 7235) to the token's server-bound scope via `store.ResolveToken` and **ignores any
+`X-Agent-Scope` header**; an unknown/revoked token is `ErrInvalidToken` (→ `401 unauthorized` → exit
+9), NEVER a silent fallthrough to the header or zero scope. With no token, the `X-Agent-Scope` header
+is the scope (absent = unscoped, passes everything; malformed = 400). `scopeOf` is a `*Server` method
+(Phase S) precisely so it can reach the store to resolve tokens while staying the one resolution
+point. Out-of-scope → `ErrOutOfScope` → `403 {"error":"out_of_scope"}` → CLI exit 8. The per-route
+picture:
 - **Task mutations** — `checkTaskMut` (the task must be in scope): `POST …/claim` (covers
   `steal_stale` too), `PATCH /api/tasks/{id}` (covers each id of a bulk `am status`/`am assign`),
   `DELETE /api/tasks/{id}`, `DELETE …/comments/{cid}`, `POST/DELETE …/deps[/…]` (checked on the
@@ -76,6 +96,9 @@ header is unscoped and passes everything). Out-of-scope → `ErrOutOfScope` → 
   no proposals carve-out).
 - **`POST /api/categories`, archive/unarchive** — 403 for ANY scoped agent (the category layer is
   above every scope).
+- **`POST/GET /api/tokens`, `POST /api/tokens/{id}/revoke`** — `tokenAdminGuard`: 403 for ANY scoped
+  caller (header OR a valid bearer token); only an unscoped caller mints/lists/revokes (mint-requires-
+  unscoped, Phase S). A bad bearer token 401s here, not 403.
 - **Untouched by scope enforcement:** `GET /api/events`, `GET /api/stream`, `GET /api/projects`,
   `GET /api/categories` (list endpoints stay unfiltered against `X-Agent-Scope`; the task layer is
   the enforcement point). Phase R added an **unscoped** `?category=` *lens* to `/api/events` +
@@ -128,6 +151,7 @@ Key methods: `CreateCategory`, `ListCategories`, `ListCategoriesWithStats` (Phas
 `UnarchiveProject`, `DeleteProject`, `ListTasks`, `GetTask`, `CreateTask`, `PatchTask`,
 `ClaimTask`, `StealStaleClaim`, `NextTask`, `AddComment`, `DeleteComment`, `ListEvents`, `RecentEvents`,
 `ListEventsBefore`, `DeleteTask`, `AddDep`, `RemoveDep`, `AddLabel`, `RemoveLabel`, `ProjectGraph`,
+the token methods `CreateToken`/`ListTokens`/`RevokeToken`/`ResolveToken` (Phase S),
 plus the meta helpers `normalizeMetaKey` and `applyMetaTx` (Phase P).
 `ArchiveProject`/`UnarchiveProject` (and their category counterparts) are transactional and
 idempotent (no event when already in the target state); all four project lifecycle paths load
@@ -210,6 +234,23 @@ with **one follow-up SELECT** (values may contain `,`/`=`, so the labels `GROUP_
 unsafe); `GetTask` loads meta too, but `getTaskTx` deliberately does **not** (labels parity —
 PATCH/claim responses omit it). **No new event kinds, error codes, or exit codes** were added.
 
+**Scope tokens** (Phase S / ADR-029): `CreateToken(sc Scope)` validates the scope (category exists +
+non-archived; a named project exists AND belongs to that category — cross-category bind → `ErrValidation`,
+unknown → `ErrNotFound`, archived → `ErrCategoryArchived`), then inserts a row with `id = newUID("tk_")`,
+`token_hash = hashToken(newToken())`, retrying on a UNIQUE collision (`isUniqueErr`, the uid precedent);
+it returns the **plaintext once** plus the public `*Token` metadata — the plaintext (`amt_` + 32 hex,
+16 bytes of `crypto/rand`) is never stored, only its sha256 hash. `ListTokens` never selects
+`token_hash` (the hash never leaves the store). `RevokeToken(id)` is a conditional
+`UPDATE … WHERE id=? AND revoked_at IS NULL` — an unknown id OR an already-revoked token both yield
+`ErrNotFound` (a no-op revoke is a 404, never silent success). `ResolveToken(plaintext)` looks up
+`token_hash = hashToken(plaintext)` and returns the bound `Scope`; an unknown OR revoked token yields
+the new sentinel **`ErrInvalidToken`** — NEVER a zero (allow-everything) Scope on a miss, which would
+silently grant the unscoped boundary to a bad credential (security-critical; `scopeOf` relies on the
+error). `ErrInvalidToken`'s message is `"unauthorized"`, so `writeErr` emits
+`401 {"error":"unauthorized"}` → CLI exit 9. **No event kind** is emitted for mint/revoke (the catalog
+stays 21; audit via `am serve --log`). The `tokens` table is added via `CREATE TABLE IF NOT EXISTS`,
+so **no migration and `currentSchemaVersion` stays 5**.
+
 `ClaimTask` and `PatchTask` call the helper `hasOpenPrereqs` before writing: if any prerequisite
 task is not `done`, they return a `*BlockedError{OpenPrereqs: []int64{…}}`. `ClaimTask` blocks
 unconditionally on open prereqs; `PatchTask` blocks only when the target status is `doing` or
@@ -280,7 +321,9 @@ Go structs in `cmd/am/store.go`: `Category`, **`CategoryStat`** (Phase R — `Ca
 `Counts map[string]int` and `ActiveAgents []string`, returned by `ListCategoriesWithStats`),
 `Project`, `Task`, `Comment`, `Event`, `TaskFilter`,
 `NextFilter`, `CreateTaskInput`, plus **`Scope`** (Phase Q — `{Category, Project}` with
-`IsZero`/`String` and the package-level `parseScope`). SQL schema in `cmd/am/schema.sql` (embedded
+`IsZero`/`String` and the package-level `parseScope`) and **`Token`** (Phase S — `{ID, Category,
+Project?, CreatedAt, RevokedAt?}` carrying only public metadata, with `Token.Scope()` reconstructing
+the bound `Scope`; `token_hash` is never a field on it). SQL schema in `cmd/am/schema.sql` (embedded
 via `//go:embed schema.sql`).
 `Category` and `Project` carry a stable `uid` (`amc_`/`amp_` + 16 hex, `newUID`); `Project`
 additionally carries `category` (slug), `vault_project_id`, and `vault_path`. `Task` carries
@@ -294,7 +337,13 @@ populated by `getTaskTx`/`GetTask`, not by list rows); `TaskFilter` and `NextFil
 any caller can claim any identity. Access control is the `127.0.0.1` bind, now hardened by the
 Phase 0 guardrails (Host allowlist + write-CSRF guard, `server.go`, ADR-011) which block
 browser-driven cross-origin/DNS-rebinding attacks but are **not** auth (any local process is still
-trusted). No per-resource authorization. See `security.md` (ADR-002/ADR-011 in `decision-records.md`).
+trusted). **Scope confinement is now token-backed (Phase S / ADR-029):** a bearer token
+(`Authorization: Bearer`) carries a server-bound scope that wins over `X-Agent-Scope`, mint requires
+an unscoped caller, and a bad/revoked token → `401 unauthorized` (exit 9). This confines a
+*token-following* agent that cannot forge another scope's token — but it is **not** auth against an
+arbitrary local process (loopback-only; a filesystem read of the identity file = token possession).
+No per-resource authorization beyond the scope boundary. See `security.md` (ADR-002/ADR-011/ADR-027/
+ADR-029 in `decision-records.md`).
 
 ## Validation
 
@@ -343,11 +392,13 @@ No job queue. Long-lived goroutines only:
 ## Error Handling
 
 Sentinel errors in `store.go`: `ErrNotFound`, `ErrConflict`, `ErrValidation`, `ErrProjectArchived`,
-`ErrCategoryArchived`, `ErrOutOfScope` (Phase Q),
+`ErrCategoryArchived`, `ErrOutOfScope` (Phase Q), `ErrInvalidToken` (Phase S — message
+`"unauthorized"`),
 typed `*ConflictError{Assignee}`, typed `*BlockedError{OpenPrereqs []int64}`, and typed
 `*NotStaleError{Assignee}`. `writeErr`
-(`server.go`) maps them: 404 / 409 / 400 / 403, with
-`ErrOutOfScope` → `403 {"error":"out_of_scope"}`, and
+(`server.go`) maps them: 404 / 409 / 400 / 403 / 401, with
+`ErrOutOfScope` → `403 {"error":"out_of_scope"}`,
+`ErrInvalidToken` → `401 {"error":"unauthorized"}` (→ CLI exit 9), and
 `ConflictError` → `409 {"error":"already_claimed","assignee":…}`,
 `BlockedError` → `409 {"error":"blocked","open_prereqs":[…]}`,
 `NotStaleError` → `409 {"error":"not_stale","assignee":…}`,
@@ -360,8 +411,10 @@ stderr — it is never sent to the client). Delete handlers (`handleDeleteTask`,
 missing (`ErrNotFound`). The CLI re-maps HTTP status to **exit codes** via `client.go
 exitCodeFor` (the single source, used by `doOrFail` and the bulk `status`/`assign` loop):
 `3` not found · `4` conflict/blocked/not-stale · `5` validation/project_archived · `6` server down
-· `8` out of scope (any 403) · `1` other; plus `7` = `am wait` timeout (CLI-side, no HTTP status
-involved).
+· `8` out of scope (any 403) · `9` bad token (401, invalid/revoked bearer) · `1` other; plus `7` =
+`am wait` timeout (CLI-side, no HTTP status involved). Exit 9 is **distinct from 8 on purpose**: a bad
+credential must hard-fail, not be swallowed as a per-id scope-skip inside a bulk loop (ADR-029). Full
+catalog: `0/3/4/5/6/7/8/9`.
 A `blocked` 409 prints e.g. `claim: #3 blocked — prereqs not done (#1 #2)`; a `not_stale` 409
 prints e.g. `claim: #3 held by agent-a (not stale yet)`. Bulk `am status`/`am assign` print one
 stderr line per failing id (`status: #13 not_found`), continue, and exit with the first failure's
@@ -380,7 +433,7 @@ per request after completion: `METHOD PATH STATUS LATENCY ACTOR` (actor = `X-Age
 
 ## Testing
 
-There are eleven test files (run `go test -race ./cmd/am/`; 239 tests, all green):
+There are eleven test files (run `go test -race ./cmd/am/`; 256 tests, all green):
 - `cmd/am/update_test.go` — version-comparison logic.
 - `cmd/am/store_test.go` — atomic-claim race (concurrent, `-race`-clean), events-cursor monotonicity,
   store CRUD + validation (`ErrValidation`), project archive/unarchive round-trip + idempotency,
@@ -412,8 +465,14 @@ There are eleven test files (run `go test -race ./cmd/am/`; 239 tests, all green
   (`ListCategoriesWithStats` — counts sum only non-archived projects' tasks, re-asserted after
   archiving a project mid-test; `active_agents` lists distinct non-human actors in the 30-min
   window, counts a commenter, excludes `human`, omits an agent whose only event is backdated out of
-  the window). Existing `ListEvents`/`ListEventsBefore`/`RecentEvents` callers updated for the new
-  `category` parameter.
+  the window), and scope tokens (Phase S): `TestCreateToken_HashNotPlaintext` (DB `token_hash` !=
+  plaintext, == `hashToken(plaintext)`; `ListTokens` rows carry no hash/plaintext; id/plaintext
+  format), `TestResolveToken` (mint→resolve returns the bound scope; unknown → `ErrInvalidToken`;
+  revoke-then-resolve → `ErrInvalidToken` + zero scope), `TestCreateToken_ScopeValidation` (unknown
+  category/project → `ErrNotFound`; cross-category project bind → `ErrValidation`; archived category
+  → `ErrCategoryArchived`), `TestRevokeToken` (unknown id and double-revoke → `ErrNotFound`); helper
+  `seedScopeWorld`. Existing `ListEvents`/`ListEventsBefore`/`RecentEvents` callers updated for the
+  new `category` parameter.
 - `cmd/am/server_test.go` — validation→status mapping (400/404/409), `hostGuard`, `csrfGuard`,
   `securityHeaders`, `listenAddr` loopback regression, archive/unarchive endpoints + 404,
   hard-delete HTTP endpoints (`TestDeleteTaskEndpoint`, `TestDeleteProjectEndpoint`,
@@ -440,7 +499,16 @@ There are eleven test files (run `go test -race ./cmd/am/`; 239 tests, all green
   `TestScopeProjectCategoryEndpoints`,
   and Phase R: `TestEventsCategoryFilter` (one category's task events only; excludes `category.*`
   and the other category; covers `?since=`/`?tail=`/`?before=`; unknown category → 404; helpers
-  `mustCreateProjectIn`/`eventKinds`)
+  `mustCreateProjectIn`/`eventKinds`),
+  and Phase S scope tokens (helpers `mintToken`/`bearer`): `TestTokenAdmin_RequiresUnscoped`
+  (POST/GET/revoke with `X-Agent-Scope` → 403, with a scoped bearer token → 403, unscoped → 201/200),
+  `TestTokenScopeOverridesHeader` (bearer work-token + `X-Agent-Scope: personal`: claim work 200,
+  claim personal 403 — token wins, header does not widen), `TestInvalidTokenRejected` (bogus bearer →
+  401, revoked → 401, DELETE with a bogus token is 401 NOT 204 — security-regression guard),
+  `TestNoTokenPathUnchanged` (no Authorization: header scope behaves as Phase Q),
+  `TestTokenScopeMatrix` (re-verifies the Q scope matrix driven by a minted token — next/claim/
+  steal-stale/bulk-per-id/proposals carve-out), `TestCreateTokenResponse` (201 body has the plaintext
+  `token` once; `GET /api/tokens` raw JSON never contains `token` or `token_hash`)
   (via `net/http/httptest`).
 - `cmd/am/migrate_test.go` — migration runner (apply/skip/idempotent/rollback), incl. the v2 step
   that adds `projects.archived_at`, the v3 step that adds `tasks.claimed_at`
@@ -454,7 +522,9 @@ There are eleven test files (run `go test -race ./cmd/am/`; 239 tests, all green
   garbage rejection, server-liveness check; `TestPruneEventsKeep`, `TestPruneEventsBefore`,
   `TestPruneEventsBeforeSameDayBoundary` (prune); Phase O: `TestExportContainsCategories`,
   `TestImportPreCategorySnapshot` (v1-baseline required-table set keeps old snapshots
-  importable), `TestImportRejectsNewerSchema` (the latter two un-hardcoded to `currentSchemaVersion`).
+  importable), `TestImportRejectsNewerSchema` (the latter two un-hardcoded to `currentSchemaVersion`);
+  Phase S: `TestExportImportWithTokens` (a DB with a token round-trips through export→validate→import;
+  `validateImportCandidate` unchanged; the token still resolves after import).
 - `cmd/am/cli_test.go` — CLI command-path + exit-code tests (Phase E1). Exercises verbs against a
   real `httptest` server via a directly-constructed `Client`, using `captureStdout`/`captureExit`
   helpers. Covers: `cmdNew` prints only the numeric id; `cmdLs` produces terse output; mutations
@@ -481,7 +551,13 @@ There are eleven test files (run `go test -race ./cmd/am/`; 239 tests, all green
   Phase Q added `TestExitCodeForOutOfScope` (403 → 8), `TestCmdClaimOutOfScopeExit8`,
   `TestCmdNextOutOfScopeExit8`, `TestClientSendsScopeHeader` (the `X-Agent-Scope` wire send), and
   `TestCmdStatusBulkOutOfScope` (per-id 403 line + continue + exit 8; 404-before-403 ordering →
-  exit 3).
+  exit 3);
+  Phase S added `TestCmdTokenNewWritesIdentity` (`am token new --scope work` merges the token into the
+  identity file preserving agent/scope; plaintext on stdout line 1), `TestCmdTokenNewRequiresScope`
+  (no `--scope` → exit 5), `TestWhoamiPrintsTokenSet` (`token: set`, never the value),
+  `TestClientSendsBearerNotScope` (with a token set, `do()` sends `Authorization: Bearer` and omits
+  `X-Agent-Scope`), `TestExitCodeForUnauthorized` (`exitCodeFor(401) == 9`), and
+  `TestDoOrFailUnauthorized` (a 401 → `doOrFail` exits 9).
 - `cmd/am/wait_test.go` — `am wait` (Phase L). `TestWaitDoneAlreadySatisfied`,
   `TestWaitDoneEventArrives`, `TestWaitDoneCrossProject` (`AGENTMAN_PROJECT` must not scope the
   `--done` stream), `TestWaitReadyOnPrereqDone` (blocked task becomes ready when its
@@ -533,7 +609,8 @@ listed above) brought it to **174**; Phase P's 25 task-metadata tests (11 store,
 4 wait, 6 CLI — listed above) brought it to **199**; Phase Q's 32 scope/enforcement tests
 (2 store, 13 server, 5 CLI, 3 wait, 7 identity, 2 migrate — listed above) brought it to **231**;
 Phase R's 8 category-dashboard/scoped-feed tests (1 store, 1 server, 2 sse, 4 hub — listed above)
-bring it to **239**.
+brought it to **239**; Phase S's 17 scope-token tests (4 store, 6 server, 6 CLI, 1 db — listed
+above) bring it to **256**.
 
 SSE streaming/reconnect, CLI verbs, exit-code mapping, and identity are now covered. The
 dashboard has a source-level XSS-sink guard but **no behavioral JS tests** — the project

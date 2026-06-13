@@ -1,34 +1,72 @@
 # Security Architecture
 
-> The single most important fact: **there is no authentication or authorization.** Access control
-> is *entirely* the `127.0.0.1` bind. Any change that widens that bind, or adds remote access,
-> must add real auth first. This is a deliberate decision (`decision-records.md` ADR-002).
+> The single most important fact: **there is no authentication, and authorization is loopback-only.**
+> Access control is *entirely* the `127.0.0.1` bind. Scope tokens (Phase S) confine a token-following
+> agent server-side but are **not** auth against arbitrary local processes — any change that widens
+> the bind, or adds remote access, must still add real auth first. Deliberate decisions
+> (`decision-records.md` ADR-002, ADR-029).
 
 ## Authentication
 
 **None.** `am serve` binds `127.0.0.1` (`cmd/am/main.go`, `Addr: "127.0.0.1:" + port`) and accepts
 all requests. The `X-Agent` header (`server.go actorOf`) is an **actor label for attribution, not a
-credential** — any caller may claim any identity, including `"human"` (the dashboard's value). The
-`X-Agent-Scope` header (Phase Q, `server.go scopeOf`) is the same kind of **client-asserted label**,
-not a credential — see Authorization below.
+credential** — any caller may claim any identity, including `"human"` (the dashboard's value).
+
+The `X-Agent-Scope` header (Phase Q) and the Phase S **bearer token** (`Authorization: Bearer <tok>`)
+are both about *scope confinement*, not authentication — there is no user to authenticate. A token
+**does** let the server derive a scope it can trust against a *config-following* agent (the token is
+server-minted and bound to a scope; the agent cannot forge a token for another scope), but it is not
+an identity check: any process that can read the identity file holds that token. See Authorization.
 
 ## Authorization
 
-**None that is a security control.** There are no roles, credentials, or authenticated
-per-resource permissions. Anyone who can reach the port can read and mutate every
-project/task/comment by sending the right headers.
+**Scope confinement is now token-backed, but it is still loopback-only — not auth against an
+arbitrary local process.** There are no users, roles, or authenticated per-resource permissions.
+Anyone who can reach the port can act unscoped (read/mutate everything) by simply sending no token
+and no scope header.
 
-**Scope confinement (Phase Q) is accident prevention, not authorization.** An agent may carry an
-**`X-Agent-Scope`** header (`category[/project]`), which the server enforces on every mutation and
-on named reads — out-of-scope → `403 {"error":"out_of_scope"}` (CLI exit 8). This keeps an agent
-that *follows its config* inside its slice of the board (a category, or one project). But like
-`X-Agent`, the scope header is **client-asserted and unauthenticated**: any caller can send any
-scope, or omit it entirely to act unscoped. It is therefore **not a security boundary against
-crafted HTTP** — it is fleet-coordination hygiene. The honest framing (mirrored from the
-requirements): scope confinement stops an agent from *accidentally* clobbering another's work; it
-does **not** stop a malicious local process. **Phase S (scope tokens) is the upgrade path** that
-turns the asserted scope into a verified credential. `scopeOf(r)` in `server.go` is the single
-reader of the header, so Phase S swaps the scope's source there without touching handlers.
+**The scope boundary, in three layers:**
+- **Phase Q — `X-Agent-Scope` (client-asserted).** An agent may carry an `X-Agent-Scope` header
+  (`category[/project]`), enforced on every mutation and on named reads — out-of-scope →
+  `403 {"error":"out_of_scope"}` (CLI exit 8). Client-asserted: any caller can send any scope or omit
+  it. Accident prevention, not a boundary against crafted HTTP.
+- **Phase S — bearer tokens (server-derived).** `am token new --scope <cat[/proj]>` mints a
+  scope-bound token (the human does this); the agent's CLI then sends it as `Authorization: Bearer`
+  on every request. **A bearer token's scope WINS over any `X-Agent-Scope` header** — the server
+  resolves the token to its bound scope and ignores the header (the CLI drops the header entirely when
+  a token is set). The token is **server-minted and bound to a scope**, so a config-following agent
+  that holds only its own token **cannot forge a token for another scope**: this is what upgrades
+  Phase Q's "any header" caveat to "a server-minted, scope-bound, revocable credential". An invalid or
+  revoked token → `401 {"error":"unauthorized"}` (CLI **exit 9**) on ANY endpoint — `scopeOf` surfaces
+  it, never a silent fallthrough to unscoped, so a bad credential hard-fails (distinct from exit 8's
+  per-id scope-skip).
+- **Mint-requires-unscoped (the boundary crux).** All three token-admin endpoints
+  (`POST/GET /api/tokens`, `POST /api/tokens/{id}/revoke`) refuse ANY request carrying a scope —
+  header OR a valid bearer token (`tokenAdminGuard` → `403`). Only a fully **unscoped** caller (the
+  human at the CLI/dashboard) administers tokens, so a confined agent can never mint a token for
+  another scope.
+
+**Token storage & transport (security-relevant):**
+- **sha256 hash stored, plaintext never.** The plaintext token (`amt_` + 32 hex) is shown **once** at
+  mint and never persisted, logged, listed (`am token ls` shows only `id/scope/created/[revoked]`), or
+  printed by `am whoami` (`token: set`). The DB stores only `sha256(plaintext)` (`tokens.token_hash`,
+  UNIQUE); the server hashes the **presented** plaintext to compare, so a stolen DB row cannot be
+  replayed as a credential.
+- **DB export carries hashes, non-replayable.** `am db export` (`VACUUM INTO`) snapshots the whole
+  file, `tokens` included — acceptable because the hashes are not replayable (see above); no scrubbing
+  was added.
+- **Cleartext on loopback.** Tokens travel in cleartext over `127.0.0.1` (no TLS); acceptable because
+  the bind never leaves loopback. A token is not a network-facing secret.
+
+**Residual honesty note (the precise boundary).** Phase S is **loopback-only and has no users**: a
+process that can read an identity file (`~/.agentman/agents/*`) holds that token and can act as that
+scope. The boundary Phase S provides is narrow and precise — *a config-following agent that cannot
+forge another scope's token is confined to its own scope.* It is **not** protection against an
+attacker with arbitrary filesystem read, and it is **not** authentication. This upgrades Phase Q's
+caveat but does **not** fully close R4's accident-prevention framing. The full remote/multi-user
+auth+TLS work (Phase G) stays parked. `scopeOf(r)` in `server.go` remains the single reader of request
+scope (now a `*Server` method so it can resolve tokens) — token-vs-header precedence lives there
+alone, no handler touches it.
 
 **Known coverage gaps in Phase Q (deliberate):**
 - `GET /api/events` and `GET /api/stream` are **not** narrowed by `X-Agent-Scope` — a scoped agent
@@ -52,9 +90,16 @@ reader of the header, so Phase S swaps the scope's source there without touching
 ## Sensitive Assets
 
 - The **SQLite DB** (`~/.agentman/agentman.db`) — contains all board content; no encryption at rest.
+  Since Phase S it also holds the `tokens` table, but only the **sha256 hash** of each token, never
+  the plaintext — a stolen DB row cannot be replayed (the server compares `hash(presented_plaintext)`).
 - **Task/comment bodies** — may hold internal plans, repo names, or secrets an agent pasted.
-- **Agent identity files** (`~/.agentman/agents/*`) — non-secret labels, low sensitivity.
-- No passwords, API keys, or tokens are stored anywhere (Confirmed: no such columns/files).
+- **Agent identity files** (`~/.agentman/agents/*`) — carry the agent label and scope (non-secret),
+  **plus, since Phase S, the agent's plaintext bearer token** (the optional `token` field). The token
+  is a scope-bound credential: a process that can read the file can act as that scope. Treat the file
+  as scope-sensitive (loopback-only mitigates; see the Authorization honesty note).
+- No passwords or API keys are stored. The only credential at rest is the bearer **token hash**
+  (sha256, non-replayable) in the `tokens` table; token plaintext lives only in the per-directory
+  identity file (or the `AGENTMAN_TOKEN` env), never in the DB.
 
 ## Input Validation
 
@@ -85,9 +130,13 @@ reader of the header, so Phase S swaps the scope's source there without touching
 
 ## Secrets Handling
 
-No secrets in the repo or runtime. `.gitignore` excludes the binary and `*.db*`. Identity uses
-`math/rand` for a non-security-sensitive suffix (`identity.go`) — acceptable since it's a label, not
-a credential.
+No secrets in the repo. `.gitignore` excludes the binary and `*.db*`. Identity uses `math/rand` for
+a non-security-sensitive suffix (`identity.go`) — acceptable since it's a label, not a credential.
+**Bearer tokens (Phase S)** are the one runtime secret: the plaintext (`amt_` + 32 hex, 16 bytes of
+`crypto/rand`) is generated and shown **once** at mint, then only ever stored as a sha256 hash in the
+DB. It is never logged (the convention bans logging tokens), never returned by `am token ls`/`whoami`,
+and the CLI keeps stdout clean (the plaintext is the first stdout line at mint so capture works; the
+hint goes to stderr). The plaintext at rest lives only in the per-directory identity file.
 
 ## Dependencies
 
@@ -132,11 +181,14 @@ the server. Their security-relevant properties:
   `AGENTMAN_URL` (`/api/projects`) via `isServerRunning` and aborts with "stop `am serve` before
   importing". This avoids replacing a live WAL DB out from under a running process and corrupting it.
 - **Candidate validation.** Before replacing anything, import runs `PRAGMA integrity_check` /
-  `foreign_key_check`, requires the five core tables (the v1 baseline set — later tables are
-  recreated by migrations on open, so old snapshots stay importable), and rejects a
-  `schema_version` newer than `currentSchemaVersion` — so a garbage or future-schema file is
-  refused, not imported. `OpenStore` applies the same version ceiling at open time (Phase O), so
-  an older binary refuses a too-new DB instead of operating on it.
+  `foreign_key_check`, requires the five core tables (the v1 baseline set — later tables, the
+  Phase-S `tokens` table included, are recreated by `schema.sql`/migrations on open, so old snapshots
+  stay importable), and rejects a `schema_version` newer than `currentSchemaVersion` — so a garbage
+  or future-schema file is refused, not imported. `OpenStore` applies the same version ceiling at open
+  time (Phase O), so an older binary refuses a too-new DB instead of operating on it.
+- **Token hashes ride the snapshot.** `VACUUM INTO` is a whole-file snapshot, so a `tokens` table
+  is exported with everything else — acceptable because only non-replayable sha256 hashes are stored
+  (the server compares `hash(presented_plaintext)`); no scrubbing is performed (ADR-029).
 
 ## Existing Controls
 
@@ -152,26 +204,40 @@ the server. Their security-relevant properties:
 - XSS-safe DOM rendering; parameterized SQL; request body size cap.
 - The **`events` table is a de-facto audit log** (actor, kind, timestamp, delta) — but the actor is
   spoofable since `X-Agent` is unauthenticated, so it's attribution, not non-repudiation.
-- **Scope confinement** (`X-Agent-Scope`, Phase Q) — the server rejects out-of-scope mutations and
-  named reads with `403 out_of_scope` and logs each denial (`agentman: out_of_scope: …`). A control
-  for **accidental** cross-scope action by a config-following agent, **not** auth (the header is
-  client-asserted; Phase S scope tokens upgrade it). Denials are log-only — no event kind.
+- **Scope confinement** (`X-Agent-Scope`, Phase Q; **scope tokens, Phase S**) — the server rejects
+  out-of-scope mutations and named reads with `403 out_of_scope` and logs each denial
+  (`agentman: out_of_scope: …`). A control for **accidental** cross-scope action by a config-following
+  agent. Phase S adds a **server-minted, scope-bound bearer token** (`Authorization: Bearer`): its
+  scope wins over the header, mint requires an unscoped caller, and an invalid/revoked token →
+  `401 unauthorized` (CLI exit 9). This confines a *token-following* agent that cannot forge another
+  scope's token — but it is **not** auth against an arbitrary local process (loopback-only; a
+  filesystem read of the identity file = token possession). Denials are log-only — no event kind, and
+  token mint/revoke emits no event either (privacy: keeps credential admin out of the unprunable feed).
 
 ## Security Gaps
 
-1. No authentication / authorization (by design, but blocks any non-loopback use).
+1. No authentication; authorization is **loopback-scoped** (by design, but blocks any non-loopback
+   use). Phase S scope tokens confine a token-following agent server-side but are not auth against an
+   arbitrary local process.
 2. ~~No CSRF / DNS-rebinding guard~~ — **mitigated in Phase 0** by the Host allowlist + write-CSRF
    guard (ADR-011). Residual: these are not auth, so any *local* process can still call the API.
-3. No TLS (a token over plain HTTP would be sniffable).
-4. No rate limiting / brute-force protection.
+3. No TLS — Phase S bearer tokens travel in **cleartext** over the `127.0.0.1` loop. Acceptable only
+   because the bind never leaves loopback; a token is not a network-facing secret. (Would be sniffable
+   the moment the bind widened — another reason remote access is an auth+TLS project, not a bolt-on.)
+4. No rate limiting / brute-force protection (token lookup is also not constant-time — a non-issue at
+   loopback scale, infeasible to make constant-time over a DB lookup).
 5. ~~500s expose internal error text~~ — **fixed (Phase D1)**; 500s return `{"error":"internal"}`; detail only in server-side logs.
 6. ~~No dependency vulnerability scanning~~ — **added (Phase F)**; `govulncheck ./...` runs in CI. Residual: no Dependabot.
 7. Audit actor is spoofable (no identity verification).
-8. **Scope is client-asserted** (Phase Q) — `X-Agent-Scope` confines a config-following agent but
-   is not a boundary against crafted HTTP (any caller can forge or omit it). Phase S scope tokens
-   are the fix. Residual reads: `/api/events`, `/api/stream`, `GET /api/projects`,
-   `GET /api/categories` are not narrowed by `X-Agent-Scope` (Phase R added an unscoped
-   `?category=` lens for the human dashboard, not an identity scope) — see Authorization above.
+8. **Scope confinement is token-backed but loopback-only** (Phase Q + Phase S). `X-Agent-Scope` alone
+   is client-asserted (forgeable/omittable). **Phase S scope tokens** make the scope server-derived
+   for a *token-following* agent — a server-minted, scope-bound token whose scope wins over the header,
+   minted only by an unscoped caller, so a confined agent cannot forge another scope's token (bad
+   token → `401`/exit 9). **Residual**: still not auth against an arbitrary local process — a process
+   that reads the identity file holds the token (loopback-only; see the Authorization honesty note).
+   Residual reads: `/api/events`, `/api/stream`, `GET /api/projects`, `GET /api/categories` are not
+   narrowed by scope (Phase R added an unscoped `?category=` lens for the human dashboard, not an
+   identity scope) — see Authorization above.
 
 ## Secure Implementation Checklist
 
@@ -181,7 +247,8 @@ Before merging a change, confirm:
 - [ ] Any new dashboard rendering uses `el()`/`textContent`, never `innerHTML`/`insertAdjacentHTML`.
 - [ ] The server still binds `127.0.0.1` **unless** you also added authentication.
 - [ ] New endpoints validate inputs and map errors via `writeErr` (no raw 500 text for expected cases; the `default` branch now returns a generic `{"error":"internal"}` body and logs detail server-side).
-- [ ] No secrets added to the repo, logs, or query strings.
+- [ ] No secrets added to the repo, logs, or query strings. **Never log or `ls`/`whoami`-print a
+      bearer token plaintext** (Phase S); store only its sha256 hash, show the plaintext once at mint.
 - [ ] If you added remote access: auth + CSRF/`Host` guard + TLS are all present, not just one.
 - [ ] Any new local file written from a DB path (snapshots, backups) is created `0o600` / `0o700`,
       and a DB-replacing op writes only to the configured DB path and guards against a live server.

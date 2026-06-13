@@ -71,6 +71,17 @@ Evidence:
   choice, not the agent identity scope). Built for agentic_brain requirement R6. Evidence:
   `cmd/am/web/app.js` (`route`/`loadOverview`/`viewParams`), `cmd/am/server.go`, `cmd/am/store.go`
   (`ListCategoriesWithStats`, `ProjectIDsInCategory`), `cmd/am/hub.go` (`subFilter`).
+- **Scope tokens** (Phase S): turn Phase Q's client-asserted scope into a **server-enforced** boundary.
+  A human (unscoped) mints a scope-bound bearer token with `am token new --scope <cat[/proj]>`; the
+  agent's CLI then sends it as `Authorization: Bearer` and the server derives the scope from the token
+  (it **wins over** the `X-Agent-Scope` header). Minting requires an unscoped caller, so a confined
+  agent cannot forge a token for another scope; an invalid/revoked token → `401`/exit 9. Tokens are
+  stored as **sha256 hashes** (never plaintext; shown once at mint), emit no event, and ride DB exports
+  non-replayably. Built for agentic_brain requirement R5 (the final phase). It is loopback-only — not
+  auth against an arbitrary local process (a filesystem read of the identity file = token possession).
+  Evidence: `cmd/am/store.go` (`Token`, `CreateToken`/`ResolveToken`/`RevokeToken`, `hashToken`),
+  `cmd/am/server.go` (`scopeOf`, `tokenAdminGuard`, `/api/tokens`), `cmd/am/cli.go` (`cmdToken`),
+  `cmd/am/identity.go` (`token` field, `AGENTMAN_TOKEN`).
 - **Stable IDs + vault binding** (Phase O): categories and projects carry an immutable `uid`
   (`amc_`/`amp_` + 16 hex) that survives slug renames (`am project edit --slug`), and projects
   can store `vault_project_id`/`vault_path` pointers back to the agentic_brain vault
@@ -146,7 +157,11 @@ Evidence:
   ≤ 500 bytes). Key presence — never the value — is the filterable unit; no separate catalog.
 - **Event** — an append-only record of every mutation; powers the activity feed, SSE stream, and
   reconnect replay (`events.id` is the cursor / SSE `Last-Event-ID`).
-- **Agent identity** — `{tasktype}_{DDMMYY}_{4 digits}`, attached as the actor on writes.
+- **Agent identity** — `{tasktype}_{DDMMYY}_{4 digits}`, attached as the actor on writes; the
+  per-directory identity record may also carry an optional scope and (Phase S) a bearer **token**.
+- **Token** (Phase S) — a scope-bound bearer credential (`amt_…`) the server binds to a scope. Stored
+  only as a sha256 hash; sent as `Authorization: Bearer`; its scope wins over `X-Agent-Scope`. Minted
+  by an unscoped human, used by an agent; no separate users.
 
 ## Non-Goals
 
@@ -167,10 +182,11 @@ Inferred (Confidence: Medium–High) from `README.md` "Security" and the localho
 
 - **Intended scale.** No stated target for concurrent agents / task volume. The single-writer
   SQLite design (`SetMaxOpenConns(1)`) implies modest scale, but this is not documented.
-- **Roadmap.** Near-term gap-closing work is now tracked in `ROADMAP.md` (repo root). Labels and
-  search shipped in Phase M; the agentic_brain foundation (categories, stable IDs, vault binding)
-  shipped in Phase O, task metadata in Phase P, scoped agent identity & enforcement in Phase Q, and
-  the category dashboard + scoped feed in Phase R — after which the integration-blocking set
-  (O+P+Q) plus the human dashboard is complete and only **scope tokens (Phase S)** remains in the
-  train; longer-term ideas (auth, remote access, due dates, prebuilt binaries) remain
-  discussion-only — treat those as unconfirmed.
+- **Roadmap.** Near-term gap-closing work is tracked in `ROADMAP.md` (repo root). Labels and search
+  shipped in Phase M; the agentic_brain foundation (categories, stable IDs, vault binding) in Phase O,
+  task metadata in Phase P, scoped agent identity & enforcement in Phase Q, the category dashboard +
+  scoped feed in Phase R, and **scope tokens in Phase S** — the final phase. **With Phase S the entire
+  agentic_brain integration train (O+P+Q+R+S) is complete: every MUST+SHOULD requirement R1–R8 is
+  shipped.** Only NICE-to-have items remain unbuilt (webhook with egress filter, copyable `vault_path`
+  in the dashboard, scoped `am db export -c`) along with longer-term ideas (full auth, remote access,
+  due dates, prebuilt binaries) — treat those as unconfirmed.
