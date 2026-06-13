@@ -94,5 +94,3 @@ update README/docs/CHANGELOG without re-reading the diff.
   - Note: hitting `/index.html` directly returns a 301 redirect to `/` (Go's
     `http.FileServer` canonical-path behavior), so the served HTML must be checked at `/`,
     not `/index.html`. Server killed and temp DB removed afterward.
-</content>
-</invoke>
