@@ -85,13 +85,16 @@ without evidence.
 - Evidence: `cmd/am/update.go`; `README.md` "Updating".
 
 ### ADR-010: Minimal in-code schema-migration runner
-- Status: Active (foundation landed in Phase 0; first real migration pending Phase 2)
+- Status: Active
 - Context: `CREATE TABLE IF NOT EXISTS` cannot add columns to existing DBs (IADR-003); upcoming
   archive (a new column) and DB import (a version-compatibility check) both need a version story.
 - Decision: A forward-only, idempotent runner in `store.go` — `readSchemaVersion` +
   `runMigrations(db, currentSchemaVersion, schemaMigrations)` wired into `OpenStore` after
   `schema.sql`. Each step applies its change **and** bumps `meta.schema_version` in one tx;
-  integer-ordered; no new dependency. `schemaMigrations` is **empty at v1** (foundation only).
+  integer-ordered; no new dependency. `schemaMigrations` shipped **empty at v1** (foundation only);
+  it is **no longer empty** — four steps (v2–v5), with `currentSchemaVersion` now `5`: v2
+  `projects.archived_at` (the first real step, ADR-013), v3 `tasks.claimed_at`, v4 the
+  category/stable-ID/vault-binding step, v5 `tasks.created_by`. See `data-model.md` (Migrations).
 - Rationale: enables additive schema evolution + import version checks without a migration library.
 - Consequences: forward-only (no down-migrations); a DB at a **newer** version than the binary was
   originally accepted silently — **closed in Phase O** (ADR-025): `OpenStore` now refuses to open a
@@ -659,10 +662,13 @@ without evidence.
      maps to `general` server-side rather than 400, so the existing dashboard (and any script
      posting `{slug,name}`) keeps working without a UI change. The v4 migration seeds `general`
      **unconditionally**, so fresh installs have it too.
-  7. **`am wait --ready -c` streams unscoped:** `/api/stream` has no `?category=` yet (Phase R);
-     the unscoped stream just triggers the category-scoped REST re-check (the ADR-023 pattern —
-     event payloads are never trusted as state). Slightly chattier (re-checks on out-of-scope
-     events) but correct.
+  7. **`am wait --ready -c` streams unscoped:** `/api/stream` had no `?category=` when this was
+     decided; it gained one in Phase R (ADR-028), but `am wait` still **deliberately streams
+     unscoped** — a category-scoped stream resolves its project-ID set once at Subscribe (ADR-028
+     item 3), so a project created after the waiter connects would be dropped for the life of that
+     long-lived connection. The unscoped stream just triggers the category-scoped REST re-check
+     (the ADR-023 pattern — event payloads are never trusted as state). Slightly chattier
+     (re-checks on out-of-scope events) but correct.
   8. **Open-time schema-version ceiling:** `OpenStore` refuses a DB whose recorded
      `schema_version` is newer than `currentSchemaVersion` ("database schema_version N is newer
      than supported M — upgrade am") — migrations only run forward, so an older binary would

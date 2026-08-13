@@ -73,9 +73,11 @@ func cmdWait(c *Client, a Args) {
 		// Project-scope the stream only for --ready: under --done the watched
 		// task may live in a different project than AGENTMAN_PROJECT, and a
 		// scoped stream would drop its events (the waiter would never re-check).
-		// A category scope deliberately does NOT narrow the stream — /api/stream
-		// has no ?category= yet (Phase R); the unscoped stream just triggers the
-		// REST re-check, which IS category-scoped (the ADR-023 pattern: event
+		// A category scope deliberately does NOT narrow the stream: /api/stream
+		// does take ?category= (Phase R, ADR-028), but it resolves the category's
+		// project set once at Subscribe, so a project created mid-wait would be
+		// dropped for the life of the connection. The unscoped stream just triggers
+		// the REST re-check, which IS category-scoped (the ADR-023 pattern: event
 		// payloads are never trusted as state).
 		if waitReady && project != "" {
 			qs.Set("project", project)

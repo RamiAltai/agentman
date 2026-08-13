@@ -257,8 +257,8 @@ func createTaskRaw(base, project, title string) {
 
 // TestWaitReadyCategoryScoped: a ready task in another category must NOT
 // release a category-scoped wait; a ready task inside the category must.
-// The stream stays unscoped (no ?category= on /api/stream in Phase O) — the
-// REST re-check carries the scope.
+// The stream stays unscoped by design (am wait does not send ?category= even
+// though /api/stream accepts it — ADR-028) — the REST re-check carries the scope.
 func TestWaitReadyCategoryScoped(t *testing.T) {
 	ts := newTestServer(t)
 	r := do(t, ts, http.MethodPost, "/api/categories", `{"slug":"work"}`,

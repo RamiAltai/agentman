@@ -255,10 +255,24 @@ Before merging a change, confirm:
 
 ## Recommended Security Tests
 
-(None exist today.) Add, in priority order:
-1. **XSS regression** — POST a task with `<script>`/`<img onerror>` title; assert the API stores it
-   literally and (via a DOM test) the dashboard renders text, not an element.
-2. **Atomic-claim race** — two concurrent `POST /claim` on one task; assert exactly one 200, one 409.
-3. **Authz/exposure guard** — a test asserting the server binds loopback (regression guard for the
-   security boundary).
-4. **Input validation** — invalid status / empty title / oversized body return 400, not 500.
+Three of the four now exist; only the XSS regression is still missing. See
+`contribution-guide.md` (Tests) for the full inventory.
+1. **XSS regression** — *not covered end-to-end.* POST a task with `<script>`/`<img onerror>` title;
+   assert the API stores it literally and (via a DOM test) the dashboard renders text, not an
+   element. Only the source-level half exists: `TestDashboardNoXSSSinks` (`web_test.go`) bans
+   `.innerHTML` / `.outerHTML` / `.insertAdjacentHTML` / `document.write` / `eval(` in the embedded
+   `web/` assets. There is no JS runtime in the suite and none is wanted (ADR-018;
+   `contribution-guide.md`: "Do not add a JS test runner"), so the DOM assertion stays an unmet
+   ideal rather than a queued task.
+2. **Atomic-claim race** — *covered.* `TestClaimRaceExactlyOneWinner` (`store_test.go`) runs two
+   concurrent `ClaimTask` calls and asserts exactly one winner; `TestLostClaim409`
+   (`server_test.go`) covers the HTTP status mapping (lost-claim 409).
+3. **Authz/exposure guard** — *covered.* `TestListenAddrLoopback` (`server_test.go`) asserts
+   `listenAddr` returns a `127.0.0.1:` prefix for every port input.
+4. **Input validation** — *covered.* `TestCreateTaskEmptyTitle400` (`server_test.go`) asserts empty
+   title → 400; `TestPatchTaskInvalidStatusValidation` (`store_test.go`) asserts an invalid status →
+   `ErrValidation`, which `writeErr` maps to 400; `TestInputLimits` (`store_test.go`) asserts
+   oversized titles/bodies and out-of-range priorities → `ErrValidation`; an oversized `?q=` → 400 is
+   covered in `server_test.go`. Request bodies are additionally capped at 1 MiB in `decode`
+   (`io.LimitReader`), and a decode failure is answered 400, not 500 (see "Request bodies capped at
+   **1 MiB**" above).

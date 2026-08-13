@@ -70,7 +70,13 @@ Flag the change if it touches any of these invariants:
 - [ ] New columns threaded through `schema.sql` → `store.go` structs → `CreateTask`/`PatchTask`/
   `getTaskTx` → API → dashboard?
 - [ ] Cascade/ownership rules considered (project→tasks→comments)?
-- [ ] Does it introduce deletes? Define semantics (none exist today) and the `ref` reuse question.
+- [ ] Does it introduce deletes? Hard deletes already exist (ADR-015) — `DELETE /api/tasks/{id}`,
+  `DELETE /api/tasks/{id}/comments/{cid}`, `DELETE /api/projects/{slug}`, CLI `am rm <id>` and
+  `am project rm <slug> --yes`. Match those semantics: irreversible hard delete (archive is the
+  reversible path, ADR-013), cascade via the existing `ON DELETE CASCADE` FKs, insert the matching
+  `*.deleted` event in the **same transaction** before the `DELETE` and broadcast after commit, and
+  leave `events` rows intact as the audit log. `ref`/`id` reuse is an **accepted** residual, not an
+  open question — see `known-risks-and-gaps.md` and `data-model.md`.
 
 ## Security Impact Checklist
 
