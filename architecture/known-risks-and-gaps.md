@@ -23,9 +23,12 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 - **Delete and history residuals** (Low). Hard-delete endpoints exist (`DELETE /api/tasks/{id}`,
   `DELETE /api/tasks/{id}/comments/{cid}`, `DELETE /api/projects/{slug}` cascade via FK; CLI
   `am rm <id>`, `am project rm <slug> --yes`), with these accepted residuals:
-  - **`ref` reuse** — the global `tasks.id` never reuses, but a per-project human `ref` (e.g. `web-3`)
-    can be reused if the highest-numbered task is deleted and a new task is then created (accepted,
-    no counter/migration added).
+  - **`ref`/`id` reuse** — `tasks.id` is a SQLite rowid (no `AUTOINCREMENT`), so a deleted task's id
+    can be reused by a later insert: wire references are stable while a task lives, but not unique
+    across the whole history (the v5 `created_by` backfill compensates by reading the latest creation
+    event). Likewise a per-project human `ref` (e.g. `web-3`) can be reused if the highest-numbered
+    task in a project is deleted and a new task is then created (accepted, no counter/migration
+    added).
   - **Deleted-project events reappear in the unfiltered feed** — because the archived-event filter is
     `LEFT JOIN projects … p.archived_at IS NULL`, and a deleted project has no row (JOIN yields NULL,
     treated as "not archived"). The `project.deleted` event and the deleted project's earlier history

@@ -196,10 +196,11 @@ without evidence.
      nullable non-FKs (`schema.sql` defines no FK on `events`), so event rows survive hard deletes.
      Each delete method inserts a `*.deleted` event in the same transaction before the `DELETE`, then
      commits. The handler broadcasts after commit (consistent with all other mutations).
-  4. **`ref` reuse accepted** — the global `tasks.id` autoincrement never reuses (wire refs are
-     stable), but a per-project human `ref` (e.g. `web-3`) can be reused if the highest-numbered
-     task is deleted and a new task is created. No counter/migration was added — acceptable for a
-     personal board.
+  4. **`ref`/`id` reuse accepted** — `tasks.id` is a plain SQLite rowid (`INTEGER PRIMARY KEY`, no
+     `AUTOINCREMENT`), so a deleted task's id can be reused by a later insert: wire refs are stable
+     while a task lives, but not unique across the whole history. Likewise a per-project human `ref`
+     (e.g. `web-3`) can be reused if the highest-numbered task in a project is deleted and a new
+     task is created. No counter/migration was added — acceptable for a personal board.
   5. **`am project rm <slug> --yes` requires `--yes`** — without the flag the CLI errors with a
      hint and a non-zero exit (destructive cascade; guard against accidents). `am rm <id>` is silent
      on success (agent-friendly), exits 3 if not found.
