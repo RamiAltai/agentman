@@ -44,7 +44,7 @@ without evidence.
 - Status: Active
 - Context: Agents (LLMs) pay per token; the CLI is their main surface.
 - Decision: Terse text output, silent success, machine-branchable exit codes
-  (`0/1/3/4/5/6`); `--json` only when needed.
+  (`0/3/4/5/6/7/8/9`); `--json` only when needed.
 - Rationale: a full pick-up → done cycle costs well under 100 tokens.
 - Consequences: stdout must stay clean (only ids on create/claim) so `id=$(am new …)` works.
 - Evidence: `cmd/am/cli.go`, `cmd/am/client.go doOrFail`; `README.md` "Why agentman"; `docs/reference.md` "CLI reference".
@@ -56,7 +56,7 @@ without evidence.
   `go install …/cmd/am@latest` yields an `am` binary.
 - Rationale: idiomatic Go; correct binary name.
 - Consequences: `go install …@latest` resolves to the highest **git tag** — releases must be tagged
-  (`v0.1.0`, `v0.2.0`, `v0.3.0` exist).
+  (run `git tag` for the published list).
 - Evidence: `go.mod`; `cmd/am/` path; `README.md` "Install"; `docs/reference.md` "Updating"; `git tag`.
 
 ### ADR-007: Embedded vanilla dashboard (no build step), XSS-safe
@@ -1181,13 +1181,20 @@ without evidence.
   Reversing the two "by design" decisions is the whole point of a parity pass — those decisions were
   scoped to their phases ("for now"), and the API was always ready.
 - Consequences / residuals (accepted): **`project.patched` is not in the `onEvent` `loadProjects()`
-  trigger set**, so a *remote* dashboard does not live-refresh another client's project rename in its
-  tab strip until its next reload — a pre-existing liveness pattern (the editing client refreshes via
-  the `openManage()` reload), not a regression. The behavioral JS (the modals, the filter popover,
-  meta editing, release) is verified by source reading + manual curl-driven check, not automated
-  tests — the documented no-JS-runner gap (ADR-018); `TestDashboardParityAffordances` locks the
-  affordances' presence at the Go build level, not their behavior. `TestDashboardNoXSSSinks` still
-  passes (all new DOM is `el()`/`textContent`, no `innerHTML`-family sink).
+  trigger set**, so on the **overview** view a *remote* dashboard does not live-refresh another
+  client's project rename in its **left rail** until its next reload (`loadOverview()`
+  re-fetches categories, not projects). On the board views `refreshRailCounts()` re-fetches projects
+  on the same event and picks the rename up on its 300 ms debounce — but only when the event is in
+  that client's stream scope: `viewParams()` sends `?project=` on a single-project board and
+  `?category=` on a category board, and `hub.Broadcast` drops `project.patched` for subscribers
+  scoped elsewhere, so a scoped board leaves out-of-scope rail rows stale until reload too. Only the
+  unscoped `All tasks` view picks up every rename. A pre-existing liveness pattern
+  (the editing client refreshes via the `openManage()` reload), not a regression.
+  The behavioral JS (the modals, the filter popover, meta editing, release) is verified by source
+  reading + manual curl-driven check, not automated tests — the documented no-JS-runner gap
+  (ADR-018); `TestDashboardParityAffordances` locks the affordances' presence at the Go build level,
+  not their behavior. `TestDashboardNoXSSSinks` still passes (all new DOM is `el()`/`textContent`,
+  no `innerHTML`-family sink).
 - Evidence: `cmd/am/web/index.html` (`#filterBtn`/`#filterPanel` in `.actions`); `cmd/am/web/app.js`
   (`openNewCategory`/`newCatCard`, the `category` create-body field, `openManage`/
   `renderManageCategories`, `openEditProject`/`btn-edit-proj`, `renderFilterPanel`/`applyFilters`/

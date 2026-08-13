@@ -71,9 +71,15 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 - **`project.patched` is not in the `onEvent` `loadProjects()` trigger set** (Low; ADR-031).
   `loadProjects()` rebuilds the **left rail** (via `renderRail()`). The GUI project-edit (rename +
   vault binding) reloads the rail on the *editing* client (via the `openManage()` reload), but
-  `onEvent` does not call `loadProjects()` on a `project.patched` event, so a *remote* dashboard does
-  not live-refresh another client's project rename in its left rail until its next reload / view
-  change. This follows the existing liveness pattern (the trigger set is
+  `onEvent` does not call `loadProjects()` on a `project.patched` event, so on the **overview** view a
+  *remote* dashboard does not live-refresh another client's project rename in its left rail until its
+  next reload (`loadOverview()` re-fetches categories, not projects). On the board views
+  `refreshRailCounts()` re-fetches projects on the same event and picks the rename up on its 300 ms
+  debounce — but only when the event is in that client's stream scope: `viewParams()` sends
+  `?project=` on a single-project board and `?category=` on a category board, and `hub.Broadcast`
+  drops `project.patched` for subscribers scoped elsewhere, so a scoped board leaves out-of-scope
+  rail rows stale until reload too. Only the unscoped `All tasks` view picks up every rename.
+  This follows the existing liveness pattern (the trigger set is
   `project.created`/`project.unarchived`/`project.archived` +
   `category.created`/`category.archived`/`category.unarchived`). → ADR-031, `frontend.md`.
 - **Identity collisions in one directory** (Low). Two agents in the same working dir share the
