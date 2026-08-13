@@ -119,9 +119,9 @@ overrides the file. The board stores only the token's sha256 hash.
 
 | Command | What it does |
 |---|---|
-| `am ls [--mine] [--status S] [-p P] [-c CAT] [--all] [--ready] [--blocked] [--stale D] [--grep TEXT] [--label L] [--meta KEY]` | list tasks (hides done; `-c` = category scope; `--ready` = todo with no open prereqs; `--blocked` = ≥1 open prereq; `--stale D` = assigned, not done, no activity for D — Go duration, e.g. `30m`, `48h`; `--grep` = substring match on title or body, ASCII-case-insensitive; `--label`/`-l` = tasks carrying that label; `--meta KEY` = tasks carrying that meta key) |
+| `am ls [--mine] [--status S] [-p P] [-c CAT] [--all] [--ready] [--blocked] [--stale D] [--grep TEXT] [--label L] [--meta KEY]` | list tasks (hides done; `--all` = every task board-wide: shows `done` **and ignores `-p`/`-c` (and `AGENTMAN_PROJECT`/`AGENTMAN_CATEGORY`)** — for one project's done tasks use `-p P --status done`, not `--all`; `-c` = category scope; `--ready` = todo with no open prereqs; `--blocked` = ≥1 open prereq; `--stale D` = assigned, not done, no activity for D — Go duration, e.g. `30m`, `48h`; `--grep` = substring match on title or body, ASCII-case-insensitive; `--label`/`-l` = tasks carrying that label; `--meta KEY` = tasks carrying that meta key; alias: `list`) |
 | `am show <id> [-c]` | task detail + `depends on:` / `blocks:` / `meta:` lines; comments with `-c` (for `show` only, `-c` means comments, not category) |
-| `am new "title" [--body B] [-p P] [--priority N] [--meta k=v]...` | create a task; prints the new id (the project determines the category; `--meta` is repeatable) |
+| `am new "title" [--body B] [-p P] [--priority N] [--assign A] [--meta k=v]...` | create a task; prints the new id (the project determines the category; `--assign`/`-a` takes an agent name or `me` — the task is created `todo` but pre-assigned to someone, which `am next` never picks; `--meta` is repeatable) |
 | `am claim <id> [--steal-stale D]` | atomic: assign me + → doing (exit 4 if already taken **or** has open prereqs); `--steal-stale D` takes over a claim idle for ≥ D (exit 4 with `not stale yet` if still fresh) |
 | `am next [-p P] [-c CAT] [--meta KEY]` | atomic pick + claim of the best ready task (priority, then FIFO; `--meta` = only tasks carrying that key); prints its id; exit 3 if nothing is ready |
 | `am wait <id> --done [--timeout D]` | block until the task is done (exit 7 on timeout; default 10m; D is a Go duration or seconds) |
@@ -147,7 +147,7 @@ overrides the file. The board stores only the token's sha256 hash.
 | `am db export [path] [--db PATH]` | write a consistent DB snapshot (prints the path) |
 | `am db import <path> [--db PATH] [--yes]` | restore a snapshot (stop `am serve` first; backs up current DB) |
 | `am db prune (--before <YYYY-MM-DD> \| --keep <N>) [--db PATH] [--yes]` | trim old events from the DB (offline; events only; stop `am serve` first) |
-| `am version` · `am update [version]` | print version · reinstall the latest (or a given) version |
+| `am version` · `am update [version]` | print version (aliases: `--version`, `-v`) · reinstall the latest (or a given) version (alias: `upgrade`) |
 
 `<id>` accepts a global id (`13`) or a project ref (`web-3`). `--status` accepts a comma list.
 Priority is `0` urgent … `3` low (default `2`). Durations use Go syntax (`30m`, `48h` — not `2d`).

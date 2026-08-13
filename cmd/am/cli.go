@@ -269,7 +269,7 @@ func cmdShow(c *Client, a Args) {
 func cmdNew(c *Client, a Args) {
 	title := a.at(0)
 	if strings.TrimSpace(title) == "" {
-		fail(5, "usage: am new \"title\" [--body ..] [-p project] [--priority N] [--meta k=v]...")
+		fail(5, "usage: am new \"title\" [--body ..] [-p project] [--priority N] [--assign A] [--meta k=v]...")
 	}
 	proj := projectFor(a)
 	if proj == "" {

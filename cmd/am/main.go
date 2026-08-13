@@ -200,9 +200,9 @@ func usage() {
   am init <tasktype> [-c CAT [-p PROJ]]  set this session's identity, optionally scoped to a category or project
   am whoami                              print the current identity (+ scope when set)
 
-  am ls [--mine] [--status S] [-p P] [-c CAT] [--all] [--ready] [--blocked] [--stale DUR] [--grep TEXT] [--label L] [--meta KEY]   list tasks (hides done)
+  am ls [--mine] [--status S] [-p P] [-c CAT] [--all] [--ready] [--blocked] [--stale DUR] [--grep TEXT] [--label L] [--meta KEY]   list tasks (hides done; --all = every task board-wide, ignores -p/-c; alias: list)
   am show <id> [-c]                            task detail (+comments +deps)
-  am new "title" [--body B] [-p P] [--priority N] [--meta k=v]...   create, prints id
+  am new "title" [--body B] [-p P] [--priority N] [--assign A] [--meta k=v]...   create, prints id
   am claim <id> [--steal-stale DUR]           assign me + ->doing (atomic; DUR is Go syntax, e.g. 30m, 48h)
   am next [-p P] [-c CAT] [--meta KEY]        atomically pick + claim the best ready task (prints id; exit 3 if none)
   am wait <id> --done | am wait --ready [-p P] [-c CAT] [--meta KEY] [--timeout D]   block until done / a ready task exists (exit 7 on timeout)
@@ -228,8 +228,8 @@ func usage() {
   am token new --scope <cat[/proj]>           mint a scope-bound bearer token (prints it once; stored in identity)
   am token ls [--json]                        list tokens (id / scope / created / [revoked])
   am token revoke <id>                        revoke a token (silent success)
-  am version                                  print version
-  am update [version]                         reinstall the latest (or a given) version
+  am version                                  print version (also --version, -v)
+  am update [version]                         reinstall the latest (or a given) version (alias: upgrade)
   am db export [path] [--db PATH]                            export a DB snapshot (prints path)
   am db import <path> [--db PATH] [--yes]                    import a snapshot (stop serve first)
   am db prune [--db PATH] (--before YYYY-MM-DD | --keep N) [--yes]  delete old events rows
