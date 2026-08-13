@@ -18,7 +18,7 @@ human-facing view. The defining constraint is **token efficiency for agents**: s
 silent success, machine-branchable exit codes.
 
 Evidence:
-- `README.md` "Why": "Built for agents, not humans first… A full pick-up→done cycle is ~65–75 tokens."
+- `README.md` "Why agentman": "**Built for agents.** Short commands, terse output, silent on success, and distinct exit codes an agent branches on without parsing. A full pick-up → done cycle is well under 100 tokens."
 - `docs/agent-integration.md`: a `CLAUDE.md` snippet teaching agents the `am` cheatsheet.
 - `cmd/am/cli.go`: terse formatters; mutations print nothing or just an id.
 
@@ -41,7 +41,7 @@ Evidence:
 3. **Live monitoring:** the dashboard subscribes to `GET /api/stream` (SSE) and reflects every
    change in real time. Evidence: `cmd/am/server.go` `handleStream`, `cmd/am/hub.go`.
 4. **Install / update:** `go install …/cmd/am@latest`; `am update` re-installs; `am serve` logs
-   when a newer tag exists. Evidence: `cmd/am/update.go`, `README.md` "Updating".
+   when a newer tag exists. Evidence: `cmd/am/update.go`, `docs/reference.md` "Updating".
 
 ## Key Features
 

@@ -12,7 +12,7 @@ without evidence.
 - Decision: One Go binary embedding everything; SQLite via `modernc.org/sqlite` (no cgo).
 - Rationale: cross-compiles to all platforms, no C toolchain, no DB server, "back up = copy one file".
 - Consequences: requires Go **1.25+** (modernc's floor); binary ~15 MB; single artifact for CLI+server.
-- Evidence: `go.mod` (`modernc.org/sqlite v1.51.0`, `go 1.25.11`); `README.md` "Why"/"Install".
+- Evidence: `go.mod` (`modernc.org/sqlite v1.51.0`, `go 1.25.11`); `README.md` "Why agentman"/"Install".
 
 ### ADR-002: Localhost-only, no authentication
 - Status: Active
@@ -45,9 +45,9 @@ without evidence.
 - Context: Agents (LLMs) pay per token; the CLI is their main surface.
 - Decision: Terse text output, silent success, machine-branchable exit codes
   (`0/1/3/4/5/6`); `--json` only when needed.
-- Rationale: a full pick-up→done cycle costs ~65–75 tokens.
+- Rationale: a full pick-up → done cycle costs well under 100 tokens.
 - Consequences: stdout must stay clean (only ids on create/claim) so `id=$(am new …)` works.
-- Evidence: `cmd/am/cli.go`, `cmd/am/client.go doOrFail`; `README.md` "Why"/"CLI reference".
+- Evidence: `cmd/am/cli.go`, `cmd/am/client.go doOrFail`; `README.md` "Why agentman"; `docs/reference.md` "CLI reference".
 
 ### ADR-006: `cmd/am/` layout + module path for `go install`
 - Status: Active
@@ -57,7 +57,7 @@ without evidence.
 - Rationale: idiomatic Go; correct binary name.
 - Consequences: `go install …@latest` resolves to the highest **git tag** — releases must be tagged
   (`v0.1.0`, `v0.2.0`, `v0.3.0` exist).
-- Evidence: `go.mod`; `cmd/am/` path; `README.md` "Install"/"Updating"; `git tag`.
+- Evidence: `go.mod`; `cmd/am/` path; `README.md` "Install"; `docs/reference.md` "Updating"; `git tag`.
 
 ### ADR-007: Embedded vanilla dashboard (no build step), XSS-safe
 - Status: Active
@@ -82,7 +82,7 @@ without evidence.
   `proxy.golang.org` at startup and logs when a newer tag exists (`AGENTMAN_NO_UPDATE_CHECK=1` opts out).
 - Rationale: zero release infrastructure; every target already has Go.
 - Consequences: machines without Go can't install yet (prebuilt binaries explicitly deferred).
-- Evidence: `cmd/am/update.go`; `README.md` "Updating".
+- Evidence: `cmd/am/update.go`; `docs/reference.md` "Updating".
 
 ### ADR-010: Minimal in-code schema-migration runner
 - Status: Active

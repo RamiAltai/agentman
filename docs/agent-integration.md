@@ -202,7 +202,7 @@ working in the **same** directory, give each its own identity by prefixing comma
        -X POST http://127.0.0.1:8787/api/tasks/13/comments -d '{"body":"done"}'
   ```
 
-  See the full surface in the [README](../README.md#http-api).
+  See the full surface in [docs/reference.md](reference.md#http-api).
 
 ---
 
@@ -279,4 +279,4 @@ launchctl kickstart -k "gui/$(id -u)/com.agentman"   # macOS, if using the launc
 systemctl --user restart agentman                     # Linux, if using the systemd unit above
 ```
 
-See the [README](../README.md#updating) for the full update flow.
+See [docs/reference.md](reference.md#updating) for the full update flow.
