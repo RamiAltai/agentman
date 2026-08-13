@@ -248,10 +248,11 @@ All built imperatively in `app.js` (no component framework):
     `innerHTML` anywhere in the graph code (the `TestDashboardNoXSSSinks` guard passes).
 - **Delete affordances** — three inline two-step confirms (no native `confirm()`/`prompt()` — they
   are blocked in webviews; all DOM built via `el()`, no `innerHTML`):
-  1. **Delete task** (`btn-danger-task`) in the task modal — on first click shows "Confirm delete?";
-     a 4-second timeout resets it; second click calls `DELETE /api/tasks/{id}`.
-  2. **Per-comment ×** (`btn-del-cm`) on each comment row — same two-step flow; calls
-     `DELETE /api/tasks/{id}/comments/{cid}`.
+  1. **Delete task** (`btn-danger-task`) in the task modal — on first click shows "Confirm delete?"
+     and inserts a **Cancel** button (`btn-cancel-del`) beside it (no timeout — the confirm state
+     persists until Cancel or a second click); second click calls `DELETE /api/tasks/{id}`.
+  2. **Per-comment ×** (`btn-del-cm`) on each comment row — two-step, reset by a **4-second
+     timeout**; calls `DELETE /api/tasks/{id}/comments/{cid}`.
   3. **Delete project** (`btn-danger-proj`) in the Manage-projects modal — distinct from the Archive
      button; two-step with a 5-second timeout; calls `DELETE /api/projects/{slug}`.
   All three are irreversible hard deletes (cascade for projects/tasks).

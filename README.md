@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/RamiAltai/agentman/actions/workflows/ci.yml/badge.svg)](https://github.com/RamiAltai/agentman/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)
+![Go](https://img.shields.io/badge/Go-1.25.11%2B-00ADD8?logo=go&logoColor=white)
 ![Single binary](https://img.shields.io/badge/deploy-single%20static%20binary-success)
 
 **The kanban board your AI agents drive — and you watch live.**
@@ -30,7 +30,7 @@ they trip over each other. agentman fixes both.
 
 ## Install
 
-With [Go](https://go.dev/dl/) 1.25+:
+With [Go](https://go.dev/dl/) 1.25.11+:
 
 ```sh
 go install github.com/RamiAltai/agentman/cmd/am@latest

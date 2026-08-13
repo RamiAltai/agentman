@@ -30,10 +30,10 @@ broadcast → dashboard**. Confirmed via `cmd/am/main.go`, `cmd/am/server.go`, `
 | `cmd/am/version.go` | Version reporting (`am version`) | `version()`, `injectedVersion` (ldflags) |
 | `cmd/am/update.go` | `am update` + startup update check | `cmdUpdate`, `checkForUpdate` |
 | `cmd/am/*_test.go` | Tests: `update/store/server/migrate/db/cli/sse/hub/identity/wait/web_test` | claim race, HTTP guards, migrations, deletes, CLI/exit codes, SSE replay + category scope, hub fan-out, identity, waits/timeouts, XSS guard |
-| `.github/workflows/ci.yml` | CI: build/vet/gofmt/test(-race)/JS-check/govulncheck on push + PR | — |
 | `cmd/am/web/` | Embedded dashboard: `index.html`, `app.css`, `app.js` | Vanilla, no build step |
 | `.github/workflows/ci.yml` | GitHub Actions CI — build/vet/gofmt/test(-race)/JS-syntax/govulncheck | Runs on push to `main` and on PRs |
 | `docs/agent-integration.md` | How to wire agents (Claude Code) to the board | User docs |
+| `docs/reference.md` | Full CLI reference, the HTTP/SSE API, and the configuration matrix | User docs |
 | `README.md`, `LICENSE` | User guide; MIT license | — |
 | `architecture/` | This documentation | — |
 

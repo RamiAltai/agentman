@@ -186,7 +186,8 @@ category's drill-down. `category` composes with `project` (ANDed). `RecentEvents
 build its WHERE clause from a `[]string` slice (like `ListProjects`) since it now joins up to three
 conditions; `ListEvents`/`ListEventsBefore` kept the incremental `q +=` style.
 `ListEventsBefore` is used by the `?before=` cursor branch in `handleEvents` for backward
-pagination (default limit 40, cap 200). `TaskFilter.Category` (`?category=`) composes with every other task
+pagination (default limit 40; a `limit` outside 1–200 falls back to 40, not clamped to 200).
+`TaskFilter.Category` (`?category=`) composes with every other task
 filter; with a category scope but no project scope, `ListTasks` still hides archived *projects*
 but keeps the (possibly archived) category itself inspectable — same rule as the explicit-project
 case.

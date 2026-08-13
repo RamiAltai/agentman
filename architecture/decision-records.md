@@ -11,7 +11,8 @@ without evidence.
 - Context: Needed dead-simple distribution and operation ("zero ops").
 - Decision: One Go binary embedding everything; SQLite via `modernc.org/sqlite` (no cgo).
 - Rationale: cross-compiles to all platforms, no C toolchain, no DB server, "back up = copy one file".
-- Consequences: requires Go **1.25+** (modernc's floor); binary ~15 MB; single artifact for CLI+server.
+- Consequences: requires Go **1.25.11+** (`go.mod`'s `go` directive, raised for a security-patched
+  stdlib; `modernc.org/sqlite`'s own floor is `go 1.25.0`); binary ~15 MB; single artifact for CLI+server.
 - Evidence: `go.mod` (`modernc.org/sqlite v1.51.0`, `go 1.25.11`); `README.md` "Why agentman"/"Install".
 
 ### ADR-002: Localhost-only, no authentication
@@ -230,7 +231,8 @@ without evidence.
   and `?tail=` query modes.
 - Decision:
   1. **`?before=` backward cursor** on `GET /api/events` — `ListEventsBefore(before, project, limit)`
-     returns events with `id < before`, newest-first (default limit 40, cap 200), applying the same
+     returns events with `id < before`, newest-first (default limit 40; a `limit` outside 1–200 falls
+     back to 40, not clamped to 200), applying the same
      archived-project filter as `ListEvents`/`RecentEvents`. The `handleEvents` handler dispatches to
      it when a `before=` param is present; returns `{"events":[...]}`.
   2. **`am db prune (--before <YYYY-MM-DD> | --keep <N>) [--yes]`** — CLI-only offline maintenance,

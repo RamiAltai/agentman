@@ -105,7 +105,7 @@ alone, no handler touches it.
 - **SQL is parameterized** (`?` placeholders throughout `store.go`) → no SQL injection. **One
   deliberate exception:** `VACUUM INTO` cannot take a bind parameter for its target path (SQLite
   forbids it), so `exportDB` builds the literal by escaping single-quotes — `strings.ReplaceAll(outPath,
-  "'", "''")` (`cmd/am/db.go:65-66`). The input is an operator-supplied local export path, not
+  "'", "''")` (`cmd/am/db.go`, `exportDB`). The input is an operator-supplied local export path, not
   agent-supplied; reviewed and accepted.
 - Status validated by `validStatus` map **and** a SQL `CHECK` constraint; empty title/slug/body
   rejected (`ErrValidation` → HTTP 400). Unknown `PATCH` fields are ignored (`PatchTask`).

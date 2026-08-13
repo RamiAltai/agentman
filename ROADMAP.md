@@ -3,8 +3,7 @@
 Open and future work only; see git history for shipped changes.
 
 Effort key: **S** ≈ a few lines + a test · **M** ≈ a focused change across 2–3 files ·
-**L** ≈ a feature or new surface. Cross-references point to
-[`architecture/known-risks-and-gaps.md`](architecture/known-risks-and-gaps.md).
+**L** ≈ a feature or new surface.
 
 ## Open items
 
