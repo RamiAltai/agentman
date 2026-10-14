@@ -369,7 +369,7 @@ func TestParseShortAlias(t *testing.T) {
 
 func TestTaskLine(t *testing.T) {
 	tk := Task{ID: 7, Status: "doing", Title: "Fix the thing", Assignee: "alice", NComments: 2, Project: "web"}
-	line := taskLine(tk, true)
+	line := taskLine(tk, true, "me-agent")
 	if !strings.Contains(line, "7") {
 		t.Errorf("taskLine missing id: %q", line)
 	}
@@ -403,12 +403,16 @@ func TestStatusShort(t *testing.T) {
 
 func TestAssignee(t *testing.T) {
 	// Unassigned.
-	if got := assignee(""); got != "-" {
+	if got := assignee("", ""); got != "-" {
 		t.Errorf("assignee(\"\") = %q, want -", got)
 	}
 	// Other agent.
-	if got := assignee("bob"); got != "@bob" {
+	if got := assignee("bob", "alice"); got != "@bob" {
 		t.Errorf("assignee(bob) = %q, want @bob", got)
+	}
+	// The caller's own id renders as @me.
+	if got := assignee("alice", "alice"); got != "@me" {
+		t.Errorf("assignee(alice) as alice = %q, want @me", got)
 	}
 }
 

@@ -192,11 +192,12 @@ func cmdLs(c *Client, a Args) {
 	case !a.has("all"):
 		qs.Set("status", "todo,doing,blocked") // hide done by default
 	}
+	self := me() // resolved once: it reads the identity file
 	if a.has("mine") {
-		if me() == "" {
+		if self == "" {
 			fail(5, "set AGENTMAN_AGENT to use --mine")
 		}
-		qs.Set("assignee", me())
+		qs.Set("assignee", self)
 	}
 	if a.has("ready") {
 		qs.Set("ready", "true")
@@ -240,7 +241,7 @@ func cmdLs(c *Client, a Args) {
 	}
 	showProj := proj == "" || a.has("all")
 	for _, t := range tasks {
-		fmt.Println(taskLine(t, showProj))
+		fmt.Println(taskLine(t, showProj, self))
 	}
 	if truncated {
 		fmt.Println(hint)
@@ -256,7 +257,7 @@ func cmdShow(c *Client, a Args) {
 		printJSON(t)
 		return
 	}
-	fmt.Printf("#%d %s  %s  [%s] p%d\n", t.ID, t.Status, assignee(t.Assignee), t.Project, t.Priority)
+	fmt.Printf("#%d %s  %s  [%s] p%d\n", t.ID, t.Status, assignee(t.Assignee, me()), t.Project, t.Priority)
 	fmt.Println(t.Title)
 	if strings.TrimSpace(t.Body) != "" {
 		fmt.Println(t.Body)
@@ -337,8 +338,6 @@ func cmdClaim(c *Client, a Args) {
 	}
 	st, data := c.do("POST", "/api/tasks/"+id+"/claim", body)
 	switch {
-	case st == 0:
-		fail(6, "agentman: cannot reach server (is `am serve` running?)")
 	case st >= 200 && st < 300:
 		var t Task
 		json.Unmarshal(data, &t)
@@ -397,8 +396,6 @@ func cmdNext(c *Client, a Args) {
 	}
 	st, data := c.do("POST", "/api/tasks/next", body)
 	switch {
-	case st == 0:
-		fail(6, "agentman: cannot reach server (is `am serve` running?)")
 	case st >= 200 && st < 300:
 		var t Task
 		json.Unmarshal(data, &t)
@@ -448,10 +445,7 @@ func cmdAssign(c *Client, a Args) {
 func bulkPatch(c *Client, verb string, ids []string, patch map[string]any) {
 	firstFail := 0
 	for _, id := range ids {
-		st, data := c.do("PATCH", "/api/tasks/"+id, patch)
-		if st == 0 {
-			fail(6, "agentman: cannot reach server at %s (is `am serve` running?)", c.base)
-		}
+		st, data := c.do("PATCH", "/api/tasks/"+id, patch) // server down exits 6 inside do()
 		if code := exitCodeFor(st); code != 0 {
 			fmt.Fprintf(os.Stderr, "%s: #%s %s\n", verb, id, apiErr(data, "error "+strconv.Itoa(st)))
 			if firstFail == 0 {
@@ -727,8 +721,9 @@ func storeToken(token string) {
 
 // ---------- formatting helpers ----------
 
-func taskLine(t Task, showProj bool) string {
-	line := fmt.Sprintf("%-4d %-5s %-36s %s", t.ID, statusShort(t.Status), trunc(t.Title, 36), assignee(t.Assignee))
+// taskLine formats one ls row; self is the caller's agent id (rendered @me).
+func taskLine(t Task, showProj bool, self string) string {
+	line := fmt.Sprintf("%-4d %-5s %-36s %s", t.ID, statusShort(t.Status), trunc(t.Title, 36), assignee(t.Assignee, self))
 	if t.NComments > 0 {
 		line += fmt.Sprintf(" (%dc)", t.NComments)
 	}
@@ -817,11 +812,12 @@ func statusShort(s string) string {
 	return s
 }
 
-func assignee(s string) string {
+// assignee renders an assignee for display; self is the caller's agent id.
+func assignee(s, self string) string {
 	switch {
 	case s == "":
 		return "-"
-	case s == me():
+	case s == self:
 		return "@me"
 	default:
 		return "@" + s

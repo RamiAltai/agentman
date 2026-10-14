@@ -1,11 +1,11 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,20 +26,24 @@ import (
 // init); an unscoped init keeps the legacy bare-id plain text, and any
 // pre-Phase-Q plain-text file is read as an unscoped identity (R8 compatibility).
 
-func identityFile() string {
+// identityFile returns this working directory's identity file. Without a home
+// directory or a working directory it errors rather than guess: a relative
+// "./.agentman" would put a bearer token inside the project tree, and a shared
+// fallback name would merge distinct directories' identities.
+func identityFile() (string, error) {
 	if f := os.Getenv("AGENTMAN_AGENT_FILE"); f != "" {
-		return f
+		return f, nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		home = "."
+		return "", fmt.Errorf("no home directory (%v); set AGENTMAN_AGENT_FILE or AGENTMAN_AGENT", err)
 	}
 	wd, err := os.Getwd()
 	if err != nil {
-		wd = "default"
+		return "", fmt.Errorf("no working directory (%v); set AGENTMAN_AGENT_FILE or AGENTMAN_AGENT", err)
 	}
 	sum := sha1.Sum([]byte(wd))
-	return filepath.Join(home, ".agentman", "agents", hex.EncodeToString(sum[:])[:12])
+	return filepath.Join(home, ".agentman", "agents", hex.EncodeToString(sum[:])[:12]), nil
 }
 
 // identityRecord is the JSON identity-file shape used when a scope or token is
@@ -55,9 +59,13 @@ type identityRecord struct {
 // readIdentityFile returns the identity file's own agent, scope and token,
 // without env overrides. A JSON record is accepted when any field is set (a
 // token minted before `am init` has no agent); anything else is the legacy
-// plain-text bare agent id.
+// plain-text bare agent id. No locatable file reads as no identity.
 func readIdentityFile() (rec identityRecord) {
-	b, err := os.ReadFile(identityFile())
+	f, err := identityFile()
+	if err != nil {
+		return rec
+	}
+	b, err := os.ReadFile(f)
 	if err != nil {
 		return rec
 	}
@@ -72,7 +80,10 @@ func readIdentityFile() (rec identityRecord) {
 // truncated identity. The temp file is created 0600: the record may hold a
 // bearer token.
 func writeIdentityFile(data []byte) error {
-	f := identityFile()
+	f, err := identityFile()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
 		return err
 	}
@@ -124,13 +135,18 @@ func resolveToken() string {
 	return t
 }
 
-// newIdentity builds a human-readable id like "bugfix_050626_4821".
+// newIdentity builds a human-readable id like "bugfix_050626_4f21a9". The
+// suffix is 24 random bits from crypto/rand: the server treats a claim by the
+// same agent string as idempotent, so two agents that drew the same id would
+// silently share a task (a 4-digit suffix collided at ~n²/20000 per day).
 func newIdentity(taskType string) string {
 	t := sanitizeType(taskType)
 	if t == "" {
 		t = "agent"
 	}
-	return fmt.Sprintf("%s_%s_%04d", t, time.Now().Format("020106"), rand.Intn(10000))
+	var b [3]byte
+	rand.Read(b[:]) // never fails (crypto/rand panics rather than return short)
+	return fmt.Sprintf("%s_%s_%s", t, time.Now().Format("020106"), hex.EncodeToString(b[:]))
 }
 
 func sanitizeType(s string) string {
@@ -174,11 +190,7 @@ func cmdInit(a Args) {
 			fail(1, "init: %v", err)
 		}
 	}
-	f := identityFile()
-	if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
-		fail(1, "init: %v", err)
-	}
-	if err := os.WriteFile(f, data, 0o644); err != nil {
+	if err := writeIdentityFile(data); err != nil {
 		fail(1, "init: %v", err)
 	}
 	fmt.Println(id) // print only the id, so `id=$(am init bugfix)` works

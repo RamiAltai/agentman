@@ -83,7 +83,27 @@ func cmdWait(c *Client, a Args) {
 		if waitReady && project != "" {
 			qs.Set("project", project)
 		}
-		resp := w.stream("/api/stream?" + qs.Encode())
+		// Each connection lives at most waitRecheckEvery, and the condition is
+		// re-checked right after every (re)open. The stream is not lossless (the
+		// hub drops events for a full subscriber, concurrent broadcasts can
+		// arrive out of order, replay is capped), so a dropped event costs at
+		// most one interval instead of the whole timeout.
+		connCtx, connCancel := context.WithTimeout(ctx, waitRecheckEvery)
+		resp := w.stream(connCtx, "/api/stream?"+qs.Encode())
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			// Not a live SSE body (e.g. 500 streaming_unsupported): reading it as
+			// SSE would hit EOF and reconnect in a tight loop until the timeout.
+			data, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			connCancel()
+			fail(1, "wait: stream: %s", apiErr(data, "error "+strconv.Itoa(resp.StatusCode)))
+		}
+		if t, met := check(); met {
+			resp.Body.Close()
+			connCancel()
+			waitPrint(a, t, waitReady)
+			return
+		}
 		br := bufio.NewReader(resp.Body)
 		for {
 			evID, data, err := readSSEFrame(br)
@@ -105,16 +125,34 @@ func cmdWait(c *Client, a Args) {
 			}
 			if t, met := check(); met {
 				resp.Body.Close()
+				connCancel()
 				waitPrint(a, t, waitReady)
 				return
 			}
 		}
 		resp.Body.Close()
+		rotated := connCtx.Err() != nil // planned re-check cycle, not a drop
+		connCancel()
 		if ctx.Err() != nil {
 			fail(7, "wait: timeout")
 		}
+		if !rotated { // the server closed the stream: back off before reconnecting
+			select {
+			case <-ctx.Done():
+				fail(7, "wait: timeout")
+			case <-time.After(waitReconnectDelay):
+			}
+		}
 	}
 }
+
+// waitRecheckEvery bounds one stream connection (then reconnect + REST
+// re-check); waitReconnectDelay is the pause after the server ends a stream.
+// Variables so tests can shorten them.
+var (
+	waitRecheckEvery   = 30 * time.Second
+	waitReconnectDelay = time.Second
+)
 
 // parseWaitTimeout accepts a Go duration ("5m") or a bare integer of seconds
 // ("300"). Non-positive or unparseable values error.
@@ -160,22 +198,25 @@ type waiter struct {
 // get performs a ctx-bounded GET; transport errors map to exit 7 (deadline)
 // or exit 6 (server down), like the rest of the CLI.
 func (w *waiter) get(path string) (int, []byte) {
-	resp := w.request(path)
+	resp := w.request(w.ctx, path)
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, data
 }
 
-// stream opens a long-lived GET (SSE); the caller closes the body.
-func (w *waiter) stream(path string) *http.Response { return w.request(path) }
+// stream opens a long-lived GET (SSE) bounded by ctx (a child of w.ctx); the
+// caller closes the body.
+func (w *waiter) stream(ctx context.Context, path string) *http.Response {
+	return w.request(ctx, path)
+}
 
-func (w *waiter) request(path string) *http.Response {
-	resp, err := w.hc.Do(w.c.newRequest(w.ctx, http.MethodGet, path, nil))
+func (w *waiter) request(ctx context.Context, path string) *http.Response {
+	resp, err := w.hc.Do(w.c.newRequest(ctx, http.MethodGet, path, nil))
 	if err != nil {
 		if w.ctx.Err() != nil {
 			fail(7, "wait: timeout")
 		}
-		fail(6, "agentman: cannot reach server at %s (is `am serve` running?)", w.c.base)
+		transportFail(w.c.base, http.MethodGet, err)
 	}
 	// A bad credential hard-fails on any request (stream included), so a
 	// revoked token can neither pass a re-check nor spin the reconnect loop.
@@ -196,7 +237,9 @@ func (w *waiter) cursor() int64 {
 	var out struct {
 		LastID int64 `json:"last_id"`
 	}
-	json.Unmarshal(data, &out)
+	if err := json.Unmarshal(data, &out); err != nil {
+		fail(1, "wait: bad response from server: %v", err)
+	}
 	return out.LastID
 }
 
@@ -212,7 +255,9 @@ func (w *waiter) checkDone(id string) (*Task, bool) {
 		fail(1, "wait: %s", apiErr(data, "error "+strconv.Itoa(st)))
 	}
 	var t Task
-	json.Unmarshal(data, &t)
+	if err := json.Unmarshal(data, &t); err != nil {
+		fail(1, "wait: bad response from server: %v", err)
+	}
 	return &t, t.Status == "done"
 }
 
@@ -238,7 +283,9 @@ func (w *waiter) checkReady(project, category, metaKey string) (*Task, bool) {
 		fail(1, "wait: %s", apiErr(data, "error "+strconv.Itoa(st)))
 	}
 	var tasks []Task
-	json.Unmarshal(data, &tasks)
+	if err := json.Unmarshal(data, &tasks); err != nil {
+		fail(1, "wait: bad response from server: %v", err)
+	}
 	if len(tasks) == 0 {
 		return nil, false
 	}

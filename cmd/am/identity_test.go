@@ -31,9 +31,9 @@ func TestInitWritesAndResolves(t *testing.T) {
 		t.Fatalf("ReadFile: %v", err)
 	}
 	contents := strings.TrimSpace(string(data))
-	matched, err := regexp.MatchString(`^bugfix_\d{6}_\d{4}$`, contents)
+	matched, err := regexp.MatchString(`^bugfix_\d{6}_[0-9a-f]{6}$`, contents)
 	if err != nil || !matched {
-		t.Fatalf("identity file contents %q does not match ^bugfix_\\d{6}_\\d{4}$", contents)
+		t.Fatalf("identity file contents %q does not match ^bugfix_\\d{6}_[0-9a-f]{6}$", contents)
 	}
 
 	// The printed id must match the file.
@@ -86,9 +86,9 @@ func TestSanitizeType(t *testing.T) {
 
 func TestNewIdentityFormat(t *testing.T) {
 	id := newIdentity("deploy")
-	matched, err := regexp.MatchString(`^deploy_\d{6}_\d{4}$`, id)
+	matched, err := regexp.MatchString(`^deploy_\d{6}_[0-9a-f]{6}$`, id)
 	if err != nil || !matched {
-		t.Fatalf("newIdentity(deploy) = %q, want ^deploy_\\d{6}_\\d{4}$", id)
+		t.Fatalf("newIdentity(deploy) = %q, want ^deploy_\\d{6}_[0-9a-f]{6}$", id)
 	}
 
 	// Empty type falls back to "agent" prefix.
@@ -96,9 +96,9 @@ func TestNewIdentityFormat(t *testing.T) {
 	if !strings.HasPrefix(id2, "agent_") {
 		t.Fatalf("newIdentity(\"\") = %q, want agent_ prefix", id2)
 	}
-	matched2, err := regexp.MatchString(`^agent_\d{6}_\d{4}$`, id2)
+	matched2, err := regexp.MatchString(`^agent_\d{6}_[0-9a-f]{6}$`, id2)
 	if err != nil || !matched2 {
-		t.Fatalf("newIdentity(\"\") = %q, want ^agent_\\d{6}_\\d{4}$", id2)
+		t.Fatalf("newIdentity(\"\") = %q, want ^agent_\\d{6}_[0-9a-f]{6}$", id2)
 	}
 }
 
@@ -115,9 +115,9 @@ func TestInitScopedWritesJSON(t *testing.T) {
 	})
 	id := strings.TrimSpace(out)
 	// Stdout stays just the id, so `id=$(am init bugfix -c personal)` works.
-	matched, err := regexp.MatchString(`^bugfix_\d{6}_\d{4}$`, id)
+	matched, err := regexp.MatchString(`^bugfix_\d{6}_[0-9a-f]{6}$`, id)
 	if err != nil || !matched {
-		t.Fatalf("printed id %q does not match ^bugfix_\\d{6}_\\d{4}$", id)
+		t.Fatalf("printed id %q does not match ^bugfix_\\d{6}_[0-9a-f]{6}$", id)
 	}
 
 	data, err := os.ReadFile(idFile)

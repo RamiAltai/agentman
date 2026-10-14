@@ -41,16 +41,23 @@ func cmdUpdate(a Args) {
 		fail(1, "update failed: %v", err)
 	}
 
-	if v := installedVersion(goBin); v != "" {
-		fmt.Println("agentman: updated — now " + v + ".")
+	bin := installedBinary(goBin)
+	if v := installedVersion(bin); v != "" {
+		fmt.Println("agentman: updated " + bin + " — now " + v + ".")
+		// go install writes to GOBIN/GOPATH/bin; an `am` run from anywhere
+		// else (a copied binary, /usr/local/bin) is left untouched — say so.
+		if exe, err := os.Executable(); err == nil && !sameFile(bin, exe) {
+			fmt.Printf("agentman: warning — this `am` (%s) was NOT updated; put %s first on PATH or replace the old copy.\n", exe, filepath.Dir(bin))
+		}
 	} else {
 		fmt.Println("agentman: updated.")
 	}
 	fmt.Println("Restart any running `am serve` to apply (and hard-refresh the dashboard).")
 }
 
-// installedVersion runs the freshly-installed binary to report its version.
-func installedVersion(goBin string) string {
+// installedBinary is where `go install` puts am: GOBIN, else GOPATH/bin
+// ("" when neither resolves).
+func installedBinary(goBin string) string {
 	dir := goEnv(goBin, "GOBIN")
 	if dir == "" {
 		if gp := goEnv(goBin, "GOPATH"); gp != "" {
@@ -60,11 +67,29 @@ func installedVersion(goBin string) string {
 	if dir == "" {
 		return ""
 	}
-	out, err := exec.Command(filepath.Join(dir, "am"), "version").Output()
+	return filepath.Join(dir, "am")
+}
+
+// installedVersion runs the freshly-installed binary to report its version.
+func installedVersion(bin string) string {
+	if bin == "" {
+		return ""
+	}
+	out, err := exec.Command(bin, "version").Output()
 	if err != nil {
 		return ""
 	}
 	return strings.TrimPrefix(strings.TrimSpace(string(out)), "am ")
+}
+
+// sameFile reports whether two paths name the same file (symlinks followed).
+func sameFile(a, b string) bool {
+	fa, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	fb, err := os.Stat(b)
+	return err == nil && os.SameFile(fa, fb)
 }
 
 func goEnv(goBin, key string) string {
@@ -83,7 +108,7 @@ func checkForUpdate() {
 		return
 	}
 	cur := version()
-	if cur == "devel" {
+	if cur == "devel" || localBuild() {
 		return // local build — nothing meaningful to compare against
 	}
 	go func() {

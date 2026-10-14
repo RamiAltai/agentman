@@ -109,6 +109,12 @@ func runServe(argv []string) {
 	if dbPath == "" {
 		dbPath = envOr("AGENTMAN_DB", defaultDBPath())
 	}
+	// Bind before touching the DB: a busy port (e.g. a second serve) must fail
+	// before OpenStore runs schema/migrations on a file another server uses.
+	ln, err := net.Listen("tcp", listenAddr(port))
+	if err != nil {
+		fail(1, "agentman: serve: %v", err)
+	}
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		fail(1, "agentman: %v", err)
 	}
@@ -136,7 +142,6 @@ func runServe(argv []string) {
 	}
 	baseCtx, cancelBase := context.WithCancel(context.Background())
 	httpServer := &http.Server{
-		Addr:              listenAddr(port),
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		BaseContext:       func(net.Listener) context.Context { return baseCtx },
@@ -147,9 +152,9 @@ func runServe(argv []string) {
 
 	checkForUpdate() // non-blocking; logs once if a newer version is published
 
+	log.Printf("agentman: dashboard on http://%s   (db: %s)", ln.Addr(), dbPath)
 	go func() {
-		log.Printf("agentman: dashboard on http://%s   (db: %s)", httpServer.Addr, dbPath)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("agentman: serve: %v", err)
 		}
 	}()
