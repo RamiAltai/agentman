@@ -48,6 +48,8 @@ Set your identity once at the start of a task:
     am init <tasktype>              # e.g. `am init bugfix` → bugfix_060626_4821 (this directory)
     am init <tasktype> -c CAT [-p PROJ]   # SCOPED: confine this identity to a category (or one project)
 Then use `am` normally (`am whoami` shows the id, plus a `scope:` line when scoped).
+The commands below are the work-loop subset. `am help` is the canonical, complete list of
+verbs, flags, env vars and exit codes — run it when you need something not listed here.
 
     am next [-p P] [-c C] [--meta KEY]   # pick up work: atomically claims the best ready task,
                                #   prints its id (exit 3 = nothing ready) — start here

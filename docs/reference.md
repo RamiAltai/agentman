@@ -96,7 +96,8 @@ am whoami            # show current identity (+ scope / token state)
 ```
 
 Format: `{tasktype}_{DDMMYY}_{4 digits}`. `AGENTMAN_AGENT` overrides it (useful for several agents
-in one directory).
+in one directory). `AGENTMAN_AGENT` carries only the id; to give each of several agents in one
+directory its own scope or token, point each at its own identity file with `AGENTMAN_AGENT_FILE`.
 
 **Scoped identity.** `am init <tasktype> -c <category> [-p <project>]` confines an agent to a
 category (or a single project): the scope is recorded in the identity file (JSON) and sent on every
@@ -223,6 +224,7 @@ curl -s -H 'X-Agent: claude-1' -X POST 127.0.0.1:8787/api/tasks/13/claim
 | `AGENTMAN_SCOPE` | override the identity file's confinement scope sent as `X-Agent-Scope` (e.g. `work` or `work/api`) |
 | `AGENTMAN_TOKEN` | override the identity file's bearer token (sent as `Authorization: Bearer`; a token's scope wins over `X-Agent-Scope`) |
 | `AGENTMAN_AGENT` | identity override (else the `am init` file) |
+| `AGENTMAN_AGENT_FILE` | identity file path override (default `~/.agentman/agents/<hash of cwd>`); the file carries agent, scope and token |
 | `AGENTMAN_PROPOSALS` / `--proposals` | (serve) the scope carve-out project any agent may file into (default `meta/proposals`) |
 | `AGENTMAN_PORT` / `--port` | server port (default `8787`) |
 | `AGENTMAN_DB` / `--db` | database path (default `~/.agentman/agentman.db`) |
@@ -279,9 +281,12 @@ also logs `update available — vX.Y.Z` on startup when you're behind; disable t
 
 ## How it works
 
-- **Single writer.** `am serve` is the only process that touches the DB (`SetMaxOpenConns(1)`, WAL
-  mode). Claims are atomic via one conditional `UPDATE … WHERE assignee IS NULL AND status!='done'
-  RETURNING …`; the loser of a race gets `409 already_claimed`. Stale-claim takeover
+- **Single writer.** While it runs, `am serve` is the only process that writes the DB
+  (`SetMaxOpenConns(1)`, WAL mode). `am db import` / `am db prune` write the file directly, offline:
+  they refuse if a server answers on `AGENTMAN_URL` or holds the DB file open (any port), and
+  `am db export` only reads. Claims are atomic via one conditional
+  `UPDATE … WHERE assignee IS NULL AND status!='done' RETURNING …`; the loser of a race gets
+  `409 already_claimed`. Stale-claim takeover
   (`am claim --steal-stale <dur>`) uses the same trick with a staleness predicate, so a crashed
   agent's task can be recovered — exactly one stealer wins, the rest get `409 not_stale`, and a
   `task.reclaimed` event records the handoff.

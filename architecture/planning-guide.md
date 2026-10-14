@@ -1,7 +1,9 @@
 # Planning Guide for Future Agents
 
 Use this before writing code. The goal is to change agentman without violating its core
-invariants (single-writer DB, atomic claims, localhost-no-auth, XSS-safe UI, token-cheap CLI).
+invariants (single-writer DB, atomic claims, localhost-no-auth, server-enforced agent scope,
+XSS-safe UI, token-cheap CLI). "No auth" means no users or login: scoped agent identities and
+bearer scope tokens confine agents, they do not authenticate anyone (`security.md` Authorization).
 
 ## Planning Workflow
 
@@ -37,6 +39,15 @@ Flag the change if it touches any of these invariants:
 - [ ] "Event in same tx, broadcast after commit" ordering.
 - [ ] The `events.id` cursor / SSE `Last-Event-ID` contract.
 - [ ] The `127.0.0.1` bind / absence of auth.
+- [ ] Scope enforcement: every new or changed handler resolves the caller's scope with `scopeOf` and
+  gates with the matching `check*` / `narrowScope` / `unscopedGuard` helper (`server.go`); a
+  deliberately unscoped read goes on the `security.md` Known coverage gaps list.
+- [ ] task→project and project→category stay immutable — the scope pre-checks run outside the store
+  tx and are sound only because of that (`PatchTask` / `PatchProject` scope notes). A move feature
+  must move the scope check inside the tx.
+- [ ] The proposals carve-out (`s.proposals`, `isProposals` / `isProposalsPair`) stays consistent
+  across every check site that uses it (`checkTaskRead`, `checkComment`, `checkCreate`,
+  `checkProjectRead`, `narrowScope`).
 - [ ] XSS-safe DOM rendering (`el()` only).
 
 ## Frontend Impact Checklist
@@ -58,14 +69,10 @@ Flag the change if it touches any of these invariants:
 
 - [ ] Schema change? A **forward-only migration runner exists and is exercised** (ADR-010) — append a
   `{version, apply}` step to `schemaMigrations` and raise `currentSchemaVersion` in `cmd/am/store.go`; do
-  **not** rely on `CREATE TABLE IF NOT EXISTS` to alter existing tables. The shipped v2–v5 steps
-  (the `projects.archived_at` / `tasks.claimed_at` `ALTER TABLE` migrations, the v4
-  category/stable-ID step with its seed + backfill, and the v5 `tasks.created_by` step with its
-  best-effort event-log backfill) are the templates to
-  copy. Add a migration test like `TestMigrationV2AddsArchivedAt` /
-  `TestMigrationV3AddsClaimedAt` / `TestMigrationV4ExistingDB` / `TestMigrationV5ExistingDB` in
-  `cmd/am/migrate_test.go`.
-  Note `OpenStore` refuses a DB newer than `currentSchemaVersion` (Phase O), so version bumps are
+  **not** rely on `CREATE TABLE IF NOT EXISTS` to alter existing tables. Copy the latest step in
+  `schemaMigrations` as the template, and add an existing-DB migration test modeled on the latest
+  `TestMigrationV*ExistingDB` in `cmd/am/migrate_test.go`.
+  Note `OpenStore` refuses a DB newer than `currentSchemaVersion` (ADR-025), so version bumps are
   one-way for any binary that opens the DB.
 - [ ] New columns threaded through `schema.sql` → `store.go` structs → `CreateTask`/`PatchTask`/
   `getTaskTx` → API → dashboard?
@@ -84,6 +91,8 @@ Flag the change if it touches any of these invariants:
 - [ ] Parameterized SQL only.
 - [ ] No new untrusted text rendered via `innerHTML`.
 - [ ] No widening of the network bind without auth + CSRF/`Host` guard + TLS.
+- [ ] No new endpoint skips `scopeOf` + a scope check unless it is deliberately unscoped (and listed
+  as a coverage gap in `security.md`).
 - [ ] No secrets in code/logs/query strings.
 
 ## Testing Checklist
@@ -111,6 +120,8 @@ Get explicit human approval before:
 - Any schema change on a model with existing data (migration risk).
 - Adding a dependency or a build/release toolchain.
 - Anything touching the atomic-claim or single-writer invariants.
+- Changing scope/token behavior: scope checks or helpers, the proposals carve-out, token
+  mint/resolve/revoke, or making task→project / project→category mutable.
 Small, additive, backward-compatible changes (a new optional field, a new CLI flag, a UI tweak)
 can proceed with a brief plan.
 
