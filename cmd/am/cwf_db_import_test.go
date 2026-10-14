@@ -76,7 +76,7 @@ func TestCwfDbPruneMissingDBCreatesNothing(t *testing.T) {
 
 // FIND-0476: importing the live DB (directly or via a symlink) onto itself is refused.
 func TestCwfDbImportRefusesSameFile(t *testing.T) {
-	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+	cwfDbNoServer(t)
 	dir := t.TempDir()
 	dest := filepath.Join(dir, "live.db")
 	st, err := OpenStore(dest)
@@ -103,7 +103,7 @@ func TestCwfDbImportRefusesSameFile(t *testing.T) {
 
 // FIND-0096: a sidecar that cannot be removed fails the import before the copy.
 func TestCwfDbImportFailsOnUnremovableSidecar(t *testing.T) {
-	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+	cwfDbNoServer(t)
 	snap := cwfDbSnapshot(t, "p")
 	dest := filepath.Join(t.TempDir(), "dest.db")
 	// A non-empty directory named like the WAL: os.Remove fails with ENOTEMPTY.
@@ -120,7 +120,7 @@ func TestCwfDbImportFailsOnUnremovableSidecar(t *testing.T) {
 
 // FIND-0081: commits left only in the WAL by an unclean shutdown survive in the backup.
 func TestCwfDbBackupKeepsWALCommits(t *testing.T) {
-	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+	cwfDbNoServer(t)
 	live := filepath.Join(t.TempDir(), "live.db")
 	st, err := OpenStore(live)
 	if err != nil {
@@ -158,7 +158,7 @@ func TestCwfDbBackupKeepsWALCommits(t *testing.T) {
 // FIND-0095: the guard is the DB file itself, not the HTTP probe — an open
 // store blocks import and prune even when AGENTMAN_URL points elsewhere.
 func TestCwfDbGuardRefusesOpenDB(t *testing.T) {
-	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+	cwfDbNoServer(t)
 	dest := filepath.Join(t.TempDir(), "busy.db")
 	st, err := OpenStore(dest)
 	if err != nil {
@@ -170,7 +170,7 @@ func TestCwfDbGuardRefusesOpenDB(t *testing.T) {
 	if err := importDB(cwfDbSnapshot(t, "other"), dest, t.TempDir(), true); err == nil {
 		t.Error("importDB onto an open DB = nil, want 'in use' error")
 	}
-	if _, err := pruneEvents(dest, "", 0); err == nil {
+	if _, err := pruneEvents(dest, "", 1); err == nil {
 		t.Error("pruneEvents on an open DB = nil, want 'in use' error")
 	}
 	var n int
@@ -191,7 +191,7 @@ func TestCwfDbGuardRefusesOpenDB(t *testing.T) {
 // FIND-0094: a copy that fails mid-stream leaves dst intact and no temp file;
 // back-to-back imports keep separate backups.
 func TestCwfDbCopyFileAtomicAndUniqueBackups(t *testing.T) {
-	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+	cwfDbNoServer(t)
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "dst.db")
 	if err := os.WriteFile(dst, []byte("original"), 0o600); err != nil {

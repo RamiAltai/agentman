@@ -21,11 +21,38 @@ func validDate(s string) bool {
 	return err == nil
 }
 
+// storeDSN is the DSN OpenStore uses: every pragma on the DSN so each
+// (re)opened connection inherits them.
+func storeDSN(path string) string {
+	return fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"+
+		"&_pragma=foreign_keys(1)&_pragma=synchronous(1)", path)
+}
+
+// serverURL is the agentman server base URL: AGENTMAN_URL or the default.
+func serverURL() string {
+	return envOr("AGENTMAN_URL", "http://127.0.0.1:8787")
+}
+
+// confirm writes prompt to stderr and reports whether the next stdin line is
+// "y" or "yes" (case-insensitive). EOF or anything else is "no".
+func confirm(prompt string) bool {
+	fmt.Fprint(os.Stderr, prompt+" [y/N] ")
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Scan()
+	line := strings.TrimSpace(strings.ToLower(scanner.Text()))
+	return line == "y" || line == "yes"
+}
+
 // pruneEvents deletes old events rows from dbPath. Exactly one of before or keep
-// must be supplied (before as a YYYY-MM-DD string, keep as a positive count).
-// Returns the number of rows deleted. VACUUM is run afterwards on a best-effort
-// basis — a VACUUM error does NOT fail the prune.
+// must be supplied (before as a YYYY-MM-DD string, keep as a positive count; the
+// unused one is "" or 0). Returns the number of rows deleted. VACUUM is run
+// afterwards on a best-effort basis — a VACUUM error does NOT fail the prune.
 func pruneEvents(dbPath, before string, keep int) (int64, error) {
+	// keep==0 doubles as "not supplied", so it can never mean "keep nothing":
+	// a caller passing a zero default must not wipe the whole events log.
+	if (before == "") == (keep == 0) || keep < 0 {
+		return 0, errors.New("provide exactly one of before (YYYY-MM-DD) or keep (a positive count)")
+	}
 	// Guard here too (not just in cmdDB): `before` feeds a string comparison
 	// against ISO-8601 timestamps, which is only correct for well-formed dates.
 	if before != "" && !validDate(before) {
@@ -38,9 +65,7 @@ func pruneEvents(dbPath, before string, keep int) (int64, error) {
 	if err := ensureDBNotInUse(dbPath); err != nil {
 		return 0, err
 	}
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"+
-		"&_pragma=foreign_keys(1)&_pragma=synchronous(1)", dbPath)
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", storeDSN(dbPath))
 	if err != nil {
 		return 0, err
 	}
@@ -116,28 +141,24 @@ func cmdDB(a Args) {
 		var keepN int
 		if keepStr != "" {
 			v, err := strconv.Atoi(keepStr)
-			if err != nil || v < 0 {
-				fail(1, "am db prune: --keep must be a non-negative integer")
+			if err != nil || v < 1 {
+				fail(1, "am db prune: --keep must be a positive integer")
 			}
 			keepN = v
 		}
 
 		// Refuse while a server is running.
-		if isServerRunning(envOr("AGENTMAN_URL", "http://127.0.0.1:8787")) {
+		if isServerRunning(serverURL()) {
 			fail(1, "am db prune: stop `am serve` before pruning")
 		}
 
 		// Confirm unless --yes.
 		if !assumeYes {
-			if beforeDate != "" {
-				fmt.Fprintf(os.Stderr, "This will delete events before %s from %s. Continue? [y/N] ", beforeDate, dbPath)
-			} else {
-				fmt.Fprintf(os.Stderr, "This will delete all but the newest %d events from %s. Continue? [y/N] ", keepN, dbPath)
+			prompt := fmt.Sprintf("This will delete events before %s from %s. Continue?", beforeDate, dbPath)
+			if beforeDate == "" {
+				prompt = fmt.Sprintf("This will delete all but the newest %d events from %s. Continue?", keepN, dbPath)
 			}
-			scanner := bufio.NewScanner(os.Stdin)
-			scanner.Scan()
-			line := strings.TrimSpace(strings.ToLower(scanner.Text()))
-			if line != "y" && line != "yes" {
+			if !confirm(prompt) {
 				fail(1, "aborted")
 			}
 		}
@@ -310,19 +331,13 @@ func importDB(srcPath, destPath, backupDir string, assumeYes bool) error {
 	}
 
 	// 2. Refuse if server is running
-	if isServerRunning(envOr("AGENTMAN_URL", "http://127.0.0.1:8787")) {
+	if isServerRunning(serverURL()) {
 		return errors.New("stop `am serve` before importing")
 	}
 
 	// 3. Confirm with user unless --yes
-	if !assumeYes {
-		fmt.Fprintf(os.Stderr, "This will replace %s with %s. Continue? [y/N] ", destPath, srcPath)
-		scanner := bufio.NewScanner(os.Stdin)
-		scanner.Scan()
-		line := strings.TrimSpace(strings.ToLower(scanner.Text()))
-		if line != "y" && line != "yes" {
-			return errors.New("aborted")
-		}
+	if !assumeYes && !confirm(fmt.Sprintf("This will replace %s with %s. Continue?", destPath, srcPath)) {
+		return errors.New("aborted")
 	}
 
 	// 4. Ensure destination directory exists

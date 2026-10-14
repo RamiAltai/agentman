@@ -123,7 +123,7 @@ func TestCwfDbImportRefusalsLeaveDestUnchanged(t *testing.T) {
 		yes        bool
 	}{
 		{"invalid source", "validation failed", func(t *testing.T) (string, string) {
-			t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+			cwfDbNoServer(t)
 			return garbage, t.TempDir()
 		}, true},
 		{"server running", "stop `am serve`", func(t *testing.T) (string, string) {
@@ -131,12 +131,12 @@ func TestCwfDbImportRefusalsLeaveDestUnchanged(t *testing.T) {
 			return cwfDbSnapshot(t, "new"), t.TempDir()
 		}, true},
 		{"user aborts", "aborted", func(t *testing.T) (string, string) {
-			t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+			cwfDbNoServer(t)
 			cwfDbStdin(t, "n\n")
 			return cwfDbSnapshot(t, "new"), t.TempDir()
 		}, false},
 		{"backup fails", "backup failed", func(t *testing.T) (string, string) {
-			t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+			cwfDbNoServer(t)
 			return cwfDbSnapshot(t, "new"), filepath.Join(t.TempDir(), "missing", "dir")
 		}, true},
 	}
@@ -163,7 +163,7 @@ func TestCwfDbImportRefusalsLeaveDestUnchanged(t *testing.T) {
 // FIND-0090: answering "y" at the prompt goes through; a dest directory that
 // cannot be created fails before anything is written.
 func TestCwfDbImportConfirmAndMkdirFailure(t *testing.T) {
-	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+	cwfDbNoServer(t)
 	dest := cwfDbStore(t, t.TempDir(), "dest.db", "old")
 	cwfDbStdin(t, "yes\n")
 	var err error
@@ -218,10 +218,10 @@ func TestCwfDbValidateRejections(t *testing.T) {
 	})
 }
 
-// FIND-0105: keep boundaries — 0 deletes everything, >= count deletes nothing,
-// an empty events table is fine.
+// FIND-0105: keep boundaries — >= count deletes nothing, an empty events table
+// is fine. keep 0 is rejected (FIND-0099, TestCwfDbPruneRejectsAmbiguousArgs).
 func TestCwfDbPruneKeepBoundaries(t *testing.T) {
-	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+	cwfDbNoServer(t)
 	p := cwfDbStore(t, t.TempDir(), "count.db", "p")
 	total := cwfDbEventCount(t, p)
 	if total == 0 {
@@ -236,7 +236,6 @@ func TestCwfDbPruneKeepBoundaries(t *testing.T) {
 	}{
 		{"keep greater than count", total + 5, false, 0, total},
 		{"keep equal to count", total, false, 0, total},
-		{"keep zero", 0, false, total, 0},
 		{"empty table", 3, true, 0, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -295,7 +294,7 @@ func TestCwfDbExportErrorsAndQuoting(t *testing.T) {
 // FIND-0101: cmdDB argument validation, liveness refusal, prompt and abort,
 // driven through the osExit hook.
 func TestCwfDbCmdDB(t *testing.T) {
-	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+	cwfDbNoServer(t)
 	t.Setenv("AGENTMAN_DB", "")
 	db := cwfDbStore(t, t.TempDir(), "board.db", "p")
 	cwfDbExec(t, db, "INSERT INTO events(actor, kind) VALUES ('t', 'test'), ('t', 'test')")
@@ -319,8 +318,9 @@ func TestCwfDbCmdDB(t *testing.T) {
 		{"prune neither flag", []string{"prune", "--db", db}, "exactly one of"},
 		{"prune both flags", []string{"prune", "--db", db, "--keep", "1", "--before", "2024-01-01"}, "exactly one of"},
 		{"prune bad date", []string{"prune", "--db", db, "--before", "2026-13-99", "--yes"}, "valid YYYY-MM-DD"},
-		{"prune negative keep", []string{"prune", "--db", db, "--keep=-1", "--yes"}, "non-negative integer"},
-		{"prune non-numeric keep", []string{"prune", "--db", db, "--keep", "abc", "--yes"}, "non-negative integer"},
+		{"prune zero keep", []string{"prune", "--db", db, "--keep", "0", "--yes"}, "positive integer"},
+		{"prune negative keep", []string{"prune", "--db", db, "--keep=-1", "--yes"}, "positive integer"},
+		{"prune non-numeric keep", []string{"prune", "--db", db, "--keep", "abc", "--yes"}, "positive integer"},
 		{"export missing source", []string{"export", filepath.Join(t.TempDir(), "o.db"), "--db", filepath.Join(t.TempDir(), "nope.db")}, "not found"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -391,7 +391,7 @@ func TestCwfDbCmdDB(t *testing.T) {
 // FIND-0092: the dest's stale -wal/-shm from an unclean shutdown are gone after
 // import, so they cannot be replayed into the imported file.
 func TestCwfDbImportRemovesStaleSidecars(t *testing.T) {
-	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+	cwfDbNoServer(t)
 	live := filepath.Join(t.TempDir(), "live.db")
 	st, err := OpenStore(live)
 	if err != nil {

@@ -10,7 +10,7 @@ import (
 )
 
 func TestPruneEventsKeep(t *testing.T) {
-	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+	cwfDbNoServer(t)
 
 	dbPath := filepath.Join(t.TempDir(), "prune_keep.db")
 	st, err := OpenStore(dbPath)
@@ -26,17 +26,12 @@ func TestPruneEventsKeep(t *testing.T) {
 			t.Fatalf("CreateTask %s: %v", title, err)
 		}
 	}
-	// Count total events.
-	var total int
-	st.db.QueryRow("SELECT COUNT(*) FROM events").Scan(&total)
+	total := cwfDbCount(t, st.db, "SELECT COUNT(*) FROM events")
 	if total < 3 {
 		t.Fatalf("expected >=3 events seeded, got %d", total)
 	}
 
 	// Collect newest event IDs so we can verify them after prune.
-	type evRow struct {
-		id int64
-	}
 	rows, err := st.db.Query("SELECT id FROM events ORDER BY id DESC LIMIT 2")
 	if err != nil {
 		t.Fatal(err)
@@ -44,8 +39,13 @@ func TestPruneEventsKeep(t *testing.T) {
 	var newestIDs []int64
 	for rows.Next() {
 		var id int64
-		rows.Scan(&id)
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
 		newestIDs = append(newestIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
 	rows.Close()
 
@@ -67,22 +67,18 @@ func TestPruneEventsKeep(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st2.Close()
-	var remaining int
-	st2.db.QueryRow("SELECT COUNT(*) FROM events").Scan(&remaining)
-	if remaining != 2 {
+	if remaining := cwfDbCount(t, st2.db, "SELECT COUNT(*) FROM events"); remaining != 2 {
 		t.Fatalf("expected 2 events after keep prune, got %d", remaining)
 	}
 	for _, nid := range newestIDs {
-		var cnt int
-		st2.db.QueryRow("SELECT COUNT(*) FROM events WHERE id=?", nid).Scan(&cnt)
-		if cnt != 1 {
+		if cwfDbCount(t, st2.db, "SELECT COUNT(*) FROM events WHERE id=?", nid) != 1 {
 			t.Errorf("newest event id=%d should survive keep prune, but not found", nid)
 		}
 	}
 }
 
 func TestPruneEventsBefore(t *testing.T) {
-	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+	cwfDbNoServer(t)
 
 	dbPath := filepath.Join(t.TempDir(), "prune_before.db")
 	st, err := OpenStore(dbPath)
@@ -96,15 +92,16 @@ func TestPruneEventsBefore(t *testing.T) {
 	// Insert events with explicit created_at so we control the date boundary.
 	oldDate := "2020-06-01T12:00:00.000Z"
 	newDate := "2025-06-01T12:00:00.000Z"
-	for i := 0; i < 3; i++ {
-		st.db.Exec("INSERT INTO events(project_id, actor, kind, data, created_at) SELECT id, 'tester', 'test.old', '{}', ? FROM projects WHERE slug='bproj'", oldDate)
+	for _, ev := range []struct {
+		kind, at string
+		n        int
+	}{{"test.old", oldDate, 3}, {"test.new", newDate, 2}} {
+		for i := 0; i < ev.n; i++ {
+			if _, err := st.db.Exec("INSERT INTO events(project_id, actor, kind, data, created_at) SELECT id, 'tester', ?, '{}', ? FROM projects WHERE slug='bproj'", ev.kind, ev.at); err != nil {
+				t.Fatalf("seed %s: %v", ev.kind, err)
+			}
+		}
 	}
-	for i := 0; i < 2; i++ {
-		st.db.Exec("INSERT INTO events(project_id, actor, kind, data, created_at) SELECT id, 'tester', 'test.new', '{}', ? FROM projects WHERE slug='bproj'", newDate)
-	}
-
-	var total int
-	st.db.QueryRow("SELECT COUNT(*) FROM events").Scan(&total)
 	st.Close()
 
 	// Prune before 2023-01-01 — only the "old" rows should be deleted.
@@ -122,14 +119,10 @@ func TestPruneEventsBefore(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st2.Close()
-	var remaining int
-	st2.db.QueryRow("SELECT COUNT(*) FROM events WHERE kind='test.new'").Scan(&remaining)
-	if remaining != 2 {
+	if remaining := cwfDbCount(t, st2.db, "SELECT COUNT(*) FROM events WHERE kind='test.new'"); remaining != 2 {
 		t.Fatalf("expected 2 'test.new' events to survive, got %d", remaining)
 	}
-	var oldRemaining int
-	st2.db.QueryRow("SELECT COUNT(*) FROM events WHERE kind='test.old'").Scan(&oldRemaining)
-	if oldRemaining != 0 {
+	if oldRemaining := cwfDbCount(t, st2.db, "SELECT COUNT(*) FROM events WHERE kind='test.old'"); oldRemaining != 0 {
 		t.Fatalf("expected 0 'test.old' events after prune, got %d", oldRemaining)
 	}
 
@@ -148,7 +141,7 @@ func TestPruneEventsBefore(t *testing.T) {
 // a bare YYYY-MM-DD cutoff must KEEP same-day events (their ISO timestamp
 // "...T..." sorts AFTER the date-only string) and only the NEXT day deletes them.
 func TestPruneEventsBeforeSameDayBoundary(t *testing.T) {
-	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+	cwfDbNoServer(t)
 
 	dbPath := filepath.Join(t.TempDir(), "prune_boundary.db")
 	st, err := OpenStore(dbPath)
@@ -187,8 +180,7 @@ func TestPruneEventsBeforeSameDayBoundary(t *testing.T) {
 
 // TestExportImportRoundtrip: create a store, export it, validate the export, import it back.
 func TestExportImportRoundtrip(t *testing.T) {
-	// Point away from any live server so isServerRunning returns false.
-	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+	cwfDbNoServer(t)
 
 	// 1. Create a source DB with a project and task
 	srcDB := filepath.Join(t.TempDir(), "src.db")
@@ -248,8 +240,7 @@ func TestExportImportRoundtrip(t *testing.T) {
 // contents (0600) and leaves the NEW contents at dest. Both DBs carry a
 // distinct project so a swapped or empty backup cannot pass.
 func TestImportCreatesBackup(t *testing.T) {
-	// Point away from any live server so isServerRunning returns false.
-	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+	cwfDbNoServer(t)
 
 	srcDB := filepath.Join(t.TempDir(), "src.db")
 	store, err := OpenStore(srcDB)
@@ -290,7 +281,10 @@ func TestImportCreatesBackup(t *testing.T) {
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 backup file in backupDir, got %d", len(entries))
 	}
-	info, _ := entries[0].Info()
+	info, err := entries[0].Info()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if info.Mode().Perm() != 0o600 {
 		t.Errorf("backup %s perm = %o, want 0o600", entries[0].Name(), info.Mode().Perm())
 	}
@@ -333,8 +327,7 @@ func TestPruneEventsRejectsBadDate(t *testing.T) {
 
 // TestIsServerRunning: quick sanity (server is NOT running in tests).
 func TestIsServerRunning(t *testing.T) {
-	// There should be no server on a random high port
-	if isServerRunning("http://127.0.0.1:19999") {
+	if isServerRunning(cwfDbNoServer(t)) {
 		t.Error("expected isServerRunning=false on unused port")
 	}
 }
@@ -344,7 +337,7 @@ func TestIsServerRunning(t *testing.T) {
 // TestExportContainsCategories: a snapshot of a current DB carries the
 // categories table (VACUUM INTO copies everything).
 func TestExportContainsCategories(t *testing.T) {
-	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+	cwfDbNoServer(t)
 
 	srcDB := filepath.Join(t.TempDir(), "src.db")
 	st, err := OpenStore(srcDB)
@@ -379,27 +372,26 @@ func TestExportContainsCategories(t *testing.T) {
 // validation — the required-table set is the v1 baseline on purpose — imports
 // cleanly, and migrates to the current version on the next OpenStore.
 func TestImportPreCategorySnapshot(t *testing.T) {
-	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+	cwfDbNoServer(t)
 
-	// Hand-build a v3 DB (schema.sql baseline + v2/v3 only), with one project.
+	// Build a v3 DB from the frozen v3 DDL (not schema.sql, which moves on), with one project.
 	srcDB := filepath.Join(t.TempDir(), "v3src.db")
 	db, err := sql.Open("sqlite", "file:"+srcDB+"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)")
 	if err != nil {
 		t.Fatal(err)
 	}
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schemaSQL); err != nil {
-		t.Fatal(err)
-	}
-	if err := runMigrations(db, 3, schemaMigrations[:2]); err != nil {
-		t.Fatal(err)
-	}
-	// Make it truly pre-category: drop the table schema.sql just created.
-	if _, err := db.Exec("DROP TABLE categories"); err != nil {
+	if _, err := db.Exec(cwfDbV3SchemaSQL); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec("INSERT INTO projects(slug,name) VALUES('oldproj','Old')"); err != nil {
 		t.Fatal(err)
+	}
+	if v, err := readSchemaVersion(db); err != nil || v != 3 {
+		t.Fatalf("fixture schema_version = %d (err %v), want 3", v, err)
+	}
+	if n := cwfDbCount(t, db, "SELECT COUNT(*) FROM sqlite_master WHERE name='categories'"); n != 0 {
+		t.Fatal("v3 fixture has a categories table")
 	}
 	db.Close()
 
@@ -418,8 +410,8 @@ func TestImportPreCategorySnapshot(t *testing.T) {
 		t.Fatalf("OpenStore after import: %v", err)
 	}
 	defer st.Close()
-	if v, _ := readSchemaVersion(st.db); v != currentSchemaVersion {
-		t.Fatalf("schema_version after import+open = %d, want %d", v, currentSchemaVersion)
+	if v, err := readSchemaVersion(st.db); err != nil || v != currentSchemaVersion {
+		t.Fatalf("schema_version after import+open = %d (err %v), want %d", v, err, currentSchemaVersion)
 	}
 	ps, err := st.ListProjects(false, "")
 	if err != nil {
@@ -454,7 +446,7 @@ func TestImportRejectsNewerSchema(t *testing.T) {
 // unchanged — its required-table set stays the v1 baseline, so the new table is
 // neither required nor rejected. After import the token still resolves.
 func TestExportImportWithTokens(t *testing.T) {
-	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
+	cwfDbNoServer(t)
 
 	srcDB := filepath.Join(t.TempDir(), "src.db")
 	store, err := OpenStore(srcDB)
