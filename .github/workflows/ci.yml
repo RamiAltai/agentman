@@ -8,17 +8,15 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          # Build/test on the latest stable Go, NOT the exact version pinned in go.mod.
-          # govulncheck reports stdlib advisories against the toolchain it runs under, so an
-          # exact-pinned (and quickly stale) patch version makes CI red as stdlib CVEs accrue.
-          # `stable` always carries the latest stdlib security patches. go.mod still declares
-          # the 1.25.11 *minimum* for users.
+          # Build/test on the latest stable Go, the same toolchain the govulncheck job scans
+          # with (see there). go.mod still declares the 1.25.11 *minimum* for users.
           go-version: 'stable'
           cache: true
 
@@ -39,7 +37,23 @@ jobs:
       - name: JS syntax check
         run: node --check cmd/am/web/app.js
 
+  # Separate job so a newly published advisory (or a vuln.go.dev outage) shows up as its own
+  # failing check instead of failing build/vet/test on unchanged code. govulncheck is pinned so a
+  # tool release cannot change the verdict; the advisory DB is still fetched live.
+  govulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # stable, not go.mod's minimum: stdlib advisories are reported against this toolchain.
+          go-version: 'stable'
+          cache: true
+
       - name: govulncheck
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
           govulncheck ./...
