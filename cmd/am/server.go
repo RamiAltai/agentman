@@ -782,6 +782,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleStream is the SSE endpoint that drives the live dashboard.
+// streamPingInterval spaces the keep-alive comments on an idle stream; a var
+// so tests can shorten it.
+var streamPingInterval = 15 * time.Second
+
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -869,7 +873,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ping := time.NewTicker(15 * time.Second)
+	ping := time.NewTicker(streamPingInterval)
 	defer ping.Stop()
 	for {
 		select {

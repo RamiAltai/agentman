@@ -275,6 +275,34 @@ func TestCSRFGuard(t *testing.T) {
 		t.Fatalf("same-origin POST = 403, want allowed")
 	}
 
+	// Origin check (browsers without Sec-Fetch-Site): a foreign or malformed
+	// Origin is refused before the handler runs; the server's own is allowed.
+	for _, c := range []struct {
+		origin, title string
+		want          int
+	}{
+		{"http://evil.com", "evil origin", http.StatusForbidden},
+		{"http://%zz", "malformed origin", http.StatusForbidden},
+		{ts.URL, "own origin", http.StatusCreated},
+	} {
+		r = do(t, ts, http.MethodPost, "/api/tasks", `{"project":"web","title":"`+c.title+`"}`,
+			map[string]string{"Origin": c.origin})
+		b, _ := io.ReadAll(r.Body)
+		r.Body.Close()
+		if r.StatusCode != c.want {
+			t.Fatalf("POST with Origin %q = %d, want %d", c.origin, r.StatusCode, c.want)
+		}
+		if c.want == http.StatusForbidden && !strings.Contains(string(b), "cross_origin") {
+			t.Fatalf("Origin %q 403 body = %s, want cross_origin", c.origin, b)
+		}
+	}
+	r = do(t, ts, http.MethodGet, "/api/tasks?project=web", "", nil)
+	b, _ := io.ReadAll(r.Body)
+	r.Body.Close()
+	if strings.Contains(string(b), "evil origin") || strings.Contains(string(b), "malformed origin") {
+		t.Fatalf("a refused cross-origin POST created a task: %s", b)
+	}
+
 	// GET read is never blocked by csrf even with a cross-site hint.
 	r = do(t, ts, http.MethodGet, "/api/events",
 		"", map[string]string{"Sec-Fetch-Site": "cross-site"})
@@ -1942,6 +1970,29 @@ func TestScopeProposalsWrongCategoryNoCarveOut(t *testing.T) {
 		t.Fatalf("scoped graph of work/proposals = %d, want 403", rg.StatusCode)
 	}
 
+	// The inline pair checks (checkTaskRead, checkComment): a task agent-p
+	// created in work/proposals is neither readable nor commentable by it
+	// under its personal scope.
+	rt := do(t, ts, http.MethodPost, "/api/tasks", `{"project":"proposals","title":"mine"}`,
+		map[string]string{"X-Agent": "agent-p", "Content-Type": "application/json"})
+	var tk Task
+	json.NewDecoder(rt.Body).Decode(&tk)
+	rt.Body.Close()
+	if rt.StatusCode != http.StatusCreated || tk.CreatedBy != "agent-p" {
+		t.Fatalf("unscoped create in work/proposals = %d, created_by %q", rt.StatusCode, tk.CreatedBy)
+	}
+	id := strconv.FormatInt(tk.ID, 10)
+	rgt := do(t, ts, http.MethodGet, "/api/tasks/"+id, "", scoped("agent-p", "personal"))
+	rgt.Body.Close()
+	if rgt.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped GET of a work/proposals task = %d, want 403", rgt.StatusCode)
+	}
+	rcm := do(t, ts, http.MethodPost, "/api/tasks/"+id+"/comments", `{"body":"follow-up"}`, scoped("agent-p", "personal"))
+	rcm.Body.Close()
+	if rcm.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped comment on own work/proposals task = %d, want 403", rcm.StatusCode)
+	}
+
 	// The normal rules still apply: the agent whose scope covers it creates fine.
 	rw := do(t, ts, http.MethodPost, "/api/tasks",
 		`{"project":"proposals","title":"plain in-scope task"}`, scoped("agent-w", "work"))
@@ -2261,6 +2312,31 @@ func TestScopeProjectCategoryEndpoints(t *testing.T) {
 	if ru.StatusCode != http.StatusOK {
 		t.Fatalf("scoped unarchive of own project = %d, want 200", ru.StatusCode)
 	}
+	// Out-of-scope archive/unarchive: 403 and the archive state is untouched.
+	activeProjects := func() string {
+		r := do(t, ts, http.MethodGet, "/api/projects", "", nil)
+		defer r.Body.Close()
+		b, _ := io.ReadAll(r.Body)
+		return string(b)
+	}
+	rao := do(t, ts, http.MethodPost, "/api/projects/wproj/archive", "", hdr)
+	rao.Body.Close()
+	if rao.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped archive of other project = %d, want 403", rao.StatusCode)
+	}
+	if !strings.Contains(activeProjects(), `"slug":"wproj"`) {
+		t.Fatal("denied archive still archived wproj")
+	}
+	do(t, ts, http.MethodPost, "/api/projects/wproj/archive", "", nil).Body.Close()
+	ruo := do(t, ts, http.MethodPost, "/api/projects/wproj/unarchive", "", hdr)
+	ruo.Body.Close()
+	if ruo.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped unarchive of other project = %d, want 403", ruo.StatusCode)
+	}
+	if strings.Contains(activeProjects(), `"slug":"wproj"`) {
+		t.Fatal("denied unarchive still unarchived wproj")
+	}
+	do(t, ts, http.MethodPost, "/api/projects/wproj/unarchive", "", nil).Body.Close()
 	rd := do(t, ts, http.MethodDelete, "/api/projects/wproj", "", hdr)
 	rd.Body.Close()
 	if rd.StatusCode != http.StatusForbidden {

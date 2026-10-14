@@ -319,24 +319,50 @@ func TestCwfStoreRoutesRejectBadToken(t *testing.T) {
 		"GET /api/events":     true,
 		"GET /api/stream":     true,
 	}
-	ts := newTestServer(t)
+	ts, st := newTestServerWithStore(t)
 	mustCreateProject(t, ts, "routes")
 	id := mustCreateTask(t, ts, "routes", "a")
 	dep := mustCreateTask(t, ts, "routes", "b")
-	for _, m := range routes {
-		method, pattern := m[1], m[2]
-		if unscopedReads[method+" "+pattern] {
-			continue
+	// FIND-0181: a revoked token is as dead as a bogus one on every route.
+	revoked, tok, err := st.CreateToken(Scope{Category: "general"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RevokeToken(tok.ID); err != nil {
+		t.Fatal(err)
+	}
+	maxBefore, _ := st.MaxEventID()
+	for _, bad := range []string{"amt_bogus", revoked} {
+		for _, m := range routes {
+			method, pattern := m[1], m[2]
+			if unscopedReads[method+" "+pattern] {
+				continue
+			}
+			path := strings.NewReplacer("{slug}", "routes", "{depId}", dep, "{label}", "x", "{cid}", "1").Replace(pattern)
+			if strings.HasPrefix(path, "/api/tokens/") {
+				path = strings.Replace(path, "{id}", tok.ID, 1)
+			}
+			path = strings.Replace(path, "{id}", id, 1)
+			r := do(t, ts, method, path, "{}", map[string]string{"Authorization": "Bearer " + bad})
+			r.Body.Close()
+			if r.StatusCode != http.StatusUnauthorized {
+				t.Errorf("%s %s with token %.8s… = %d, want 401 (scope not resolved?)", method, path, bad, r.StatusCode)
+			}
 		}
-		path := strings.NewReplacer("{slug}", "routes", "{depId}", dep, "{label}", "x", "{cid}", "1").Replace(pattern)
-		if strings.HasPrefix(path, "/api/tokens/") {
-			path = strings.Replace(path, "{id}", "tk_0000000000000000", 1)
-		}
-		path = strings.Replace(path, "{id}", id, 1)
-		r := do(t, ts, method, path, "{}", map[string]string{"Authorization": "Bearer amt_bogus"})
-		r.Body.Close()
-		if r.StatusCode != http.StatusUnauthorized {
-			t.Errorf("%s %s with a bad token = %d, want 401 (scope not resolved?)", method, path, r.StatusCode)
-		}
+	}
+	// No rejected request changed anything: no event was written, and the
+	// task and project the deletes targeted are still there.
+	if maxAfter, _ := st.MaxEventID(); maxAfter != maxBefore {
+		t.Errorf("rejected requests wrote events %d..%d", maxBefore+1, maxAfter)
+	}
+	n, _ := strconv.ParseInt(id, 10, 64)
+	if _, err := st.GetTask(n); err != nil {
+		t.Errorf("task %s after rejected requests: %v", id, err)
+	}
+	if _, err := st.projectID("routes"); err != nil {
+		t.Errorf("project after rejected requests: %v", err)
+	}
+	if toks, err := st.ListTokens(); err != nil || len(toks) != 1 {
+		t.Errorf("tokens after rejected requests = %d, %v; want only the revoked one", len(toks), err)
 	}
 }

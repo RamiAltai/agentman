@@ -139,14 +139,36 @@ func TestRunMigrationsIdempotent(t *testing.T) {
 func TestRunMigrationsRollbackLeavesPriorVersion(t *testing.T) {
 	st := openTestStore(t)
 	target := currentSchemaVersion + 1
+	// The step does real DDL before failing, so a missing rollback would leave
+	// m_partial behind (or the connection wedged in an open tx).
 	steps := []migration{
-		{version: target, apply: func(*sql.Tx) error { return sql.ErrConnDone }},
+		{version: target, apply: func(tx *sql.Tx) error {
+			if _, err := tx.Exec("CREATE TABLE m_partial (x INTEGER)"); err != nil {
+				return err
+			}
+			return sql.ErrConnDone
+		}},
 	}
 	if err := runMigrations(st.db, target, steps); err == nil {
 		t.Fatal("runMigrations: want error from failing step, got nil")
 	}
 	if v, _ := readSchemaVersion(st.db); v != currentSchemaVersion {
 		t.Fatalf("schema_version after failed migration = %d, want %d (rolled back)", v, currentSchemaVersion)
+	}
+	var n int
+	if err := st.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name='m_partial'").Scan(&n); err != nil || n != 0 {
+		t.Fatalf("m_partial count = %d (%v), want 0: the failed step's DDL was not rolled back", n, err)
+	}
+	// The connection is usable afterwards: a good step applies and bumps.
+	ok := []migration{{version: target, apply: func(tx *sql.Tx) error {
+		_, err := tx.Exec("CREATE TABLE m_after (x INTEGER)")
+		return err
+	}}}
+	if err := runMigrations(st.db, target, ok); err != nil {
+		t.Fatalf("runMigrations after a rolled-back step: %v", err)
+	}
+	if v, _ := readSchemaVersion(st.db); v != target {
+		t.Fatalf("schema_version = %d, want %d", v, target)
 	}
 }
 
