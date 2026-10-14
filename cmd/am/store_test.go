@@ -618,21 +618,42 @@ func TestDropClearsClaimedAt(t *testing.T) {
 		t.Fatalf("ClaimTask: %v", err)
 	}
 	// am drop = PATCH {assignee:"", status:"todo"}.
-	dropped, _, err := st.PatchTask(task.ID, map[string]any{"assignee": "", "status": "todo"}, "agent-a")
+	dropped, ev, err := st.PatchTask(task.ID, map[string]any{"assignee": "", "status": "todo"}, "agent-a")
 	if err != nil {
 		t.Fatalf("PatchTask drop: %v", err)
 	}
 	if dropped.ClaimedAt != "" {
 		t.Fatalf("claimed_at after drop = %q, want cleared", dropped.ClaimedAt)
 	}
+	// The dashboard feed keys on these kinds and [old,new] pairs: a status
+	// change outranks an assignee change in the same patch.
+	wantEvent := func(ev *Event, kind, data string) {
+		t.Helper()
+		if ev == nil || ev.Kind != kind || string(ev.Data) != data {
+			t.Fatalf("event = %+v, want %s %s", ev, kind, data)
+		}
+	}
+	wantEvent(ev, "task.status", `{"assignee":["agent-a",null],"status":["doing","todo"]}`)
 	// Reassigning via PATCH sets it again.
-	reassigned, _, err := st.PatchTask(task.ID, map[string]any{"assignee": "agent-b"}, "alice")
+	reassigned, ev, err := st.PatchTask(task.ID, map[string]any{"assignee": "agent-b"}, "alice")
 	if err != nil {
 		t.Fatalf("PatchTask assign: %v", err)
 	}
 	if reassigned.ClaimedAt == "" {
 		t.Fatal("claimed_at not set on PATCH reassign")
 	}
+	wantEvent(ev, "task.assign", `{"assignee":[null,"agent-b"]}`)
+	// Status alone, and an assignee change riding along with a title.
+	_, ev, err = st.PatchTask(task.ID, map[string]any{"status": "done"}, "agent-b")
+	if err != nil {
+		t.Fatalf("PatchTask status: %v", err)
+	}
+	wantEvent(ev, "task.status", `{"status":["todo","done"]}`)
+	_, ev, err = st.PatchTask(task.ID, map[string]any{"assignee": "agent-c", "title": "renamed"}, "alice")
+	if err != nil {
+		t.Fatalf("PatchTask assign+title: %v", err)
+	}
+	wantEvent(ev, "task.assign", `{"assignee":["agent-b","agent-c"],"title":["drop me","renamed"]}`)
 }
 
 func TestArchiveUnarchiveProject(t *testing.T) {
@@ -2862,9 +2883,11 @@ func TestPatchTaskMetaAtomicOneEvent(t *testing.T) {
 	}
 
 	// Second-key validation failure rolls back the first key too (all-or-nothing).
+	// Key names are validated before any write, so the failure must come from
+	// the per-value check: "a1" sorts first and is written before "b" fails.
 	st2, ta, _, _ := setupDepFixture(t)
-	if _, _, err := st2.PatchTask(ta, map[string]any{"meta": map[string]any{"a1": "ok", "bad key": "y"}}, "alice"); !errors.Is(err, ErrValidation) {
-		t.Fatalf("invalid second key err = %v, want ErrValidation", err)
+	if _, _, err := st2.PatchTask(ta, map[string]any{"meta": map[string]any{"a1": "ok", "b": strings.Repeat("x", maxTitleLen+1)}}, "alice"); !errors.Is(err, ErrValidation) {
+		t.Fatalf("oversized second value err = %v, want ErrValidation", err)
 	}
 	var rows int
 	st2.db.QueryRow("SELECT COUNT(*) FROM task_meta WHERE task_id=?", ta).Scan(&rows)
@@ -3441,6 +3464,52 @@ func TestListCategoriesCounts(t *testing.T) {
 	}
 	if len(work.ActiveAgents) != 1 || work.ActiveAgents[0] != "robo-fresh" {
 		t.Fatalf("active_agents = %v, want [robo-fresh] (human excluded, robo-old aged out)", work.ActiveAgents)
+	}
+
+	// Window edges: an event 29 minutes old is inside a 30-minute window, one
+	// 31 minutes old is outside it.
+	for actor, age := range map[string]time.Duration{"robo-29m": 29 * time.Minute, "robo-31m": 31 * time.Minute} {
+		if _, _, err := st.AddComment(freshTask, actor, "edge"); err != nil {
+			t.Fatalf("AddComment %s: %v", actor, err)
+		}
+		at := time.Now().Add(-age).UTC().Format("2006-01-02T15:04:05.000Z")
+		if _, err := st.db.Exec("UPDATE events SET created_at=? WHERE actor=?", at, actor); err != nil {
+			t.Fatalf("backdate %s: %v", actor, err)
+		}
+	}
+	// An archived category is listed only with includeArchived, and its counts
+	// still come from its non-archived projects (alpha, not beta).
+	if _, _, err := st.ArchiveCategory("work", "human"); err != nil {
+		t.Fatalf("ArchiveCategory work: %v", err)
+	}
+	for _, includeArchived := range []bool{false, true} {
+		cats, err = st.ListCategoriesWithStats(includeArchived, 30*time.Minute)
+		if err != nil {
+			t.Fatalf("ListCategoriesWithStats(%v): %v", includeArchived, err)
+		}
+		work = nil
+		for i := range cats {
+			if cats[i].Slug == "work" {
+				work = &cats[i]
+			}
+		}
+		if !includeArchived {
+			if work != nil {
+				t.Fatalf("archived work category listed without includeArchived")
+			}
+			continue
+		}
+		if work == nil {
+			t.Fatalf("archived work category missing with includeArchived")
+		}
+		// alpha's tasks plus "fresh"; fmt prints maps with sorted keys.
+		want := map[string]int{"todo": 3, "doing": 1, "blocked": 0, "done": 1}
+		if fmt.Sprint(work.Counts) != fmt.Sprint(want) {
+			t.Fatalf("archived work counts = %v, want %v", work.Counts, want)
+		}
+		if got := strings.Join(work.ActiveAgents, ","); got != "robo-29m,robo-fresh" {
+			t.Fatalf("active_agents = %s, want robo-29m,robo-fresh", got)
+		}
 	}
 }
 

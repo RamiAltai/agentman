@@ -120,11 +120,11 @@ func TestSSEDeliversLiveEvent(t *testing.T) {
 	// Now create a task — this should produce a task.created event.
 	mustCreateTask(t, ts, "sseproj", "SSE Live Task")
 
-	ev := readSSEUntil(t, ctx, br, func(e sseEvent) bool {
-		return e.kind == "task.created"
-	})
-	if ev.kind != "task.created" {
-		t.Fatalf("expected task.created event, got kind=%q", ev.kind)
+	// Without a cursor the stream replays the log from the start, which here is
+	// only sseproj's project.created; the next frame must be the live event.
+	ev := readSSEUntil(t, ctx, br, func(e sseEvent) bool { return e.kind != "project.created" })
+	if ev.kind != "task.created" || ev.id <= 0 || !strings.Contains(ev.data, "SSE Live Task") {
+		t.Fatalf("first frame = id %d %q %s, want the SSE Live Task task.created", ev.id, ev.kind, ev.data)
 	}
 }
 
@@ -239,9 +239,11 @@ func TestSSECategoryScopedStream(t *testing.T) {
 	respB, brB := openStream(t, ctx, ts, "/api/stream?category=bcat")
 	defer respB.Body.Close()
 
-	// A task in bproj must NOT reach A, but a task in aproj must.
+	// A task in bproj must NOT reach A, but a task in aproj must; the second
+	// bproj task, created after A's, makes B's side discriminating too.
 	mustCreateTask(t, ts, "bproj", "B Task")
 	mustCreateTask(t, ts, "aproj", "A Task")
+	mustCreateTask(t, ts, "bproj", "B Task 2")
 
 	// A should see the aproj task.created (and never the bproj one — the bproj
 	// event has a lower id, so if A wrongly delivered it, this read would catch
@@ -251,10 +253,13 @@ func TestSSECategoryScopedStream(t *testing.T) {
 		t.Fatalf("subscriber A first task.created = %q, want the aproj task", ev.data)
 	}
 
-	// B should see its own task, not A's.
-	evB := readSSEUntil(t, ctx, brB, func(e sseEvent) bool { return e.kind == "task.created" })
-	if !strings.Contains(evB.data, "B Task") {
-		t.Fatalf("subscriber B first task.created = %q, want the bproj task", evB.data)
+	// B should see its own two tasks back to back, never A's (which has an id
+	// between them, so a leak would arrive second).
+	for _, want := range []string{`"B Task"`, `"B Task 2"`} {
+		evB := readSSEUntil(t, ctx, brB, func(e sseEvent) bool { return e.kind == "task.created" })
+		if !strings.Contains(evB.data, want) {
+			t.Fatalf("subscriber B task.created = %q, want %s", evB.data, want)
+		}
 	}
 
 	// project.created carve-out: a new project in bcat still reaches A (so a new

@@ -2718,9 +2718,13 @@ func TestTokenScopeMatrix(t *testing.T) {
 	pTok := mintToken(t, ts, "personal")
 
 	// next never returns out-of-scope work even when work has a more urgent task.
-	do(t, ts, http.MethodPost, "/api/tasks",
+	ru := do(t, ts, http.MethodPost, "/api/tasks",
 		`{"project":"wproj","title":"urgent work","priority":0}`,
-		map[string]string{"Content-Type": "application/json"}).Body.Close()
+		map[string]string{"Content-Type": "application/json"})
+	ru.Body.Close()
+	if ru.StatusCode != http.StatusCreated {
+		t.Fatalf("create urgent work task = %d, want 201", ru.StatusCode)
+	}
 	rn := do(t, ts, http.MethodPost, "/api/tasks/next", "", bearer("agent-p", pTok))
 	if rn.StatusCode != http.StatusOK {
 		rn.Body.Close()
@@ -2743,12 +2747,18 @@ func TestTokenScopeMatrix(t *testing.T) {
 	// steal-stale out-of-scope → 403.
 	rs0 := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", "", map[string]string{"X-Agent": "agent-gone"})
 	rs0.Body.Close()
+	if rs0.StatusCode != http.StatusOK {
+		t.Fatalf("unscoped claim by agent-gone = %d, want 200", rs0.StatusCode)
+	}
 	n, _ := strconv.ParseInt(workID, 10, 64)
 	backdateTask(t, store, n)
 	rs := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", `{"steal_stale":"1h"}`, bearer("agent-p", pTok))
 	rs.Body.Close()
 	if rs.StatusCode != http.StatusForbidden {
 		t.Fatalf("token-scoped out-of-scope steal = %d, want 403", rs.StatusCode)
+	}
+	if got, err := store.GetTask(n); err != nil || got.Assignee != "agent-gone" {
+		t.Fatalf("work task after denied steal = %+v, %v; want still assigned to agent-gone", got, err)
 	}
 
 	// bulk per-id: in-scope status succeeds, out-of-scope 403 (drive both via the token).
