@@ -47,6 +47,8 @@ let pendingProject = "";     // a project slug to auto-select after the next app
 let tasks = new Map();       // id -> task (terse)
 let doneCapped = false;      // true when the done fetch hit DONE_FETCH_LIMIT (done column shows "N+")
 let cursor = 0;              // highest event id seen (SSE since=)
+let streamDropped = false;   // the stream errored; the next onopen resyncs (the server replays at most 500 missed events)
+let resyncTimer = null, resyncDelay = 1000; // retry of a failed live reconcile (capped backoff)
 let es = null, backoff = 1000, refreshTimer = null, openTaskId = null, lastFocus = null, dragId = null;
 let filterQ = "";            // search-box text filter (server-side ?q=)
 let filterLabel = "";        // active label filter (server-side ?label=)
@@ -61,6 +63,7 @@ let feedPaginated = false;   // true once the user has clicked "Load older"; tri
                              // to avoid fighting pagination (raising the cap is the other option,
                              // but skipping trimming is simpler since the user explicitly asked for more)
 let loadOlderBtn = null;     // reference to the "Load older" button element
+let boardSeq = 0, feedSeq = 0; // request generations: a load whose response is no longer the latest is dropped
 
 const $ = (id) => document.getElementById(id);
 
@@ -224,17 +227,33 @@ async function loadBoard() {
   if (filterMetaKey) extra.meta_key = filterMetaKey;
   // Two fetches: a single capped list sorts by priority first, so old done P0-P2
   // tasks would push open P3 work out of the result. Open statuses are uncapped.
-  const [open, done] = await Promise.all([
-    api("GET", "/api/tasks" + qstr({ ...extra, status: "todo,doing,blocked" })),
-    api("GET", "/api/tasks" + qstr({ ...extra, status: "done", limit: DONE_FETCH_LIMIT })),
-  ]);
+  const seq = ++boardSeq;
+  let open, done;
+  try {
+    [open, done] = await Promise.all([
+      api("GET", "/api/tasks" + qstr({ ...extra, status: "todo,doing,blocked" })),
+      api("GET", "/api/tasks" + qstr({ ...extra, status: "done", limit: DONE_FETCH_LIMIT })),
+    ]);
+  } catch (e) {
+    if (seq !== boardSeq) return; // a newer load owns the board; its outcome is the one to report
+    throw e;
+  }
+  if (seq !== boardSeq) return; // overlapping loads can resolve out of order
   doneCapped = done.length >= DONE_FETCH_LIMIT;
   tasks = new Map(open.concat(done).map((t) => [t.id, t]));
   renderBoard();
 }
 
 async function loadFeed() {
-  const res = await api("GET", "/api/events" + qstr({ tail: 50 }));
+  const seq = ++feedSeq;
+  let res;
+  try {
+    res = await api("GET", "/api/events" + qstr({ tail: 50 }));
+  } catch (e) {
+    if (seq !== feedSeq) return;
+    throw e;
+  }
+  if (seq !== feedSeq) return; // a newer load (view/selection change) owns the feed
   const list = $("feedList");
   list.replaceChildren();
   feedPaginated = false; // reset pagination state on full reload
@@ -586,7 +605,12 @@ async function route() {
   const h = location.hash || "#/";
   let next = "overview", cat = "";
   if (h === "#/all") next = "all";
-  else if (h.startsWith("#/cat/")) { next = "category"; cat = decodeURIComponent(h.slice("#/cat/".length)); }
+  else if (h.startsWith("#/cat/")) {
+    // A hand-edited link can hold a malformed %-escape; fall back to the overview
+    // instead of throwing before applyView (which would leave no board and no stream).
+    try { next = "category"; cat = decodeURIComponent(h.slice("#/cat/".length)); }
+    catch (e) { next = "overview"; cat = ""; showToast("Unknown category link: " + h); }
+  }
   await applyView(next, cat);
 }
 
@@ -714,6 +738,10 @@ function catCard(c) {
 
 // ---------- label filter ----------
 
+// reportBoardError surfaces a failed filter/search reload: the filter UI already
+// shows the new state, so a silent failure would leave it over the old board.
+function reportBoardError(e) { showToast("Couldn't load the board: " + e.message); }
+
 function setLabelFilter(l) {
   filterLabel = l;
   const chip = $("labelFilterChip");
@@ -721,7 +749,7 @@ function setLabelFilter(l) {
     document.createTextNode(l),
     el("button", { class: "label-filter-x", "aria-label": "Clear label filter", onclick: clearLabelFilter }, "✕"));
   chip.classList.remove("hidden");
-  loadBoard().catch(() => {});
+  loadBoard().catch(reportBoardError);
 }
 
 function clearLabelFilter() {
@@ -729,7 +757,7 @@ function clearLabelFilter() {
   const chip = $("labelFilterChip");
   chip.replaceChildren();
   chip.classList.add("hidden");
-  loadBoard().catch(() => {});
+  loadBoard().catch(reportBoardError);
 }
 
 // ---------- board filters ----------
@@ -793,7 +821,7 @@ function renderFilterPanel() {
 // button's count chip in sync.
 function applyFilters() {
   renderFilterBadge();
-  loadBoard().catch(() => {});
+  loadBoard().catch(reportBoardError);
 }
 
 function clearFilters() {
@@ -807,7 +835,7 @@ function clearFilters() {
   filterMetaKey = "";
   renderFilterPanel();
   renderFilterBadge();
-  loadBoard().catch(() => {});
+  loadBoard().catch(reportBoardError);
 }
 
 function renderFilterBadge() {
@@ -1250,6 +1278,7 @@ function renderModal(t) {
 }
 
 function openNew() {
+  openTaskId = null; // the sheet no longer shows a task: live events must not re-render one over this form
   const s = $("sheet");
   s.replaceChildren();
   s.append(el("button", { class: "x", onclick: closeModal, "aria-label": "Close" }, "✕"));
@@ -1289,6 +1318,7 @@ function openNew() {
 // /api/categories. Categories live above the project layer, so there is no scope
 // picker here.
 function openNewCategory() {
+  openTaskId = null; // the sheet no longer shows a task: live events must not re-render one over this form
   const s = $("sheet");
   s.replaceChildren();
   s.append(el("button", { class: "x", onclick: closeModal, "aria-label": "Close" }, "✕"));
@@ -1323,6 +1353,7 @@ async function openNewProject() {
   if (!categories.length) {
     try { categories = await api("GET", "/api/categories"); } catch (e) { /* fall back to a single "general" option below */ }
   }
+  openTaskId = null; // the sheet no longer shows a task: live events must not re-render one over this form
   const s = $("sheet");
   s.replaceChildren();
   s.append(el("button", { class: "x", onclick: closeModal, "aria-label": "Close" }, "✕"));
@@ -1372,6 +1403,7 @@ async function openNewProject() {
 // ---------- manage categories + projects modal ----------
 
 async function openManage() {
+  openTaskId = null; // the sheet no longer shows a task: live events must not re-render one over this form
   const s = $("sheet");
   s.replaceChildren();
   s.append(el("button", { class: "x", onclick: closeModal, "aria-label": "Close" }, "✕"));
@@ -1428,7 +1460,10 @@ async function renderManageCategories(list, err) {
         try {
           await api("POST", "/api/categories/" + encodeURIComponent(c.slug) + (isArchived ? "/unarchive" : "/archive"));
           await loadProjects();
+          // The rail renders `categories`; category events never reach a scoped
+          // (category/project) stream, so refresh them here in every view.
           if (view === "overview") await loadOverview();
+          else await loadCategories();
           await renderManageCategories(list, err);
         } catch (e) {
           err.textContent = e.message;
@@ -1535,6 +1570,7 @@ async function renderManageList(list, err) {
 // user may deliberately rename). On a slug change we follow the selection so the
 // renamed project stays selected after the tab bar reloads.
 function openEditProject(p) {
+  openTaskId = null; // the sheet no longer shows a task: live events must not re-render one over this form
   const s = $("sheet");
   s.replaceChildren();
   s.append(el("button", { class: "x", onclick: closeModal, "aria-label": "Close" }, "✕"));
@@ -1576,14 +1612,55 @@ function openEditProject(p) {
 
 // ---------- live stream ----------
 
+// resync reloads the current view from REST (the loads applyView does, minus the stream).
+async function resync() {
+  if (view === "overview") { await loadOverview(); await loadFeed(); }
+  else { await loadFeed(); await loadBoard(); }
+}
+
+// loadRail re-fetches projects + categories (their open-counts) and re-renders the rail.
+async function loadRail() {
+  const [ps, cs] = await Promise.all([api("GET", "/api/projects"), api("GET", "/api/categories")]);
+  projects = ps;
+  categories = cs;
+  renderRail();
+}
+
+// resyncNow reloads the view, the rail and the open task. A live reconcile that
+// fails lands here through reconcileFailed: the header stops claiming "live" and
+// the reload retries with capped backoff, instead of waiting for an unrelated event.
+async function resyncNow() {
+  clearTimeout(resyncTimer);
+  try {
+    await resync();
+    if (view !== "overview") await loadRail(); // loadOverview already refreshed both
+    refreshModal();
+    resyncDelay = 1000;
+    if (es && es.readyState === 1) setStatus("live", "ok");
+  } catch (e) { reconcileFailed(); }
+}
+
+function reconcileFailed() {
+  setStatus("out of date — retrying…", "warn");
+  clearTimeout(resyncTimer);
+  resyncTimer = setTimeout(resyncNow, resyncDelay);
+  resyncDelay = Math.min(resyncDelay * 2, 10000);
+}
+
 function connect() {
   if (es) es.close();
   setStatus("connecting…", "");
   es = new EventSource("/api/stream" + qstr({ since: cursor }));
-  es.onopen = () => { backoff = 1000; setStatus("live", "ok"); };
+  es.onopen = () => {
+    backoff = 1000;
+    setStatus("live", "ok");
+    // After a drop, the replay can miss events (it is capped), so reload from REST.
+    if (streamDropped) { streamDropped = false; resyncNow(); }
+  };
   es.onmessage = (m) => { let ev; try { ev = JSON.parse(m.data); } catch (e) { return; } onEvent(ev); };
   es.onerror = () => {
     es.close();
+    streamDropped = true;
     // Surface degraded liveness clearly: once backoff has climbed (repeated
     // failures) or the browser reports offline, show a loud "offline" state in
     // the reserved error channel; otherwise the transient "reconnecting…" warn.
@@ -1622,7 +1699,7 @@ function onEvent(ev) {
       // elapses must not write to the now-hidden #overview element.
       overviewTimer = setTimeout(() => {
         if (view !== "overview") return;
-        loadOverview().catch(() => {});
+        loadOverview().catch(reconcileFailed);
       }, 250);
     }
     return;
@@ -1668,7 +1745,7 @@ function onEvent(ev) {
   // worth surfacing; deletes are handled above.
   if (view !== "overview" && ev.task_id && /^task\./.test(ev.kind) && ev.kind !== "task.deleted") flashIds.add(ev.task_id);
   clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(() => loadBoard().catch(() => {}), 250); // debounced reconcile
+  refreshTimer = setTimeout(() => loadBoard().catch(reconcileFailed), 250); // debounced reconcile
   // Keep the rail's open-counts live on the board views: task moves change a
   // project's (and its category's) open count. Refresh both on the same debounce
   // cadence as the board reconcile, but lightly — one projects+categories fetch.
@@ -1691,17 +1768,9 @@ function reconcileModal(ev) {
 // re-renders the rail, debounced so a burst of live events causes one refresh.
 function refreshRailCounts() {
   clearTimeout(railTimer);
-  railTimer = setTimeout(async () => {
+  railTimer = setTimeout(() => {
     if (view === "overview") return; // the overview path refreshes projects + categories via loadOverview()
-    try {
-      const [ps, cs] = await Promise.all([
-        api("GET", "/api/projects"),
-        api("GET", "/api/categories"),
-      ]);
-      projects = ps;
-      categories = cs;
-      renderRail();
-    } catch (e) { /* ignore — next event retries */ }
+    loadRail().catch(reconcileFailed);
   }, 300);
 }
 
@@ -1710,7 +1779,7 @@ function feedItem(ev) {
   // The glyph carries the non-color event-kind cue; it is decorative to screen
   // readers since .ev-text already states the event in words. The k-<kind> class
   // (kept) still colors the glyph and would color a legacy .ev-dot.
-  return el("li", { class: "ev k-" + kind },
+  return el("li", { class: "ev k-" + kind, "data-id": ev.id },
     el("span", { class: "ev-icon", "aria-hidden": "true" }, EV_GLYPH[kind] || EV_GLYPH.other),
     evText(ev),
     el("span", { class: "ev-time", title: fullTime(ev.created_at) }, fmtTime(ev.created_at)));
@@ -1721,13 +1790,17 @@ function trimFeed() {
   // preserved. Without this, each live event would pop the oldest paginated row.
   if (feedPaginated) return;
   const l = $("feedList");
+  if (l.children.length <= 200) return;
   while (l.children.length > 200) l.removeChild(l.lastChild);
+  // "Load older" must continue from the oldest row still shown, not from rows trimmed away.
+  feedOldest = Number(l.lastChild.dataset.id) || feedOldest;
 }
 
 async function loadOlderActivity() {
   if (!feedOldest || !loadOlderBtn) return;
   loadOlderBtn.disabled = true;
   const limit = 50;
+  const seq = feedSeq; // a feed reload (view change) while this is in flight makes the page stale
   try {
     const params = { before: String(feedOldest), limit: String(limit) };
     const scope = viewParams();
@@ -1735,6 +1808,7 @@ async function loadOlderActivity() {
     else if (scope.category) params.category = scope.category;
     const qs = new URLSearchParams(params);
     const res = await api("GET", "/api/events?" + qs.toString());
+    if (seq !== feedSeq) return;
     const evs = res.events || [];
     const list = $("feedList");
     for (const ev of evs) list.append(feedItem(ev)); // already newest-first, append to bottom
@@ -1750,7 +1824,7 @@ async function loadOlderActivity() {
       loadOlderBtn.disabled = false;
     }
   } catch (e) {
-    loadOlderBtn.disabled = false;
+    if (seq === feedSeq) loadOlderBtn.disabled = false;
   }
 }
 
@@ -1984,6 +2058,7 @@ function initTheme() {
 
 function onKey(e) {
   if (e.key === "Escape") {
+    if (graphOpen) { closeGraphOverlay(); return; } // focus may be outside the overlay (e.g. on body)
     if (!$("filterPanel").classList.contains("hidden")) { closeFilterPanel(); $("filterBtn").focus(); return; }
     if (!$("modal").classList.contains("hidden")) { closeModal(); return; }
     if (document.body.classList.contains("rail-open")) { closeMobileRail(); return; }
@@ -1994,6 +2069,7 @@ function onKey(e) {
   const typing = tag === "input" || tag === "textarea" || tag === "select" || e.target.isContentEditable;
   if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
   const k = e.key.toLowerCase();
+  if (graphOpen && k !== "g") return; // the other shortcuts would act on the page hidden behind the overlay
   if (k === "a") { e.preventDefault(); toggleFeed(); }
   else if (k === "n") { e.preventDefault(); openNew(); }
   else if (k === "g") { e.preventDefault(); if (graphOpen) closeGraphOverlay(); else openGraphOverlay(); }
@@ -2010,7 +2086,7 @@ $("searchBox").oninput = (e) => {
   clearTimeout(searchTimer);
   searchTimer = setTimeout(() => {
     filterQ = e.target.value.trim();
-    loadBoard().catch(() => {});
+    loadBoard().catch(reportBoardError);
   }, 250);
 };
 $("modal").onclick = (e) => { if (e.target.id === "modal") closeModal(); };
@@ -2025,7 +2101,7 @@ initFeed();
 initRail();
 initTheme();
 
-window.addEventListener("hashchange", () => { route().catch(() => {}); });
+window.addEventListener("hashchange", () => { route().catch((e) => setStatus("error: " + e.message, "warn")); });
 
 (async function init() {
   // Show loading skeletons immediately so the first paint isn't a blank board /
@@ -2194,6 +2270,8 @@ let graphDragState = null;
 let graphRefreshTimer = null;
 let graphLastFocus = null;
 let graphKeepView = false; // false → next renderGraph resets pan/zoom (set on open and project switch)
+let graphFetchSeq = 0;     // generation of the latest graph fetch; older responses are dropped
+let graphDragMoved = false; // the current/last drag moved the view, so its trailing click is not a deselect
 
 // BFS upstream (ancestors) and downstream (descendants) from a node.
 function graphNeighbors(nodeId, edges) {
@@ -2274,13 +2352,17 @@ async function fetchAndRenderGraph(slug) {
   const sel = $("graphProjectSel");
   if (sel.value !== slug) sel.value = slug;
 
+  const seq = ++graphFetchSeq;
   let data;
   try {
     data = await api("GET", "/api/projects/" + encodeURIComponent(slug) + "/graph");
   } catch (e) {
+    if (seq !== graphFetchSeq || !graphOpen) return;
     showGraphEmpty("Error loading graph: " + e.message);
     return;
   }
+  // The overlay may have closed, or another project been picked, while this was in flight.
+  if (seq !== graphFetchSeq || !graphOpen) return;
   graphData = data;
   if (!data.nodes || !data.nodes.length) {
     showGraphEmpty("No tasks in this project yet.");
@@ -2652,26 +2734,34 @@ function rebuildFocusAfterDetailNav() {
 // It runs once at load (below): only the svg's children are replaced per render.
 function installGraphPanZoom(svgEl) {
   const setViewBox = () => svgEl.setAttribute("viewBox", viewBoxStr(graphViewState));
+  // The svg keeps the default preserveAspectRatio (xMidYMid meet): one uniform
+  // scale, min(rect/viewBox) on both axes, with the content centered. Pixel deltas
+  // convert to viewBox units through that scale, not through per-axis ratios.
+  const unitsPerPx = (rect) => 1 / Math.min(rect.width / graphViewState.width, rect.height / graphViewState.height);
 
   svgEl.addEventListener("wheel", (ev) => {
     ev.preventDefault();
     const rect = svgEl.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
-    const px = (ev.clientX - rect.left) / rect.width;
-    const py = (ev.clientY - rect.top) / rect.height;
-    const anchorX = graphViewState.x + px * graphViewState.width;
-    const anchorY = graphViewState.y + py * graphViewState.height;
+    const u = unitsPerPx(rect);
+    // Cursor in viewBox coordinates: offset from the element center, through the uniform scale.
+    const anchorX = graphViewState.x + graphViewState.width / 2 + (ev.clientX - rect.left - rect.width / 2) * u;
+    const anchorY = graphViewState.y + graphViewState.height / 2 + (ev.clientY - rect.top - rect.height / 2) * u;
     const factor = ev.deltaY < 0 ? 0.9 : 1.1;
-    const nextW = Math.min(Math.max(260, graphViewState.width * factor), 6000);
-    const nextH = Math.min(Math.max(180, graphViewState.height * factor), 4000);
-    graphViewState.x = anchorX - px * nextW;
-    graphViewState.y = anchorY - py * nextH;
-    graphViewState.width = nextW;
-    graphViewState.height = nextH;
+    // One factor for both axes (keeps the viewBox aspect), clamped relative to the
+    // fitted view: zoom in to 260 units wide, out to 4x the whole graph.
+    const w = graphViewState.width;
+    const f = Math.min(Math.max(w * factor, 260), graphInitialView.width * 4) / w;
+    if (factor < 1 ? f >= 1 : f <= 1) return; // at a bound: a step never zooms the other way
+    graphViewState.x = anchorX - (anchorX - graphViewState.x) * f;
+    graphViewState.y = anchorY - (anchorY - graphViewState.y) * f;
+    graphViewState.width = w * f;
+    graphViewState.height *= f;
     setViewBox();
   }, { passive: false });
 
   svgEl.addEventListener("mousedown", (ev) => {
+    graphDragMoved = false;
     if (!(ev.target === svgEl || ev.target.classList?.contains("graph-pan-surface"))) return;
     graphDragState = { startX: ev.clientX, startY: ev.clientY, viewX: graphViewState.x, viewY: graphViewState.y };
   });
@@ -2679,14 +2769,20 @@ function installGraphPanZoom(svgEl) {
     if (!graphDragState) return;
     const rect = svgEl.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
-    const dx = ((ev.clientX - graphDragState.startX) * graphViewState.width) / rect.width;
-    const dy = ((ev.clientY - graphDragState.startY) * graphViewState.height) / rect.height;
-    graphViewState.x = graphDragState.viewX - dx;
-    graphViewState.y = graphDragState.viewY - dy;
+    const mx = ev.clientX - graphDragState.startX, my = ev.clientY - graphDragState.startY;
+    if (Math.abs(mx) + Math.abs(my) > 3) graphDragMoved = true;
+    const u = unitsPerPx(rect);
+    graphViewState.x = graphDragState.viewX - mx * u;
+    graphViewState.y = graphDragState.viewY - my * u;
     setViewBox();
   });
   svgEl.addEventListener("mouseup", () => { graphDragState = null; });
-  svgEl.addEventListener("mouseleave", () => { graphDragState = null; });
+  svgEl.addEventListener("mouseleave", () => { graphDragState = null; graphDragMoved = false; });
+  // A pan ends in a click on the surface; swallow it (capture phase, before the
+  // surface/svg deselect handlers) so panning keeps the selected node and its path.
+  svgEl.addEventListener("click", (ev) => {
+    if (graphDragMoved) { graphDragMoved = false; ev.stopPropagation(); }
+  }, true);
   svgEl.addEventListener("click", (ev) => {
     if (ev.target === svgEl) {
       graphSelectedId = null;
@@ -2729,7 +2825,7 @@ function buildGraphLegend() {
 // graphMaybeRefresh is called from onEvent (below) when the graph overlay is open.
 const GRAPH_REFRESH_KINDS = new Set([
   "task.dep_added", "task.dep_removed", "task.status", "task.created", "task.deleted",
-  "task.assign", "task.patched", "task.reclaimed",
+  "task.assign", "task.patched", "task.reclaimed", "task.claimed",
 ]);
 
 function graphMaybeRefresh(ev) {
