@@ -174,13 +174,20 @@ func TestCmdMutationsSilent(t *testing.T) {
 	if strings.TrimSpace(noteOut) != "" {
 		t.Errorf("cmdNote stdout = %q, want empty", noteOut)
 	}
+	if tk := cwfCliGetTask(t, ts, id); len(tk.Comments) != 1 || tk.Comments[0].Body != "a comment" || tk.Comments[0].Author != "tester" {
+		t.Errorf("comments after note = %+v, want one 'a comment' by tester", tk.Comments)
+	}
 
-	// cmdDrop (resets to todo)
+	// cmdDrop (releases the claim and resets to todo)
+	cmdAssign(c, parse([]string{id, "tester"}))
 	dropOut := captureStdout(t, func() {
 		cmdDrop(c, parse([]string{id}))
 	})
 	if strings.TrimSpace(dropOut) != "" {
 		t.Errorf("cmdDrop stdout = %q, want empty", dropOut)
+	}
+	if tk := cwfCliGetTask(t, ts, id); tk.Status != "todo" || tk.Assignee != "" {
+		t.Errorf("after drop status = %q assignee = %q, want todo and unassigned", tk.Status, tk.Assignee)
 	}
 }
 
@@ -385,6 +392,16 @@ func TestTaskLine(t *testing.T) {
 	if !strings.Contains(line, "2c") {
 		t.Errorf("taskLine missing comment count: %q", line)
 	}
+
+	// Prereq markers, @me for the caller, and no project suffix when scoped.
+	tk = Task{ID: 8, Status: "todo", Title: "t", Assignee: "me-agent", Project: "web", NPrereqs: 3, NOpenPrereqs: 2}
+	if line := taskLine(tk, false, "me-agent"); !strings.Contains(line, "@me [blk:2]") || strings.HasSuffix(line, "web") {
+		t.Errorf("blocked taskLine = %q, want '@me [blk:2]' and no project", line)
+	}
+	tk.NOpenPrereqs = 0
+	if line := taskLine(tk, true, "other"); !strings.HasSuffix(line, "@me-agent [ready] web") {
+		t.Errorf("ready taskLine = %q, want '@me-agent [ready] web' suffix", line)
+	}
 }
 
 func TestStatusShort(t *testing.T) {
@@ -426,6 +443,9 @@ func TestTrunc(t *testing.T) {
 		{"hello world", 8, "hello w…"},
 		{"ab", 2, "ab"},
 		{"abc", 2, "a…"},
+		{"abc", 1, "a"},
+		{"abc", 0, ""},
+		{"line one\nline two", 20, "line one line two"},
 	}
 	for _, c := range cases {
 		if got := trunc(c.s, c.n); got != c.want {
@@ -1237,11 +1257,16 @@ func TestCmdStatusBulkOutOfScope(t *testing.T) {
 			t.Fatalf("task #%s status = %q, want done (loop continues past 403)", id, tk.Status)
 		}
 	}
+	// The rejected out-of-scope task is untouched.
+	if st := cwfCliGetTask(t, ts, workID).Status; st != "todo" {
+		t.Fatalf("out-of-scope task #%s status = %q after a 403, want todo (unchanged)", workID, st)
+	}
 
 	// 404 before 403: exit code = 3 (first failure), both lines on stderr.
+	// "doing" (not the starting todo) so a leaked PATCH would show.
 	msg = captureStderr(t, func() {
 		code = captureExit(t, func() {
-			cmdStatus(c, parse([]string{"99999", workID, "todo"}))
+			cmdStatus(c, parse([]string{"99999", workID, "doing"}))
 		})
 	})
 	if code != 3 {
@@ -1249,6 +1274,9 @@ func TestCmdStatusBulkOutOfScope(t *testing.T) {
 	}
 	if !strings.Contains(msg, "#99999") || !strings.Contains(msg, "#"+workID) {
 		t.Fatalf("stderr = %q, want lines for #99999 and #%s", msg, workID)
+	}
+	if st := cwfCliGetTask(t, ts, workID).Status; st != "todo" {
+		t.Fatalf("out-of-scope task #%s status = %q after a 403, want todo (unchanged)", workID, st)
 	}
 }
 
@@ -1592,6 +1620,15 @@ func TestCmdTokenNewBeforeInit(t *testing.T) {
 	agent, scope, token := resolveIdentity()
 	if agent != "" || scope != "" || token != plain {
 		t.Fatalf("resolveIdentity = (%q, %q, %q), want (\"\", \"\", %q)", agent, scope, token, plain)
+	}
+	// FIND-0065: whoami on the token-only record asks for `am init` (exit 5)
+	// and never echoes the plaintext.
+	var code int
+	msg := captureStderr(t, func() {
+		out = captureStdout(t, func() { code = captureExit(t, cmdWhoami) })
+	})
+	if code != 5 || !strings.Contains(msg, "am init") || strings.Contains(out+msg, plain) {
+		t.Fatalf("whoami: exit = %d stdout = %q stderr = %q, want exit 5 asking for am init, no token", code, out, msg)
 	}
 }
 

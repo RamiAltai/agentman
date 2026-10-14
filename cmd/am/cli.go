@@ -48,7 +48,8 @@ func (a Args) at(i int) string {
 // A bare `--` ends the flags (everything after it is positional), and a dash
 // token whose name has whitespace ("- fixed parser") is text, not a flag. A
 // value flag with no value (last token, or followed by another flag) is a
-// usage error; pass --flag=VALUE for a value that itself starts with '-'.
+// usage error; pass --flag=VALUE for a value that itself starts with '-'. A
+// boolean flag accepts --flag=true/false; any other value is a usage error.
 func parse(argv []string) Args {
 	a := Args{flags: map[string]string{}, bools: map[string]bool{}, multi: map[string][]string{}}
 	value := func(i int, key string) string {
@@ -67,6 +68,14 @@ func parse(argv []string) Args {
 			key := canonFlag(strings.TrimLeft(s, "-"))
 			if eq := strings.IndexByte(key, '='); eq >= 0 {
 				k := canonFlag(key[:eq])
+				if boolFlags[k] { // --json=true / --json=false; never a silent no-op
+					b, err := strconv.ParseBool(key[eq+1:])
+					if err != nil {
+						usageErr("--%s takes no value (got %q)", k, key[eq+1:])
+					}
+					a.bools[k] = b
+					continue
+				}
 				if multiFlags[k] {
 					a.multi[k] = append(a.multi[k], key[eq+1:])
 					continue
