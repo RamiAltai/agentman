@@ -348,8 +348,8 @@ record instead.
   `govulncheck`-clean codebase but no automated enforcement.
 - Decision: Add `.github/workflows/ci.yml` — two `ubuntu-latest` jobs triggered on **push to
   `main`** and on **pull_request**. Job `ci` (`timeout-minutes: 15`), steps in order:
-  1. `actions/checkout@v4`
-  2. `actions/setup-go@v5` with `cache: true`, run as a matrix (`fail-fast: false`) of
+  1. `actions/checkout@v7`
+  2. `actions/setup-go@v7` with `cache: true`, run as a matrix (`fail-fast: false`) of
      `go-version: 'stable'` and `go-version-file: go.mod`, with `GOTOOLCHAIN=local` so `go` never
      downloads a newer toolchain — the declared `1.25.11` minimum is built and tested, and code that
      needs a newer Go than users are promised fails here.
