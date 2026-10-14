@@ -1094,7 +1094,8 @@ function renderModal(t) {
     labelErr.textContent = "";
     try {
       await api("POST", "/api/tasks/" + t.id + "/labels", { label: v });
-      labelBox.value = "";
+      labelBox.value = ""; // no input event fires, so run the echo refresh deferred meanwhile
+      runDeferredRefresh();
     } catch (err) {
       labelErr.textContent = err.message === "validation" ? "labels are 1-50 chars of a-z 0-9 . _ -" : err.message;
     }
@@ -1137,6 +1138,7 @@ function renderModal(t) {
       keyBox.value = "";
       valBox.value = "";
       keyBox.focus();
+      runDeferredRefresh(); // the SSE echo arrived while the boxes still held text
     } catch (e) {
       metaErr.textContent = metaErrMsg(e);
     }
