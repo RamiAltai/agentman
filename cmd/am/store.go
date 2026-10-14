@@ -834,20 +834,27 @@ func setArchivedTx(tx *sql.Tx, table, slug, actor string, archive bool) (int64, 
 	if (archivedAt != "") == archive {
 		return id, nil, nil
 	}
-	set, kind := "NULL", "unarchived"
+	set := "NULL"
 	if archive {
-		set, kind = sqlNow, "archived"
+		set = sqlNow
 	}
 	if _, err := tx.Exec("UPDATE "+table+" SET archived_at="+set+" WHERE id=?", id); err != nil {
 		return 0, nil, err
 	}
 	// Category events are category-level (NULL project_id); project events
-	// carry the project's id.
-	evProject, noun := int64(0), "category"
-	if table == "projects" {
-		evProject, noun = id, "project"
+	// carry the project's id. Kinds stay literal strings: they are the wire
+	// vocabulary the dashboard switches on (and the web tests grep for).
+	evProject, kind := int64(0), "category.unarchived"
+	if archive {
+		kind = "category.archived"
 	}
-	ev, err := insertEvent(tx, evProject, 0, actorOr(actor), noun+"."+kind, map[string]any{"slug": slug})
+	if table == "projects" {
+		evProject, kind = id, "project.unarchived"
+		if archive {
+			kind = "project.archived"
+		}
+	}
+	ev, err := insertEvent(tx, evProject, 0, actorOr(actor), kind, map[string]any{"slug": slug})
 	if err != nil {
 		return 0, nil, err
 	}

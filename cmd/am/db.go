@@ -21,13 +21,6 @@ func validDate(s string) bool {
 	return err == nil
 }
 
-// storeDSN is the DSN OpenStore uses: every pragma on the DSN so each
-// (re)opened connection inherits them.
-func storeDSN(path string) string {
-	return fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"+
-		"&_pragma=foreign_keys(1)&_pragma=synchronous(1)", path)
-}
-
 // serverURL is the agentman server base URL: AGENTMAN_URL or the default.
 func serverURL() string {
 	return envOr("AGENTMAN_URL", "http://127.0.0.1:8787")
