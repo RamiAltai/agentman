@@ -103,8 +103,9 @@ func TestListEventsBefore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListEventsBefore limited: %v", err)
 	}
-	if len(limited) > 2 {
-		t.Fatalf("expected <=2 events with limit=2, got %d", len(limited))
+	if len(limited) != 2 || len(gotAfterArchive) < 2 ||
+		limited[0].ID != gotAfterArchive[0].ID || limited[1].ID != gotAfterArchive[1].ID {
+		t.Fatalf("limit=2 returned %+v, want the newest two of %+v", limited, gotAfterArchive)
 	}
 }
 
@@ -270,6 +271,11 @@ func TestStealStaleClaim(t *testing.T) {
 				id := newTask(t, st, "stale")
 				mustClaim(t, st, id, "agent-old")
 				backdateTask(t, st, id)
+				// Backdate claimed_at too, so the "bumped past" check below
+				// fails if the steal keeps the previous holder's claimed_at.
+				if _, err := st.db.Exec("UPDATE tasks SET claimed_at=? WHERE id=?", staleISO, id); err != nil {
+					t.Fatal(err)
+				}
 				return id
 			},
 			agent: "agent-new", dur: time.Hour,
@@ -809,10 +815,22 @@ func TestFeedHidesArchivedProjectEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Resolve alpha's project id for assertion checks.
+	// Resolve both project ids for assertion checks.
 	alphaPID, err := st.projectID("alpha")
 	if err != nil {
 		t.Fatal(err)
+	}
+	betaPID, err := st.projectID("beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasBeta := func(evs []Event) bool {
+		for _, e := range evs {
+			if e.ProjectID == betaPID {
+				return true
+			}
+		}
+		return false
 	}
 
 	// Archive alpha.
@@ -830,6 +848,9 @@ func TestFeedHidesArchivedProjectEvents(t *testing.T) {
 			t.Errorf("RecentEvents(\"\") returned event with archived project_id %d (kind=%s)", alphaPID, e.Kind)
 		}
 	}
+	if !hasBeta(recent) {
+		t.Error("RecentEvents(\"\") hides beta's events while only alpha is archived")
+	}
 
 	// Unfiltered ListEvents must NOT include alpha's events.
 	all, _, err := st.ListEvents(0, "", "", 200)
@@ -840,6 +861,9 @@ func TestFeedHidesArchivedProjectEvents(t *testing.T) {
 		if e.ProjectID == alphaPID {
 			t.Errorf("ListEvents(0,\"\") returned event with archived project_id %d (kind=%s)", alphaPID, e.Kind)
 		}
+	}
+	if !hasBeta(all) {
+		t.Error("ListEvents(0,\"\") hides beta's events while only alpha is archived")
 	}
 
 	// Explicit project=alpha MUST still return alpha's events.
@@ -889,10 +913,12 @@ func TestCreateTaskRejectsArchivedProject(t *testing.T) {
 	}
 
 	// Creating into an archived project must return ErrProjectArchived.
+	snap := cwfStoreSnapshot(t, st)
 	_, _, err := st.CreateTask(CreateTaskInput{Project: "archived", Title: "should fail"})
 	if !errors.Is(err, ErrProjectArchived) {
 		t.Fatalf("CreateTask into archived project: got %v, want ErrProjectArchived", err)
 	}
+	cwfStoreAssertUnchanged(t, st, snap, "rejected create in archived project")
 
 	// Creating into an active project must still succeed.
 	task, ev, err := st.CreateTask(CreateTaskInput{Project: "active", Title: "should work"})
@@ -980,6 +1006,15 @@ func TestDeleteCommentRemovesOnlyComment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AddComment 2: %v", err)
 	}
+	// A stale claim: deleting a comment counts as activity and must bump
+	// updated_at, taking the task out of the stale list.
+	if _, _, err := st.ClaimTask(task.ID, "agent-a"); err != nil {
+		t.Fatalf("ClaimTask: %v", err)
+	}
+	backdateTask(t, st, task.ID)
+	if stale, err := st.ListTasks(TaskFilter{Stale: time.Hour}); err != nil || len(stale) != 1 {
+		t.Fatalf("stale before delete = %d, %v; want the backdated task", len(stale), err)
+	}
 
 	ev, err := st.DeleteComment(task.ID, c1.ID, "alice")
 	if err != nil {
@@ -1000,15 +1035,32 @@ func TestDeleteCommentRemovesOnlyComment(t *testing.T) {
 		t.Fatalf("comment c2 should still exist, count=%d", count)
 	}
 
-	// Task itself is still present.
-	if _, err := st.GetTask(task.ID); err != nil {
+	// Task itself is still present, with updated_at bumped past the backdate.
+	got, err := st.GetTask(task.ID)
+	if err != nil {
 		t.Fatalf("task should still exist: %v", err)
 	}
+	if got.UpdatedAt <= staleISO {
+		t.Fatalf("updated_at = %q after DeleteComment, want bumped past %s", got.UpdatedAt, staleISO)
+	}
+	if stale, err := st.ListTasks(TaskFilter{Stale: time.Hour}); err != nil || len(stale) != 0 {
+		t.Fatalf("stale after delete = %d, %v; want none", len(stale), err)
+	}
 
-	// Wrong task id → ErrNotFound.
-	_, err = st.DeleteComment(task.ID+999, c2.ID, "bob")
-	if !errors.Is(err, ErrNotFound) {
-		t.Fatalf("DeleteComment wrong taskID = %v, want ErrNotFound", err)
+	// Wrong task id (missing, or another existing task) → ErrNotFound, and c2
+	// survives both attempts.
+	other, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "other task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tid := range []int64{task.ID + 999, other.ID} {
+		if _, err := st.DeleteComment(tid, c2.ID, "bob"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("DeleteComment(task %d, c2) = %v, want ErrNotFound", tid, err)
+		}
+	}
+	st.db.QueryRow("SELECT COUNT(*) FROM comments WHERE id=? AND task_id=?", c2.ID, task.ID).Scan(&count)
+	if count != 1 {
+		t.Fatalf("c2 deleted by a wrong-task DeleteComment, count=%d", count)
 	}
 }
 
@@ -1192,10 +1244,12 @@ func TestAddDepHappyPath(t *testing.T) {
 
 func TestAddDepSelfRejected(t *testing.T) {
 	st, t1, _, _ := setupDepFixture(t)
+	snap := cwfStoreSnapshot(t, st)
 	_, err := st.AddDep(t1, t1, "alice")
 	if !errors.Is(err, ErrValidation) {
 		t.Fatalf("self-dep err = %v, want ErrValidation", err)
 	}
+	cwfStoreAssertUnchanged(t, st, snap, "rejected self-dep")
 }
 
 func TestAddDepCrossProjectRejected(t *testing.T) {
@@ -1208,10 +1262,12 @@ func TestAddDepCrossProjectRejected(t *testing.T) {
 	}
 	ta, _, _ := st.CreateTask(CreateTaskInput{Project: "proj1", Title: "A"})
 	tb, _, _ := st.CreateTask(CreateTaskInput{Project: "proj2", Title: "B"})
+	snap := cwfStoreSnapshot(t, st)
 	_, err := st.AddDep(ta.ID, tb.ID, "alice")
 	if !errors.Is(err, ErrValidation) {
 		t.Fatalf("cross-project dep err = %v, want ErrValidation", err)
 	}
+	cwfStoreAssertUnchanged(t, st, snap, "rejected cross-project dep")
 }
 
 func TestAddDepCycleRejected(t *testing.T) {
@@ -1225,10 +1281,12 @@ func TestAddDepCycleRejected(t *testing.T) {
 		t.Fatalf("AddDep(t3->t2): %v", err)
 	}
 	// t1 depends on t3 would form a cycle: t1->t3->t2->t1
+	snap := cwfStoreSnapshot(t, st)
 	_, err := st.AddDep(t1, t3, "alice")
 	if !errors.Is(err, ErrValidation) {
 		t.Fatalf("cycle dep err = %v, want ErrValidation", err)
 	}
+	cwfStoreAssertUnchanged(t, st, snap, "rejected cycle")
 }
 
 func TestAddDepDirectCycleRejected(t *testing.T) {
@@ -1237,10 +1295,12 @@ func TestAddDepDirectCycleRejected(t *testing.T) {
 		t.Fatalf("AddDep(t2->t1): %v", err)
 	}
 	// t1 depends on t2 would form a direct cycle
+	snap := cwfStoreSnapshot(t, st)
 	_, err := st.AddDep(t1, t2, "alice")
 	if !errors.Is(err, ErrValidation) {
 		t.Fatalf("direct cycle err = %v, want ErrValidation", err)
 	}
+	cwfStoreAssertUnchanged(t, st, snap, "rejected direct cycle")
 }
 
 func TestAddDepIdempotent(t *testing.T) {
@@ -1438,6 +1498,7 @@ func TestClaimBlockedByOpenPrereq(t *testing.T) {
 	}
 
 	// Claim t2 while t1 is todo → must be blocked.
+	snap := cwfStoreSnapshot(t, st)
 	_, _, err := st.ClaimTask(t2, "agent-a")
 	var be *BlockedError
 	if !errors.As(err, &be) {
@@ -1446,6 +1507,7 @@ func TestClaimBlockedByOpenPrereq(t *testing.T) {
 	if len(be.OpenPrereqs) == 0 {
 		t.Fatal("BlockedError.OpenPrereqs should be non-empty")
 	}
+	cwfStoreAssertUnchanged(t, st, snap, "blocked claim")
 }
 
 func TestClaimUnblockedAfterPrereqDone(t *testing.T) {
@@ -1474,6 +1536,7 @@ func TestPatchTaskBlockedByOpenPrereq(t *testing.T) {
 	}
 
 	// Cannot patch t2 to doing while t1 is todo.
+	snap := cwfStoreSnapshot(t, st)
 	_, _, err := st.PatchTask(t2, map[string]any{"status": "doing"}, "alice")
 	var be *BlockedError
 	if !errors.As(err, &be) {
@@ -1485,6 +1548,7 @@ func TestPatchTaskBlockedByOpenPrereq(t *testing.T) {
 	if !errors.As(err, &be) {
 		t.Fatalf("PatchTask(done) with open prereq: got %v, want *BlockedError", err)
 	}
+	cwfStoreAssertUnchanged(t, st, snap, "blocked status patches")
 
 	// Allowed to patch title even with open prereq.
 	_, _, err = st.PatchTask(t2, map[string]any{"title": "New Title"}, "alice")
@@ -2917,6 +2981,9 @@ func TestPatchTaskMetaNoOpNoEvent(t *testing.T) {
 
 func TestMetaOnlyPatchDoesNotBumpUpdatedAt(t *testing.T) {
 	st, t1, _, _ := setupDepFixture(t)
+	// Backdate first: a bump landing in the creation millisecond would
+	// otherwise leave updated_at unchanged and the check would pass vacuously.
+	backdateTask(t, st, t1)
 	before, err := st.GetTask(t1)
 	if err != nil {
 		t.Fatal(err)
@@ -2935,9 +3002,7 @@ func TestMetaOnlyPatchDoesNotBumpUpdatedAt(t *testing.T) {
 		t.Fatalf("updated_at changed %q → %q; meta edits must not refresh a stale claim", before.UpdatedAt, after.UpdatedAt)
 	}
 
-	// A mixed patch (field + meta) still bumps. Sleep past the millisecond
-	// resolution of strftime('%f') so the bump is observable.
-	time.Sleep(10 * time.Millisecond)
+	// A mixed patch (field + meta) still bumps past the backdated value.
 	if _, _, err := st.PatchTask(t1, map[string]any{"priority": 1, "meta": map[string]any{"auto": "y"}}, "alice"); err != nil {
 		t.Fatalf("mixed patch: %v", err)
 	}
@@ -3398,6 +3463,11 @@ func TestListCategoriesCounts(t *testing.T) {
 	mk("alpha", "a2", "todo")
 	mk("alpha", "a3", "doing")
 	mk("alpha", "a4", "done")
+	// Three blocked, so the blocked count differs from every other column and
+	// from the zero default.
+	mk("alpha", "a5", "blocked")
+	mk("alpha", "a6", "blocked")
+	mk("alpha", "a7", "blocked")
 	mk("beta", "b1", "todo")
 	mk("beta", "b2", "todo")
 	mk("beta", "b3", "todo")
@@ -3420,8 +3490,8 @@ func TestListCategoriesCounts(t *testing.T) {
 	if work == nil {
 		t.Fatalf("work category not found in %+v", cats)
 	}
-	// Only alpha contributes (beta archived): 2 todo, 1 doing, 0 blocked, 1 done.
-	want := map[string]int{"todo": 2, "doing": 1, "blocked": 0, "done": 1}
+	// Only alpha contributes (beta archived): 2 todo, 1 doing, 3 blocked, 1 done.
+	want := map[string]int{"todo": 2, "doing": 1, "blocked": 3, "done": 1}
 	for k, v := range want {
 		if work.Counts[k] != v {
 			t.Fatalf("work counts[%s] = %d, want %d (counts=%+v)", k, work.Counts[k], v, work.Counts)
@@ -3503,7 +3573,7 @@ func TestListCategoriesCounts(t *testing.T) {
 			t.Fatalf("archived work category missing with includeArchived")
 		}
 		// alpha's tasks plus "fresh"; fmt prints maps with sorted keys.
-		want := map[string]int{"todo": 3, "doing": 1, "blocked": 0, "done": 1}
+		want := map[string]int{"todo": 3, "doing": 1, "blocked": 3, "done": 1}
 		if fmt.Sprint(work.Counts) != fmt.Sprint(want) {
 			t.Fatalf("archived work counts = %v, want %v", work.Counts, want)
 		}
