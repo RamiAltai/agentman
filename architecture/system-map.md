@@ -43,14 +43,15 @@ Unknown/absent: no `internal/`, `pkg/`, `Makefile`, `Dockerfile`, or `.gorelease
 
 - **Process entry:** `cmd/am/main.go` `func main()`. It reads `os.Args[1]` and dispatches.
   Local-only verbs (`init`, `whoami`, `version`, `update`, `db`) run without a server — `db`
-  dispatches before the `Client` is built, operating directly on the SQLite file (`export`,
-  `import`, and `prune` all refuse while a server is running); everything else
+  dispatches before the `Client` is built, operating directly on the SQLite file (`import` and
+  `prune` refuse while a server is running; `export` is a `VACUUM INTO` snapshot that works
+  alongside one); everything else
   constructs a `Client` (`NewClient()`); `serve` calls `runServe()`.
 - **Server entry:** `runServe()` opens the store, builds `Server` (`NewServer`), sets the proposals
   carve-out project from `--proposals CAT/PROJ` / `AGENTMAN_PROPOSALS` (default `meta/proposals`;
   both segments required or startup `fail(1)`), optionally enables request logging (`--log` flag or
   `AGENTMAN_LOG` env var, any non-empty value; use `AGENTMAN_LOG=1`), and runs
-  `http.Server{Addr: "127.0.0.1:"+port}`.
+  the server on `listenAddr(port)` (pinned to `127.0.0.1`).
 - **HTTP route table:** `Server.Handler()` in `cmd/am/server.go` (see Major Modules).
 
 ## Runtime Flow
@@ -59,7 +60,9 @@ Unknown/absent: no `internal/`, `pkg/`, `Makefile`, `Dockerfile`, or `.gorelease
 `cmd/am/cli.go cmdClaim` → `Client.do` (HTTP POST `/api/tasks/13/claim`, `X-Agent` +
 `X-Agent-Scope` headers when set) → `server.go handleClaim` → **scope pre-check** (`scopeOf(r)` then
 `checkTaskMut`; out of scope → `403 out_of_scope` → CLI exit 8) → `store.go ClaimTask` (atomic
-`UPDATE … RETURNING`, inserts an `events` row in the same tx) → on commit `Hub.Broadcast(event)` →
+`UPDATE … RETURNING`, inserts an `events` row in the same tx) → after the store call returns
+(committed), the handler broadcasts via `s.publish` → `Hub.Broadcast(event)` (the store never
+calls the hub) →
 every SSE subscriber (open dashboards) receives it → exit code mapped from HTTP status via
 `client.go exitCodeFor` (the single source, used by `doOrFail` and the bulk `status`/`assign` loop).
 
@@ -288,8 +291,8 @@ flowchart LR
     S["HTTP handlers<br/>server.go"]
     H["SSE hub<br/>hub.go"]
     ST["Store<br/>store.go"]
-    S --> ST
-    ST -->|commit then| H
+    S -->|write| ST
+    S -->|after store returns,<br/>Broadcast| H
   end
   ST --> DB[("SQLite<br/>~/.agentman/agentman.db")]
 ```

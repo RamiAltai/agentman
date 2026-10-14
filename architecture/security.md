@@ -1,22 +1,20 @@
 # Security Architecture
 
 > The single most important fact: **there is no authentication, and authorization is loopback-only.**
-> Access control is *entirely* the `127.0.0.1` bind. Scope tokens confine a token-following
-> agent server-side but are **not** auth against arbitrary local processes — any change that widens
-> the bind, or adds remote access, must still add real auth first. Deliberate decisions
-> (`decision-records.md` ADR-002, ADR-029).
+> Access control is *entirely* the `127.0.0.1` bind; scope tokens confine agents but are not auth
+> (see the Authorization residual honesty note) — any change that widens the bind, or adds remote
+> access, must still add real auth first. Deliberate decisions (`decision-records.md` ADR-002, ADR-029).
 
 ## Authentication
 
-**None.** `am serve` binds `127.0.0.1` (`cmd/am/main.go`, `Addr: "127.0.0.1:" + port`) and accepts
-all requests. The `X-Agent` header (`server.go actorOf`) is an **actor label for attribution, not a
-credential** — any caller may claim any identity, including `"human"` (the dashboard's value).
+**None.** `am serve` binds `127.0.0.1` (`listenAddr` in `cmd/am/main.go`, pinned by
+`TestListenAddrLoopback`) and accepts all requests. The `X-Agent` header (`server.go actorOf`) is an
+**actor label for attribution, not a credential** — any caller may claim any identity, including
+`"human"` (the dashboard's value).
 
 The `X-Agent-Scope` header and the **bearer token** (`Authorization: Bearer <tok>`)
-are both about *scope confinement*, not authentication — there is no user to authenticate. A token
-**does** let the server derive a scope it can trust against a *config-following* agent (the token is
-server-minted and bound to a scope; the agent cannot forge a token for another scope), but it is not
-an identity check: any process that can read the identity file holds that token. See Authorization.
+are both about *scope confinement*, not authentication — there is no user to authenticate. See
+Authorization for what a token does and does not guarantee.
 
 ## Authorization
 
@@ -37,9 +35,10 @@ and no scope header.
   a token is set). The token is **server-minted and bound to a scope**, so a config-following agent
   that holds only its own token **cannot forge a token for another scope** — a server-minted,
   scope-bound, revocable credential. An invalid or
-  revoked token → `401 {"error":"unauthorized"}` (CLI **exit 9**) on ANY endpoint — `scopeOf` surfaces
-  it, never a silent fallthrough to unscoped, so a bad credential hard-fails (distinct from exit 8's
-  per-id scope-skip).
+  revoked token → `401 {"error":"unauthorized"}` (CLI **exit 9**) on any endpoint that resolves scope
+  (calls `scopeOf`) — never a silent fallthrough to unscoped, so a bad credential hard-fails there
+  (distinct from exit 8's per-id scope-skip). The four unscoped reads listed under Known coverage gaps
+  never resolve the token, so they answer `200` even to a revoked one.
 - **Mint-requires-unscoped (the boundary crux).** All three token-admin endpoints
   (`POST/GET /api/tokens`, `POST /api/tokens/{id}/revoke`) refuse ANY request carrying a scope —
   header OR a valid bearer token (`tokenAdminGuard` → `403`). Only a fully **unscoped** caller (the
@@ -47,10 +46,12 @@ and no scope header.
   another scope.
 
 **Token storage & transport (security-relevant):**
-- **sha256 hash stored, plaintext never.** The plaintext token (`amt_` + 32 hex) is shown **once** at
-  mint and never persisted, logged, listed (`am token ls` shows only `id/scope/created/[revoked]`), or
-  printed by `am whoami` (`token: set`). The DB stores only `sha256(plaintext)` (`tokens.token_hash`,
-  UNIQUE); the server hashes the **presented** plaintext to compare, so a stolen DB row cannot be
+- **sha256 hash stored, plaintext never (server side).** The plaintext token (`amt_` + 32 hex) is
+  shown **once** at mint; the server never persists, logs or lists it (`am token ls` shows only
+  `id/scope/created/[revoked]`), and `am whoami` prints only `token: set`. The CLI keeps the plaintext
+  in the caller's identity file (mode `0600`; see the residual note below). The DB stores only
+  `sha256(plaintext)` (`tokens.token_hash`, UNIQUE); the server hashes the **presented** plaintext
+  to compare, so a stolen DB row cannot be
   replayed as a credential.
 - **DB export carries hashes, non-replayable.** `am db export` (`VACUUM INTO`) snapshots the whole
   file, `tokens` included — acceptable because the hashes are not replayable (see above); no scrubbing
@@ -75,6 +76,10 @@ alone, no handler touches it.
 - `GET /api/projects` and `GET /api/categories` list endpoints are **not** narrowed — board
   metadata (slugs/names) is visible to any scope; task *data* is the enforcement point
   (`/api/categories` is unscoped on purpose — it serves the unscoped human dashboard).
+- `GET /api/events`, `GET /api/stream`, `GET /api/projects` and `GET /api/categories` also **skip
+  token validation** — they never call `scopeOf`, so an invalid or revoked bearer token gets `200`,
+  not `401`, and `am projects` / `am categories` never exit 9. A revoked token is caught on the next
+  scope-checked call (any task read/write, `am wait`'s re-check, a project/category mutation).
 - An explicit unknown `?project=` for a scoped agent returns 403 (not 404/empty) — the server
   cannot prove it in-scope, so it fails loud (mild existence ambiguity, accepted).
 
@@ -89,16 +94,14 @@ alone, no handler touches it.
 ## Sensitive Assets
 
 - The **SQLite DB** (`~/.agentman/agentman.db`) — contains all board content; no encryption at rest.
-  It also holds the `tokens` table, but only the **sha256 hash** of each token, never
-  the plaintext — a stolen DB row cannot be replayed (the server compares `hash(presented_plaintext)`).
+  It also holds the `tokens` table — sha256 hashes only (see Authorization → Token storage).
 - **Task/comment bodies** — may hold internal plans, repo names, or secrets an agent pasted.
 - **Agent identity files** (`~/.agentman/agents/*`) — carry the agent label and scope (non-secret),
   **plus the agent's plaintext bearer token** (the optional `token` field). The token
-  is a scope-bound credential: a process that can read the file can act as that scope. Treat the file
-  as scope-sensitive (loopback-only mitigates; see the Authorization honesty note).
-- No passwords or API keys are stored. The only credential at rest is the bearer **token hash**
-  (sha256, non-replayable) in the `tokens` table; token plaintext lives only in the per-directory
-  identity file (or the `AGENTMAN_TOKEN` env), never in the DB.
+  is a scope-bound credential; treat the file as scope-sensitive (see the Authorization residual
+  honesty note).
+- No passwords or API keys are stored. Token plaintext lives only in the per-directory identity file
+  (or the `AGENTMAN_TOKEN` env), never in the DB.
 
 ## Input Validation
 
@@ -187,9 +190,7 @@ the server. Their security-relevant properties:
   stay importable), and rejects a `schema_version` newer than `currentSchemaVersion` — so a garbage
   or future-schema file is refused, not imported. `OpenStore` applies the same version ceiling at open
   time, so an older binary refuses a too-new DB instead of operating on it.
-- **Token hashes ride the snapshot.** `VACUUM INTO` is a whole-file snapshot, so a `tokens` table
-  is exported with everything else — acceptable because only non-replayable sha256 hashes are stored
-  (the server compares `hash(presented_plaintext)`); no scrubbing is performed (ADR-029).
+- **Token hashes ride the snapshot** — see Authorization → Token storage (ADR-029).
 
 ## Existing Controls
 
@@ -208,35 +209,25 @@ the server. Their security-relevant properties:
 - **Scope confinement** (`X-Agent-Scope` header + **scope tokens**) — the server rejects
   out-of-scope mutations and named reads with `403 out_of_scope` and logs each denial
   (`agentman: out_of_scope: …`). A control for **accidental** cross-scope action by a config-following
-  agent. A **server-minted, scope-bound bearer token** (`Authorization: Bearer`) has its
-  scope win over the header, mint requires an unscoped caller, and an invalid/revoked token →
-  `401 unauthorized` (CLI exit 9). This confines a *token-following* agent that cannot forge another
-  scope's token — but it is **not** auth against an arbitrary local process (loopback-only; a
-  filesystem read of the identity file = token possession). Denials are log-only — no event kind, and
-  token mint/revoke emits no event either (privacy: keeps credential admin out of the unprunable feed).
+  agent; the token layer and its limits are described once under Authorization. Denials are
+  log-only — no event kind, and token mint/revoke emits no event either (privacy: keeps credential
+  admin out of the unprunable feed).
 
 ## Security Gaps
 
 (Current gaps only. Resolved items live in git history.)
 
 1. No authentication; authorization is **loopback-scoped** (by design, but blocks any non-loopback
-   use). Scope tokens confine a token-following agent server-side but are not auth against an
-   arbitrary local process.
+   use).
 2. No TLS — bearer tokens travel in **cleartext** over the `127.0.0.1` loop. Acceptable only
    because the bind never leaves loopback; a token is not a network-facing secret. (Would be sniffable
    the moment the bind widened — another reason remote access is an auth+TLS project, not a bolt-on.)
 3. No rate limiting / brute-force protection (token lookup is also not constant-time — a non-issue at
    loopback scale, infeasible to make constant-time over a DB lookup).
 4. Audit actor is spoofable (no identity verification).
-5. **Scope confinement is token-backed but loopback-only.** `X-Agent-Scope` alone
-   is client-asserted (forgeable/omittable). **Scope tokens** make the scope server-derived
-   for a *token-following* agent — a server-minted, scope-bound token whose scope wins over the header,
-   minted only by an unscoped caller, so a confined agent cannot forge another scope's token (bad
-   token → `401`/exit 9). **Residual**: still not auth against an arbitrary local process — a process
-   that reads the identity file holds the token (loopback-only; see the Authorization honesty note).
-   Residual reads: `/api/events`, `/api/stream`, `GET /api/projects`, `GET /api/categories` are not
-   narrowed by scope (an unscoped `?category=` lens serves the human dashboard, not an identity
-   scope) — see Authorization above.
+5. **Scope confinement is token-backed but loopback-only** — not auth against a process that can
+   read an identity file (Authorization → Residual honesty note), and four reads are not narrowed by
+   scope (Authorization → Known coverage gaps).
 
 ## Secure Implementation Checklist
 

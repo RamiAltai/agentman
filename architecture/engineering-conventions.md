@@ -10,7 +10,8 @@ convention is loose, it's called out.
   `wait.go` (the `am wait` SSE-consuming verb), `db.go` (offline DB export/import/prune),
   `identity.go`, `version.go`, `update.go`. The web UI is in `cmd/am/web/`.
 - Keep that split: HTTP handling in `server.go`, all SQL in `store.go`, CLI presentation in `cli.go`.
-  Do **not** put SQL in handlers or HTTP in the store.
+  Do **not** put SQL in handlers or HTTP in the store. The one exception is `db.go` (see Data Access
+  Conventions).
 - There is no `internal/`/`pkg/`; because it's one package, every symbol is mutually visible —
   discipline is by convention. Don't reach across concerns just because you can.
 
@@ -83,6 +84,13 @@ convention is loose, it's called out.
 ## Data Access Conventions
 
 - **All DB access goes through `store.go`.** No direct SQLite access from handlers or the CLI.
+  **Sole exception: the offline `am db` tools in `db.go`**, which open the file with `sql.Open` and
+  run their own SQL. `exportDB` opens it read-only (`?mode=ro`) and writes a `VACUUM INTO` snapshot,
+  which is safe next to a running server. `importDB` and `pruneEvents` write, so each is guarded
+  twice: `isServerRunning` probes `AGENTMAN_URL` (default port) before the prompt, and
+  `ensureDBNotInUse` then takes and releases an exclusive SQLite lock on the file, which fails while
+  any `am serve` holds it open, whatever port it listens on. A new offline verb that writes the file
+  belongs in `db.go` and must call `ensureDBNotInUse` first; nothing else may open the file.
 - **Always parameterize** (`?`); never concatenate caller input into SQL.
 - A mutation and its `events` row must be in **one `*sql.Tx`**; **broadcast only after commit**
   (`hub.Broadcast(ev)` in the handler, not the store).
@@ -186,7 +194,8 @@ JS syntax (`node --check`), and `govulncheck` — on every push to `main` and on
 ## SVG Convention
 
 SVG elements in `web/app.js` are created with the `svg(tag, attrs)` helper
-(`document.createElementNS(SVG_NS, tag)`), parallel to `el()` for HTML. All text is set via
+(`document.createElementNS` in the SVG namespace), parallel to `el()` for HTML — but unlike `el()`
+it only sets attributes and takes no children, so append children yourself and set all text via
 `.textContent`, never by attribute concatenation or `innerHTML`. This keeps the XSS-safe DOM
 convention consistent across HTML and SVG. **Never** use `innerHTML` to construct SVG either —
 the `TestDashboardNoXSSSinks` guard will catch it. When adding new SVG-based UI, use `svg()` for
@@ -198,7 +207,8 @@ SVG elements and `el()` for any HTML wrapper elements (e.g., the detail panel ne
   and `svg()` / `textContent` for SVG (XSS).
 - ❌ SQL built by string concatenation with user input.
 - ❌ Broadcasting an SSE event before the DB transaction commits.
-- ❌ A second DB writer / opening the SQLite file from the CLI (breaks the single-writer model).
+- ❌ A second DB writer / opening the SQLite file from the CLI (breaks the single-writer model) —
+  except the `db.go` offline tools under the `ensureDBNotInUse` guard (Data Access Conventions).
 - ❌ Binding beyond `127.0.0.1` without adding authentication first.
 - ❌ Printing chatter to **stdout** in the CLI (breaks `id=$(am new …)` and token budgets).
 - ❌ Editing `cmd/am/web/*` and forgetting to rebuild — the running server serves stale embedded assets.

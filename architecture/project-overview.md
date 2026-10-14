@@ -59,8 +59,9 @@ Evidence:
   hierarchy is the enforcement axis (`task→project→category` immutability makes the check sound
   outside the store tx). Out of scope → `403 out_of_scope` → CLI exit 8; unfiltered lists are
   silently narrowed; any agent may still file into a **proposals** project (default `meta/proposals`).
-  The scope is a client-asserted label (accident prevention, not auth — scope tokens are a later
-  phase); `tasks.created_by` (migration v5) backs the "comment on your own proposal" carve-out.
+  The `X-Agent-Scope` header on its own is a client-asserted label (accident prevention, not auth);
+  Phase S scope tokens (below) make the scope server-enforced; `tasks.created_by` (migration v5)
+  backs the "comment on your own proposal" carve-out.
   Built for agentic_brain requirement R4. Evidence: `cmd/am/server.go` (`scopeOf`, `check*`,
   `narrowScope`), `cmd/am/identity.go`, `cmd/am/store.go` (`Scope`, migration v5).
 - **Category dashboard + scoped feed** (Phase R): the human dashboard opens to a **category-home**
@@ -172,7 +173,8 @@ Evidence:
 ## Non-Goals
 
 Inferred (Confidence: Medium–High) from `README.md` "Security" and the localhost bind:
-- **Not** a multi-tenant / authenticated / internet-facing service. No auth, binds `127.0.0.1`.
+- **Not** a multi-tenant / authenticated / internet-facing service. No user accounts or login,
+  binds `127.0.0.1`; Phase S scope tokens confine agents but are not auth against a local process.
 - **Not** a heavyweight project manager (no sprints, due dates, or attachments today; the only
   metadata beyond status/priority/assignee is lightweight free-form labels — Phase M — and
   opaque `key=value` meta pairs — Phase P).

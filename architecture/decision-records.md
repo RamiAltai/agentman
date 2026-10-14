@@ -4,6 +4,11 @@ Records below are split into **Confirmed** (stated in docs/code) and **Inferred*
 implementation — verify before relying on them). Do not promote an inferred decision to confirmed
 without evidence.
 
+**Status values.** `Active` — the record is current as written. `Amended by …` — still in force,
+but a later decision or change altered part of it; the status line names what changed, and any
+in-place edits to the body follow it. `Superseded by …` — no longer in force; read the named
+record instead.
+
 ## Confirmed Decisions
 
 ### ADR-001: Single static Go binary with pure-Go SQLite
@@ -16,7 +21,9 @@ without evidence.
 - Evidence: `go.mod` (`modernc.org/sqlite v1.51.0`, `go 1.25.11`); `README.md` "Why agentman"/"Install".
 
 ### ADR-002: Localhost-only, no authentication
-- Status: Active
+- Status: Amended by ADR-027/ADR-029 — opt-in scope identities (ADR-027) and server-enforced,
+  revocable scope tokens (ADR-029) now exist; the loopback bind is still the primary boundary, and
+  callers without a token remain unauthenticated.
 - Context: A personal, single-user board.
 - Decision: Bind `127.0.0.1`; no auth/authz; `X-Agent` is an attribution label only.
 - Rationale: simplest secure-by-default for local use.
@@ -86,16 +93,17 @@ without evidence.
 - Evidence: `cmd/am/update.go`; `docs/reference.md` "Updating".
 
 ### ADR-010: Minimal in-code schema-migration runner
-- Status: Active
+- Status: Amended by ADR-025 — the newer-version case is now refused at open (see Consequences).
 - Context: `CREATE TABLE IF NOT EXISTS` cannot add columns to existing DBs (IADR-003); upcoming
   archive (a new column) and DB import (a version-compatibility check) both need a version story.
 - Decision: A forward-only, idempotent runner in `store.go` — `readSchemaVersion` +
   `runMigrations(db, currentSchemaVersion, schemaMigrations)` wired into `OpenStore` after
   `schema.sql`. Each step applies its change **and** bumps `meta.schema_version` in one tx;
   integer-ordered; no new dependency. `schemaMigrations` shipped **empty at v1** (foundation only);
-  it is **no longer empty** — four steps (v2–v5), with `currentSchemaVersion` now `5`: v2
-  `projects.archived_at` (the first real step, ADR-013), v3 `tasks.claimed_at`, v4 the
-  category/stable-ID/vault-binding step, v5 `tasks.created_by`. See `data-model.md` (Migrations).
+  it is **no longer empty** — v2 `projects.archived_at` (the first real step, ADR-013), v3
+  `tasks.claimed_at`, v4 the category/stable-ID/vault-binding step, v5 `tasks.created_by`, and later
+  steps. The current version is `currentSchemaVersion` in `store.go`; the step list lives in
+  `data-model.md` (Migrations).
 - Rationale: enables additive schema evolution + import version checks without a migration library.
 - Consequences: forward-only (no down-migrations); a DB at a **newer** version than the binary was
   originally accepted silently — **closed in Phase O** (ADR-025): `OpenStore` now refuses to open a
@@ -106,9 +114,11 @@ without evidence.
   `cmd/am/migrate_test.go`.
 
 ### ADR-011: Localhost HTTP guardrails (Host allowlist + write-CSRF + CSP), no auth
-- Status: Active
-- Context: localhost-no-auth remains the posture (ADR-002), but a malicious website can drive the
-  loopback API (CSRF) and DNS rebinding bypasses the same-origin assumption; upcoming
+- Status: Amended by ADR-029 — "no auth" is no longer absolute: opt-in scope tokens authenticate the
+  callers that present one. The guardrails below are unchanged.
+- Context: localhost-no-auth remained the posture when this was decided (ADR-002), but a
+  malicious website can drive the loopback API (CSRF) and DNS rebinding bypasses the same-origin
+  assumption; upcoming
   archive/import make those gaps destructive.
 - Decision: Middleware around `Handler()` — a **Host-header allowlist** (`127.0.0.1`/`localhost`/
   `::1`, else 403; DNS-rebinding guard), a **write-CSRF guard** (block cross-origin browser writes
@@ -118,7 +128,8 @@ without evidence.
 - Rationale: closes the realistic browser-driven attack surface without adding auth, preserving the
   CLI, the same-origin dashboard, and SSE.
 - Consequences: cross-origin browser writes are blocked; CLI + dashboard unaffected. This is **not
-  authentication** — any local process can still call the API.
+  authentication** — any local process can still call the API (since ADR-029, a token-less caller
+  is treated as unscoped or as its self-asserted `X-Agent-Scope`).
 - Evidence: `cmd/am/server.go` (`hostGuard`/`csrfGuard`/`securityHeaders`, `Handler`);
   `cmd/am/server_test.go`.
 
@@ -131,17 +142,26 @@ without evidence.
   `VACUUM INTO` for an online, consistent snapshot, then `chmod 0o600`. Import validates the
   candidate (`PRAGMA integrity_check`, `foreign_key_check`, 5 required tables, `schema_version <=
   currentSchemaVersion`), **refuses while a server is running** (probes `AGENTMAN_URL /api/projects`),
-  prompts unless `--yes`, backs up the existing DB (`0o600`) into the DB's dir, removes stale
-  `-wal`/`-shm`, then does an atomic copy. The `VACUUM INTO` path is an **escaped string literal**
-  (single-quotes doubled), **not** a bound `?` param — a deliberate, reviewed exception to "all SQL
-  parameterized", because SQLite forbids a bind param there; the destination is always the configured
-  DB path, never caller-supplied.
+  prompts unless `--yes`, re-checks that no connection holds the DB file (`ensureDBNotInUse`), backs
+  up the existing DB with `exportDB` (`VACUUM INTO`, `0o600`) into the DB's dir, removes stale
+  `-wal`/`-shm`, then copies the snapshot to a temp file in the DB's dir, fsyncs it and renames it
+  over the DB (`copyFile`), so an interrupted import never leaves a truncated DB. The `VACUUM INTO`
+  destination is an **escaped string literal** (single quotes doubled), **not** a bound `?`
+  param — a deliberate, reviewed exception to "all SQL parameterized", because SQLite forbids a bind
+  param
+  there. That destination **is caller-supplied**: it is the `am db export [path]` argument (or a
+  generated `agentman-export-<ts>.db` in the cwd), or the generated backup path during import. The
+  configured DB path is the *source*. The only source of the export path is the local CLI user, who
+  already has full access to the DB file; the quote-doubling is the sole injection defence, so it
+  must stay, and `exportDB` must not be exposed to a less-trusted caller (an HTTP route, a script
+  forwarding untrusted paths) without revisiting this.
 - Rationale: keeps backup/restore out of the loopback attack surface (ADR-011); avoids fighting the
   single-writer connection; refuse-while-serving prevents clobbering a live DB.
-- Consequences: backup/restore is local-only (no remote admin); a malformed snapshot path string is
-  the only place untrusted text reaches SQL, and it is escaped + server-controlled.
+- Consequences: backup/restore is local-only (no remote admin); the export path string is the only
+  place caller-supplied text reaches SQL unbound — escaped, and supplied only by the local CLI user.
 - Evidence: `cmd/am/db.go` (`exportDB` VACUUM INTO + `0o600`, `validateImportCandidate`,
-  `isServerRunning`, `importDB` backup/atomic copy); `cmd/am/main.go` (`db` dispatch before client);
+  `isServerRunning`, `ensureDBNotInUse`, `importDB` backup + `copyFile` temp-and-rename);
+  `cmd/am/main.go` (`db` dispatch before client);
   `cmd/am/cli.go` (`yes` in boolFlags); `cmd/am/db_test.go`.
 
 ### ADR-013: Project archive as a reversible soft-delete (first real migration, v2)
@@ -185,7 +205,8 @@ without evidence.
   `renderBoard` `selected.has(t.project)`, `tab()`/`card()`).
 
 ### ADR-015: Hard-delete endpoints with FK cascade and retained audit log (Phase C1)
-- Status: Active
+- Status: Amended by schema migration v6 — item 4's global-id reuse no longer happens (`projects`,
+  `tasks`, `events` use `AUTOINCREMENT`); per-project `ref` reuse still does (`data-model.md`).
 - Context: No API existed to delete tasks, comments, or projects — removal was only possible by
   editing the SQLite file directly. Archive (ADR-013) is reversible and projects-only; a distinct
   "permanently remove" path was needed. The existing `ON DELETE CASCADE` FKs
@@ -249,7 +270,8 @@ without evidence.
   surface (ADR-011) and avoids fighting the single-writer connection (ADR-003). Events-only scope
   is intentional — tasks/comments already have hard-delete; event rows are denormalized (ADR-004),
   so pruning them doesn't break referential integrity.
-- Residuals: prune is manual, the `isServerRunning` guard is bypassable on non-default ports, and a
+- Residuals: prune is manual, the `isServerRunning` HTTP probe misses non-default ports (the
+  `ensureDBNotInUse` file-lock check behind it catches them, after the prompt), and a
   paginated feed disables `trimFeed` — all catalogued in `known-risks-and-gaps.md`.
 - Evidence: `cmd/am/store.go` (`ListEventsBefore`); `cmd/am/server.go` (`handleEvents` `?before=`
   branch); `cmd/am/db.go` (`pruneEvents`, `cmdDB` prune case); `cmd/am/web/app.js`
@@ -624,7 +646,8 @@ without evidence.
   filter, modal Labels section); Phase M tests.
 
 ### ADR-025: Category layer + stable IDs + vault binding — `amc_`/`amp_` crypto/rand uids, nullable FK with app-enforced NOT NULL, globally-unique slugs, `-c` flag with a `show` carve-out, open-time version ceiling (Phase O)
-- Status: Active
+- Status: Amended by ADR-028 — item 7 edited in place: `/api/stream` gained `?category=`, but
+  `am wait` still streams unscoped.
 - Context: The agentic_brain integration (requirements R1/R2/R3/R8) needs a **category** layer
   above projects (one instance, one DB, agents scoped down later), **stable IDs** the vault can
   bind to across slug renames, **vault binding metadata** on projects, and a migration that
@@ -754,10 +777,12 @@ without evidence.
   9. **`NextTask(project, category, agent)` → `NextTask(f NextFilter, agent)`** with
      `NextFilter{Project, Category, MetaKey}` — a fourth string parameter would be unreadable and
      Phase Q adds more scope dimensions; extending the struct beats widening the signature again.
-  10. **Same-predicate next/wait invariant** — the NextTask meta predicate is textually identical
-      to ListTasks' `MetaKey` predicate (enforced by comment at both sites): a task that releases
-      `am wait --ready --meta K` must be pickable by `am next --meta K`, so a worker loop can't
-      hot-spin on a wait that `next` then refuses. `--meta` on `wait --ready` narrows only the
+  10. **Shared meta predicate for next/wait** — NextTask and ListTasks' `MetaKey` filter use the
+      same `metaKeyExpr` constant (and the same `openPrereqExpr`), so `am wait --ready --meta K`
+      and `am next --meta K` agree on which tasks carry K. They do not agree on everything:
+      NextTask also requires `assignee IS NULL` and non-archived project and category, so a wait
+      can still release on a pre-assigned or explicitly selected archived task that `next`
+      refuses (see `backend.md`). `--meta` on `wait --ready` narrows only the
       REST re-check, never the SSE stream (ADR-023: event payloads are triggers, not state).
 - Rationale: every piece rides proven machinery — the `EXISTS` filter builder, the
   `CREATE TABLE IF NOT EXISTS` no-migration path, the delta-event shape, the conditional-UPDATE
@@ -877,7 +902,9 @@ without evidence.
   `AGENTMAN_PROPOSALS`, `usage()` scope/exit-8 lines); the 32 Phase Q tests.
 
 ### ADR-028: Category dashboard + scoped feed — hub category fan-out resolved at Subscribe, `?category=` feed/stream filtering excluding category-level events, category stats folded into `/api/categories`, dashboard hash routing with overview-as-landing (Phase R)
-- Status: Active
+- Status: Amended by ADR-032 — item 7's navigation surface (the project-tab strip and the
+  `← Categories` breadcrumb-back button) was replaced by the left-rail navigation; the hash routes
+  remain valid.
 - Context: The agentic_brain integration (requirement R6) needs a **human** view organized by
   category — a category-home landing page showing where work is happening, drill-down into a
   single category's board, and a feed/stream that can be scoped to one category. This builds on the
@@ -999,11 +1026,15 @@ without evidence.
      `401 {"error":"unauthorized"}`.
   3. **sha256 hash stored, plaintext never.** The plaintext token is `amt_` + 32 lowercase hex
      (16 bytes of `crypto/rand`, `newToken`); only `hashToken(plaintext)` (hex sha256) is stored
-     (`token_hash`, UNIQUE). The plaintext is shown **once** at mint and never persisted, logged,
-     listed, or printed by `whoami`. Possessing the stored hash does not let one authenticate — the
-     server hashes the **presented** plaintext to compare, so a hash cannot be replayed as a
+     (`token_hash`, UNIQUE). The server shows the plaintext **once** at mint and never persists it
+     (DB or files), logs it, lists it, or prints it via `whoami`. **The CLI does persist it:**
+     `am token new` stores it in the caller's identity file (`storeToken` →
+     `~/.agentman/agents/<cwd hash>` or `AGENTMAN_AGENT_FILE`, written mode `0600`), so anyone who
+     can read that file holds the credential (see the residuals below). Possessing the stored
+     hash does not let one authenticate — the server hashes the **presented** plaintext to compare,
+     so a hash cannot be replayed as a
      credential. The token id is `tk_` + 16 hex (`newUID`).
-  4. **`tokens` table via `CREATE TABLE IF NOT EXISTS`, no migration, `currentSchemaVersion` stays 5.**
+  4. **`tokens` table via `CREATE TABLE IF NOT EXISTS`, no migration, no version bump.**
      A brand-new empty table has nothing to backfill, so a migration step would only add risk — the
      `task_deps`/`task_labels`/`task_meta` precedent. Columns: `id`, `token_hash`, `category`,
      `project` (NULL = category-wide), `created_at`, `revoked_at` (NULL = active); plus
@@ -1114,7 +1145,8 @@ without evidence.
   `matchMedia` follow-only-while-unset listener); `cmd/am/web_test.go` (`TestDashboardThemeAssets`).
 
 ### ADR-031: Dashboard CLI↔GUI parity — filter as a popover (not a row), columns are the status axis, category lifecycle in the Manage modal, and the explicit reversal of "create is category-unaware" + "Meta is read-only"
-- Status: Active
+- Status: Amended by ADR-032 — item 3's Manage (and New project) entry points moved off the
+  header/tab bar into the left-rail action rows; the Manage modal itself is unchanged.
 - Context: Seven dashboard operations still required dropping to the `am` CLI: creating a category,
   choosing a category at project-create time, archiving/unarchiving a category, editing a project
   (rename + vault binding), filtering the board, editing task meta, and releasing a task. The HTTP
@@ -1238,8 +1270,9 @@ without evidence.
      `renderRail()`/`railItem()`/`goProject()` plus a `pendingProject` handoff for single-project
      select; layout shell is `body > .shell > (aside#rail, .appcol > (header, main))`. Collapse state
      persists in `localStorage["am.railCollapsed"]`; an off-canvas drawer + `#railBackdrop` is used on
-     mobile (≤820px). `renderTabs()`/`tab()` were removed; `#tabs` is a hidden stub; `toggleProject()`
-     is retained only as a vestigial helper (the rail uses `goProject` for single-select).
+     mobile (≤820px). `renderTabs()`/`tab()` were removed; `#tabs` is a hidden stub; the rail uses
+     `goProject` for single-select, while `toggleProject()` stays in use by the new-task and
+     new-project save handlers (see `frontend.md`).
 - Supersedes in part: **ADR-028** (its navigation/breadcrumb item — the tab strip + breadcrumb-back
   button) and **ADR-031** (its manage-in-the-tab-bar item — Manage/New project moved into rail
   actions). The hash routes (`route()`), the Manage/New-project modals themselves, and the ADR-030
@@ -1255,7 +1288,8 @@ without evidence.
 - Consequences / residuals (accepted): the behavioral JS (rail render/collapse, `goProject` handoff,
   off-canvas drawer) is verified by source reading + manual check, not automated tests — the
   documented no-JS-runner gap (ADR-018); `TestDashboardNoXSSSinks` still passes (all new DOM is
-  `el()`/`svg()`/`textContent`). `toggleProject()` lingers as dead-ish code until a future cleanup.
+  `el()`/`svg()`/`textContent`). `toggleProject()` is not dead: the new-task and new-project save
+  handlers still call it, so removing it means migrating them to `goProject` first.
 - Evidence: `cmd/am/web/app.css` (token custom properties, `.status-pill`, `.chip-prio`/
   `--chip-prio-ink`, `.ctrouble`, `.col[data-status=…]` edge/header tints, `.ev-icon`, skeleton/toast
   styles, `--accent`/`--accent-strong`/`--accent-btn`/`--app-glow`, `.rail*`/`.shell`/`.appcol`, the
