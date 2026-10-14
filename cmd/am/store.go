@@ -741,7 +741,7 @@ func (s *Store) ListCategoriesWithStats(includeArchived bool, activeWindow time.
 	// window, keyed by category. task_id IS NOT NULL ensures comment.added counts
 	// (commenting is activity) while category-level events (project/category
 	// admin) do not. Ordered for stable output.
-	cutoff := time.Now().Add(-activeWindow).UTC().Format("2006-01-02T15:04:05.000Z")
+	cutoff := staleCutoff(activeWindow)
 	arows, err := s.db.Query(`SELECT DISTINCT c.id, events.actor
 	      FROM events
 	      JOIN projects p ON p.id = events.project_id
@@ -789,72 +789,69 @@ func (s *Store) ProjectIDsInCategory(cid int64) (map[int64]bool, error) {
 
 // ArchiveCategory soft-archives a category (sets archived_at). Idempotent.
 func (s *Store) ArchiveCategory(slug, actor string) (*Category, *Event, error) {
+	return s.setCategoryArchived(slug, actor, true)
+}
+
+// UnarchiveCategory restores a category (clears archived_at). Idempotent.
+func (s *Store) UnarchiveCategory(slug, actor string) (*Category, *Event, error) {
+	return s.setCategoryArchived(slug, actor, false)
+}
+
+func (s *Store) setCategoryArchived(slug, actor string, archive bool) (*Category, *Event, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, nil, err
 	}
 	defer tx.Rollback()
-
+	id, ev, err := setArchivedTx(tx, "categories", slug, actor, archive)
+	if err != nil {
+		return nil, nil, err
+	}
 	var c Category
-	var archivedAt string
-	err = tx.QueryRow("SELECT id, uid, slug, name, created_at, COALESCE(archived_at,'') FROM categories WHERE slug=?", slug).
-		Scan(&c.ID, &c.UID, &c.Slug, &c.Name, &c.CreatedAt, &archivedAt)
-	if err == sql.ErrNoRows {
-		return nil, nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, nil, err
-	}
-	if archivedAt != "" {
-		// Already archived — idempotent success, no event
-		c.ArchivedAt = archivedAt
-		return &c, nil, tx.Commit()
-	}
-	if _, err := tx.Exec(
-		"UPDATE categories SET archived_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?", c.ID); err != nil {
-		return nil, nil, err
-	}
-	ev, err := insertEvent(tx, 0, 0, actorOr(actor), "category.archived", map[string]any{"slug": slug})
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := tx.QueryRow("SELECT COALESCE(archived_at,'') FROM categories WHERE id=?", c.ID).Scan(&c.ArchivedAt); err != nil {
+	if err := tx.QueryRow("SELECT id, uid, slug, name, created_at, COALESCE(archived_at,'') FROM categories WHERE id=?", id).
+		Scan(&c.ID, &c.UID, &c.Slug, &c.Name, &c.CreatedAt, &c.ArchivedAt); err != nil {
 		return nil, nil, err
 	}
 	return &c, ev, tx.Commit()
 }
 
-// UnarchiveCategory restores a category (clears archived_at). Idempotent.
-func (s *Store) UnarchiveCategory(slug, actor string) (*Category, *Event, error) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, nil, err
-	}
-	defer tx.Rollback()
-
-	var c Category
+// setArchivedTx is the shared body of the category and project
+// archive/unarchive methods: it loads the row of table ("categories" or
+// "projects") by slug, and unless it is already in the wanted state sets
+// (archive) or clears archived_at and records <category|project>.<un>archived.
+// Already in that state is idempotent success with a nil event. Returns the
+// row id for the caller to reload.
+func setArchivedTx(tx *sql.Tx, table, slug, actor string, archive bool) (int64, *Event, error) {
+	var id int64
 	var archivedAt string
-	err = tx.QueryRow("SELECT id, uid, slug, name, created_at, COALESCE(archived_at,'') FROM categories WHERE slug=?", slug).
-		Scan(&c.ID, &c.UID, &c.Slug, &c.Name, &c.CreatedAt, &archivedAt)
+	err := tx.QueryRow("SELECT id, COALESCE(archived_at,'') FROM "+table+" WHERE slug=?", slug).Scan(&id, &archivedAt)
 	if err == sql.ErrNoRows {
-		return nil, nil, ErrNotFound
+		return 0, nil, ErrNotFound
 	}
 	if err != nil {
-		return nil, nil, err
+		return 0, nil, err
 	}
-	if archivedAt == "" {
-		// Not archived — idempotent success, no event
-		return &c, nil, tx.Commit()
+	if (archivedAt != "") == archive {
+		return id, nil, nil
 	}
-	if _, err := tx.Exec("UPDATE categories SET archived_at=NULL WHERE id=?", c.ID); err != nil {
-		return nil, nil, err
+	set, kind := "NULL", "unarchived"
+	if archive {
+		set, kind = "strftime('%Y-%m-%dT%H:%M:%fZ','now')", "archived"
 	}
-	ev, err := insertEvent(tx, 0, 0, actorOr(actor), "category.unarchived", map[string]any{"slug": slug})
+	if _, err := tx.Exec("UPDATE "+table+" SET archived_at="+set+" WHERE id=?", id); err != nil {
+		return 0, nil, err
+	}
+	// Category events are category-level (NULL project_id); project events
+	// carry the project's id.
+	evProject, noun := int64(0), "category"
+	if table == "projects" {
+		evProject, noun = id, "project"
+	}
+	ev, err := insertEvent(tx, evProject, 0, actorOr(actor), noun+"."+kind, map[string]any{"slug": slug})
 	if err != nil {
-		return nil, nil, err
+		return 0, nil, err
 	}
-	c.ArchivedAt = "" // explicitly clear; was scanned into a local var, not c.ArchivedAt
-	return &c, ev, tx.Commit()
+	return id, ev, nil
 }
 
 func (s *Store) categoryID(slug string) (int64, error) {
@@ -917,75 +914,21 @@ func (s *Store) ListProjects(includeArchived bool, category string) ([]Project, 
 
 // ArchiveProject soft-archives a project (sets archived_at). Idempotent.
 func (s *Store) ArchiveProject(slug, actor string) (*Project, *Event, error) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, nil, err
-	}
-	defer tx.Rollback()
-
-	var id int64
-	var archivedAt string
-	err = tx.QueryRow("SELECT id, COALESCE(archived_at,'') FROM projects WHERE slug=?", slug).
-		Scan(&id, &archivedAt)
-	if err == sql.ErrNoRows {
-		return nil, nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, nil, err
-	}
-	if archivedAt != "" {
-		// Already archived — idempotent success, no event
-		p, err := getProjectTx(tx, id)
-		if err != nil {
-			return nil, nil, err
-		}
-		return p, nil, tx.Commit()
-	}
-	if _, err := tx.Exec(
-		"UPDATE projects SET archived_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?", id); err != nil {
-		return nil, nil, err
-	}
-	ev, err := insertEvent(tx, id, 0, actorOr(actor), "project.archived", map[string]any{"slug": slug})
-	if err != nil {
-		return nil, nil, err
-	}
-	p, err := getProjectTx(tx, id)
-	if err != nil {
-		return nil, nil, err
-	}
-	return p, ev, tx.Commit()
+	return s.setProjectArchived(slug, actor, true)
 }
 
 // UnarchiveProject restores a project (clears archived_at). Idempotent.
 func (s *Store) UnarchiveProject(slug, actor string) (*Project, *Event, error) {
+	return s.setProjectArchived(slug, actor, false)
+}
+
+func (s *Store) setProjectArchived(slug, actor string, archive bool) (*Project, *Event, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, nil, err
 	}
 	defer tx.Rollback()
-
-	var id int64
-	var archivedAt string
-	err = tx.QueryRow("SELECT id, COALESCE(archived_at,'') FROM projects WHERE slug=?", slug).
-		Scan(&id, &archivedAt)
-	if err == sql.ErrNoRows {
-		return nil, nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, nil, err
-	}
-	if archivedAt == "" {
-		// Not archived — idempotent success, no event
-		p, err := getProjectTx(tx, id)
-		if err != nil {
-			return nil, nil, err
-		}
-		return p, nil, tx.Commit()
-	}
-	if _, err := tx.Exec("UPDATE projects SET archived_at=NULL WHERE id=?", id); err != nil {
-		return nil, nil, err
-	}
-	ev, err := insertEvent(tx, id, 0, actorOr(actor), "project.unarchived", map[string]any{"slug": slug})
+	id, ev, err := setArchivedTx(tx, "projects", slug, actor, archive)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2657,96 +2600,43 @@ func (s *Store) AddComment(id int64, author, body string) (*Comment, *Event, err
 
 // ---------- events / feed ----------
 
-func (s *Store) ListEvents(since int64, project, category string, limit int) ([]Event, int64, error) {
-	if limit <= 0 || limit > 500 {
-		limit = 200
-	}
-	var args []any
-	q := `SELECT events.id,COALESCE(events.project_id,0),COALESCE(events.task_id,0),events.actor,events.kind,events.data,events.created_at
-	      FROM events LEFT JOIN projects p ON p.id = events.project_id
-	      LEFT JOIN categories c ON c.id = p.category_id
-	      WHERE events.id>?`
-	args = append(args, since)
+// eventQuery builds the feed SELECT shared by ListEvents, ListEventsBefore and
+// RecentEvents, so the dashboard bootstrap, paging and SSE replay agree on
+// which events exist: the events/projects/categories join, the caller's
+// cursor clauses (where, args), then the project, category and
+// archived-exclusion predicates. Callers append only ORDER BY and LIMIT.
+func (s *Store) eventQuery(project, category string, where []string, args []any) (string, []any, error) {
 	if project != "" {
 		pid, err := s.projectID(project)
 		if err != nil {
-			return nil, since, err
+			return "", nil, err
 		}
-		q += " AND events.project_id=?"
+		where = append(where, "events.project_id=?")
 		args = append(args, pid)
 	}
 	if category != "" {
 		cid, err := s.categoryID(category)
 		if err != nil {
-			return nil, since, err
+			return "", nil, err
 		}
 		// c.id=? matches only events whose project lives in the category. This
 		// intentionally EXCLUDES category-level events (NULL project_id) — they
 		// belong to the All/overview feed, not a single category's drill-down.
-		q += " AND c.id=?"
+		where = append(where, "c.id=?")
 		args = append(args, cid)
 	}
 	if project == "" && category == "" {
-		q += " AND (events.project_id IS NULL OR (p.archived_at IS NULL AND c.archived_at IS NULL))"
+		where = append(where, "(events.project_id IS NULL OR (p.archived_at IS NULL AND c.archived_at IS NULL))")
 	}
-	q += " ORDER BY events.id ASC LIMIT ?"
-	args = append(args, limit)
-	rows, err := s.db.Query(q, args...)
-	if err != nil {
-		return nil, since, err
-	}
-	defer rows.Close()
-	out := []Event{}
-	last := since
-	for rows.Next() {
-		var e Event
-		var data string
-		if err := rows.Scan(&e.ID, &e.ProjectID, &e.TaskID, &e.Actor, &e.Kind, &data, &e.CreatedAt); err != nil {
-			return nil, since, err
-		}
-		e.Data = json.RawMessage(data)
-		out = append(out, e)
-		last = e.ID
-	}
-	return out, last, rows.Err()
-}
-
-// ListEventsBefore returns events with id < before, newest-first, up to limit.
-// It mirrors the archived-project filter used by ListEvents and RecentEvents.
-// Default limit 40, cap 200.
-func (s *Store) ListEventsBefore(before int64, project, category string, limit int) ([]Event, error) {
-	if limit <= 0 || limit > 200 {
-		limit = 40
-	}
-	var args []any
 	q := `SELECT events.id,COALESCE(events.project_id,0),COALESCE(events.task_id,0),events.actor,events.kind,events.data,events.created_at
 	      FROM events LEFT JOIN projects p ON p.id = events.project_id
 	      LEFT JOIN categories c ON c.id = p.category_id
-	      WHERE events.id<?`
-	args = append(args, before)
-	if project != "" {
-		pid, err := s.projectID(project)
-		if err != nil {
-			return nil, err
-		}
-		q += " AND events.project_id=?"
-		args = append(args, pid)
-	}
-	if category != "" {
-		cid, err := s.categoryID(category)
-		if err != nil {
-			return nil, err
-		}
-		// c.id=? excludes category-level (NULL project_id) events on purpose; see
-		// ListEvents.
-		q += " AND c.id=?"
-		args = append(args, cid)
-	}
-	if project == "" && category == "" {
-		q += " AND (events.project_id IS NULL OR (p.archived_at IS NULL AND c.archived_at IS NULL))"
-	}
-	q += " ORDER BY events.id DESC LIMIT ?"
-	args = append(args, limit)
+	      WHERE ` + strings.Join(where, " AND ")
+	return q, args, nil
+}
+
+// queryEvents runs a query built by eventQuery and decodes its rows.
+func (s *Store) queryEvents(q string, args []any) ([]Event, error) {
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
@@ -2765,6 +2655,39 @@ func (s *Store) ListEventsBefore(before int64, project, category string, limit i
 	return out, rows.Err()
 }
 
+func (s *Store) ListEvents(since int64, project, category string, limit int) ([]Event, int64, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 200
+	}
+	q, args, err := s.eventQuery(project, category, []string{"events.id>?"}, []any{since})
+	if err != nil {
+		return nil, since, err
+	}
+	out, err := s.queryEvents(q+" ORDER BY events.id ASC LIMIT ?", append(args, limit))
+	if err != nil {
+		return nil, since, err
+	}
+	last := since
+	if len(out) > 0 {
+		last = out[len(out)-1].ID
+	}
+	return out, last, nil
+}
+
+// ListEventsBefore returns events with id < before, newest-first, up to limit,
+// under the same filters as ListEvents and RecentEvents (eventQuery).
+// Default limit 40, cap 200.
+func (s *Store) ListEventsBefore(before int64, project, category string, limit int) ([]Event, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 40
+	}
+	q, args, err := s.eventQuery(project, category, []string{"events.id<?"}, []any{before})
+	if err != nil {
+		return nil, err
+	}
+	return s.queryEvents(q+" ORDER BY events.id DESC LIMIT ?", append(args, limit))
+}
+
 func (s *Store) MaxEventID() (int64, error) {
 	var id int64
 	err := s.db.QueryRow("SELECT COALESCE(MAX(id),0) FROM events").Scan(&id)
@@ -2777,55 +2700,19 @@ func (s *Store) RecentEvents(project, category string, limit int) ([]Event, int6
 	if limit <= 0 || limit > 200 {
 		limit = 40
 	}
-	var args []any
-	var where []string
-	q := `SELECT events.id,COALESCE(events.project_id,0),COALESCE(events.task_id,0),events.actor,events.kind,events.data,events.created_at
-	      FROM events LEFT JOIN projects p ON p.id = events.project_id
-	      LEFT JOIN categories c ON c.id = p.category_id`
-	if project != "" {
-		pid, err := s.projectID(project)
-		if err != nil {
-			return nil, 0, err
-		}
-		where = append(where, "events.project_id=?")
-		args = append(args, pid)
-	}
-	if category != "" {
-		cid, err := s.categoryID(category)
-		if err != nil {
-			return nil, 0, err
-		}
-		// c.id=? excludes category-level (NULL project_id) events on purpose; see
-		// ListEvents.
-		where = append(where, "c.id=?")
-		args = append(args, cid)
-	}
-	if project == "" && category == "" {
-		where = append(where, "(events.project_id IS NULL OR (p.archived_at IS NULL AND c.archived_at IS NULL))")
-	}
-	q += " WHERE " + strings.Join(where, " AND ")
-	q += " ORDER BY events.id DESC LIMIT ?"
-	args = append(args, limit)
-	rows, err := s.db.Query(q, args...)
+	q, args, err := s.eventQuery(project, category, nil, nil)
 	if err != nil {
 		return nil, 0, err
 	}
-	defer rows.Close()
-	out := []Event{}
-	var max int64
-	for rows.Next() {
-		var e Event
-		var data string
-		if err := rows.Scan(&e.ID, &e.ProjectID, &e.TaskID, &e.Actor, &e.Kind, &data, &e.CreatedAt); err != nil {
-			return nil, 0, err
-		}
-		e.Data = json.RawMessage(data)
-		if e.ID > max {
-			max = e.ID
-		}
-		out = append(out, e)
+	out, err := s.queryEvents(q+" ORDER BY events.id DESC LIMIT ?", append(args, limit))
+	if err != nil {
+		return nil, 0, err
 	}
-	return out, max, rows.Err()
+	var max int64
+	if len(out) > 0 {
+		max = out[0].ID // newest first
+	}
+	return out, max, nil
 }
 
 // ---------- project graph ----------

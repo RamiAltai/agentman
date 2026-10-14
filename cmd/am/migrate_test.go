@@ -21,6 +21,38 @@ func openTestStore(t *testing.T) *Store {
 	return st
 }
 
+// buildDBAtVersion hand-builds the db at path at schema version n: schema.sql
+// plus every schemaMigrations step up to n, opened with OpenStore's DSN so the
+// fixture runs under the production pragmas. The caller seeds version-n data,
+// closes db and reopens with OpenStore to run the remaining migrations.
+func buildDBAtVersion(t *testing.T, path string, n int) *sql.DB {
+	t.Helper()
+	var steps []migration
+	for _, m := range schemaMigrations {
+		if m.version <= n {
+			steps = append(steps, m)
+		}
+	}
+	if len(steps) == 0 || steps[len(steps)-1].version != n {
+		t.Fatalf("schemaMigrations has no step for v%d", n)
+	}
+	db, err := sql.Open("sqlite", storeDSN(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(schemaSQL); err != nil {
+		t.Fatalf("seed schema: %v", err)
+	}
+	if err := runMigrations(db, n, steps); err != nil {
+		t.Fatalf("migrate to v%d: %v", n, err)
+	}
+	if v, _ := readSchemaVersion(db); v != n {
+		t.Fatalf("hand-built DB version = %d, want %d", v, n)
+	}
+	return db
+}
+
 func TestReadSchemaVersionFresh(t *testing.T) {
 	st := openTestStore(t)
 	v, err := readSchemaVersion(st.db)
@@ -263,28 +295,8 @@ func TestMigrationV4Fresh(t *testing.T) {
 func TestMigrationV4ExistingDB(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "v3.db")
 
-	// Hand-build a v3 DB: seed schema.sql, then apply ONLY v2+v3 (the first two
-	// entries of schemaMigrations — v4 must not have run yet).
-	if schemaMigrations[0].version != 2 || schemaMigrations[1].version != 3 {
-		t.Fatalf("schemaMigrations layout changed; first two steps = v%d, v%d, want v2, v3",
-			schemaMigrations[0].version, schemaMigrations[1].version)
-	}
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"+
-		"&_pragma=foreign_keys(1)&_pragma=synchronous(1)", dbPath)
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schemaSQL); err != nil {
-		t.Fatalf("seed schema: %v", err)
-	}
-	if err := runMigrations(db, 3, schemaMigrations[:2]); err != nil {
-		t.Fatalf("migrate to v3: %v", err)
-	}
-	if v, _ := readSchemaVersion(db); v != 3 {
-		t.Fatalf("hand-built DB version = %d, want 3", v)
-	}
+	// Hand-build a v3 DB (v4 must not have run yet).
+	db := buildDBAtVersion(t, dbPath, 3)
 	// Seed v3-era data: two projects, tasks with refs/claimed_at, a label.
 	for _, slug := range []string{"alpha", "beta"} {
 		if _, err := db.Exec("INSERT INTO projects(slug,name) VALUES(?,?)", slug, slug); err != nil {
@@ -388,28 +400,8 @@ func TestMigrationV5Fresh(t *testing.T) {
 func TestMigrationV5ExistingDB(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "v4.db")
 
-	// Hand-build a v4 DB: seed schema.sql, then apply ONLY v2-v4 (the first
-	// three entries of schemaMigrations — v5 must not have run yet).
-	if schemaMigrations[0].version != 2 || schemaMigrations[1].version != 3 || schemaMigrations[2].version != 4 {
-		t.Fatalf("schemaMigrations layout changed; first three steps = v%d, v%d, v%d, want v2, v3, v4",
-			schemaMigrations[0].version, schemaMigrations[1].version, schemaMigrations[2].version)
-	}
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"+
-		"&_pragma=foreign_keys(1)&_pragma=synchronous(1)", dbPath)
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schemaSQL); err != nil {
-		t.Fatalf("seed schema: %v", err)
-	}
-	if err := runMigrations(db, 4, schemaMigrations[:3]); err != nil {
-		t.Fatalf("migrate to v4: %v", err)
-	}
-	if v, _ := readSchemaVersion(db); v != 4 {
-		t.Fatalf("hand-built DB version = %d, want 4", v)
-	}
+	// Hand-build a v4 DB (v5 must not have run yet).
+	db := buildDBAtVersion(t, dbPath, 4)
 	// Seed v4-era data: one project, a task WITH a task.created event (the
 	// backfill source) and a task WITHOUT one (events pruned).
 	if _, err := db.Exec("INSERT INTO projects(slug,name,category_id,uid) VALUES('web','web',(SELECT id FROM categories WHERE slug='general'),'amp_0000000000000001')"); err != nil {
@@ -514,22 +506,7 @@ func TestMigrationV5ExistingDB(t *testing.T) {
 // seen, so ids deleted BEFORE the migration are not reissued either.
 func TestMigrationV6ExistingDB(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "v5.db")
-	if schemaMigrations[3].version != 5 {
-		t.Fatalf("schemaMigrations layout changed; step 4 = v%d, want v5", schemaMigrations[3].version)
-	}
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"+
-		"&_pragma=foreign_keys(1)&_pragma=synchronous(1)", dbPath)
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schemaSQL); err != nil {
-		t.Fatalf("seed schema: %v", err)
-	}
-	if err := runMigrations(db, 5, schemaMigrations[:4]); err != nil {
-		t.Fatalf("migrate to v5: %v", err)
-	}
+	db := buildDBAtVersion(t, dbPath, 5)
 	for _, q := range []string{
 		`INSERT INTO projects(slug,name,category_id,uid) VALUES
 		   ('alpha','alpha',(SELECT id FROM categories WHERE slug='general'),'amp_00000000000000a1'),

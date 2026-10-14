@@ -1134,7 +1134,7 @@ func (s *Server) checkTaskRead(r *http.Request, sc Scope, taskID int64) error {
 	if err != nil {
 		return err
 	}
-	if scopeAllows(sc, cat, proj) || (cat == s.proposals.Category && proj == s.proposals.Project) {
+	if scopeAllows(sc, cat, proj) || s.isProposalsPair(cat, proj) {
 		return nil
 	}
 	return denyScope(r, sc)
@@ -1155,8 +1155,7 @@ func (s *Server) checkComment(r *http.Request, sc Scope, taskID int64) error {
 	if scopeAllows(sc, cat, proj) {
 		return nil
 	}
-	if cat == s.proposals.Category && proj == s.proposals.Project &&
-		createdBy != "" && createdBy == actorOf(r) {
+	if s.isProposalsPair(cat, proj) && createdBy != "" && createdBy == actorOf(r) {
 		return nil
 	}
 	return denyScope(r, sc)
@@ -1170,8 +1169,8 @@ func (s *Server) checkComment(r *http.Request, sc Scope, taskID int64) error {
 // other agent's proposals. A missing project still counts (ErrNotFound
 // passes through as true): the gate stays open and the store 404s, keeping
 // the carve-out inert rather than special-cased. Every site that consults
-// the carve-out goes through here or checks the (category, project) pair
-// directly (checkTaskRead, checkComment) — the five sites must agree.
+// the carve-out goes through here or, when it already holds a task's
+// (category, project) pair, through isProposalsPair.
 func (s *Server) isProposals(slug string) (bool, error) {
 	if slug != s.proposals.Project {
 		return false, nil
@@ -1183,7 +1182,30 @@ func (s *Server) isProposals(slug string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return cat == s.proposals.Category, nil
+	return s.isProposalsPair(cat, slug), nil
+}
+
+// isProposalsPair reports whether (cat, proj) is the designated carve-out
+// project.
+func (s *Server) isProposalsPair(cat, proj string) bool {
+	return cat == s.proposals.Category && proj == s.proposals.Project
+}
+
+// projectInScope reports whether project slug lies inside the non-zero scope
+// sc: a project scope must name slug, and the project's actual category must
+// be sc.Category. The category is checked for project scopes too: slugs are
+// freed by delete, so a same-named project recreated in another category must
+// not inherit a token minted for the old one (scopeAllows compares the pair).
+// Store errors, ErrNotFound for an unknown slug included, pass through.
+func (s *Server) projectInScope(sc Scope, slug string) (bool, error) {
+	if sc.Project != "" && slug != sc.Project {
+		return false, nil
+	}
+	cat, err := s.store.projectCategory(slug)
+	if err != nil {
+		return false, err
+	}
+	return cat == sc.Category, nil
 }
 
 // checkCreate gates task creation: the target project must be in scope, OR be
@@ -1200,20 +1222,8 @@ func (s *Server) checkCreate(r *http.Request, sc Scope, projectSlug string) erro
 	} else if ok {
 		return nil
 	}
-	if sc.Project != "" && projectSlug != sc.Project {
-		return denyScope(r, sc)
-	}
-	// The category is checked for project scopes too: slugs are freed by
-	// delete, so a same-named project recreated in another category must not
-	// inherit a token minted for the old one (scopeAllows compares the pair).
-	cat, err := s.store.projectCategory(projectSlug)
-	if err != nil {
-		return err // unknown slug stays a 404, matching unscoped create
-	}
-	if cat == sc.Category {
-		return nil
-	}
-	return denyScope(r, sc)
+	// An unknown slug stays a 404, matching unscoped create.
+	return s.checkProjectMut(r, sc, projectSlug)
 }
 
 // checkProjectRead gates project-level reads (graph): in scope or the
@@ -1240,17 +1250,14 @@ func (s *Server) checkProjectMut(r *http.Request, sc Scope, slug string) error {
 	if sc.IsZero() {
 		return nil
 	}
-	if sc.Project != "" && slug != sc.Project {
-		return denyScope(r, sc)
-	}
-	cat, err := s.store.projectCategory(slug) // pair check, as in checkCreate
+	ok, err := s.projectInScope(sc, slug)
 	if err != nil {
 		return err // unknown slug stays a 404
 	}
-	if cat == sc.Category {
-		return nil
+	if !ok {
+		return denyScope(r, sc)
 	}
-	return denyScope(r, sc)
+	return nil
 }
 
 // narrowScope merges the caller's scope into explicit list/next filters.
@@ -1278,17 +1285,11 @@ func (s *Server) narrowScope(r *http.Request, sc Scope, proj, cat string, allowP
 				return proj, cat, nil
 			}
 		}
-		if sc.Project != "" && proj != sc.Project {
-			return "", "", denyScope(r, sc)
-		}
-		pcat, err := s.store.projectCategory(proj) // pair check, as in checkCreate
-		if err != nil {
-			if errors.Is(err, ErrNotFound) {
-				return "", "", denyScope(r, sc) // unknown explicit slug: not provably in scope
-			}
+		ok, err := s.projectInScope(sc, proj)
+		if err != nil && !errors.Is(err, ErrNotFound) {
 			return "", "", err
 		}
-		if pcat != sc.Category {
+		if !ok { // an unknown explicit slug is not provably in scope either
 			return "", "", denyScope(r, sc)
 		}
 		// Hand the scope's category to the store as well, so its own query

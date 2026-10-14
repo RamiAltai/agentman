@@ -20,9 +20,10 @@ type sseEvent struct {
 	kind string // decoded from data JSON "kind" field
 }
 
-// readSSEEvents reads lines from br until it accumulates count events with a
-// non-empty "data:" line, or until the context is done (in which case the
-// test fails). Each SSE event is terminated by a blank line.
+// readSSEUntil reads events (blank-line terminated, with a non-empty "data:"
+// line) from br until until(ev) returns true, and returns that event. Events
+// that do not match are consumed and discarded, so a later call on the same
+// reader cannot see them. Fails the test when ctx is done first.
 func readSSEUntil(t *testing.T, ctx context.Context, br *bufio.Reader, until func(sseEvent) bool) sseEvent {
 	t.Helper()
 	var curID int64
@@ -93,6 +94,38 @@ func waitForRetry(t *testing.T, ctx context.Context, br *bufio.Reader) {
 	}
 }
 
+// dialStream opens an SSE connection to path with the extra request headers
+// hdr and fails the test unless it answers 200. It does not consume the
+// retry: preamble; reconnect tests read replayed frames straight away.
+func dialStream(t *testing.T, ctx context.Context, ts *httptest.Server, path string, hdr map[string]string) (*http.Response, *bufio.Reader) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+path, nil)
+	if err != nil {
+		t.Fatalf("NewRequest %s: %v", path, err)
+	}
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("stream %s status = %d, want 200", path, resp.StatusCode)
+	}
+	return resp, bufio.NewReader(resp.Body)
+}
+
+// openStream opens an SSE connection and waits for the retry: preamble, proving
+// the subscription is live before the caller triggers events.
+func openStream(t *testing.T, ctx context.Context, ts *httptest.Server, path string) (*http.Response, *bufio.Reader) {
+	t.Helper()
+	resp, br := dialStream(t, ctx, ts, path, nil)
+	waitForRetry(t, ctx, br)
+	return resp, br
+}
+
 func TestSSEDeliversLiveEvent(t *testing.T) {
 	ts := newTestServer(t)
 	mustCreateProject(t, ts, "sseproj")
@@ -100,22 +133,8 @@ func TestSSEDeliversLiveEvent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/api/stream", nil)
-	if err != nil {
-		t.Fatalf("NewRequest: %v", err)
-	}
-	resp, err := ts.Client().Do(req)
-	if err != nil {
-		t.Fatalf("GET /api/stream: %v", err)
-	}
+	resp, br := openStream(t, ctx, ts, "/api/stream")
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("stream status = %d, want 200", resp.StatusCode)
-	}
-
-	br := bufio.NewReader(resp.Body)
-	waitForRetry(t, ctx, br)
 
 	// Now create a task — this should produce a task.created event.
 	mustCreateTask(t, ts, "sseproj", "SSE Live Task")
@@ -136,17 +155,7 @@ func TestSSEReplayOnReconnect(t *testing.T) {
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel1()
 
-	req1, err := http.NewRequestWithContext(ctx1, http.MethodGet, ts.URL+"/api/stream", nil)
-	if err != nil {
-		t.Fatalf("NewRequest: %v", err)
-	}
-	resp1, err := ts.Client().Do(req1)
-	if err != nil {
-		t.Fatalf("GET /api/stream: %v", err)
-	}
-
-	br1 := bufio.NewReader(resp1.Body)
-	waitForRetry(t, ctx1, br1)
+	resp1, br1 := openStream(t, ctx1, ts, "/api/stream")
 
 	// Create a task and capture its event id.
 	mustCreateTask(t, ts, "replayproj", "Task One")
@@ -167,19 +176,9 @@ func TestSSEReplayOnReconnect(t *testing.T) {
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel2()
 
-	req2, err := http.NewRequestWithContext(ctx2, http.MethodGet, ts.URL+"/api/stream", nil)
-	if err != nil {
-		t.Fatalf("NewRequest reconnect: %v", err)
-	}
-	req2.Header.Set("Last-Event-ID", strconv.FormatInt(firstID, 10))
-
-	resp2, err := ts.Client().Do(req2)
-	if err != nil {
-		t.Fatalf("GET /api/stream reconnect: %v", err)
-	}
+	resp2, br2 := dialStream(t, ctx2, ts, "/api/stream",
+		map[string]string{"Last-Event-ID": strconv.FormatInt(firstID, 10)})
 	defer resp2.Body.Close()
-
-	br2 := bufio.NewReader(resp2.Body)
 
 	// Every frame up to the newest event, unfiltered: exactly Task Two and
 	// Task Three, in order — a re-sent firstID or any extra frame fails.
@@ -197,26 +196,6 @@ func TestSSEReplayOnReconnect(t *testing.T) {
 	if ev := readSSEUntil(t, ctx2, br2, func(sseEvent) bool { return true }); ev.id != maxID+1 || ev.kind != "task.created" {
 		t.Fatalf("first frame after replay = id %d %q, want the live task.created %d", ev.id, ev.kind, maxID+1)
 	}
-}
-
-// openStream opens an SSE connection and waits for the retry: preamble, proving
-// the subscription is live before the caller triggers events.
-func openStream(t *testing.T, ctx context.Context, ts *httptest.Server, path string) (*http.Response, *bufio.Reader) {
-	t.Helper()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+path, nil)
-	if err != nil {
-		t.Fatalf("NewRequest %s: %v", path, err)
-	}
-	resp, err := ts.Client().Do(req)
-	if err != nil {
-		t.Fatalf("GET %s: %v", path, err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("stream %s status = %d, want 200", path, resp.StatusCode)
-	}
-	br := bufio.NewReader(resp.Body)
-	waitForRetry(t, ctx, br)
-	return resp, br
 }
 
 // TestSSECategoryScopedStream verifies /api/stream?category= delivers only the
@@ -292,17 +271,8 @@ func TestSSECategoryReconnectReplay(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		ts.URL+"/api/stream?category=acat&since="+strconv.FormatInt(maxBefore, 10), nil)
-	if err != nil {
-		t.Fatalf("NewRequest: %v", err)
-	}
-	resp, err := ts.Client().Do(req)
-	if err != nil {
-		t.Fatalf("GET stream: %v", err)
-	}
+	resp, br := dialStream(t, ctx, ts, "/api/stream?category=acat&since="+strconv.FormatInt(maxBefore, 10), nil)
 	defer resp.Body.Close()
-	br := bufio.NewReader(resp.Body)
 
 	// The first replayed task.created must be A's "A Gap" (B's "B Gap" has a lower
 	// event id, so if it were wrongly replayed it would arrive first).
@@ -321,17 +291,8 @@ func TestSSEStaleCursorResets(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/api/stream", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Last-Event-ID", "999999")
-	resp, err := ts.Client().Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp, br := dialStream(t, ctx, ts, "/api/stream", map[string]string{"Last-Event-ID": "999999"})
 	defer resp.Body.Close()
-	br := bufio.NewReader(resp.Body)
 	waitForRetry(t, ctx, br)
 
 	mustCreateTask(t, ts, "stale", "after reset")

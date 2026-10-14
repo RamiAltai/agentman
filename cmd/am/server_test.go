@@ -17,9 +17,7 @@ import (
 
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	store := openTestStore(t)
-	ts := httptest.NewServer(NewServer(store).Handler())
-	t.Cleanup(ts.Close)
+	ts, _ := newTestServerWithStore(t)
 	return ts
 }
 
@@ -175,16 +173,8 @@ func TestStealStaleEndpoint(t *testing.T) {
 	if stolen.Assignee != "agent-b" {
 		t.Fatalf("assignee after steal = %q, want agent-b", stolen.Assignee)
 	}
-	re := do(t, ts, http.MethodGet, "/api/events?tail=50", "", nil)
-	defer re.Body.Close()
-	var feed struct {
-		Events []Event `json:"events"`
-	}
-	if err := json.NewDecoder(re.Body).Decode(&feed); err != nil {
-		t.Fatalf("decode events: %v", err)
-	}
 	found := false
-	for _, e := range feed.Events {
+	for _, e := range eventKinds(t, do(t, ts, http.MethodGet, "/api/events?tail=50", "", nil)) {
 		if e.Kind == "task.reclaimed" && strconv.FormatInt(e.TaskID, 10) == staleID {
 			found = true
 		}
@@ -348,24 +338,32 @@ func TestListenAddrLoopback(t *testing.T) {
 	}
 }
 
+// projectListed reports whether GET /api/projects<query> lists slug.
+func projectListed(t *testing.T, ts *httptest.Server, query, slug string) bool {
+	t.Helper()
+	r := do(t, ts, http.MethodGet, "/api/projects"+query, "", nil)
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/projects%s = %d, want 200", query, r.StatusCode)
+	}
+	var ps []Project
+	if err := json.NewDecoder(r.Body).Decode(&ps); err != nil {
+		t.Fatalf("decode projects%s: %v", query, err)
+	}
+	for _, p := range ps {
+		if p.Slug == slug {
+			return true
+		}
+	}
+	return false
+}
+
 func TestArchiveUnarchiveEndpoints(t *testing.T) {
 	ts := newTestServer(t)
 	mustCreateProject(t, ts, "archivedemo")
 
 	// Initially visible in default list
-	r := do(t, ts, http.MethodGet, "/api/projects", "", nil)
-	defer r.Body.Close()
-	var ps []Project
-	if err := json.NewDecoder(r.Body).Decode(&ps); err != nil {
-		t.Fatalf("decode projects: %v", err)
-	}
-	found := false
-	for _, p := range ps {
-		if p.Slug == "archivedemo" {
-			found = true
-		}
-	}
-	if !found {
+	if !projectListed(t, ts, "", "archivedemo") {
 		t.Fatal("project should appear in default list before archive")
 	}
 
@@ -384,32 +382,12 @@ func TestArchiveUnarchiveEndpoints(t *testing.T) {
 	}
 
 	// No longer visible in default list
-	r3 := do(t, ts, http.MethodGet, "/api/projects", "", nil)
-	defer r3.Body.Close()
-	var ps2 []Project
-	if err := json.NewDecoder(r3.Body).Decode(&ps2); err != nil {
-		t.Fatalf("decode projects: %v", err)
-	}
-	for _, p := range ps2 {
-		if p.Slug == "archivedemo" {
-			t.Fatal("archived project should not appear in default list")
-		}
+	if projectListed(t, ts, "", "archivedemo") {
+		t.Fatal("archived project should not appear in default list")
 	}
 
 	// Visible with ?archived=true
-	r4 := do(t, ts, http.MethodGet, "/api/projects?archived=true", "", nil)
-	defer r4.Body.Close()
-	var ps3 []Project
-	if err := json.NewDecoder(r4.Body).Decode(&ps3); err != nil {
-		t.Fatalf("decode projects all: %v", err)
-	}
-	found = false
-	for _, p := range ps3 {
-		if p.Slug == "archivedemo" {
-			found = true
-		}
-	}
-	if !found {
+	if !projectListed(t, ts, "?archived=true", "archivedemo") {
 		t.Fatal("archived project should appear in ?archived=true list")
 	}
 
@@ -428,19 +406,7 @@ func TestArchiveUnarchiveEndpoints(t *testing.T) {
 	}
 
 	// Visible again in default list
-	r6 := do(t, ts, http.MethodGet, "/api/projects", "", nil)
-	defer r6.Body.Close()
-	var ps4 []Project
-	if err := json.NewDecoder(r6.Body).Decode(&ps4); err != nil {
-		t.Fatalf("decode projects: %v", err)
-	}
-	found = false
-	for _, p := range ps4 {
-		if p.Slug == "archivedemo" {
-			found = true
-		}
-	}
-	if !found {
+	if !projectListed(t, ts, "", "archivedemo") {
 		t.Fatal("unarchived project should appear in default list again")
 	}
 
@@ -530,16 +496,8 @@ func TestDeleteProjectEndpoint(t *testing.T) {
 	}
 
 	// Project no longer in list.
-	r2 := do(t, ts, http.MethodGet, "/api/projects?archived=true", "", nil)
-	defer r2.Body.Close()
-	var ps []Project
-	if err := json.NewDecoder(r2.Body).Decode(&ps); err != nil {
-		t.Fatalf("decode projects: %v", err)
-	}
-	for _, p := range ps {
-		if p.Slug == "toberemoved" {
-			t.Fatal("deleted project still in list")
-		}
+	if projectListed(t, ts, "?archived=true", "toberemoved") {
+		t.Fatal("deleted project still in list")
 	}
 
 	// DELETE again → 404.
@@ -1188,16 +1146,8 @@ func TestLabelEndpoints(t *testing.T) {
 	}
 
 	// Exactly one task.labeled and one task.unlabeled event (dup add emitted none).
-	r = do(t, ts, http.MethodGet, "/api/events?since=0", "", nil)
-	defer r.Body.Close()
-	var feed struct {
-		Events []Event `json:"events"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&feed); err != nil {
-		t.Fatalf("decode events: %v", err)
-	}
 	var labeled, unlabeled int
-	for _, ev := range feed.Events {
+	for _, ev := range eventKinds(t, do(t, ts, http.MethodGet, "/api/events?since=0", "", nil)) {
 		switch ev.Kind {
 		case "task.labeled":
 			labeled++
@@ -1370,9 +1320,7 @@ func TestProjectPayloadAndCategoryFilter(t *testing.T) {
 func TestListTasksCategoryParam(t *testing.T) {
 	ts := newTestServer(t)
 	mustCreateCategory(t, ts, "work")
-	r := do(t, ts, http.MethodPost, "/api/projects", `{"slug":"wproj","category":"work"}`,
-		map[string]string{"Content-Type": "application/json"})
-	r.Body.Close()
+	mustCreateProjectIn(t, ts, "wproj", "work")
 	mustCreateProject(t, ts, "gproj")
 	wID := mustCreateTask(t, ts, "wproj", "work task")
 	mustCreateTask(t, ts, "gproj", "general task")
@@ -1400,9 +1348,7 @@ func TestListTasksCategoryParam(t *testing.T) {
 func TestNextEndpointCategoryBody(t *testing.T) {
 	ts := newTestServer(t)
 	mustCreateCategory(t, ts, "work")
-	r := do(t, ts, http.MethodPost, "/api/projects", `{"slug":"wproj","category":"work"}`,
-		map[string]string{"Content-Type": "application/json"})
-	r.Body.Close()
+	mustCreateProjectIn(t, ts, "wproj", "work")
 	mustCreateProject(t, ts, "gproj")
 	// The general task is more urgent — a category-scoped next must skip it.
 	rg := do(t, ts, http.MethodPost, "/api/tasks",
@@ -1485,9 +1431,7 @@ func TestPatchProjectEndpoint(t *testing.T) {
 func TestCreateTaskArchivedCategory400(t *testing.T) {
 	ts := newTestServer(t)
 	mustCreateCategory(t, ts, "work")
-	r := do(t, ts, http.MethodPost, "/api/projects", `{"slug":"wproj","category":"work"}`,
-		map[string]string{"Content-Type": "application/json"})
-	r.Body.Close()
+	mustCreateProjectIn(t, ts, "wproj", "work")
 	ra := do(t, ts, http.MethodPost, "/api/categories/work/archive", "", nil)
 	ra.Body.Close()
 
@@ -1535,16 +1479,8 @@ func TestCreateTaskWithMeta(t *testing.T) {
 	}
 
 	// The task.created event data carries the meta.
-	r = do(t, ts, http.MethodGet, "/api/events?since=0", "", nil)
-	var feed struct {
-		Events []Event `json:"events"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&feed); err != nil {
-		t.Fatalf("decode events: %v", err)
-	}
-	r.Body.Close()
 	var found bool
-	for _, ev := range feed.Events {
+	for _, ev := range eventKinds(t, do(t, ts, http.MethodGet, "/api/events?since=0", "", nil)) {
 		if ev.Kind == "task.created" && strings.Contains(string(ev.Data), `"auto":"packet-7"`) {
 			found = true
 		}
@@ -1602,16 +1538,8 @@ func TestPatchTaskMetaEndpoint(t *testing.T) {
 	}
 
 	// Exactly two task.patched events (set + removal), the first carrying both keys.
-	r = do(t, ts, http.MethodGet, "/api/events?since=0", "", nil)
-	var feed struct {
-		Events []Event `json:"events"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&feed); err != nil {
-		t.Fatalf("decode events: %v", err)
-	}
-	r.Body.Close()
 	var patched []Event
-	for _, ev := range feed.Events {
+	for _, ev := range eventKinds(t, do(t, ts, http.MethodGet, "/api/events?since=0", "", nil)) {
 		if ev.Kind == "task.patched" {
 			patched = append(patched, ev)
 		}
@@ -1721,15 +1649,8 @@ func scopedBoard(t *testing.T, ts *httptest.Server) (workID, personalID string) 
 	t.Helper()
 	mustCreateCategory(t, ts, "work")
 	mustCreateCategory(t, ts, "personal")
-	for _, pair := range [][2]string{{"wproj", "work"}, {"pproj", "personal"}} {
-		r := do(t, ts, http.MethodPost, "/api/projects",
-			`{"slug":"`+pair[0]+`","category":"`+pair[1]+`"}`,
-			map[string]string{"Content-Type": "application/json"})
-		r.Body.Close()
-		if r.StatusCode != http.StatusCreated {
-			t.Fatalf("create project %s = %d, want 201", pair[0], r.StatusCode)
-		}
-	}
+	mustCreateProjectIn(t, ts, "wproj", "work")
+	mustCreateProjectIn(t, ts, "pproj", "personal")
 	return mustCreateTask(t, ts, "wproj", "work task"), mustCreateTask(t, ts, "pproj", "personal task")
 }
 
@@ -1737,13 +1658,7 @@ func scopedBoard(t *testing.T, ts *httptest.Server) (workID, personalID string) 
 func mustCreateProposals(t *testing.T, ts *httptest.Server) {
 	t.Helper()
 	mustCreateCategory(t, ts, "meta")
-	r := do(t, ts, http.MethodPost, "/api/projects",
-		`{"slug":"proposals","category":"meta"}`,
-		map[string]string{"Content-Type": "application/json"})
-	r.Body.Close()
-	if r.StatusCode != http.StatusCreated {
-		t.Fatalf("create proposals project = %d, want 201", r.StatusCode)
-	}
+	mustCreateProjectIn(t, ts, "proposals", "meta")
 }
 
 // scoped builds the request headers for a scoped agent.
@@ -1932,15 +1847,8 @@ func TestScopeProposalsConfigurable(t *testing.T) {
 
 	mustCreateCategory(t, ts, "ops")
 	mustCreateCategory(t, ts, "personal")
-	for _, pair := range [][2]string{{"inbox", "ops"}, {"pproj", "personal"}} {
-		r := do(t, ts, http.MethodPost, "/api/projects",
-			`{"slug":"`+pair[0]+`","category":"`+pair[1]+`"}`,
-			map[string]string{"Content-Type": "application/json"})
-		r.Body.Close()
-		if r.StatusCode != http.StatusCreated {
-			t.Fatalf("create project %s = %d, want 201", pair[0], r.StatusCode)
-		}
-	}
+	mustCreateProjectIn(t, ts, "inbox", "ops")
+	mustCreateProjectIn(t, ts, "pproj", "personal")
 
 	// The custom carve-out works from any scope…
 	r := do(t, ts, http.MethodPost, "/api/tasks",
@@ -1951,10 +1859,7 @@ func TestScopeProposalsConfigurable(t *testing.T) {
 	}
 	// …and the default name is no longer special on this server.
 	mustCreateCategory(t, ts, "meta")
-	rp := do(t, ts, http.MethodPost, "/api/projects",
-		`{"slug":"proposals","category":"meta"}`,
-		map[string]string{"Content-Type": "application/json"})
-	rp.Body.Close()
+	mustCreateProjectIn(t, ts, "proposals", "meta")
 	rd := do(t, ts, http.MethodPost, "/api/tasks",
 		`{"project":"proposals","title":"not special here"}`, scoped("agent-p", "personal"))
 	rd.Body.Close()
@@ -1985,13 +1890,7 @@ func TestScopeProposalsWrongCategoryNoCarveOut(t *testing.T) {
 	ts := newTestServer(t)
 	scopedBoard(t, ts)
 	// "proposals" exists, but under work — NOT the designated meta/proposals.
-	r := do(t, ts, http.MethodPost, "/api/projects",
-		`{"slug":"proposals","category":"work"}`,
-		map[string]string{"Content-Type": "application/json"})
-	r.Body.Close()
-	if r.StatusCode != http.StatusCreated {
-		t.Fatalf("create work/proposals = %d, want 201", r.StatusCode)
-	}
+	mustCreateProjectIn(t, ts, "proposals", "work")
 
 	// Out-of-scope create: 403, not the carve-out's 201.
 	rc := do(t, ts, http.MethodPost, "/api/tasks",
@@ -2175,15 +2074,8 @@ func TestScopeMutationSweep(t *testing.T) {
 func TestScopeProjectScopedAgent(t *testing.T) {
 	ts := newTestServer(t)
 	mustCreateCategory(t, ts, "work")
-	for _, slug := range []string{"api", "web"} {
-		r := do(t, ts, http.MethodPost, "/api/projects",
-			`{"slug":"`+slug+`","category":"work"}`,
-			map[string]string{"Content-Type": "application/json"})
-		r.Body.Close()
-		if r.StatusCode != http.StatusCreated {
-			t.Fatalf("create project %s = %d, want 201", slug, r.StatusCode)
-		}
-	}
+	mustCreateProjectIn(t, ts, "api", "work")
+	mustCreateProjectIn(t, ts, "web", "work")
 	webID := mustCreateTask(t, ts, "web", "web task")
 	apiID := mustCreateTask(t, ts, "api", "api task")
 
@@ -2557,6 +2449,33 @@ func mintToken(t *testing.T, ts *httptest.Server, scope string) string {
 	return body.Token
 }
 
+// tokenIDByScope returns the id of the one listed token bound to scope
+// ("category" or "category/project"), failing with the list body when the
+// list does not decode or holds no single such token.
+func tokenIDByScope(t *testing.T, ts *httptest.Server, scope string) string {
+	t.Helper()
+	r := do(t, ts, http.MethodGet, "/api/tokens", "", nil)
+	defer r.Body.Close()
+	raw, err := io.ReadAll(r.Body)
+	if err != nil || r.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/tokens = %d (%v): %s", r.StatusCode, err, raw)
+	}
+	var toks []Token
+	if err := json.Unmarshal(raw, &toks); err != nil {
+		t.Fatalf("decode token list: %v: %s", err, raw)
+	}
+	var ids []string
+	for _, tk := range toks {
+		if tk.Scope().String() == scope {
+			ids = append(ids, tk.ID)
+		}
+	}
+	if len(ids) != 1 {
+		t.Fatalf("tokens with scope %q = %v, want exactly one: %s", scope, ids, raw)
+	}
+	return ids[0]
+}
+
 // bearer builds request headers carrying a bearer token (and agent).
 func bearer(agent, token string) map[string]string {
 	return map[string]string{"X-Agent": agent, "Authorization": "Bearer " + token, "Content-Type": "application/json"}
@@ -2605,34 +2524,19 @@ func TestTokenAdmin_RequiresUnscoped(t *testing.T) {
 	}
 
 	// revoke: mint one unscoped first, then prove scoped revoke is refused.
-	revokeTok := mintToken(t, ts, "personal")
-	var rb struct{ ID string }
-	{
-		r := do(t, ts, http.MethodGet, "/api/tokens", "", map[string]string{"Content-Type": "application/json"})
-		var toks []Token
-		json.NewDecoder(r.Body).Decode(&toks)
-		r.Body.Close()
-		for _, tk := range toks {
-			if tk.Category == "personal" {
-				rb.ID = tk.ID
-			}
-		}
-	}
-	_ = revokeTok
-	if rb.ID == "" {
-		t.Fatalf("could not find the personal token id to revoke")
-	}
-	rh := do(t, ts, http.MethodPost, "/api/tokens/"+rb.ID+"/revoke", "", scoped("agent-w", "work"))
+	mintToken(t, ts, "personal")
+	revokeID := tokenIDByScope(t, ts, "personal")
+	rh := do(t, ts, http.MethodPost, "/api/tokens/"+revokeID+"/revoke", "", scoped("agent-w", "work"))
 	rh.Body.Close()
 	if rh.StatusCode != http.StatusForbidden {
 		t.Fatalf("scoped revoke = %d, want 403", rh.StatusCode)
 	}
-	rs := do(t, ts, http.MethodPost, "/api/tokens/"+rb.ID+"/revoke", "", bearer("agent-w", scopedTok))
+	rs := do(t, ts, http.MethodPost, "/api/tokens/"+revokeID+"/revoke", "", bearer("agent-w", scopedTok))
 	rs.Body.Close()
 	if rs.StatusCode != http.StatusForbidden {
 		t.Fatalf("scoped-token revoke = %d, want 403", rs.StatusCode)
 	}
-	ru := do(t, ts, http.MethodPost, "/api/tokens/"+rb.ID+"/revoke", "", map[string]string{"Content-Type": "application/json"})
+	ru := do(t, ts, http.MethodPost, "/api/tokens/"+revokeID+"/revoke", "", map[string]string{"Content-Type": "application/json"})
 	ru.Body.Close()
 	if ru.StatusCode != http.StatusOK {
 		t.Fatalf("unscoped revoke = %d, want 200", ru.StatusCode)
@@ -2675,22 +2579,16 @@ func TestInvalidTokenRejected(t *testing.T) {
 		t.Fatalf("bogus-token claim = %d, want 401", rb.StatusCode)
 	}
 	var body map[string]string
-	json.NewDecoder(rb.Body).Decode(&body)
+	if err := json.NewDecoder(rb.Body).Decode(&body); err != nil {
+		t.Fatalf("decode 401 body: %v", err)
+	}
 	if body["error"] != "unauthorized" {
 		t.Fatalf("401 body = %v, want unauthorized", body)
 	}
 
 	// Revoked token → 401 too.
 	tok := mintToken(t, ts, "work")
-	var id string
-	{
-		r := do(t, ts, http.MethodGet, "/api/tokens", "", nil)
-		var toks []Token
-		json.NewDecoder(r.Body).Decode(&toks)
-		r.Body.Close()
-		id = toks[0].ID
-	}
-	rr := do(t, ts, http.MethodPost, "/api/tokens/"+id+"/revoke", "", nil)
+	rr := do(t, ts, http.MethodPost, "/api/tokens/"+tokenIDByScope(t, ts, "work")+"/revoke", "", nil)
 	rr.Body.Close()
 	rv := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", "", bearer("agent-x", tok))
 	rv.Body.Close()

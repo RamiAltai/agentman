@@ -208,21 +208,8 @@ func TestCwfStoreMigrationErrorNamesStep(t *testing.T) {
 // FIND-0474: the v5 created_by backfill finds each task's creation event
 // through an index rather than scanning the event log.
 func TestCwfStoreV5BackfillIndexed(t *testing.T) {
-	db, err := sql.Open("sqlite", storeDSN(filepath.Join(t.TempDir(), "v5.db")))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := buildDBAtVersion(t, filepath.Join(t.TempDir(), "v5.db"), 5)
 	defer db.Close()
-	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schemaSQL); err != nil {
-		t.Fatal(err)
-	}
-	if schemaMigrations[3].version != 5 {
-		t.Fatalf("schemaMigrations[3] = v%d, want v5", schemaMigrations[3].version)
-	}
-	if err := runMigrations(db, 5, schemaMigrations[:4]); err != nil {
-		t.Fatal(err)
-	}
 	var plan strings.Builder
 	rows, err := db.Query(`EXPLAIN QUERY PLAN SELECT e.actor FROM events e
 	       WHERE e.task_id=1 AND e.kind='task.created' ORDER BY e.id DESC LIMIT 1`)
