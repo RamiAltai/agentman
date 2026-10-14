@@ -932,6 +932,7 @@ function growTitle() { const ta = $("sheet").querySelector(".mtitle"); if (ta) a
 
 async function openTask(id) {
   openTaskId = id;
+  depCandidates = null; // the picker cache only lives across live refreshes of one open modal
   try {
     const t = await api("GET", "/api/tasks/" + id);
     renderModal(t);
@@ -1659,6 +1660,7 @@ async function resyncNow() {
   try {
     await resync();
     if (view !== "overview") await loadRail(); // loadOverview already refreshed both
+    depCandidates = null; // a dropped stream may have lost the events that invalidate it
     refreshModal();
     resyncDelay = 1000;
     if (es && es.readyState === 1) setStatus("live", "ok");
