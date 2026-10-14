@@ -67,7 +67,7 @@ func TestCreateTaskEmptyTitle400(t *testing.T) {
 }
 
 func TestLostClaim409(t *testing.T) {
-	ts := newTestServer(t)
+	ts, st := newTestServerWithStore(t)
 	mustCreateProject(t, ts, "web")
 	id := mustCreateTask(t, ts, "web", "Claimable")
 
@@ -78,12 +78,17 @@ func TestLostClaim409(t *testing.T) {
 	if r1.StatusCode != http.StatusOK {
 		t.Fatalf("first claim = %d, want 200", r1.StatusCode)
 	}
-	// Second claim by agent-b loses.
+	// Second claim by agent-b loses and changes nothing (agent-a keeps it).
+	before := cwfStoreSnapshot(t, st)
 	r2 := do(t, ts, http.MethodPost, "/api/tasks/"+id+"/claim", "",
 		map[string]string{"X-Agent": "agent-b"})
 	defer r2.Body.Close()
 	if r2.StatusCode != http.StatusConflict {
 		t.Fatalf("lost claim = %d, want 409", r2.StatusCode)
+	}
+	cwfStoreAssertUnchanged(t, st, before, "lost claim")
+	if got := cwfStoreGetTask(t, ts, id); got.Assignee != "agent-a" {
+		t.Fatalf("assignee after lost claim = %q, want agent-a", got.Assignee)
 	}
 }
 
@@ -188,7 +193,8 @@ func TestStealStaleEndpoint(t *testing.T) {
 		t.Fatal("task.reclaimed event not found in /api/events")
 	}
 
-	// Fresh → 409 not_stale naming the holder.
+	// Fresh → 409 not_stale naming the holder; neither rejection below writes.
+	before := cwfStoreSnapshot(t, store)
 	rf := do(t, ts, http.MethodPost, "/api/tasks/"+freshID+"/claim",
 		`{"steal_stale":"1h"}`,
 		map[string]string{"X-Agent": "agent-b", "Content-Type": "application/json"})
@@ -203,6 +209,7 @@ func TestStealStaleEndpoint(t *testing.T) {
 	if body["error"] != "not_stale" || body["assignee"] != "agent-a" {
 		t.Fatalf("409 body = %v, want error=not_stale assignee=agent-a", body)
 	}
+	cwfStoreAssertUnchanged(t, store, before, "steal of a fresh claim")
 
 	// Malformed duration → 400.
 	rb := do(t, ts, http.MethodPost, "/api/tasks/"+freshID+"/claim",
@@ -212,6 +219,7 @@ func TestStealStaleEndpoint(t *testing.T) {
 	if rb.StatusCode != http.StatusBadRequest {
 		t.Fatalf("steal bad duration = %d, want 400", rb.StatusCode)
 	}
+	cwfStoreAssertUnchanged(t, store, before, "steal with a bad duration")
 }
 
 func TestHostGuard(t *testing.T) {
@@ -445,7 +453,7 @@ func TestArchiveUnarchiveEndpoints(t *testing.T) {
 }
 
 func TestCreateTaskIntoArchivedProject400(t *testing.T) {
-	ts := newTestServer(t)
+	ts, st := newTestServerWithStore(t)
 	mustCreateProject(t, ts, "archproj")
 
 	// Archive the project.
@@ -455,7 +463,9 @@ func TestCreateTaskIntoArchivedProject400(t *testing.T) {
 		t.Fatalf("archive = %d, want 200", r.StatusCode)
 	}
 
-	// Attempt to create a task into the archived project — must get 400.
+	// Attempt to create a task into the archived project — must get 400 and
+	// write no task or event.
+	before := cwfStoreSnapshot(t, st)
 	resp := do(t, ts, http.MethodPost, "/api/tasks",
 		`{"project":"archproj","title":"blocked task"}`,
 		map[string]string{"Content-Type": "application/json"})
@@ -470,6 +480,7 @@ func TestCreateTaskIntoArchivedProject400(t *testing.T) {
 	if body["error"] != "project_archived" {
 		t.Fatalf("error body = %q, want project_archived", body["error"])
 	}
+	cwfStoreAssertUnchanged(t, st, before, "create into archived project")
 }
 
 func TestDeleteTaskEndpoint(t *testing.T) {
@@ -719,7 +730,7 @@ func TestAddDepEndpoint(t *testing.T) {
 }
 
 func TestAddDepCycleEndpoint(t *testing.T) {
-	ts := newTestServer(t)
+	ts, st := newTestServerWithStore(t)
 	mustCreateProject(t, ts, "cyc")
 	id1 := mustCreateTask(t, ts, "cyc", "T1")
 	id2 := mustCreateTask(t, ts, "cyc", "T2")
@@ -733,7 +744,8 @@ func TestAddDepCycleEndpoint(t *testing.T) {
 		t.Fatalf("first dep = %d, want 200", r1.StatusCode)
 	}
 
-	// id1 depends on id2 → cycle → 400
+	// id1 depends on id2 → cycle → 400, and no edge or event is added.
+	before := cwfStoreSnapshot(t, st)
 	r2 := do(t, ts, http.MethodPost, "/api/tasks/"+id1+"/deps",
 		`{"depends_on":`+id2+`}`,
 		map[string]string{"Content-Type": "application/json"})
@@ -741,6 +753,7 @@ func TestAddDepCycleEndpoint(t *testing.T) {
 	if r2.StatusCode != http.StatusBadRequest {
 		t.Fatalf("cycle dep = %d, want 400", r2.StatusCode)
 	}
+	cwfStoreAssertUnchanged(t, st, before, "cyclic dep")
 }
 
 func TestRemoveDepEndpoint(t *testing.T) {
@@ -775,7 +788,7 @@ func TestRemoveDepEndpoint(t *testing.T) {
 }
 
 func TestClaimBlockedEndpoint(t *testing.T) {
-	ts := newTestServer(t)
+	ts, st := newTestServerWithStore(t)
 	mustCreateProject(t, ts, "blkproj")
 	id1 := mustCreateTask(t, ts, "blkproj", "Prereq")
 	id2 := mustCreateTask(t, ts, "blkproj", "Blocked task")
@@ -786,7 +799,8 @@ func TestClaimBlockedEndpoint(t *testing.T) {
 		map[string]string{"Content-Type": "application/json"})
 	r.Body.Close()
 
-	// Attempt to claim id2 → 409 blocked.
+	// Attempt to claim id2 → 409 blocked; the task stays unassigned.
+	before := cwfStoreSnapshot(t, st)
 	rc := do(t, ts, http.MethodPost, "/api/tasks/"+id2+"/claim", "",
 		map[string]string{"X-Agent": "agent-x"})
 	defer rc.Body.Close()
@@ -802,6 +816,10 @@ func TestClaimBlockedEndpoint(t *testing.T) {
 	}
 	if _, ok := body["open_prereqs"]; !ok {
 		t.Fatal("response missing open_prereqs field")
+	}
+	cwfStoreAssertUnchanged(t, st, before, "blocked claim")
+	if got := cwfStoreGetTask(t, ts, id2); got.Assignee != "" || got.Status != "todo" {
+		t.Fatalf("blocked task after claim = assignee %q status %q, want unassigned todo", got.Assignee, got.Status)
 	}
 }
 

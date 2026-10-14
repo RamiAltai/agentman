@@ -299,7 +299,7 @@ func TestStealStaleClaim(t *testing.T) {
 					t.Fatalf("event data %s does not name previous assignee", ev.Data)
 				}
 				var n int
-				st.db.QueryRow("SELECT COUNT(*) FROM events WHERE kind='task.reclaimed' AND task_id=?", id).Scan(&n)
+				n = cwfStoreCount(t, st, "SELECT COUNT(*) FROM events WHERE kind='task.reclaimed' AND task_id=?", id)
 				if n != 1 {
 					t.Fatalf("task.reclaimed event rows = %d, want 1", n)
 				}
@@ -521,7 +521,7 @@ func TestStealRaceExactlyOneWinner(t *testing.T) {
 		t.Fatalf("final owner = %q, want winner %q", final.Assignee, winner)
 	}
 	var n int
-	st.db.QueryRow("SELECT COUNT(*) FROM events WHERE kind='task.reclaimed' AND task_id=?", task.ID).Scan(&n)
+	n = cwfStoreCount(t, st, "SELECT COUNT(*) FROM events WHERE kind='task.reclaimed' AND task_id=?", task.ID)
 	if n != 1 {
 		t.Fatalf("task.reclaimed event rows = %d, want exactly 1", n)
 	}
@@ -960,7 +960,7 @@ func TestDeleteTaskCascadesComments(t *testing.T) {
 
 	// Comment must also be gone (cascade).
 	var count int
-	st.db.QueryRow("SELECT COUNT(*) FROM comments WHERE task_id=?", task.ID).Scan(&count)
+	count = cwfStoreCount(t, st, "SELECT COUNT(*) FROM comments WHERE task_id=?", task.ID)
 	if count != 0 {
 		t.Fatalf("comments after task delete = %d, want 0", count)
 	}
@@ -1026,11 +1026,11 @@ func TestDeleteCommentRemovesOnlyComment(t *testing.T) {
 
 	// First comment gone, second still present.
 	var count int
-	st.db.QueryRow("SELECT COUNT(*) FROM comments WHERE id=?", c1.ID).Scan(&count)
+	count = cwfStoreCount(t, st, "SELECT COUNT(*) FROM comments WHERE id=?", c1.ID)
 	if count != 0 {
 		t.Fatalf("comment c1 still exists after delete")
 	}
-	st.db.QueryRow("SELECT COUNT(*) FROM comments WHERE id=?", c2.ID).Scan(&count)
+	count = cwfStoreCount(t, st, "SELECT COUNT(*) FROM comments WHERE id=?", c2.ID)
 	if count != 1 {
 		t.Fatalf("comment c2 should still exist, count=%d", count)
 	}
@@ -1058,7 +1058,7 @@ func TestDeleteCommentRemovesOnlyComment(t *testing.T) {
 			t.Fatalf("DeleteComment(task %d, c2) = %v, want ErrNotFound", tid, err)
 		}
 	}
-	st.db.QueryRow("SELECT COUNT(*) FROM comments WHERE id=? AND task_id=?", c2.ID, task.ID).Scan(&count)
+	count = cwfStoreCount(t, st, "SELECT COUNT(*) FROM comments WHERE id=? AND task_id=?", c2.ID, task.ID)
 	if count != 1 {
 		t.Fatalf("c2 deleted by a wrong-task DeleteComment, count=%d", count)
 	}
@@ -1103,7 +1103,7 @@ func TestDeleteProjectCascades(t *testing.T) {
 
 	// Comments gone (cascade).
 	var count int
-	st.db.QueryRow("SELECT COUNT(*) FROM comments WHERE task_id=?", task.ID).Scan(&count)
+	count = cwfStoreCount(t, st, "SELECT COUNT(*) FROM comments WHERE task_id=?", task.ID)
 	if count != 0 {
 		t.Fatalf("comments after project delete = %d, want 0", count)
 	}
@@ -1111,7 +1111,7 @@ func TestDeleteProjectCascades(t *testing.T) {
 	// project.deleted event persists in event log (events are NOT deleted).
 	// Use direct DB query since ListEvents filters by archived projects.
 	var evCount int
-	st.db.QueryRow("SELECT COUNT(*) FROM events WHERE kind='project.deleted'").Scan(&evCount)
+	evCount = cwfStoreCount(t, st, "SELECT COUNT(*) FROM events WHERE kind='project.deleted'")
 	if evCount == 0 {
 		t.Error("project.deleted event not found in event log")
 	}
@@ -1390,7 +1390,7 @@ func TestDeleteTaskCascadesDeps(t *testing.T) {
 		t.Fatalf("DeleteTask: %v", err)
 	}
 	var count int
-	st.db.QueryRow("SELECT COUNT(*) FROM task_deps WHERE depends_on_id=?", t1).Scan(&count)
+	count = cwfStoreCount(t, st, "SELECT COUNT(*) FROM task_deps WHERE depends_on_id=?", t1)
 	if count != 0 {
 		t.Fatalf("task_deps row survived deletion of prereq, count=%d", count)
 	}
@@ -1867,7 +1867,7 @@ func TestNextTaskNoneReady(t *testing.T) {
 		t.Fatalf("NextTask err = %v, want ErrNotFound", err)
 	}
 	var n int
-	st.db.QueryRow("SELECT COUNT(*) FROM events WHERE kind='task.claimed'").Scan(&n)
+	n = cwfStoreCount(t, st, "SELECT COUNT(*) FROM events WHERE kind='task.claimed'")
 	if n != 0 {
 		t.Fatalf("task.claimed event rows = %d, want 0 (no event on miss)", n)
 	}
@@ -2248,7 +2248,7 @@ func TestDeleteTaskCascadesLabels(t *testing.T) {
 		t.Fatalf("DeleteTask: %v", err)
 	}
 	var count int
-	st.db.QueryRow("SELECT COUNT(*) FROM task_labels WHERE task_id=?", t1).Scan(&count)
+	count = cwfStoreCount(t, st, "SELECT COUNT(*) FROM task_labels WHERE task_id=?", t1)
 	if count != 0 {
 		t.Fatalf("task_labels rows survived task deletion, count=%d", count)
 	}
@@ -2941,7 +2941,7 @@ func TestPatchTaskMetaAtomicOneEvent(t *testing.T) {
 		t.Fatalf("delta = %s, want both keys", ev.Data)
 	}
 	var n int
-	st.db.QueryRow("SELECT COUNT(*) FROM events WHERE kind='task.patched' AND task_id=?", t1).Scan(&n)
+	n = cwfStoreCount(t, st, "SELECT COUNT(*) FROM events WHERE kind='task.patched' AND task_id=?", t1)
 	if n != 1 {
 		t.Fatalf("task.patched events = %d, want 1", n)
 	}
@@ -2954,11 +2954,11 @@ func TestPatchTaskMetaAtomicOneEvent(t *testing.T) {
 		t.Fatalf("oversized second value err = %v, want ErrValidation", err)
 	}
 	var rows int
-	st2.db.QueryRow("SELECT COUNT(*) FROM task_meta WHERE task_id=?", ta).Scan(&rows)
+	rows = cwfStoreCount(t, st2, "SELECT COUNT(*) FROM task_meta WHERE task_id=?", ta)
 	if rows != 0 {
 		t.Fatalf("task_meta rows after failed patch = %d, want 0 (tx rollback)", rows)
 	}
-	st2.db.QueryRow("SELECT COUNT(*) FROM events WHERE kind='task.patched' AND task_id=?", ta).Scan(&rows)
+	rows = cwfStoreCount(t, st2, "SELECT COUNT(*) FROM events WHERE kind='task.patched' AND task_id=?", ta)
 	if rows != 0 {
 		t.Fatalf("events after failed patch = %d, want 0", rows)
 	}
@@ -3261,11 +3261,15 @@ func TestDeleteTaskCascadesMeta(t *testing.T) {
 	if _, _, err := st.PatchTask(t1, map[string]any{"meta": map[string]any{"auto": "x"}}, "a"); err != nil {
 		t.Fatal(err)
 	}
+	// The row must exist first, or the zero count below proves nothing.
+	if n := cwfStoreCount(t, st, "SELECT COUNT(*) FROM task_meta WHERE task_id=?", t1); n != 1 {
+		t.Fatalf("task_meta rows before delete = %d, want 1", n)
+	}
 	if _, err := st.DeleteTask(t1, "alice"); err != nil {
 		t.Fatalf("DeleteTask: %v", err)
 	}
 	var count int
-	st.db.QueryRow("SELECT COUNT(*) FROM task_meta WHERE task_id=?", t1).Scan(&count)
+	count = cwfStoreCount(t, st, "SELECT COUNT(*) FROM task_meta WHERE task_id=?", t1)
 	if count != 0 {
 		t.Fatalf("task_meta rows survived task deletion, count=%d", count)
 	}
@@ -3702,7 +3706,8 @@ func TestCreateToken_ScopeValidation(t *testing.T) {
 	}
 }
 
-// TestRevokeToken: unknown id and double-revoke both 404.
+// TestRevokeToken: unknown id and double-revoke both 404; a revoke sets
+// revoked_at (returned and listed) and leaves other tokens resolvable.
 func TestRevokeToken(t *testing.T) {
 	st := openTestStore(t)
 	seedScopeWorld(t, st)
@@ -3715,8 +3720,35 @@ func TestRevokeToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateToken: %v", err)
 	}
-	if _, err := st.RevokeToken(tok.ID); err != nil {
+	keepPlain, keep, err := st.CreateToken(Scope{Category: "work"})
+	if err != nil {
+		t.Fatalf("CreateToken keep: %v", err)
+	}
+	revoked, err := st.RevokeToken(tok.ID)
+	if err != nil {
 		t.Fatalf("first revoke: %v", err)
+	}
+	if revoked.ID != tok.ID || revoked.RevokedAt == "" {
+		t.Fatalf("RevokeToken returned %+v, want id %s with revoked_at set", revoked, tok.ID)
+	}
+	// ListTokens must show the revocation too (it is what `am token ls` and
+	// the dashboard render), and leave the other token active.
+	toks, err := st.ListTokens()
+	if err != nil {
+		t.Fatalf("ListTokens: %v", err)
+	}
+	got := map[string]string{}
+	for _, lt := range toks {
+		got[lt.ID] = lt.RevokedAt
+	}
+	if got[tok.ID] != revoked.RevokedAt {
+		t.Fatalf("listed revoked_at = %q, want %q", got[tok.ID], revoked.RevokedAt)
+	}
+	if ra, ok := got[keep.ID]; !ok || ra != "" {
+		t.Fatalf("unrevoked token listed=%v revoked_at=%q, want listed and active", ok, ra)
+	}
+	if sc, err := st.ResolveToken(keepPlain); err != nil || sc.Category != "work" {
+		t.Fatalf("ResolveToken(unrevoked) = %+v, %v; want work scope", sc, err)
 	}
 	if _, err := st.RevokeToken(tok.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("double revoke err = %v, want ErrNotFound", err)
