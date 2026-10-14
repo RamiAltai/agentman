@@ -177,8 +177,9 @@ sink guard in `web_test.go`. Behavioral dashboard JS logic is not automatically 
   create/patch/get and the API and UI.
 - There is **no migration runner** (ADR-033): `schema.sql` is the single schema, stamped
   `schema_version` 1, and `OpenStore` refuses any other version. Change a table by editing
-  `schema.sql` directly — no migration step while there is no live data to keep (`CREATE TABLE IF
-  NOT EXISTS` does not alter an existing DB file, so recreate it). Reintroduce migrations only
+  `schema.sql` directly — no migration step while there is no live data to keep. The edit changes
+  `schema_hash`, so `OpenStore` refuses existing DB files made from the old schema: start a fresh
+  `--db`. Reintroduce migrations only
   when a live schema first has to change.
 
 ## Adding Tests

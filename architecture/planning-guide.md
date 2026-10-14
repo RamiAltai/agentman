@@ -68,8 +68,8 @@ Flag the change if it touches any of these invariants:
 ## Data Impact Checklist
 
 - [ ] Schema change? There is **no migration runner** (ADR-033) — edit `cmd/am/schema.sql` (still
-  `schema_version` 1; `OpenStore` refuses any other) and add a `cmd/am/schema_test.go` case. An
-  existing DB file is not altered (`CREATE TABLE IF NOT EXISTS`), so it needs a fresh DB; once a live
+  `schema_version` 1; `OpenStore` refuses any other) and add a `cmd/am/schema_test.go` case. The
+  edit changes `schema_hash`, so existing DB files are refused and need a fresh DB; once a live
   schema with data to keep has to change, reintroduce migrations first.
 - [ ] New columns threaded through `schema.sql` → `store.go` structs → `CreateTask`/`PatchTask`/
   `getTaskTx` → API → dashboard?

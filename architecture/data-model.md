@@ -13,7 +13,7 @@ lexically.
 
 | Entity | Purpose | Source |
 |--------|---------|--------|
-| `meta` | Key/value config; currently only `schema_version` (always `1`; `OpenStore` refuses any other — see [Schema](#schema)) | `schema.sql` |
+| `meta` | Key/value config: `schema_version` (always `1`) and `schema_hash` (the `schema.sql` the DB was made from); `OpenStore` refuses a mismatch of either — see [Schema](#schema) | `schema.sql` |
 | `categories` | The layer above projects (`instance → category → project → task`): `uid` stable id, `slug` unique lowercase, `name`, `archived_at` | `schema.sql`, `store.go Category` |
 | `projects` | Named boards (`slug` unique, `name`, `archived_at`, `category_id`, `uid` stable id, `vault_project_id`/`vault_path` binding) | `schema.sql`, `store.go Project` |
 | `tasks` | Tickets (status, priority, assignee, dual id) | `schema.sql`, `store.go Task` |
@@ -30,7 +30,7 @@ lexically.
   AUTOINCREMENT`, so a deleted task's id is never reissued (`projects.id` and `events.id`
   likewise). **`tasks.ref`** — per-project sequence (`web-3`), allocated as `MAX(ref)+1`
   within the project in the insert tx (`store.go CreateTask`); `UNIQUE(project_id, ref)`.
-- **`tasks.created_by`** — TEXT, the actor that created the task (Phase Q, for the proposals
+- **`tasks.created_by`** — TEXT NOT NULL, the actor that created the task (Phase Q, for the proposals
   carve-out: a scoped agent may comment on its OWN proposal tickets). Set on every new task from the
   request actor (`actorOf(r)`, default `"human"`; the store-level `actorOr` fallback `"anon"` is
   only reachable for direct store callers passing an empty actor). The column is nullable, but
@@ -264,9 +264,13 @@ pruned prefix — anything that replays or backfills from events must tolerate m
 `schema_version` `1` (`currentSchemaVersion = 1` in `store.go`). `OpenStore` executes it
 (`CREATE TABLE IF NOT EXISTS` + `INSERT OR IGNORE … schema_version`), **refuses any DB whose
 `schema_version` is not 1** (`database schema_version N, this am supports 1`; an unreadable version
-is an error too), and seeds the default `general` category itself. There is no migration runner:
-there is no older data to keep (ADR-033). To change the schema, edit `schema.sql`; a migration step
-comes back only when a live schema first has to change.
+is an error too), and seeds the default `general` category itself. It also stamps
+`meta.schema_hash` (sha256 of `schema.sql` without comments and whitespace) and **refuses a DB made
+from a different `schema.sql`** before running the DDL (`database was created from a different
+schema … start a fresh --db`), since `CREATE TABLE IF NOT EXISTS` would not alter it; import
+requires the same hash. Comment-only edits keep the hash. There is no migration runner: there is no
+older data to keep (ADR-033). To change the schema, edit `schema.sql` and start a fresh DB; a
+migration step comes back only when a live schema first has to change.
 
 Backup/restore:
 

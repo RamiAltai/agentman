@@ -6,9 +6,9 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 ## Architecture Risks
 
 - **No schema migrations** (Low, deliberate — ADR-033). `schema.sql` is the single schema at
-  `schema_version` 1; `OpenStore` and `validateImportCandidate` refuse any other version. Residual:
-  a `schema.sql` change does not alter an existing DB file (`CREATE TABLE IF NOT EXISTS`), so until
-  migrations are reintroduced a schema change means a fresh DB. → `data-model.md` (Schema),
+  `schema_version` 1; `OpenStore` and `validateImportCandidate` refuse any other version, and any DB
+  made from a different `schema.sql` (`meta.schema_hash`). Residual: until migrations are
+  reintroduced a schema change means a fresh DB (the old one is refused, not upgraded). → `data-model.md` (Schema),
   `decision-records.md` ADR-033.
 - **Single-writer throughput ceiling** (Low for stated scope). `SetMaxOpenConns(1)` serializes all
   writes; correct and simple, but caps write concurrency. → ADR-003.

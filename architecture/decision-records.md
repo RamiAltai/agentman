@@ -1342,7 +1342,7 @@ record instead.
   17 migration-only tests, a baseline the real schema had to be reconstructed from).
 - Consequences: schema changes are edits to `schema.sql`. **Migrations are reintroduced only when a
   live schema first has to change** under data someone keeps; until then, a changed schema means a
-  fresh DB. Supersedes ADR-010; amends ADR-008/012/013/015/022/025/027/029.
+  fresh DB, enforced by `meta.schema_hash` (a DB made from another `schema.sql` is refused). Supersedes ADR-010; amends ADR-008/012/013/015/022/025/027/029.
 - Evidence: `cmd/am/schema.sql`; `cmd/am/store.go` (`OpenStore`, `currentSchemaVersion`);
   `cmd/am/db.go` (`validateImportCandidate`); `cmd/am/identity.go` (`readIdentityFile`);
   `cmd/am/schema_test.go` (replaces `migrate_test.go`); commit `0f493c9`.

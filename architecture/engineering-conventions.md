@@ -215,8 +215,8 @@ SVG elements and `el()` for any HTML wrapper elements (e.g., the detail panel ne
 - ❌ Printing chatter to **stdout** in the CLI (breaks `id=$(am new …)` and token budgets).
 - ❌ Editing `cmd/am/web/*` and forgetting to rebuild — the running server serves stale embedded assets.
 - ❌ Editing a table in `schema.sql` and assuming existing DB files get it — there is **no
-  migration runner** (ADR-033) and `CREATE TABLE IF NOT EXISTS` never alters an existing table, so
-  a changed schema needs a fresh DB. Schema changes are edits to `schema.sql` (still
+  migration runner** (ADR-033); `CREATE TABLE IF NOT EXISTS` never alters an existing table, and
+  `OpenStore` refuses a DB whose `schema_hash` no longer matches, so a changed schema needs a fresh DB. Schema changes are edits to `schema.sql` (still
   `schema_version` 1); reintroduce migrations only when a live schema first has to change.
 
 ## Unknowns

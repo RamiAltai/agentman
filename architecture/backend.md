@@ -470,8 +470,8 @@ project deliberately adopts no JS test runner (preserves the single-binary/no-np
 
 ## Risks and Gaps
 
-- **No migrations** (ADR-033): `OpenStore` refuses any DB whose `schema_version` is not 1, and a
-  `schema.sql` edit does not alter an existing DB file (`CREATE TABLE IF NOT EXISTS`), so a schema
-  change means a fresh DB until migrations are reintroduced.
+- **No migrations** (ADR-033): `OpenStore` refuses any DB whose `schema_version` is not 1 or whose
+  `meta.schema_hash` differs from the current `schema.sql`, so after a schema change the old DB is
+  refused and a fresh one is needed until migrations are reintroduced.
 - **Single-writer** caps write throughput; fine for a personal board, unproven at scale.
 - **No request size/time limits** beyond a 1 MiB body cap and `ReadHeaderTimeout`.
