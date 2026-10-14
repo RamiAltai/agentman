@@ -1,24 +1,22 @@
 "use strict";
 
 const COLS = [["todo", "Todo"], ["doing", "In Progress"], ["blocked", "Blocked"], ["done", "Done"]];
-const STALE_MS = 30 * 60 * 1000; // a doing+assigned card with no activity this long gets a stale badge
-const STALE_FILTER = "30m";      // ?stale= duration sent when the Stale board-filter is on (matches STALE_MS)
+const STALE_MINUTES = 30;                   // a doing+assigned card with no activity this long is stale
+const STALE_MS = STALE_MINUTES * 60 * 1000; // the card's Stale badge
+const STALE_FILTER = STALE_MINUTES + "m";   // ?stale= duration sent when the Stale board-filter is on
+const DONE_FETCH_LIMIT = 500;    // done tasks accumulate forever, so only they are capped; open work never is
 const ST = { todo: "var(--st-todo)", doing: "var(--st-doing)", blocked: "var(--st-blocked)", done: "var(--st-done)" };
 const ST_LABEL = { todo: "Todo", doing: "Doing", blocked: "Blocked", done: "Done" };
-const PRIO = ["#f4756b", "#f8b738", "#8b93a4", "#6e7681"]; // 0 urgent .. 3 low
-// Themed priority colors (mirror the --prio-N CSS custom properties, which carry
-// AA-clearing light/dark values). Use these — not the raw PRIO[] hex — anywhere a
-// priority color is painted as text/border (e.g. the graph nodes, detail chip, and
-// legend), so the color adapts per theme. var() resolves in both inline style and
-// SVG presentation attributes (same as ST[]/var(--st-*)).
-const PRIO_VAR = ["var(--prio-0)", "var(--prio-1)", "var(--prio-2)", "var(--prio-3)"];
-const PRIO_LABEL = ["Urgent", "High", "", ""];
-// Always-present rank token for EVERY priority level (text, not color-only). The
-// rank ("P0".."P3") plus the word make priority readable for all four levels;
-// Normal/Low used to render nothing.
-const PRIO_RANK = ["P0", "P1", "P2", "P3"];
-const PRIO_WORD = ["Urgent", "High", "Normal", "Low"];
-const PRIO_OPTS = ["0 — Urgent", "1 — High", "2 — Normal", "3 — Low"];
+// Priority levels by rank (0 urgent .. 3 low): the word, the always-present rank
+// token ("P0".."P3", so priority is readable as text, not color alone) and the
+// themed --prio-N color (AA-clearing light/dark values in app.css; var() resolves
+// in inline style and SVG presentation attributes alike). Every priority label,
+// option and color is derived from this table.
+const PRIORITIES = ["Urgent", "High", "Normal", "Low"].map((word, rank) =>
+  ({ rank, word, token: "P" + rank, color: "var(--prio-" + rank + ")" }));
+// prio returns a task's priority level; an unknown value reads as Low.
+function prio(n) { return PRIORITIES[n] || PRIORITIES[PRIORITIES.length - 1]; }
+
 // Per-kind feed glyphs (decorative; .ev-text states the event in words). These
 // carry the non-color-only meaning the design asks for.
 const EV_GLYPH = { claimed: "▸", status: "⇄", done: "✓", blocked: "⏸", comment: "💬", other: "•" };
@@ -40,12 +38,13 @@ let selected = new Set();    // selected project slugs; empty = "All" (within th
 let view = "overview";       // "overview" (category home) | "all" (cross-category board) | "category"
 let activeCategory = "";     // category slug when view==="category"
 let categories = [];         // CategoryStat[] for the overview (counts + active_agents)
-let overviewTimer = null;    // debounce for live overview count refresh
-let railTimer = null;        // debounce for live rail count refresh (projects + categories)
 let pendingProject = "";     // a project slug to auto-select after the next applyView() (see goProject)
 let tasks = new Map();       // id -> task (terse)
+let doneCapped = false;      // true when the done fetch hit DONE_FETCH_LIMIT (done column shows "N+")
 let cursor = 0;              // highest event id seen (SSE since=)
-let es = null, backoff = 1000, refreshTimer = null, openTaskId = null, lastFocus = null, dragId = null;
+let streamDropped = false;   // the stream errored; the next onopen resyncs (the server replays at most 500 missed events)
+let resyncTimer = null, resyncDelay = 1000; // retry of a failed live reconcile (capped backoff)
+let es = null, backoff = 1000, openTaskId = null, lastFocus = null, dragId = null;
 let filterQ = "";            // search-box text filter (server-side ?q=)
 let filterLabel = "";        // active label filter (server-side ?label=)
 let filterReady = false;     // board filter: ready tasks only (server-side ?ready=true)
@@ -55,19 +54,30 @@ let filterMine = "";         // board filter: assignee (server-side ?assignee=)
 let filterMetaKey = "";      // board filter: tasks carrying a meta key (server-side ?meta_key=)
 let searchTimer = null;      // search-box input debounce
 let feedOldest = 0;          // lowest event id currently in #feedList (0 = none loaded)
-let feedPaginated = false;   // true once the user has clicked "Load older"; trimFeed is then skipped
-                             // to avoid fighting pagination (raising the cap is the other option,
-                             // but skipping trimming is simpler since the user explicitly asked for more)
+let feedCap = 200;           // #feedList row cap; each "Load older" page raises it by the rows it added,
+                             // so live events don't pop rows the user just loaded
 let loadOlderBtn = null;     // reference to the "Load older" button element
+let boardSeq = 0, feedSeq = 0; // request generations: a load whose response is no longer the latest is dropped
+let depCandidates = null;    // {project, list: Promise<task[]>}: the prerequisite picker's tasks, reused across modal refreshes
+const coalesceTimers = {};   // key -> pending timer (see coalesce)
 
 const $ = (id) => document.getElementById(id);
+
+// coalesce runs fn once, ms after the first call for key since the last run. Live
+// event bursts share one refresh, and unlike a clear-and-rearm debounce a steady
+// stream cannot postpone it indefinitely: it fires at least every ms.
+function coalesce(key, fn, ms) {
+  if (coalesceTimers[key]) return;
+  coalesceTimers[key] = setTimeout(() => { coalesceTimers[key] = null; fn(); }, ms);
+}
 
 // Storage may be unavailable (private mode, sandboxed iframe) — never let it break the app.
 function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
 function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* ignore */ } }
 
 // el builds DOM safely: string children become text nodes (never innerHTML),
-// so agent-supplied titles/comments can't inject markup.
+// so agent-supplied titles/comments can't inject markup. An on* prop must be a
+// function; a string one would become an inline-script attribute, so it is dropped.
 function el(tag, props, ...kids) {
   const n = document.createElement(tag);
   props = props || {};
@@ -76,7 +86,7 @@ function el(tag, props, ...kids) {
     if (v == null) continue;
     if (k === "class") n.className = v;
     else if (k === "value") n.value = v;
-    else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2).toLowerCase(), v);
+    else if (k.startsWith("on")) { if (typeof v === "function") n.addEventListener(k.slice(2).toLowerCase(), v); }
     else n.setAttribute(k, v);
   }
   for (const kid of kids) {
@@ -84,6 +94,12 @@ function el(tag, props, ...kids) {
     n.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
   }
   return n;
+}
+
+// onActivate returns a keydown handler that runs fn on Enter or Space, the keys
+// that activate a role="button"/"link" element. Pass the same fn as its onclick.
+function onActivate(fn) {
+  return (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fn(e); } };
 }
 
 // ---------- loading skeletons + toasts (additive, el()-only) ----------
@@ -196,6 +212,7 @@ function setStatus(text, cls) {
 async function loadProjects() {
   projects = await api("GET", "/api/projects");
   renderRail();
+  setBreadcrumb();
 }
 
 // loadCategories fetches the category list used by the rail tree. loadOverview()
@@ -211,7 +228,7 @@ async function loadBoard() {
   // where a search filter is meaningless. Filtering server-side means the SSE
   // debounce (which re-calls loadBoard) keeps the filter across live reloads,
   // and body text can match (the list payload has no body for client matching).
-  const extra = { limit: 500 };
+  const extra = {};
   if (filterQ) extra.q = filterQ;
   if (filterLabel) extra.label = filterLabel;
   if (filterReady) extra.ready = "true";
@@ -219,16 +236,38 @@ async function loadBoard() {
   if (filterStale) extra.stale = STALE_FILTER;
   if (filterMine) extra.assignee = filterMine;
   if (filterMetaKey) extra.meta_key = filterMetaKey;
-  const list = await api("GET", "/api/tasks" + qstr(extra));
-  tasks = new Map(list.map((t) => [t.id, t]));
+  // Two fetches: a single capped list sorts by priority first, so old done P0-P2
+  // tasks would push open P3 work out of the result. Open statuses are uncapped.
+  const seq = ++boardSeq;
+  let open, done;
+  try {
+    [open, done] = await Promise.all([
+      api("GET", "/api/tasks" + qstr({ ...extra, status: "todo,doing,blocked" })),
+      api("GET", "/api/tasks" + qstr({ ...extra, status: "done", limit: DONE_FETCH_LIMIT })),
+    ]);
+  } catch (e) {
+    if (seq !== boardSeq) return; // a newer load owns the board; its outcome is the one to report
+    throw e;
+  }
+  if (seq !== boardSeq) return; // overlapping loads can resolve out of order
+  doneCapped = done.length >= DONE_FETCH_LIMIT;
+  tasks = new Map(open.concat(done).map((t) => [t.id, t]));
   renderBoard();
 }
 
 async function loadFeed() {
-  const res = await api("GET", "/api/events" + qstr({ tail: 50 }));
+  const seq = ++feedSeq;
+  let res;
+  try {
+    res = await api("GET", "/api/events" + qstr({ tail: 50 }));
+  } catch (e) {
+    if (seq !== feedSeq) return;
+    throw e;
+  }
+  if (seq !== feedSeq) return; // a newer load (view/selection change) owns the feed
   const list = $("feedList");
   list.replaceChildren();
-  feedPaginated = false; // reset pagination state on full reload
+  feedCap = 200; // reset pagination state on full reload
   if (!res.events.length) {
     list.append(el("li", { class: "feed-empty" }, "No activity yet"));
     feedOldest = 0;
@@ -239,13 +278,19 @@ async function loadFeed() {
   }
   cursor = Math.max(cursor, res.last_id || 0);
 
-  // Rebuild the "Load older" button outside #feedList so trimFeed can't remove it.
+  setLoadOlder(feedOldest > 0);
+}
+
+// setLoadOlder drops the "Load older" button or the start-of-activity marker,
+// whichever is shown, and with show adds a fresh button. It lives outside
+// #feedList so trimFeed can't remove it.
+function setLoadOlder(show) {
   const feed = $("feed");
+  feed.querySelector(".feed-start-marker")?.remove();
   if (loadOlderBtn) { loadOlderBtn.remove(); loadOlderBtn = null; }
-  if (feedOldest > 0) {
-    loadOlderBtn = el("button", { class: "feed-load-older", onclick: loadOlderActivity }, "Load older activity");
-    feed.append(loadOlderBtn);
-  }
+  if (!show) return;
+  loadOlderBtn = el("button", { class: "feed-load-older", onclick: loadOlderActivity }, "Load older activity");
+  feed.append(loadOlderBtn);
 }
 
 function openCount(c) { c = c || {}; return (c.todo || 0) + (c.doing || 0) + (c.blocked || 0); }
@@ -359,6 +404,7 @@ function renderBoard() {
   for (const [key, label] of COLS) {
     let list = (by[key] || []).sort((a, b) => a.priority - b.priority || b.id - a.id);
     const total = list.length;
+    const plus = key === "done" && doneCapped ? "+" : ""; // the done fetch was capped; total is a floor
     let truncated = false;
     if (key === "done" && list.length > 50) { list = list.slice(0, 50); truncated = true; }
 
@@ -381,11 +427,11 @@ function renderBoard() {
     col.append(el("div", { class: "colhead" },
       el("span", { class: "swatch", style: "background:" + ST[key] }),
       label,
-      el("span", { class: "count" }, String(total))));
+      el("span", { class: "count" }, String(total) + plus)));
     const cards = el("div", { class: "cards" });
     if (!list.length) cards.append(el("div", { class: "empty-col" }, key === "done" ? "Nothing done yet" : "No tasks"));
     for (const t of list) cards.append(card(t));
-    if (truncated) cards.append(el("div", { class: "more-note" }, "+" + (total - 50) + " more"));
+    if (truncated) cards.append(el("div", { class: "more-note" }, "+" + (total - 50) + plus + " more"));
     col.append(cards);
     board.append(col);
   }
@@ -428,7 +474,7 @@ function boardEmpty() {
 function card(t) {
   const c = el("div", {
     class: "card", role: "button", tabindex: "0", draggable: "true", "data-id": String(t.id),
-    style: "--prio:" + (PRIO[t.priority] || PRIO[3]),
+    style: "--prio:" + prio(t.priority).color,
     "aria-label": "#" + t.id + " " + t.title + " — " + t.status + ". Press Enter to open, or [ and ] to change status.",
     onclick: () => openTask(t.id),
     onkeydown: (e) => onCardKey(e, t),
@@ -445,10 +491,10 @@ function card(t) {
     },
   });
   // ROW 1 (head): #id · priority rank (all levels) · status pill.
-  const pr = PRIO_RANK[t.priority] != null ? t.priority : 3;
+  const pr = prio(t.priority);
   const crow = el("div", { class: "crow" },
     el("span", { class: "cid" }, "#" + t.id),
-    el("span", { class: "chip-prio p" + pr, title: "Priority: " + PRIO_WORD[pr] }, PRIO_RANK[pr]),
+    el("span", { class: "chip-prio p" + pr.rank, title: "Priority: " + pr.word }, pr.token),
     el("span", { class: "status-pill st-" + t.status }, ST_LABEL[t.status] || t.status));
   c.append(crow);
 
@@ -470,16 +516,17 @@ function card(t) {
   if (t.nopen > 0) trouble.append(el("span", { class: "tag-blocked", title: t.nopen + " open prerequisite(s)" }, "🔒 Blocked " + t.nopen));
   else if (t.nprereq > 0) trouble.append(el("span", { class: "tag-ready" }, "✓ Ready"));
   if (t.status === "doing" && t.assignee && Date.now() - Date.parse(t.updated_at) > STALE_MS)
-    trouble.append(el("span", { class: "tag-stale", title: "no activity for 30+ min" }, "⏳ Stale"));
+    trouble.append(el("span", { class: "tag-stale", title: "no activity for " + STALE_MINUTES + "+ min" }, "⏳ Stale"));
   c.append(trouble);
 
   // ROW 3c (tags): label chips · comment count.
   const tags = el("div", { class: "ctags" });
   const labels = t.labels || [];
   for (const l of labels.slice(0, 3)) {
+    const filter = (e) => { e.stopPropagation(); setLabelFilter(l); }; // the card must not open too
     tags.append(el("span", {
       class: "tag-label", role: "button", tabindex: "0", title: "Filter by " + l,
-      onclick: (e) => { e.stopPropagation(); setLabelFilter(l); },
+      onclick: filter, onkeydown: onActivate(filter),
     }, l));
   }
   if (labels.length > 3) tags.append(el("span", { class: "tag-label" }, "+" + (labels.length - 3)));
@@ -491,14 +538,16 @@ function card(t) {
 function initials(name) { const m = (name || "").replace(/[^a-zA-Z0-9]/g, ""); return (m.slice(0, 2) || "?").toUpperCase(); }
 
 function onCardKey(e, t) {
-  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTask(t.id); return; }
+  if (e.target !== e.currentTarget) return; // keys on a nested control (label chip) are not card keys
   if (e.key === "[" || e.key === "]") {           // keyboard equivalent of drag between columns
     e.preventDefault();
     const order = COLS.map((c) => c[0]);
     let i = order.indexOf(t.status) + (e.key === "]" ? 1 : -1);
     i = Math.max(0, Math.min(order.length - 1, i));
     moveTask(t.id, order[i]);
+    return;
   }
+  onActivate(() => openTask(t.id))(e);
 }
 
 // moveTask optimistically moves a card to a new status, then persists it.
@@ -530,9 +579,9 @@ async function goProject(p) {
                    (!p.category && view === "all");
   if (sameView) {
     selected = new Set([p.slug]);
+    setBreadcrumb();
     renderRail();
-    try { await loadBoard(); await loadFeed(); } catch (e) { setStatus("error", "warn"); }
-    connect();
+    await reloadView();
     return;
   }
   pendingProject = p.slug;
@@ -549,9 +598,22 @@ async function toggleProject(slug) {
   } else {
     selected.add(slug);          // clicking an inactive row adds it
   }
+  setBreadcrumb();
   renderRail();
-  try { await loadBoard(); await loadFeed(); } catch (e) { setStatus("error", "warn"); }
+  await reloadView();
+}
+
+// dropSelectedProject takes an archived or deleted project out of the selection.
+// If it was selected the scope widens, so the title, rail, stream, feed and board
+// follow. The Manage modal's archive/delete and the live project.archived/deleted
+// events all go through here. The stream reopens first: unlike a view load (see
+// reloadView), the live cursor is already current.
+function dropSelectedProject(slug) {
+  if (!selected.delete(slug)) return;
+  setBreadcrumb();
+  renderRail();
   connect();
+  resync().catch(reconcileFailed);
 }
 
 // ---------- view routing (hash) ----------
@@ -572,7 +634,12 @@ async function route() {
   const h = location.hash || "#/";
   let next = "overview", cat = "";
   if (h === "#/all") next = "all";
-  else if (h.startsWith("#/cat/")) { next = "category"; cat = decodeURIComponent(h.slice("#/cat/".length)); }
+  else if (h.startsWith("#/cat/")) {
+    // A hand-edited link can hold a malformed %-escape; fall back to the overview
+    // instead of throwing before applyView (which would leave no board and no stream).
+    try { next = "category"; cat = decodeURIComponent(h.slice("#/cat/".length)); }
+    catch (e) { next = "overview"; cat = ""; showToast("Unknown category link: " + h); }
+  }
   await applyView(next, cat);
 }
 
@@ -586,18 +653,17 @@ async function applyView(next, cat) {
   document.body.classList.toggle("view-overview", view === "overview");
   setBreadcrumb();
   renderRail(); // keep the rail's active highlight in sync in every view
-  try {
-    if (view === "overview") {
-      await loadOverview();
-      await loadFeed(); // one global, unfiltered recent-activity feed on the overview
-    } else {
-      await loadBoard();
-      await loadFeed();
-    }
-  } catch (e) {
-    setStatus("error: " + e.message, "warn");
-  }
-  connect(); // re-open the stream with the new scope (?category= or unfiltered)
+  await reloadView();
+}
+
+// reloadView reloads the current view from REST (resync: feed first, so the
+// stream cursor covers anything committed while the board is read) and then
+// reopens the stream with the new scope. Every view or selection change reloads
+// through here. A failure is toasted: connect() immediately replaces the header
+// status, so a status message alone would never be seen.
+async function reloadView() {
+  try { await resync(); } catch (e) { showToast("Couldn't load the view: " + e.message); }
+  connect();
 }
 
 // setBreadcrumb fills the lean top-bar TITLE (#breadcrumb) with the current scope
@@ -623,7 +689,8 @@ function setBreadcrumb() {
 // ---------- overview (category home) ----------
 
 async function loadOverview() {
-  categories = await api("GET", "/api/categories");
+  // projects feed the All card and every rail count, so refresh them with the categories.
+  [categories, projects] = await Promise.all([api("GET", "/api/categories"), api("GET", "/api/projects")]);
   renderOverview();
   setBreadcrumb(); // category names are now known
   renderRail();    // category names + counts are now known
@@ -646,8 +713,7 @@ function renderOverview() {
 function newCatCard() {
   const card = el("div", {
     class: "cat-card cat-card-add", role: "button", tabindex: "0",
-    onclick: openNewCategory,
-    onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openNewCategory(); } },
+    onclick: openNewCategory, onkeydown: onActivate(openNewCategory),
   });
   card.append(el("div", { class: "cat-name" }, "＋ New category"));
   return card;
@@ -655,11 +721,8 @@ function newCatCard() {
 
 function allCard() {
   const total = projects.reduce((n, p) => n + openCount(p.counts), 0);
-  const card = el("div", {
-    class: "cat-card cat-card-all", role: "link", tabindex: "0",
-    onclick: () => navigate("#/all"),
-    onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); navigate("#/all"); } },
-  });
+  const go = () => navigate("#/all");
+  const card = el("div", { class: "cat-card cat-card-all", role: "link", tabindex: "0", onclick: go, onkeydown: onActivate(go) });
   card.append(el("div", { class: "cat-name" }, "All"));
   card.append(el("div", { class: "cat-sub" }, total + " open across all categories"));
   return card;
@@ -667,11 +730,8 @@ function allCard() {
 
 function catCard(c) {
   const slug = c.slug;
-  const card = el("div", {
-    class: "cat-card", role: "link", tabindex: "0",
-    onclick: () => navigate("#/cat/" + encodeURIComponent(slug)),
-    onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); navigate("#/cat/" + encodeURIComponent(slug)); } },
-  });
+  const go = () => navigate("#/cat/" + encodeURIComponent(slug));
+  const card = el("div", { class: "cat-card", role: "link", tabindex: "0", onclick: go, onkeydown: onActivate(go) });
   card.append(el("div", { class: "cat-name" }, c.name || slug));
   const counts = c.counts || {};
   const chips = el("div", { class: "count-chips" });
@@ -697,6 +757,10 @@ function catCard(c) {
 
 // ---------- label filter ----------
 
+// reportBoardError surfaces a failed filter/search reload: the filter UI already
+// shows the new state, so a silent failure would leave it over the old board.
+function reportBoardError(e) { showToast("Couldn't load the board: " + e.message); }
+
 function setLabelFilter(l) {
   filterLabel = l;
   const chip = $("labelFilterChip");
@@ -704,7 +768,7 @@ function setLabelFilter(l) {
     document.createTextNode(l),
     el("button", { class: "label-filter-x", "aria-label": "Clear label filter", onclick: clearLabelFilter }, "✕"));
   chip.classList.remove("hidden");
-  loadBoard().catch(() => {});
+  loadBoard().catch(reportBoardError);
 }
 
 function clearLabelFilter() {
@@ -712,7 +776,7 @@ function clearLabelFilter() {
   const chip = $("labelFilterChip");
   chip.replaceChildren();
   chip.classList.add("hidden");
-  loadBoard().catch(() => {});
+  loadBoard().catch(reportBoardError);
 }
 
 // ---------- board filters ----------
@@ -757,7 +821,7 @@ function renderFilterPanel() {
     clearTimeout(filterMineTimer);
     filterMineTimer = setTimeout(() => { filterMine = mineBox.value.trim(); applyFilters(); }, 250);
   };
-  const mineBtn = el("button", { class: "iconbtn filter-mine-btn", title: "Show tasks assigned to me", onclick: () => { filterMine = "human"; mineBox.value = "human"; applyFilters(); } }, "Mine");
+  const mineBtn = el("button", { class: "iconbtn filter-mine-btn", title: "Show tasks assigned to me", onclick: () => { clearTimeout(filterMineTimer); filterMine = "human"; mineBox.value = "human"; applyFilters(); } }, "Mine");
   const metaBox = el("input", { class: "field", value: filterMetaKey, placeholder: "meta key", "aria-label": "Filter by meta key" });
   metaBox.oninput = () => {
     clearTimeout(filterMetaTimer);
@@ -776,10 +840,13 @@ function renderFilterPanel() {
 // button's count chip in sync.
 function applyFilters() {
   renderFilterBadge();
-  loadBoard().catch(() => {});
+  loadBoard().catch(reportBoardError);
 }
 
 function clearFilters() {
+  // A pending debounced box edit would otherwise fire after the clear and re-apply its old value.
+  clearTimeout(filterMineTimer);
+  clearTimeout(filterMetaTimer);
   filterReady = false;
   filterBlocked = false;
   filterStale = false;
@@ -787,7 +854,7 @@ function clearFilters() {
   filterMetaKey = "";
   renderFilterPanel();
   renderFilterBadge();
-  loadBoard().catch(() => {});
+  loadBoard().catch(reportBoardError);
 }
 
 function renderFilterBadge() {
@@ -871,6 +938,7 @@ function growTitle() { const ta = $("sheet").querySelector(".mtitle"); if (ta) a
 
 async function openTask(id) {
   openTaskId = id;
+  depCandidates = null; // the picker cache only lives across live refreshes of one open modal
   try {
     const t = await api("GET", "/api/tasks/" + id);
     renderModal(t);
@@ -880,9 +948,33 @@ async function openTask(id) {
   } catch (e) { alert(e.message); openTaskId = null; }
 }
 
+// modalDirty reports whether any text field in the sheet holds uncommitted input.
+// renderModal stamps each field's defaultValue with what it rendered; the
+// self-saving fields re-stamp it when they commit (on change).
+function modalDirty() {
+  return [...$("sheet").querySelectorAll("input, textarea")].some((x) => x.value !== x.defaultValue);
+}
+
+// refreshModal re-renders the open task from server truth. A live event must not
+// wipe text the user is still typing, so while the sheet is dirty the refresh is
+// deferred until the sheet is clean again (see the sheet input/change listener).
+let modalRefreshDeferred = false;
 async function refreshModal() {
   if (!openTaskId) return;
-  try { const t = await api("GET", "/api/tasks/" + openTaskId); if (openTaskId === t.id) { renderModal(t); growTitle(); } } catch (e) { /* ignore */ }
+  if (modalDirty()) { modalRefreshDeferred = true; return; }
+  try {
+    const t = await api("GET", "/api/tasks/" + openTaskId);
+    if (openTaskId !== t.id) return;
+    if (modalDirty()) { modalRefreshDeferred = true; return; } // typing started during the fetch
+    const a = document.activeElement;
+    const focusLabel = $("sheet").contains(a) && a.getAttribute("aria-label");
+    renderModal(t);
+    growTitle();
+    if (focusLabel) { // keep focus on the same control across the rebuild
+      const n = [...$("sheet").querySelectorAll("[aria-label]")].find((x) => x.getAttribute("aria-label") === focusLabel);
+      if (n) n.focus();
+    }
+  } catch (e) { /* ignore */ }
 }
 
 function patch(id, body) {
@@ -902,11 +994,11 @@ function label(text, node) { return el("label", { class: "lbl" }, el("span", {},
 
 function prioSelect(value, onchange) {
   const sel = el("select", { onchange, "aria-label": "Priority" });
-  PRIO_OPTS.forEach((l, i) => {
-    const o = el("option", { value: String(i) }, l);
-    if (i === value) o.setAttribute("selected", "selected");
+  for (const p of PRIORITIES) {
+    const o = el("option", { value: String(p.rank) }, p.rank + " — " + p.word);
+    if (p.rank === value) o.setAttribute("selected", "selected");
     sel.append(o);
-  });
+  }
   return sel;
 }
 
@@ -914,13 +1006,14 @@ function renderModal(t) {
   $("modal").setAttribute("aria-label", "Task #" + t.id + ": " + t.title);
   const s = $("sheet");
   s.replaceChildren();
+  modalRefreshDeferred = false;
   s.append(el("button", { class: "x", onclick: closeModal, "aria-label": "Close" }, "✕"));
   s.append(el("div", { class: "mhead" }, "#" + t.id + " · " + t.project + "-" + t.ref + " · created " + fmtDate(t.created_at)));
 
   const title = el("textarea", { class: "mtitle", rows: "1", "aria-label": "Task title", spellcheck: "false" });
   title.value = t.title;
   title.oninput = () => autoGrow(title);
-  title.onchange = () => { if (title.value.trim()) patch(t.id, { title: title.value.trim() }); };
+  title.onchange = () => { if (title.value.trim()) { title.defaultValue = title.value; patch(t.id, { title: title.value.trim() }); } };
   s.append(title);
 
   const status = el("select", { "aria-label": "Status", onchange: (e) => patch(t.id, { status: e.target.value }) });
@@ -930,17 +1023,37 @@ function renderModal(t) {
     status.append(o);
   }
   const asg = el("input", { class: "field", value: t.assignee || "", placeholder: "unassigned", "aria-label": "Assignee" });
-  asg.onchange = () => patch(t.id, { assignee: asg.value.trim() });
+  asg.onchange = () => { asg.defaultValue = asg.value; patch(t.id, { assignee: asg.value.trim() }); };
   const pri = prioSelect(t.priority, (e) => patch(t.id, { priority: Number(e.target.value) }));
   s.append(el("div", { class: "mrow" }, label("Status", status), label("Assignee", asg), label("Priority", pri)));
 
   const body = el("textarea", { class: "mbody", placeholder: "Add a description…", "aria-label": "Description" });
   body.value = t.body || "";
-  body.onchange = () => patch(t.id, { body: body.value });
+  body.onchange = () => { body.defaultValue = body.value; patch(t.id, { body: body.value }); };
   s.append(el("label", { class: "lbl" }, el("span", {}, "Description"), body));
 
-  // ---- Dependencies section ----
-  s.append(el("h3", {}, "Dependencies"));
+  s.append(...renderTaskDeps(t), ...renderTaskLabels(t), ...renderTaskMeta(t), ...renderTaskComments(t));
+
+  s.append(el("h3", {}, "History"));
+  const hl = el("ul", { class: "hist" });
+  for (const ev of t.events || []) hl.append(el("li", {}, el("span", { class: "t" }, fmtTime(ev.created_at)), el("span", {}, describeText(ev))));
+  s.append(hl);
+
+  s.append(renderTaskActions(t));
+  // Baseline for modalDirty(): el() sets .value, which leaves defaultValue empty.
+  for (const x of s.querySelectorAll("input, textarea")) x.defaultValue = x.value;
+}
+
+// The task modal's sections. Each takes the task and returns its nodes (heading
+// first); renderModal appends them in order.
+
+// depRef is a dependency's project-ref link; activating it opens that task.
+function depRef(dep) {
+  const open = (e) => { e.stopPropagation(); openTask(dep.id); };
+  return el("span", { class: "dep-ref", role: "link", tabindex: "0", onclick: open, onkeydown: onActivate(open) }, dep.project + "-" + dep.ref);
+}
+
+function renderTaskDeps(t) {
   const depsSection = el("div", { class: "deps-section" });
 
   // "Depends on" chips
@@ -949,8 +1062,8 @@ function renderModal(t) {
   if (prereqs.length) {
     prereqs.forEach((dep) => {
       const chip = el("div", { class: "dep-chip" + (dep.status !== "done" ? " dep-open" : " dep-done") });
-      chip.append(el("span", { class: "dep-dot", style: "background:" + (dep.status === "done" ? "var(--st-done)" : dep.status === "doing" ? "var(--st-doing)" : dep.status === "blocked" ? "var(--st-blocked)" : "var(--st-todo)") }));
-      chip.append(el("span", { class: "dep-ref", role: "link", tabindex: "0", onclick: (e) => { e.stopPropagation(); openTask(dep.id); } }, dep.project + "-" + dep.ref));
+      chip.append(el("span", { class: "dep-dot", style: "background:" + (ST[dep.status] || ST.todo) }));
+      chip.append(depRef(dep));
       chip.append(el("span", { class: "dep-title" }, dep.title));
       chip.append(el("span", { class: "dep-status" }, dep.status));
       const rmBtn = el("button", { class: "dep-rm", "aria-label": "Remove prerequisite", title: "Remove" }, "✕");
@@ -974,17 +1087,22 @@ function renderModal(t) {
   const addDepErr = el("div", { class: "ferr" });
   const depSel = el("select", { "aria-label": "Add prerequisite" });
   depSel.append(el("option", { value: "" }, "Add prerequisite…"));
-  // Fetch same-project candidates lazily (do it async, populate when ready)
+  // Fetch same-project candidates once per project (reconcileModal drops the cache
+  // when the list changes), not on every live refresh; populate when ready.
+  if (!depCandidates || depCandidates.project !== t.project) {
+    depCandidates = { project: t.project, list: api("GET", "/api/tasks?project=" + encodeURIComponent(t.project) + "&limit=500") };
+  }
+  const want = depCandidates;
   (async () => {
     try {
-      const candidates = await api("GET", "/api/tasks?project=" + encodeURIComponent(t.project) + "&limit=500");
+      const candidates = await want.list;
       const existingIds = new Set(prereqs.map((d) => d.id));
       existingIds.add(t.id); // exclude self
       for (const cand of candidates) {
         if (existingIds.has(cand.id)) continue;
         depSel.append(el("option", { value: String(cand.id) }, cand.project + "-" + cand.ref + " " + cand.title));
       }
-    } catch (e) { /* ignore */ }
+    } catch (e) { if (depCandidates === want) depCandidates = null; } // retry on the next render
   })();
   depSel.onchange = async () => {
     const val = depSel.value;
@@ -1006,25 +1124,21 @@ function renderModal(t) {
   const blocks = t.blocks || [];
   if (blocks.length) {
     const blocksDiv = el("div", { class: "deps-blocks" });
-    blocks.forEach((dep) => {
-      const row = el("div", { class: "dep-block-row" });
-      row.append(
-        el("span", { class: "dep-ref", role: "link", tabindex: "0", onclick: (e) => { e.stopPropagation(); openTask(dep.id); } }, dep.project + "-" + dep.ref),
+    for (const dep of blocks) {
+      blocksDiv.append(el("div", { class: "dep-block-row" },
+        depRef(dep),
         el("span", { class: "dep-title" }, dep.title),
-        el("span", { class: "dep-status" }, "(" + dep.status + ")")
-      );
-      blocksDiv.append(row);
-    });
+        el("span", { class: "dep-status" }, "(" + dep.status + ")")));
+    }
     depsSection.append(el("div", { class: "deps-group" }, el("span", { class: "deps-label" }, "Blocks"), blocksDiv));
   }
-  s.append(depsSection);
+  return [el("h3", {}, "Dependencies"), depsSection];
+}
 
-  // ---- Labels section ----
-  s.append(el("h3", {}, "Labels"));
+function renderTaskLabels(t) {
   const labelsDiv = el("div", { class: "labels-row" });
   const labelErr = el("div", { class: "ferr" });
-  const tLabels = t.labels || [];
-  for (const l of tLabels) {
+  for (const l of t.labels || []) {
     const chip = el("span", { class: "tag-label tag-label-modal" }, l);
     const rmLbl = el("button", { class: "dep-rm", "aria-label": "Remove label " + l, title: "Remove" }, "✕");
     rmLbl.onclick = async () => {
@@ -1049,16 +1163,18 @@ function renderModal(t) {
     labelErr.textContent = "";
     try {
       await api("POST", "/api/tasks/" + t.id + "/labels", { label: v });
-      labelBox.value = "";
+      labelBox.value = ""; // no input event fires, so run the echo refresh deferred meanwhile
+      runDeferredRefresh();
     } catch (err) {
       labelErr.textContent = err.message === "validation" ? "labels are 1-50 chars of a-z 0-9 . _ -" : err.message;
     }
   };
   labelsDiv.append(labelBox);
-  s.append(labelsDiv, labelErr);
+  return [el("h3", {}, "Labels"), labelsDiv, labelErr];
+}
 
-  // ---- Meta section (editable key=value pairs; mirrors the Labels section) ----
-  s.append(el("h3", {}, "Meta"));
+// renderTaskMeta lists the editable key=value pairs (it mirrors renderTaskLabels).
+function renderTaskMeta(t) {
   const metaWrap = el("div", { class: "meta-section" });
   const metaErr = el("div", { class: "ferr" });
   const tMeta = t.meta || {};
@@ -1092,6 +1208,7 @@ function renderModal(t) {
       keyBox.value = "";
       valBox.value = "";
       keyBox.focus();
+      runDeferredRefresh(); // the SSE echo arrived while the boxes still held text
     } catch (e) {
       metaErr.textContent = metaErrMsg(e);
     }
@@ -1101,42 +1218,21 @@ function renderModal(t) {
   valBox.onkeydown = onMetaKey;
   metaWrap.append(el("div", { class: "meta-add-row" }, keyBox, valBox,
     el("button", { class: "btn-primary meta-add-btn", onclick: addMeta }, "Add")));
-  s.append(metaWrap, metaErr);
+  return [el("h3", {}, "Meta"), metaWrap, metaErr];
+}
 
-  s.append(el("h3", {}, "Comments" + (t.comments && t.comments.length ? " (" + t.comments.length + ")" : "")));
+function renderTaskComments(t) {
+  const comments = t.comments || [];
   const cl = el("div", { class: "comments" });
-  if (!t.comments || !t.comments.length) cl.append(el("div", { class: "feed-empty" }, "No comments yet"));
-  for (const cm of t.comments || []) {
-    const cmDiv = el("div", { class: "cm" });
-    const cmHead = el("div", { class: "cm-head" },
-      el("b", {}, cm.author),
-      el("span", { class: "t" }, fmtTime(cm.created_at)));
-    // Inline two-step delete for each comment.
-    const delCm = el("button", { class: "btn-del-cm", "aria-label": "Delete comment" }, "×");
-    let cmConfirming = false;
-    delCm.onclick = async () => {
-      if (!cmConfirming) {
-        cmConfirming = true;
-        delCm.textContent = "Confirm delete?";
-        delCm.classList.add("confirming");
-        setTimeout(() => { if (cmConfirming) { cmConfirming = false; delCm.textContent = "×"; delCm.classList.remove("confirming"); } }, 4000);
-        return;
-      }
-      delCm.disabled = true;
-      try {
-        await api("DELETE", "/api/tasks/" + t.id + "/comments/" + cm.id);
-      } catch (e) {
-        delCm.disabled = false;
-        cmConfirming = false;
-        delCm.textContent = "×";
-        delCm.classList.remove("confirming");
-      }
-    };
-    cmHead.append(delCm);
-    cmDiv.append(cmHead, el("div", { class: "cbody" }, cm.body));
-    cl.append(cmDiv);
+  if (!comments.length) cl.append(el("div", { class: "feed-empty" }, "No comments yet"));
+  for (const cm of comments) {
+    const delCm = armButton(el("button", { class: "btn-del-cm", "aria-label": "Delete comment" }, "×"),
+      () => api("DELETE", "/api/tasks/" + t.id + "/comments/" + cm.id),
+      (e) => alert(e.message));
+    cl.append(el("div", { class: "cm" },
+      el("div", { class: "cm-head" }, el("b", {}, cm.author), el("span", { class: "t" }, fmtTime(cm.created_at)), delCm),
+      el("div", { class: "cbody" }, cm.body)));
   }
-  s.append(cl);
 
   const cbox = el("input", { class: "field cbox", placeholder: "Add a comment…", "aria-label": "Add a comment" });
   const submit = () => {
@@ -1146,44 +1242,15 @@ function renderModal(t) {
     api("POST", "/api/tasks/" + t.id + "/comments", { body: v }).catch((err) => alert(err.message));
   };
   cbox.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } };
-  s.append(el("div", { class: "cm-row" }, cbox, el("button", { class: "btn-primary", onclick: submit }, "Send")));
+  return [el("h3", {}, "Comments" + (comments.length ? " (" + comments.length + ")" : "")), cl,
+    el("div", { class: "cm-row" }, cbox, el("button", { class: "btn-primary", onclick: submit }, "Send"))];
+}
 
-  s.append(el("h3", {}, "History"));
-  const hl = el("ul", { class: "hist" });
-  for (const ev of t.events || []) hl.append(el("li", {}, el("span", { class: "t" }, fmtTime(ev.created_at)), el("span", {}, describeText(ev))));
-  s.append(hl);
-
-  // Inline two-step delete for the task itself.
-  const delBtn = el("button", { class: "btn-danger-task" }, "Delete task");
-  let delConfirming = false;
-  delBtn.onclick = async () => {
-    if (!delConfirming) {
-      delConfirming = true;
-      delBtn.textContent = "Confirm delete?";
-      delBtn.classList.add("confirming");
-      const cancelEl = el("button", { class: "btn-cancel-del" }, "Cancel");
-      cancelEl.onclick = () => {
-        delConfirming = false;
-        delBtn.textContent = "Delete task";
-        delBtn.classList.remove("confirming");
-        cancelEl.remove();
-      };
-      delBtn.after(cancelEl);
-      return;
-    }
-    delBtn.disabled = true;
-    try {
-      await api("DELETE", "/api/tasks/" + t.id);
-      closeModal();
-    } catch (e) {
-      delBtn.disabled = false;
-      delConfirming = false;
-      delBtn.textContent = "Delete task";
-      delBtn.classList.remove("confirming");
-      const sibling = delBtn.nextSibling;
-      if (sibling && sibling.classList && sibling.classList.contains("btn-cancel-del")) sibling.remove();
-    }
-  };
+// renderTaskActions is the Release + Delete row at the foot of the modal.
+function renderTaskActions(t) {
+  const delBtn = armButton(el("button", { class: "btn-danger-task" }, "Delete task"),
+    async () => { await api("DELETE", "/api/tasks/" + t.id); closeModal(); },
+    (e) => alert(e.message));
   // One-click Release: hand the task back to the unclaimed pool (clear assignee,
   // reset to todo). Only shown when there's something to release.
   const relBtn = el("button", { class: "btn-release" }, "Release");
@@ -1197,18 +1264,53 @@ function renderModal(t) {
     }
   };
   const showRelease = !!t.assignee || t.status !== "todo";
-  s.append(el("div", { class: "del-task-row" }, showRelease ? relBtn : null, delBtn));
+  return el("div", { class: "del-task-row" }, showRelease ? relBtn : null, delBtn);
+}
+
+const CONFIRM_MS = 5000; // how long an armed delete button waits for its confirming click
+
+// armButton makes btn a two-step delete: the first click arms it ("Confirm
+// delete?", .confirming) for CONFIRM_MS, after which it disarms; a click while
+// armed disables it and runs confirm(). If confirm() fails, the button is
+// re-enabled and disarmed and onError reports why. The comment, task and project
+// deletes all use it. Returns btn.
+function armButton(btn, confirm, onError) {
+  const idle = btn.textContent;
+  let armed = false, timer = null;
+  const disarm = () => { armed = false; clearTimeout(timer); btn.textContent = idle; btn.classList.remove("confirming"); };
+  btn.onclick = async () => {
+    if (!armed) {
+      armed = true;
+      btn.textContent = "Confirm delete?";
+      btn.classList.add("confirming");
+      timer = setTimeout(disarm, CONFIRM_MS);
+      return;
+    }
+    clearTimeout(timer); // the label must not revert while the delete is in flight
+    btn.disabled = true;
+    try {
+      await confirm();
+    } catch (e) {
+      btn.disabled = false;
+      disarm();
+      onError(e);
+    }
+  };
+  return btn;
 }
 
 function openNew() {
+  openTaskId = null; // the sheet no longer shows a task: live events must not re-render one over this form
   const s = $("sheet");
   s.replaceChildren();
   s.append(el("button", { class: "x", onclick: closeModal, "aria-label": "Close" }, "✕"));
   s.append(el("div", { class: "mhead" }, "New task"));
   const title = el("input", { class: "mtitle field", placeholder: "Task title", "aria-label": "Task title" });
   const psel = el("select", { "aria-label": "Project" });
-  const defaultProj = selected.size === 1 ? [...selected][0] : (projects[0] ? projects[0].slug : "");
-  for (const p of projects) {
+  // Offer only the projects this board shows, so the new task lands where the user can see it.
+  const pool = projectsInView();
+  const defaultProj = selected.size === 1 ? [...selected][0] : (pool[0] ? pool[0].slug : "");
+  for (const p of pool) {
     const o = el("option", { value: p.slug }, p.name);
     if (p.slug === defaultProj) o.setAttribute("selected", "selected");
     psel.append(o);
@@ -1220,12 +1322,13 @@ function openNew() {
     class: "save", onclick: async () => {
       if (!title.value.trim()) { err.textContent = "enter a title"; title.focus(); return; }
       if (!psel.value) { err.textContent = "create a project first (＋ in the tab bar)"; return; }
+      save.disabled = true; // a second click would create a second task (POST is not deduplicated)
       try {
         const t = await api("POST", "/api/tasks", { project: psel.value, title: title.value.trim(), body: body.value, priority: Number(pri.value) });
         closeModal();
         if (selected.size === 1 && t.project !== [...selected][0]) await toggleProject(t.project);
         else { await loadBoard().catch(() => {}); loadProjects().catch(() => {}); }
-      } catch (e) { err.textContent = e.message; }
+      } catch (e) { save.disabled = false; err.textContent = e.message; }
     }
   }, "Create task");
   s.append(title, el("div", { class: "mrow" }, label("Project", psel), label("Priority", pri)),
@@ -1238,6 +1341,7 @@ function openNew() {
 // /api/categories. Categories live above the project layer, so there is no scope
 // picker here.
 function openNewCategory() {
+  openTaskId = null; // the sheet no longer shows a task: live events must not re-render one over this form
   const s = $("sheet");
   s.replaceChildren();
   s.append(el("button", { class: "x", onclick: closeModal, "aria-label": "Close" }, "✕"));
@@ -1252,11 +1356,13 @@ function openNewCategory() {
     class: "save", onclick: async () => {
       const sv = slugify(slug.value || name.value);
       if (!sv) { err.textContent = "enter a name"; name.focus(); return; }
+      save.disabled = true; // a second click would 409 while the first succeeds
       try {
         await api("POST", "/api/categories", { slug: sv, name: name.value.trim() || sv });
         await loadOverview();
         closeModal();
       } catch (e) {
+        save.disabled = false;
         err.textContent = e.message === "conflict" ? "a category with slug “" + sv + "” already exists" : e.message;
       }
     }
@@ -1272,6 +1378,7 @@ async function openNewProject() {
   if (!categories.length) {
     try { categories = await api("GET", "/api/categories"); } catch (e) { /* fall back to a single "general" option below */ }
   }
+  openTaskId = null; // the sheet no longer shows a task: live events must not re-render one over this form
   const s = $("sheet");
   s.replaceChildren();
   s.append(el("button", { class: "x", onclick: closeModal, "aria-label": "Close" }, "✕"));
@@ -1303,12 +1410,14 @@ async function openNewProject() {
     class: "save", onclick: async () => {
       const sv = slugify(slug.value || name.value);
       if (!sv) { err.textContent = "enter a name"; name.focus(); return; }
+      save.disabled = true; // a second click would 409 while the first succeeds
       try {
         const p = await api("POST", "/api/projects", { slug: sv, name: name.value.trim() || sv, category: csel.value });
         await loadProjects();
         closeModal();
         toggleProject(p.slug);
       } catch (e) {
+        save.disabled = false;
         err.textContent = e.message === "conflict" ? "a project with slug “" + sv + "” already exists" : e.message;
       }
     }
@@ -1321,6 +1430,7 @@ async function openNewProject() {
 // ---------- manage categories + projects modal ----------
 
 async function openManage() {
+  openTaskId = null; // the sheet no longer shows a task: live events must not re-render one over this form
   const s = $("sheet");
   s.replaceChildren();
   s.append(el("button", { class: "x", onclick: closeModal, "aria-label": "Close" }, "✕"));
@@ -1377,7 +1487,10 @@ async function renderManageCategories(list, err) {
         try {
           await api("POST", "/api/categories/" + encodeURIComponent(c.slug) + (isArchived ? "/unarchive" : "/archive"));
           await loadProjects();
+          // The rail renders `categories`; category events never reach a scoped
+          // (category/project) stream, so refresh them here in every view.
           if (view === "overview") await loadOverview();
+          else await loadCategories();
           await renderManageCategories(list, err);
         } catch (e) {
           err.textContent = e.message;
@@ -1427,13 +1540,7 @@ async function renderManageList(list, err) {
             await api("POST", "/api/projects/" + p.slug + "/unarchive");
           } else {
             await api("POST", "/api/projects/" + p.slug + "/archive");
-            // If this project was selected, remove it from selection.
-            if (selected.has(p.slug)) {
-              selected.delete(p.slug);
-              loadBoard().catch(() => {});
-              loadFeed().catch(() => {});
-              connect();
-            }
+            dropSelectedProject(p.slug);
           }
           // Refresh tab bar.
           await loadProjects();
@@ -1446,31 +1553,12 @@ async function renderManageList(list, err) {
       },
     }, isArchived ? "Unarchive" : "Archive");
 
-    // Inline two-step delete button for the project.
-    const rmBtn = el("button", { class: "btn-danger-proj" }, "Delete");
-    let rmConfirming = false;
-    rmBtn.onclick = async () => {
-      if (!rmConfirming) {
-        rmConfirming = true;
-        rmBtn.textContent = "Confirm delete?";
-        rmBtn.classList.add("confirming");
-        setTimeout(() => { if (rmConfirming) { rmConfirming = false; rmBtn.textContent = "Delete"; rmBtn.classList.remove("confirming"); } }, 5000);
-        return;
-      }
-      rmBtn.disabled = true;
-      try {
-        await api("DELETE", "/api/projects/" + p.slug);
-        if (selected.has(p.slug)) { selected.delete(p.slug); loadBoard().catch(() => {}); loadFeed().catch(() => {}); connect(); }
-        await loadProjects();
-        await renderManageList(list, err);
-      } catch (e) {
-        err.textContent = e.message;
-        rmBtn.disabled = false;
-        rmConfirming = false;
-        rmBtn.textContent = "Delete";
-        rmBtn.classList.remove("confirming");
-      }
-    };
+    const rmBtn = armButton(el("button", { class: "btn-danger-proj" }, "Delete"), async () => {
+      await api("DELETE", "/api/projects/" + p.slug);
+      dropSelectedProject(p.slug);
+      await loadProjects();
+      await renderManageList(list, err);
+    }, (e) => { err.textContent = e.message; });
 
     if (isArchived) row.append(nameSpan, slugSpan, el("span", { class: "badge-archived" }, "Archived"), countSpan, editBtn, archBtn, rmBtn);
     else row.append(nameSpan, slugSpan, countSpan, editBtn, archBtn, rmBtn);
@@ -1484,6 +1572,7 @@ async function renderManageList(list, err) {
 // user may deliberately rename). On a slug change we follow the selection so the
 // renamed project stays selected after the tab bar reloads.
 function openEditProject(p) {
+  openTaskId = null; // the sheet no longer shows a task: live events must not re-render one over this form
   const s = $("sheet");
   s.replaceChildren();
   s.append(el("button", { class: "x", onclick: closeModal, "aria-label": "Close" }, "✕"));
@@ -1525,14 +1614,58 @@ function openEditProject(p) {
 
 // ---------- live stream ----------
 
+// resync reloads the current view from REST (reloadView, minus the stream). The
+// overview shows one global, unfiltered feed; a board view reads the feed first,
+// since loadFeed sets the stream cursor.
+async function resync() {
+  if (view === "overview") { await loadOverview(); await loadFeed(); }
+  else { await loadFeed(); await loadBoard(); }
+}
+
+// loadRail re-fetches projects + categories (their open-counts) and re-renders the rail.
+async function loadRail() {
+  const [ps, cs] = await Promise.all([api("GET", "/api/projects"), api("GET", "/api/categories")]);
+  projects = ps;
+  categories = cs;
+  renderRail();
+}
+
+// resyncNow reloads the view, the rail and the open task. A live reconcile that
+// fails lands here through reconcileFailed: the header stops claiming "live" and
+// the reload retries with capped backoff, instead of waiting for an unrelated event.
+async function resyncNow() {
+  clearTimeout(resyncTimer);
+  try {
+    await resync();
+    if (view !== "overview") await loadRail(); // loadOverview already refreshed both
+    depCandidates = null; // a dropped stream may have lost the events that invalidate it
+    refreshModal();
+    resyncDelay = 1000;
+    if (es && es.readyState === 1) setStatus("live", "ok");
+  } catch (e) { reconcileFailed(); }
+}
+
+function reconcileFailed() {
+  setStatus("out of date — retrying…", "warn");
+  clearTimeout(resyncTimer);
+  resyncTimer = setTimeout(resyncNow, resyncDelay);
+  resyncDelay = Math.min(resyncDelay * 2, 10000);
+}
+
 function connect() {
   if (es) es.close();
   setStatus("connecting…", "");
   es = new EventSource("/api/stream" + qstr({ since: cursor }));
-  es.onopen = () => { backoff = 1000; setStatus("live", "ok"); };
+  es.onopen = () => {
+    backoff = 1000;
+    setStatus("live", "ok");
+    // After a drop, the replay can miss events (it is capped), so reload from REST.
+    if (streamDropped) { streamDropped = false; resyncNow(); }
+  };
   es.onmessage = (m) => { let ev; try { ev = JSON.parse(m.data); } catch (e) { return; } onEvent(ev); };
   es.onerror = () => {
     es.close();
+    streamDropped = true;
     // Surface degraded liveness clearly: once backoff has climbed (repeated
     // failures) or the browser reports offline, show a loud "offline" state in
     // the reserved error channel; otherwise the transient "reconnecting…" warn.
@@ -1557,84 +1690,72 @@ function onEvent(ev) {
   trimFeed();
   if (ev.kind === "project.created" || ev.kind === "project.unarchived" ||
       ev.kind === "category.archived" || ev.kind === "category.unarchived" ||
-      ev.kind === "category.created") loadProjects().catch(() => {});
-  // Overview view: no board/modal to reconcile — keep the global feed live and
-  // debounce-refresh the category cards on any task/project/category change.
+      ev.kind === "category.created" || ev.kind === "project.patched") loadProjects().catch(() => {});
+  // The task modal can be open in any view (overview feed refs open it too), so
+  // reconcile it before the overview early return.
+  reconcileModal(ev);
+  // Task, project and category kinds change open-counts (overview cards, rail).
+  const countsChanged = /^(task|project|category)\./.test(ev.kind);
+  // Overview view: no board to reconcile — keep the global feed live and
+  // coalesce-refresh the category cards and project counts (loadOverview).
   if (view === "overview") {
-    if (/^(task|project|category)\./.test(ev.kind)) {
-      clearTimeout(overviewTimer);
-      // Re-check the view at fire time: navigating away before the debounce
-      // elapses must not write to the now-hidden #overview element.
-      overviewTimer = setTimeout(() => {
-        if (view !== "overview") return;
-        loadOverview().catch(() => {});
-      }, 250);
-    }
+    // Re-check the view at fire time: navigating away before the timer
+    // elapses must not write to the now-hidden #overview element.
+    if (countsChanged) coalesce("overview", () => { if (view === "overview") loadOverview().catch(reconcileFailed); }, 250);
     return;
   }
-  if (ev.kind === "project.archived") {
-    const archivedSlug = (ev.data || {}).slug;
-    if (selected.has(archivedSlug)) {
-      selected.delete(archivedSlug);
-      renderRail();
-      loadBoard().catch(() => {});
-      loadFeed().catch(() => {});
+  // The coalesced board reconcile below drops an unselected project's cards.
+  if (ev.kind === "project.archived" || ev.kind === "project.deleted") {
+    dropSelectedProject((ev.data || {}).slug);
+    loadProjects().catch(() => {});
+  }
+  if (ev.kind === "project.patched") {
+    // A slug rename (data.slug = [old, new], e.g. from the CLI) must follow the
+    // selection, or the board keeps querying a slug that no longer exists.
+    const sl = (ev.data || {}).slug;
+    if (Array.isArray(sl) && selected.has(sl[0])) {
+      selected.delete(sl[0]);
+      selected.add(sl[1]);
       connect();
     }
-    loadProjects().catch(() => {});
   }
   if (ev.kind === "task.deleted") {
     tasks.delete(ev.task_id);
     renderBoard();
-    if (openTaskId === ev.task_id) closeModal();
     loadProjects().catch(() => {});
-  }
-  if (ev.kind === "comment.deleted") {
-    if (openTaskId === ev.task_id) refreshModal();
-  }
-  if (ev.kind === "project.deleted") {
-    const deletedSlug = (ev.data || {}).slug;
-    if (selected.has(deletedSlug)) {
-      selected.delete(deletedSlug);
-      renderRail();
-      connect();
-    }
-    loadProjects().catch(() => {});
-    loadBoard().catch(() => {});
-  }
-  if (ev.kind === "task.dep_added" || ev.kind === "task.dep_removed") {
-    // Refresh modal if it shows either the task or the prereq being linked/unlinked.
-    const depId = (ev.data || {}).depends_on;
-    if (openTaskId === ev.task_id || openTaskId === depId) refreshModal();
   }
   // Mark the touched task so the next board render flashes it once (board views
   // only — the overview has no cards). Status moves and edits are the signals
   // worth surfacing; deletes are handled above.
   if (view !== "overview" && ev.task_id && /^task\./.test(ev.kind) && ev.kind !== "task.deleted") flashIds.add(ev.task_id);
-  clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(() => loadBoard().catch(() => {}), 250); // debounced reconcile
+  coalesce("board", () => loadBoard().catch(reconcileFailed), 250); // coalesced reconcile
   // Keep the rail's open-counts live on the board views: task moves change a
-  // project's (and its category's) open count. Refresh both on the same debounce
+  // project's (and its category's) open count. Refresh both on the same
   // cadence as the board reconcile, but lightly — one projects+categories fetch.
-  if (/^(task|project|category)\./.test(ev.kind)) refreshRailCounts();
-  if (openTaskId && ev.task_id === openTaskId && ev.kind !== "task.deleted" && ev.kind !== "comment.deleted" && ev.kind !== "task.dep_added" && ev.kind !== "task.dep_removed") refreshModal();
+  if (countsChanged) refreshRailCounts();
+}
+
+// reconcileModal keeps the open task modal in step with a live event.
+function reconcileModal(ev) {
+  // The prerequisite picker lists project tasks by ref + title: drop the cache when that list changes.
+  // (A title edit can ride on task.status/task.assign too, so check the data, not the kind.)
+  if (ev.kind === "task.created" || ev.kind === "task.deleted" || (ev.data || {}).title !== undefined) depCandidates = null;
+  if (!openTaskId) return;
+  if (ev.kind === "task.deleted") {
+    if (openTaskId === ev.task_id) closeModal();
+    return;
+  }
+  // Refresh if the modal shows the task, or the prereq being linked/unlinked.
+  const depId = ev.kind === "task.dep_added" || ev.kind === "task.dep_removed" ? (ev.data || {}).depends_on : null;
+  if (ev.task_id === openTaskId || depId === openTaskId) coalesce("modal", () => refreshModal(), 150);
 }
 
 // refreshRailCounts re-fetches projects + categories (their open-counts) and
-// re-renders the rail, debounced so a burst of live events causes one refresh.
+// re-renders the rail, coalesced so a burst of live events causes one refresh.
 function refreshRailCounts() {
-  clearTimeout(railTimer);
-  railTimer = setTimeout(async () => {
-    if (view === "overview") return; // the overview path already refreshes via loadOverview()
-    try {
-      const [ps, cs] = await Promise.all([
-        api("GET", "/api/projects"),
-        api("GET", "/api/categories"),
-      ]);
-      projects = ps;
-      categories = cs;
-      renderRail();
-    } catch (e) { /* ignore — next event retries */ }
+  coalesce("rail", () => {
+    if (view === "overview") return; // the overview path refreshes projects + categories via loadOverview()
+    loadRail().catch(reconcileFailed);
   }, 300);
 }
 
@@ -1643,24 +1764,28 @@ function feedItem(ev) {
   // The glyph carries the non-color event-kind cue; it is decorative to screen
   // readers since .ev-text already states the event in words. The k-<kind> class
   // (kept) still colors the glyph and would color a legacy .ev-dot.
-  return el("li", { class: "ev k-" + kind },
+  return el("li", { class: "ev k-" + kind, "data-id": ev.id },
     el("span", { class: "ev-icon", "aria-hidden": "true" }, EV_GLYPH[kind] || EV_GLYPH.other),
     evText(ev),
     el("span", { class: "ev-time", title: fullTime(ev.created_at) }, fmtTime(ev.created_at)));
 }
 
 function trimFeed() {
-  // Once the user has paginated, skip trimming so older entries they loaded are
-  // preserved. Without this, each live event would pop the oldest paginated row.
-  if (feedPaginated) return;
+  // feedCap grows with each "Load older" page, so live events pop paginated rows
+  // only after that many newer rows arrived, and the list stays bounded.
   const l = $("feedList");
-  while (l.children.length > 200) l.removeChild(l.lastChild);
+  if (l.children.length <= feedCap) return;
+  while (l.children.length > feedCap) l.removeChild(l.lastChild);
+  // "Load older" must continue from the oldest row still shown, not from rows trimmed away.
+  feedOldest = Number(l.lastChild.dataset.id) || feedOldest;
+  if (!loadOlderBtn) setLoadOlder(true); // rows above the start marker were dropped: offer them again
 }
 
 async function loadOlderActivity() {
   if (!feedOldest || !loadOlderBtn) return;
   loadOlderBtn.disabled = true;
   const limit = 50;
+  const seq = feedSeq; // a feed reload (view change) while this is in flight makes the page stale
   try {
     const params = { before: String(feedOldest), limit: String(limit) };
     const scope = viewParams();
@@ -1668,12 +1793,13 @@ async function loadOlderActivity() {
     else if (scope.category) params.category = scope.category;
     const qs = new URLSearchParams(params);
     const res = await api("GET", "/api/events?" + qs.toString());
+    if (seq !== feedSeq) return;
     const evs = res.events || [];
     const list = $("feedList");
     for (const ev of evs) list.append(feedItem(ev)); // already newest-first, append to bottom
     if (evs.length > 0) {
       feedOldest = evs.reduce((min, ev) => ev.id < min ? ev.id : min, evs[0].id);
-      feedPaginated = true;
+      feedCap += evs.length;
     }
     if (evs.length < limit) {
       // No more older events — replace button with an end-marker.
@@ -1683,7 +1809,7 @@ async function loadOlderActivity() {
       loadOlderBtn.disabled = false;
     }
   } catch (e) {
-    loadOlderBtn.disabled = false;
+    if (seq === feedSeq) loadOlderBtn.disabled = false;
   }
 }
 
@@ -1699,72 +1825,62 @@ function evKind(ev) {
 }
 
 function refLink(id) {
-  return el("span", { class: "ref", role: "link", tabindex: "0", onclick: (e) => { e.stopPropagation(); openTask(id); }, onkeydown: (e) => { if (e.key === "Enter") openTask(id); } }, "#" + id);
+  const open = (e) => { e.stopPropagation(); openTask(id); };
+  return el("span", { class: "ref", role: "link", tabindex: "0", onclick: open, onkeydown: onActivate(open) }, "#" + id);
+}
+
+// evParts words an event once for both renderers: plain strings, {ref: id} for
+// the task, and {name: slug} for a project or category. evText renders the ref as
+// a link and the name in bold (the activity feed); describeText flattens both to
+// text (the task modal's history). Kinds without a task ref get no ref part.
+function evParts(ev) {
+  const d = ev.data || {};
+  const t = ev.task_id ? { ref: ev.task_id } : "";
+  const slug = { name: String(d.slug || "") };
+  switch (ev.kind) {
+    case "task.created": return ["created ", t];
+    case "task.claimed": return ["claimed ", t];
+    case "task.reclaimed": return ["reclaimed ", t, " from " + ((d.assignee || [])[0] || "—")];
+    case "task.status": return ["moved ", t, " → " + last(d.status)];
+    case "task.assign": return ["assigned ", t, " → " + (last(d.assignee) || "—")];
+    case "task.patched": return ["edited ", t, d.meta ? " (meta: " + Object.keys(d.meta).sort().join(", ") + ")" : ""];
+    case "task.deleted": return ["deleted ", t];
+    case "task.dep_added": return ["linked ", t, " → depends on #" + (d.depends_on || "")];
+    case "task.dep_removed": return ["unlinked ", t, " dep #" + (d.depends_on || "")];
+    case "task.labeled": return ["labeled ", t, " +" + (d.label || "")];
+    case "task.unlabeled": return ["unlabeled ", t, " -" + (d.label || "")];
+    case "comment.added": return ["commented on ", t];
+    case "comment.deleted": return ["deleted a comment on ", t];
+    case "project.created": return ["created project ", slug];
+    case "project.archived": return ["archived project ", slug];
+    case "project.unarchived": return ["unarchived project ", slug];
+    case "project.patched": return ["edited project ", { name: patchedProjectSlug(ev) }];
+    case "project.deleted": return ["deleted project ", slug];
+    case "category.created": return ["created category ", slug];
+    case "category.archived": return ["archived category ", slug];
+    case "category.unarchived": return ["unarchived category ", slug];
+    default: return [ev.kind, t ? " " : "", t];
+  }
 }
 
 function evText(ev) {
-  const span = el("span", { class: "ev-text" });
-  const who = el("b", {}, ev.actor || "someone");
-  const d = ev.data || {};
-  const ref = ev.task_id ? refLink(ev.task_id) : null;
-  switch (ev.kind) {
-    case "task.created": span.append(who, " created ", ref); break;
-    case "task.claimed": span.append(who, " claimed ", ref); break;
-    case "task.reclaimed": span.append(who, " reclaimed ", ref, " from ", String((d.assignee || [])[0] || "—")); break;
-    case "task.status": span.append(who, " moved ", ref, " → ", String(last(d.status))); break;
-    case "task.assign": span.append(who, " assigned ", ref, " → ", String(last(d.assignee) || "—")); break;
-    case "task.patched":
-      span.append(who, " edited ", ref);
-      if (d.meta) span.append(" (meta: " + Object.keys(d.meta).sort().join(", ") + ")");
-      break;
-    case "comment.added": span.append(who, " commented on ", ref); break;
-    case "project.created": span.append(who, " created project ", el("b", {}, d.slug || "")); break;
-    case "project.archived": span.append(who, " archived project ", el("b", {}, d.slug || "")); break;
-    case "project.unarchived": span.append(who, " unarchived project ", el("b", {}, d.slug || "")); break;
-    // category.* events carry no project/task ref, so the default branch would
-    // render a literal "null" ref — they need explicit cases.
-    case "category.created": span.append(who, " created category ", el("b", {}, d.slug || "")); break;
-    case "category.archived": span.append(who, " archived category ", el("b", {}, d.slug || "")); break;
-    case "category.unarchived": span.append(who, " unarchived category ", el("b", {}, d.slug || "")); break;
-    case "task.deleted": span.append(who, " deleted ", ref || document.createTextNode("#" + ev.task_id)); break;
-    case "comment.deleted": span.append(who, " deleted a comment on ", ref || document.createTextNode("#" + ev.task_id)); break;
-    case "project.deleted": span.append(who, " deleted project ", el("b", {}, d.slug || "")); break;
-    case "task.dep_added": span.append(who, " linked ", ref, " → depends on #", String(d.depends_on || "")); break;
-    case "task.dep_removed": span.append(who, " unlinked ", ref, " dep #", String(d.depends_on || "")); break;
-    case "task.labeled": span.append(who, " labeled ", ref, " +" + (d.label || "")); break;
-    case "task.unlabeled": span.append(who, " unlabeled ", ref, " -" + (d.label || "")); break;
-    default: span.append(who, " " + ev.kind + " ", ref);
-  }
+  const span = el("span", { class: "ev-text" }, el("b", {}, ev.actor || "someone"), " ");
+  for (const p of evParts(ev)) span.append(p.ref ? refLink(p.ref) : p.name != null ? el("b", {}, p.name) : p);
   return span;
 }
 
+// patchedProjectSlug names the project of a project.patched event: the new slug
+// when it was renamed (data.slug = [old, new]), else the slug looked up by id.
+function patchedProjectSlug(ev) {
+  const s = last((ev.data || {}).slug);
+  if (s) return s;
+  const p = projects.find((x) => x.id === ev.project_id);
+  return p ? p.slug : "";
+}
+
 function describeText(ev) {
-  const who = ev.actor || "someone";
-  const t = ev.task_id ? "#" + ev.task_id : "";
-  const d = ev.data || {};
-  switch (ev.kind) {
-    case "task.created": return `${who} created ${t}`;
-    case "task.claimed": return `${who} claimed ${t}`;
-    case "task.reclaimed": return `${who} reclaimed ${t} from ${(d.assignee || [])[0] || "—"}`;
-    case "task.status": return `${who} moved ${t} → ${last(d.status)}`;
-    case "task.assign": return `${who} assigned ${t} → ${last(d.assignee) || "—"}`;
-    case "task.patched": return `${who} edited ${t}` + (d.meta ? ` (meta: ${Object.keys(d.meta).sort().join(", ")})` : "");
-    case "comment.added": return `${who} commented on ${t}`;
-    case "project.created": return `${who} created project ${d.slug || ""}`;
-    case "project.archived": return `${who} archived project ${d.slug || ""}`;
-    case "project.unarchived": return `${who} unarchived project ${d.slug || ""}`;
-    case "category.created": return `${who} created category ${d.slug || ""}`;
-    case "category.archived": return `${who} archived category ${d.slug || ""}`;
-    case "category.unarchived": return `${who} unarchived category ${d.slug || ""}`;
-    case "task.deleted": return `${who} deleted task`;
-    case "comment.deleted": return `${who} deleted a comment on ${t}`;
-    case "project.deleted": return `${who} deleted project ${d.slug || ""}`;
-    case "task.dep_added": return `${who} linked ${t} depends on #${d.depends_on || ""}`;
-    case "task.dep_removed": return `${who} unlinked ${t} dep #${d.depends_on || ""}`;
-    case "task.labeled": return `${who} labeled ${t} +${d.label || ""}`;
-    case "task.unlabeled": return `${who} unlabeled ${t} -${d.label || ""}`;
-    default: return `${who} ${ev.kind} ${t}`;
-  }
+  const parts = evParts(ev).map((p) => p.ref ? "#" + p.ref : p.name != null ? p.name : p);
+  return (ev.actor || "someone") + " " + parts.join("");
 }
 
 function last(v) { return Array.isArray(v) ? v[v.length - 1] : v; }
@@ -1906,6 +2022,7 @@ function initTheme() {
 
 function onKey(e) {
   if (e.key === "Escape") {
+    if (graphOpen) { closeGraphOverlay(); return; } // focus may be outside the overlay (e.g. on body)
     if (!$("filterPanel").classList.contains("hidden")) { closeFilterPanel(); $("filterBtn").focus(); return; }
     if (!$("modal").classList.contains("hidden")) { closeModal(); return; }
     if (document.body.classList.contains("rail-open")) { closeMobileRail(); return; }
@@ -1916,6 +2033,7 @@ function onKey(e) {
   const typing = tag === "input" || tag === "textarea" || tag === "select" || e.target.isContentEditable;
   if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
   const k = e.key.toLowerCase();
+  if (graphOpen && k !== "g") return; // the other shortcuts would act on the page hidden behind the overlay
   if (k === "a") { e.preventDefault(); toggleFeed(); }
   else if (k === "n") { e.preventDefault(); openNew(); }
   else if (k === "g") { e.preventDefault(); if (graphOpen) closeGraphOverlay(); else openGraphOverlay(); }
@@ -1932,35 +2050,19 @@ $("searchBox").oninput = (e) => {
   clearTimeout(searchTimer);
   searchTimer = setTimeout(() => {
     filterQ = e.target.value.trim();
-    loadBoard().catch(() => {});
+    loadBoard().catch(reportBoardError);
   }, 250);
 };
 $("modal").onclick = (e) => { if (e.target.id === "modal") closeModal(); };
+// Run a live refresh that refreshModal deferred once the sheet has no uncommitted
+// text (a field committed on change, or the user emptied it).
+const runDeferredRefresh = () => { if (modalRefreshDeferred && !modalDirty()) refreshModal(); };
+$("sheet").addEventListener("input", runDeferredRefresh);
+$("sheet").addEventListener("change", runDeferredRefresh);
 $("filterBtn").onclick = (e) => { e.stopPropagation(); toggleFilterPanel(); };
 document.addEventListener("keydown", onKey);
-initFeed();
-initRail();
-initTheme();
 
-window.addEventListener("hashchange", () => { route().catch(() => {}); });
-
-(async function init() {
-  // Show loading skeletons immediately so the first paint isn't a blank board /
-  // feed; the real renders replace them via replaceChildren() on data arrival.
-  if (!document.body.classList.contains("view-overview")) boardSkeleton();
-  feedSkeleton();
-  // Load projects + categories first so the rail can render its full tree in any
-  // view (the board views never call loadOverview, which is the other place that
-  // populates `categories`). route() then applies the URL-hash view and opens the
-  // stream; it handles its own board/overview data loads.
-  try {
-    await Promise.all([
-      loadProjects(),
-      loadCategories().catch(() => {}), // rail still works project-only if this fails
-    ]);
-  } catch (e) { setStatus("error: " + e.message, "warn"); }
-  route().catch((e) => setStatus("error: " + e.message, "warn"));
-})();
+window.addEventListener("hashchange", () => { route().catch((e) => setStatus("error: " + e.message, "warn")); });
 
 // ===================== dependency graph overlay =====================
 
@@ -2110,39 +2212,32 @@ let graphSelectedId = null; // selected node id (number)
 let graphDragState = null;
 let graphRefreshTimer = null;
 let graphLastFocus = null;
-let graphPanZoomInstalled = false; // installed once per overlay open; guards listener leak
+let graphKeepView = false; // false → next renderGraph resets pan/zoom (set on open and project switch)
+let graphFetchSeq = 0;     // generation of the latest graph fetch; older responses are dropped
+let graphDragMoved = false; // the current/last drag moved the view, so its trailing click is not a deselect
 
-// BFS upstream (ancestors) and downstream (descendants) from a node.
+// BFS upstream (ancestors) and downstream (descendants) from a node, O(V+E):
+// edges are indexed by their start end once, and the queue is walked by index.
 function graphNeighbors(nodeId, edges) {
-  const upstream = new Set();
-  const downstream = new Set();
-  const upEdges = new Set();
-  const downEdges = new Set();
-
-  // upstream: walk edges backward (to→from)
-  let q = [nodeId];
-  while (q.length) {
-    const cur = q.shift();
+  const walk = (at, next) => {
+    const adj = new Map();
     for (const e of edges) {
-      if (e.to === cur && !upstream.has(e.from)) {
-        upstream.add(e.from);
-        upEdges.add(e);
-        q.push(e.from);
+      if (!adj.has(e[at])) adj.set(e[at], []);
+      adj.get(e[at]).push(e);
+    }
+    const seen = new Set(), via = new Set(), q = [nodeId];
+    for (let i = 0; i < q.length; i++) {
+      for (const e of adj.get(q[i]) || []) {
+        via.add(e); // every edge at a reached node lies on a path, even when its other end was already seen
+        if (seen.has(e[next])) continue;
+        seen.add(e[next]);
+        q.push(e[next]);
       }
     }
-  }
-  // downstream: walk edges forward (from→to)
-  q = [nodeId];
-  while (q.length) {
-    const cur = q.shift();
-    for (const e of edges) {
-      if (e.from === cur && !downstream.has(e.to)) {
-        downstream.add(e.to);
-        downEdges.add(e);
-        q.push(e.to);
-      }
-    }
-  }
+    return [seen, via];
+  };
+  const [upstream, upEdges] = walk("to", "from"); // walk edges backward (to→from)
+  const [downstream, downEdges] = walk("from", "to"); // walk edges forward (from→to)
   return { upstream, downstream, upEdges, downEdges };
 }
 
@@ -2154,7 +2249,7 @@ function openGraphOverlay() {
   graphSelectedId = null;
   $("graphOverlay").classList.remove("hidden");
   graphOpen = true;
-  graphPanZoomInstalled = false;
+  graphKeepView = false;
   buildGraphProjectSelect(slug);
   fetchAndRenderGraph(slug);
   $("graphClose").focus();
@@ -2179,6 +2274,7 @@ function buildGraphProjectSelect(activeSlug) {
   }
   sel.onchange = () => {
     graphSelectedId = null;
+    graphKeepView = false; // a different project starts from its own fitted view
     fetchAndRenderGraph(sel.value);
   };
 }
@@ -2190,13 +2286,17 @@ async function fetchAndRenderGraph(slug) {
   const sel = $("graphProjectSel");
   if (sel.value !== slug) sel.value = slug;
 
+  const seq = ++graphFetchSeq;
   let data;
   try {
     data = await api("GET", "/api/projects/" + encodeURIComponent(slug) + "/graph");
   } catch (e) {
+    if (seq !== graphFetchSeq || !graphOpen) return;
     showGraphEmpty("Error loading graph: " + e.message);
     return;
   }
+  // The overlay may have closed, or another project been picked, while this was in flight.
+  if (seq !== graphFetchSeq || !graphOpen) return;
   graphData = data;
   if (!data.nodes || !data.nodes.length) {
     showGraphEmpty("No tasks in this project yet.");
@@ -2225,34 +2325,18 @@ function renderGraph() {
   // Update the initial (reset-target) viewBox from layout dims.
   graphInitialView = { x: 0, y: 0, width, height };
   // Preserve the user's current pan/zoom on live refresh; only reset on first render.
-  if (!graphPanZoomInstalled) graphViewState = { ...graphInitialView };
+  if (!graphKeepView) { graphViewState = { ...graphInitialView }; graphKeepView = true; }
 
   const svgEl = $("graphSvg");
   svgEl.replaceChildren();
   svgEl.setAttribute("viewBox", viewBoxStr(graphViewState));
+  svgEl.append(graphArrowDefs());
 
-  // Arrowhead markers (two: green for cleared, amber for blocking).
-  const defs = svg("defs");
-
-  function makeArrow(id, color) {
-    const m = svg("marker", {
-      id, viewBox: "0 0 10 10", refX: "9", refY: "5",
-      markerWidth: "6", markerHeight: "6", orient: "auto-start-reverse",
-    });
-    const p = svg("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: color });
-    m.append(p);
-    return m;
-  }
-  defs.append(makeArrow("gArrowCleared", "var(--st-done)"));
-  defs.append(makeArrow("gArrowBlocking", "var(--warn)"));
-  defs.append(makeArrow("gArrowUp", "var(--accent)"));
-  defs.append(makeArrow("gArrowDown", "var(--violet)"));
-  svgEl.append(defs);
-
-  // Pan surface (transparent background for drag/click).
+  // Pan surface (transparent background for drag/click; a click on it deselects).
   const panSurface = svg("rect", {
     x: "0", y: "0", width: String(width), height: String(height), class: "graph-pan-surface",
   });
+  panSurface.addEventListener("click", () => selectGraphNode(null));
   svgEl.append(panSurface);
 
   // Divider + label between the dependency DAG and the dependency-free lane.
@@ -2268,155 +2352,107 @@ function renderGraph() {
   }
 
   const edgeGroup = svg("g", { class: "gedge-group" });
-  const nodeGroup = svg("g", { class: "gnode-group" });
-  svgEl.append(edgeGroup);
-  svgEl.append(nodeGroup);
-
-  // --- draw edges ---
-  const edgeEls = new Map();  // Map<GraphEdge, SVGElement>
-
   for (const e of edges) {
-    const fp = positions.get(e.from);
-    const tp = positions.get(e.to);
-    if (!fp || !tp) continue;
-
-    const sx = fp.x + fp.w;
-    const sy = fp.y + fp.h / 2;
-    const tx = tp.x;
-    const ty = tp.y + tp.h / 2;
-    const delta = tx - sx;
-    const bend = Math.max(58, Math.abs(delta) * 0.42);
-    const d = delta >= 0
-      ? `M ${sx} ${sy} C ${sx + bend} ${sy}, ${tx - bend} ${ty}, ${tx} ${ty}`
-      : `M ${sx} ${sy} C ${sx + bend} ${sy}, ${tx - bend} ${ty - 80}, ${tx} ${ty}`;
-
-    const fromNode = nodesById.get(e.from);
-    const cleared = fromNode && fromNode.status === "done";
-    const marker = cleared ? "url(#gArrowCleared)" : "url(#gArrowBlocking)";
-    const edgeCls = "gedge " + (cleared ? "gedge-cleared" : "gedge-blocking");
-
-    const path = svg("path", { d, class: edgeCls, "marker-end": marker,
-      "data-from": String(e.from), "data-to": String(e.to) });
-    edgeGroup.append(path);
-    edgeEls.set(e, path);
+    const fp = positions.get(e.from), tp = positions.get(e.to);
+    if (fp && tp) edgeGroup.append(drawGraphEdge(e, fp, tp, nodesById));
   }
-
-  // --- draw nodes ---
-  const nodeEls = new Map();  // Map<id, SVGElement>
-
+  const nodeGroup = svg("g", { class: "gnode-group" });
   for (const n of nodes) {
     const pos = positions.get(n.id);
-    if (!pos) continue;
-
-    const prioColor = PRIO_VAR[n.priority] || PRIO_VAR[3];
-    const statusColor = ST[n.status] || "var(--faint)";
-    const isDone = n.status === "done";
-    const isBlocked = n.nopen > 0;
-    const isReady = n.nprereq > 0 && n.nopen === 0;
-
-    const g = svg("g", {
-      class: "gnode" + (isDone ? " gnode-done" : ""),
-      transform: `translate(${pos.x}, ${pos.y})`,
-      "data-id": String(n.id),
-      role: "button",
-      tabindex: "0",
-      "aria-label": n.project + "-" + n.ref + " " + n.title + " (" + n.status + ")",
-    });
-
-    const rect = svg("rect", {
-      x: "0", y: "0", width: String(pos.w), height: String(pos.h),
-      rx: "9", class: "gnode-rect",
-      stroke: prioColor,
-    });
-    g.append(rect);
-
-    // Status dot.
-    const dot = svg("circle", { cx: "14", cy: "16", r: "5", class: "gnode-dot", fill: statusColor });
-    g.append(dot);
-
-    // Ready/blocked indicator text.
-    if (isBlocked) {
-      const ind = svg("text", { x: String(pos.w - 10), y: "16", class: "gnode-ind gnode-ind-blocked",
-        "text-anchor": "end", "dominant-baseline": "middle" });
-      ind.textContent = "🔒";  // lock emoji
-      g.append(ind);
-    } else if (isReady) {
-      const ind = svg("text", { x: String(pos.w - 10), y: "16", class: "gnode-ind gnode-ind-ready",
-        "text-anchor": "end", "dominant-baseline": "middle" });
-      ind.textContent = "✓";
-      g.append(ind);
-    }
-
-    // Label: #ref + title wrapped.
-    const refLine = n.project + "-" + n.ref;
-    const refT = svg("text", { x: "26", y: "16", class: "gnode-ref", "dominant-baseline": "middle" });
-    refT.textContent = refLine;
-    g.append(refT);
-
-    const titleLines = wrapTextLines(n.title, 22, 2);
-    const titleGroup = svg("text", { x: "8", y: "36", class: "gnode-title" });
-    titleLines.forEach((line, i) => {
-      const span = svg("tspan", { x: "8", dy: i === 0 ? "0" : "14" });
-      span.textContent = line;
-      titleGroup.append(span);
-    });
-    g.append(titleGroup);
-
-    nodeGroup.append(g);
-    nodeEls.set(n.id, g);
-
-    g.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      if (graphSelectedId === n.id) {
-        graphSelectedId = null;
-      } else {
-        graphSelectedId = n.id;
-      }
-      applyGraphFocus(nodeEls, edgeEls, edges, nodesById);
-      if (graphSelectedId != null) renderGraphDetail(n, edges, nodesById);
-      else clearGraphDetail();
-    });
-    g.addEventListener("keydown", (ev) => {
-      if (ev.key === "Enter" || ev.key === " ") {
-        ev.preventDefault();
-        g.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      }
-    });
+    if (pos) nodeGroup.append(drawGraphNode(n, pos));
   }
+  svgEl.append(edgeGroup, nodeGroup);
 
-  // Pan-surface click clears selection (panSurface is a new element each render; no leak).
-  panSurface.addEventListener("click", () => {
-    graphSelectedId = null;
-    rebuildFocusAfterDetailNav(); // uses current DOM, not stale closure
-    clearGraphDetail();
-  });
-  // svgEl is persistent — add this click-to-deselect listener only once (guarded by graphPanZoomInstalled).
-  if (!graphPanZoomInstalled) {
-    svgEl.addEventListener("click", (ev) => {
-      if (ev.target === svgEl) {
-        graphSelectedId = null;
-        rebuildFocusAfterDetailNav();
-        clearGraphDetail();
-      }
-    });
-  }
-
-  // Restore selection if the node still exists.
-  if (graphSelectedId != null && nodesById.has(graphSelectedId)) {
-    applyGraphFocus(nodeEls, edgeEls, edges, nodesById);
-    renderGraphDetail(nodesById.get(graphSelectedId), edges, nodesById);
-  } else {
-    graphSelectedId = null;
-    clearGraphDetail();
-  }
-
-  // Pan/zoom — install listeners only once per overlay open to avoid stacking them
-  // on every live refresh (svgEl is the same DOM node across re-renders).
-  if (!graphPanZoomInstalled) {
-    installGraphPanZoom(svgEl, panSurface);
-    graphPanZoomInstalled = true;
-  }
+  // A live refresh keeps graphSelectedId; this is the one place it is restored
+  // (or dropped, when the node is gone) after a render.
+  selectGraphNode(nodesById.has(graphSelectedId) ? graphSelectedId : null);
   buildGraphLegend();
+}
+
+// graphArrowDefs builds the arrowhead markers: cleared (green), blocking (amber),
+// and the upstream/downstream path highlights.
+function graphArrowDefs() {
+  const defs = svg("defs");
+  const arrows = [["gArrowCleared", "var(--st-done)"], ["gArrowBlocking", "var(--warn)"], ["gArrowUp", "var(--accent)"], ["gArrowDown", "var(--violet)"]];
+  for (const [id, color] of arrows) {
+    const m = svg("marker", {
+      id, viewBox: "0 0 10 10", refX: "9", refY: "5",
+      markerWidth: "6", markerHeight: "6", orient: "auto-start-reverse",
+    });
+    m.append(svg("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: color }));
+    defs.append(m);
+  }
+  return defs;
+}
+
+// graphEdgeCleared reports whether an edge's prerequisite is done (its resting
+// arrow is then the cleared one, else the blocking one).
+function graphEdgeCleared(e, nodesById) {
+  const from = nodesById.get(e.from);
+  return !!from && from.status === "done";
+}
+
+// drawGraphEdge draws the curve from the prerequisite (fp) to the dependent (tp).
+function drawGraphEdge(e, fp, tp, nodesById) {
+  const sx = fp.x + fp.w;
+  const sy = fp.y + fp.h / 2;
+  const tx = tp.x;
+  const ty = tp.y + tp.h / 2;
+  const delta = tx - sx;
+  const bend = Math.max(58, Math.abs(delta) * 0.42);
+  const d = delta >= 0
+    ? `M ${sx} ${sy} C ${sx + bend} ${sy}, ${tx - bend} ${ty}, ${tx} ${ty}`
+    : `M ${sx} ${sy} C ${sx + bend} ${sy}, ${tx - bend} ${ty - 80}, ${tx} ${ty}`;
+  const cleared = graphEdgeCleared(e, nodesById);
+  return svg("path", {
+    d, class: "gedge " + (cleared ? "gedge-cleared" : "gedge-blocking"),
+    "marker-end": cleared ? "url(#gArrowCleared)" : "url(#gArrowBlocking)",
+    "data-from": String(e.from), "data-to": String(e.to),
+  });
+}
+
+// drawGraphNode draws one task box (priority border, status dot, ready/blocked
+// indicator, ref, wrapped title); clicking or activating it toggles its selection.
+function drawGraphNode(n, pos) {
+  const g = svg("g", {
+    class: "gnode" + (n.status === "done" ? " gnode-done" : ""),
+    transform: `translate(${pos.x}, ${pos.y})`,
+    "data-id": String(n.id),
+    role: "button",
+    tabindex: "0",
+    "aria-label": n.project + "-" + n.ref + " " + n.title + " (" + n.status + ")",
+  });
+  g.append(svg("rect", {
+    x: "0", y: "0", width: String(pos.w), height: String(pos.h),
+    rx: "9", class: "gnode-rect", stroke: prio(n.priority).color,
+  }));
+  g.append(svg("circle", { cx: "14", cy: "16", r: "5", class: "gnode-dot", fill: ST[n.status] || "var(--faint)" }));
+
+  // Ready/blocked indicator text.
+  const ready = n.nprereq > 0 && n.nopen === 0;
+  if (n.nopen > 0 || ready) {
+    const ind = svg("text", { x: String(pos.w - 10), y: "16", class: "gnode-ind " + (ready ? "gnode-ind-ready" : "gnode-ind-blocked"),
+      "text-anchor": "end", "dominant-baseline": "middle" });
+    ind.textContent = ready ? "✓" : "🔒";
+    g.append(ind);
+  }
+
+  const refT = svg("text", { x: "26", y: "16", class: "gnode-ref", "dominant-baseline": "middle" });
+  refT.textContent = n.project + "-" + n.ref;
+  g.append(refT);
+
+  const titleGroup = svg("text", { x: "8", y: "36", class: "gnode-title" });
+  wrapTextLines(n.title, 22, 2).forEach((line, i) => {
+    const span = svg("tspan", { x: "8", dy: i === 0 ? "0" : "14" });
+    span.textContent = line;
+    titleGroup.append(span);
+  });
+  g.append(titleGroup);
+
+  const toggle = () => selectGraphNode(graphSelectedId === n.id ? null : n.id);
+  g.addEventListener("click", (ev) => { ev.stopPropagation(); toggle(); }); // not a background (deselect) click
+  g.addEventListener("keydown", onActivate(toggle));
+  return g;
 }
 
 function viewBoxStr(vs) {
@@ -2429,9 +2465,7 @@ function applyGraphFocus(nodeEls, edgeEls, edges, nodesById) {
   edgeEls.forEach((el) => el.classList.remove("gedge-up", "gedge-down", "gedge-dim"));
   // Reset marker refs on edges to their original markers.
   edgeEls.forEach((pathEl, e) => {
-    const fromNode = nodesById.get(e.from);
-    const cleared = fromNode && fromNode.status === "done";
-    pathEl.setAttribute("marker-end", cleared ? "url(#gArrowCleared)" : "url(#gArrowBlocking)");
+    pathEl.setAttribute("marker-end", graphEdgeCleared(e, nodesById) ? "url(#gArrowCleared)" : "url(#gArrowBlocking)");
   });
 
   if (graphSelectedId == null) return;
@@ -2484,7 +2518,7 @@ function renderGraphDetail(node, edges, nodesById) {
   const d = $("graphDetail");
   d.replaceChildren();
 
-  const prioColor = PRIO_VAR[node.priority] || PRIO_VAR[3];
+  const p = prio(node.priority);
   const statusColor = ST[node.status] || "var(--faint)";
 
   const head = el("div", { class: "gd-head" });
@@ -2498,8 +2532,7 @@ function renderGraphDetail(node, edges, nodesById) {
   // the resolved color with transparent to get a real ~14% soft background.
   chips.append(el("span", { class: "gd-chip",
     style: "background:color-mix(in srgb, " + statusColor + " 14%, transparent);color:" + statusColor }, node.status));
-  chips.append(el("span", { class: "gd-chip", style: "border-color:" + prioColor + ";color:" + prioColor },
-    PRIO_LABEL[node.priority] || ("P" + node.priority)));
+  chips.append(el("span", { class: "gd-chip", style: "border-color:" + p.color + ";color:" + p.color }, p.word));
   if (node.assignee) chips.append(el("span", { class: "gd-chip gd-assignee" }, node.assignee));
   d.append(chips);
 
@@ -2513,47 +2546,15 @@ function renderGraphDetail(node, edges, nodesById) {
   }
   d.append(blockedLine);
 
-  // Prerequisites (incoming edges from→this node).
-  const prereqs = edges.filter((e) => e.to === node.id).map((e) => nodesById.get(e.from)).filter(Boolean);
-  const prereqSec = el("div", { class: "gd-section" });
-  prereqSec.append(el("div", { class: "gd-section-label" }, "Prerequisites (" + prereqs.length + ")"));
-  if (!prereqs.length) {
-    prereqSec.append(el("div", { class: "gd-none" }, "None"));
-  } else {
-    for (const p of prereqs) {
-      const row = el("div", { class: "gd-dep-row", role: "link", tabindex: "0",
-        onclick: () => { graphSelectedId = p.id; renderGraphDetail(p, edges, nodesById); rebuildFocusAfterDetailNav(); },
-        onkeydown: (ev) => { if (ev.key === "Enter") { graphSelectedId = p.id; renderGraphDetail(p, edges, nodesById); rebuildFocusAfterDetailNav(); } },
-      });
-      const dot = el("span", { class: "gd-dep-dot", style: "background:" + (ST[p.status] || "var(--faint)") });
-      row.append(dot, el("span", { class: "gd-dep-ref" }, p.project + "-" + p.ref),
-        el("span", { class: "gd-dep-title" }, p.title),
-        el("span", { class: "gd-dep-status" }, p.status === "done" ? "✓" : p.status));
-      prereqSec.append(row);
-    }
-  }
-  d.append(prereqSec);
-
-  // Unblocks (outgoing edges this→to).
-  const unblocks = edges.filter((e) => e.from === node.id).map((e) => nodesById.get(e.to)).filter(Boolean);
-  const unblockSec = el("div", { class: "gd-section" });
-  unblockSec.append(el("div", { class: "gd-section-label" }, "Unblocks (" + unblocks.length + ")"));
-  if (!unblocks.length) {
-    unblockSec.append(el("div", { class: "gd-none" }, "None"));
-  } else {
-    for (const u of unblocks) {
-      const row = el("div", { class: "gd-dep-row", role: "link", tabindex: "0",
-        onclick: () => { graphSelectedId = u.id; renderGraphDetail(u, edges, nodesById); rebuildFocusAfterDetailNav(); },
-        onkeydown: (ev) => { if (ev.key === "Enter") { graphSelectedId = u.id; renderGraphDetail(u, edges, nodesById); rebuildFocusAfterDetailNav(); } },
-      });
-      const dot = el("span", { class: "gd-dep-dot", style: "background:" + (ST[u.status] || "var(--faint)") });
-      row.append(dot, el("span", { class: "gd-dep-ref" }, u.project + "-" + u.ref),
-        el("span", { class: "gd-dep-title" }, u.title),
-        el("span", { class: "gd-dep-status" }, u.status === "done" ? "✓" : u.status));
-      unblockSec.append(row);
-    }
-  }
-  d.append(unblockSec);
+  const section = (label, deps) => {
+    const sec = el("div", { class: "gd-section" }, el("div", { class: "gd-section-label" }, label + " (" + deps.length + ")"));
+    if (!deps.length) sec.append(el("div", { class: "gd-none" }, "None"));
+    for (const dep of deps) sec.append(graphDepRow(dep));
+    return sec;
+  };
+  // Prerequisites are the incoming edges (from → this node), Unblocks the outgoing ones.
+  d.append(section("Prerequisites", edges.filter((e) => e.to === node.id).map((e) => nodesById.get(e.from)).filter(Boolean)));
+  d.append(section("Unblocks", edges.filter((e) => e.from === node.id).map((e) => nodesById.get(e.to)).filter(Boolean)));
 
   // Leave the graph and open the full task: close the overlay first so the task
   // modal isn't hidden behind it, then open the task on the board.
@@ -2561,63 +2562,95 @@ function renderGraphDetail(node, edges, nodesById) {
   d.append(openBtn);
 }
 
-function rebuildFocusAfterDetailNav() {
-  if (!graphData) return;
-  const { nodes, edges } = graphData;
+// graphDepRow is one Prerequisites/Unblocks row of the detail panel; activating
+// it selects that task in the graph.
+function graphDepRow(n) {
+  const go = () => selectGraphNode(n.id);
+  return el("div", { class: "gd-dep-row", role: "link", tabindex: "0", onclick: go, onkeydown: onActivate(go) },
+    el("span", { class: "gd-dep-dot", style: "background:" + (ST[n.status] || "var(--faint)") }),
+    el("span", { class: "gd-dep-ref" }, n.project + "-" + n.ref),
+    el("span", { class: "gd-dep-title" }, n.title),
+    el("span", { class: "gd-dep-status" }, n.status === "done" ? "✓" : n.status));
+}
+
+// selectGraphNode selects a node (null clears the selection) and redraws the path
+// highlight and the detail panel from graphData and the drawn SVG. Every selection
+// change goes through here: node and detail-row activation, background clicks, and
+// renderGraph restoring the selection after a live refresh.
+function selectGraphNode(id) {
+  graphSelectedId = id;
+  const { nodes, edges } = graphData || { nodes: [], edges: [] };
   const nodesById = new Map(nodes.map((n) => [n.id, n]));
-  // Re-collect SVG elements by data-id.
+  // Collect the drawn elements: nodes by data-id, edges back to their edge objects by from:to.
   const svgEl = $("graphSvg");
   const nodeEls = new Map();
-  svgEl.querySelectorAll(".gnode[data-id]").forEach((el) => nodeEls.set(Number(el.dataset.id), el));
+  svgEl.querySelectorAll(".gnode[data-id]").forEach((g) => nodeEls.set(Number(g.dataset.id), g));
   const edgeEls = new Map();
-  // For edges we need the original edge objects — iterate all path elements.
+  const edgesByKey = new Map(edges.map((x) => [x.from + ":" + x.to, x]));
   svgEl.querySelectorAll(".gedge").forEach((pathEl) => {
-    const from = Number(pathEl.getAttribute("data-from"));
-    const to = Number(pathEl.getAttribute("data-to"));
-    // Find matching edge.
-    const e = edges.find((x) => x.from === from && x.to === to);
+    const e = edgesByKey.get(pathEl.getAttribute("data-from") + ":" + pathEl.getAttribute("data-to"));
     if (e) edgeEls.set(e, pathEl);
   });
   applyGraphFocus(nodeEls, edgeEls, edges, nodesById);
+  const node = id == null ? null : nodesById.get(id);
+  if (node) renderGraphDetail(node, edges, nodesById);
+  else clearGraphDetail();
 }
 
-function installGraphPanZoom(svgEl, panSurface) {
+// installGraphPanZoom wires pan/zoom and click-to-deselect on the static #graphSvg.
+// It runs once at load (below): only the svg's children are replaced per render.
+function installGraphPanZoom(svgEl) {
   const setViewBox = () => svgEl.setAttribute("viewBox", viewBoxStr(graphViewState));
+  // The svg keeps the default preserveAspectRatio (xMidYMid meet): one uniform
+  // scale, min(rect/viewBox) on both axes, with the content centered. Pixel deltas
+  // convert to viewBox units through that scale, not through per-axis ratios.
+  const unitsPerPx = (rect) => 1 / Math.min(rect.width / graphViewState.width, rect.height / graphViewState.height);
 
   svgEl.addEventListener("wheel", (ev) => {
     ev.preventDefault();
     const rect = svgEl.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
-    const px = (ev.clientX - rect.left) / rect.width;
-    const py = (ev.clientY - rect.top) / rect.height;
-    const anchorX = graphViewState.x + px * graphViewState.width;
-    const anchorY = graphViewState.y + py * graphViewState.height;
+    const u = unitsPerPx(rect);
+    // Cursor in viewBox coordinates: offset from the element center, through the uniform scale.
+    const anchorX = graphViewState.x + graphViewState.width / 2 + (ev.clientX - rect.left - rect.width / 2) * u;
+    const anchorY = graphViewState.y + graphViewState.height / 2 + (ev.clientY - rect.top - rect.height / 2) * u;
     const factor = ev.deltaY < 0 ? 0.9 : 1.1;
-    const nextW = Math.min(Math.max(260, graphViewState.width * factor), 6000);
-    const nextH = Math.min(Math.max(180, graphViewState.height * factor), 4000);
-    graphViewState.x = anchorX - px * nextW;
-    graphViewState.y = anchorY - py * nextH;
-    graphViewState.width = nextW;
-    graphViewState.height = nextH;
+    // One factor for both axes (keeps the viewBox aspect), clamped relative to the
+    // fitted view: zoom in to 260 units wide, out to 4x the whole graph.
+    const w = graphViewState.width;
+    const f = Math.min(Math.max(w * factor, 260), graphInitialView.width * 4) / w;
+    if (factor < 1 ? f >= 1 : f <= 1) return; // at a bound: a step never zooms the other way
+    graphViewState.x = anchorX - (anchorX - graphViewState.x) * f;
+    graphViewState.y = anchorY - (anchorY - graphViewState.y) * f;
+    graphViewState.width = w * f;
+    graphViewState.height *= f;
     setViewBox();
   }, { passive: false });
 
   svgEl.addEventListener("mousedown", (ev) => {
-    if (!(ev.target === svgEl || ev.target === panSurface || ev.target.classList?.contains("graph-pan-surface"))) return;
+    graphDragMoved = false;
+    if (!(ev.target === svgEl || ev.target.classList?.contains("graph-pan-surface"))) return;
     graphDragState = { startX: ev.clientX, startY: ev.clientY, viewX: graphViewState.x, viewY: graphViewState.y };
   });
   svgEl.addEventListener("mousemove", (ev) => {
     if (!graphDragState) return;
     const rect = svgEl.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
-    const dx = ((ev.clientX - graphDragState.startX) * graphViewState.width) / rect.width;
-    const dy = ((ev.clientY - graphDragState.startY) * graphViewState.height) / rect.height;
-    graphViewState.x = graphDragState.viewX - dx;
-    graphViewState.y = graphDragState.viewY - dy;
+    const mx = ev.clientX - graphDragState.startX, my = ev.clientY - graphDragState.startY;
+    if (Math.abs(mx) + Math.abs(my) > 3) graphDragMoved = true;
+    const u = unitsPerPx(rect);
+    graphViewState.x = graphDragState.viewX - mx * u;
+    graphViewState.y = graphDragState.viewY - my * u;
     setViewBox();
   });
   svgEl.addEventListener("mouseup", () => { graphDragState = null; });
-  svgEl.addEventListener("mouseleave", () => { graphDragState = null; });
+  svgEl.addEventListener("mouseleave", () => { graphDragState = null; graphDragMoved = false; });
+  // A pan ends in a click on the surface; swallow it (capture phase, before the
+  // surface/svg deselect handlers) so panning keeps the selected node and its path.
+  svgEl.addEventListener("click", (ev) => {
+    if (graphDragMoved) { graphDragMoved = false; ev.stopPropagation(); }
+  }, true);
+  svgEl.addEventListener("click", (ev) => { if (ev.target === svgEl) selectGraphNode(null); });
 }
 
 function buildGraphLegend() {
@@ -2625,10 +2658,7 @@ function buildGraphLegend() {
   leg.replaceChildren();
 
   const items = [
-    { color: PRIO_VAR[0], label: "Urgent" },
-    { color: PRIO_VAR[1], label: "High" },
-    { color: PRIO_VAR[2], label: "Normal" },
-    { color: PRIO_VAR[3], label: "Low" },
+    ...PRIORITIES.map((p) => ({ color: p.color, label: p.word })),
     { color: "var(--st-done)", label: "Cleared edge", isLine: true },
     { color: "var(--warn)", label: "Blocking edge", isLine: true, dashed: true },
     { color: "var(--st-done)", label: "Done task", isDot: true },
@@ -2653,32 +2683,21 @@ function buildGraphLegend() {
 // graphMaybeRefresh is called from onEvent (below) when the graph overlay is open.
 const GRAPH_REFRESH_KINDS = new Set([
   "task.dep_added", "task.dep_removed", "task.status", "task.created", "task.deleted",
-  "task.assign", "task.patched", "task.reclaimed",
+  "task.assign", "task.patched", "task.reclaimed", "task.claimed",
 ]);
 
 function graphMaybeRefresh(ev) {
   if (!graphOpen || !graphSlug || !graphData) return;
   if (!GRAPH_REFRESH_KINDS.has(ev.kind)) return;
-  // Skip if the event clearly belongs to a different project.
-  if (ev.task_id) {
-    const node = graphData.nodes.find((n) => n.id === ev.task_id);
-    if (node && node.project !== graphSlug) return;
-  }
-  if (graphRefreshTimer) clearTimeout(graphRefreshTimer);
-  graphRefreshTimer = setTimeout(async () => {
-    if (!graphOpen) return;
-    const prevSel = graphSelectedId;
-    await fetchAndRenderGraph(graphSlug);
-    // Restore selection if the node still exists after refresh.
-    if (prevSel != null && graphData && graphData.nodes.find((n) => n.id === prevSel)) {
-      graphSelectedId = prevSel;
-      rebuildFocusAfterDetailNav();
-      const n = graphData.nodes.find((x) => x.id === prevSel);
-      if (n) {
-        const nodesById = new Map(graphData.nodes.map((x) => [x.id, x]));
-        renderGraphDetail(n, graphData.edges, nodesById);
-      }
-    }
+  // Skip events of another project. graphData holds only this project's tasks, so
+  // compare the event's project_id with the displayed project's id instead.
+  const shown = projects.find((p) => p.slug === graphSlug);
+  if (shown && ev.project_id !== shown.id) return;
+  // Coalesce a burst into one refetch without letting a steady stream postpone it.
+  if (graphRefreshTimer) return;
+  graphRefreshTimer = setTimeout(() => {
+    graphRefreshTimer = null;
+    if (graphOpen) fetchAndRenderGraph(graphSlug); // renderGraph restores the selection
   }, 350);
 }
 
@@ -2694,6 +2713,7 @@ function graphTrapFocus(ev) {
 }
 
 // Wire up graph overlay controls.
+installGraphPanZoom($("graphSvg"));
 $("graphBtn").onclick = openGraphOverlay;
 $("graphClose").onclick = closeGraphOverlay;
 $("graphReset").onclick = () => {
@@ -2704,3 +2724,30 @@ $("graphOverlay").addEventListener("keydown", (ev) => {
   if (ev.key === "Escape") { ev.stopPropagation(); closeGraphOverlay(); }
   graphTrapFocus(ev);
 });
+
+// ===================== startup =====================
+
+// Startup runs last, after every module-level declaration above (graph state
+// included) is initialized: a synchronous call from here into code that reads a
+// later `let` would otherwise throw a temporal-dead-zone ReferenceError.
+initFeed();
+initRail();
+initTheme();
+
+(async function init() {
+  // Show loading skeletons immediately so the first paint isn't a blank board /
+  // feed; the real renders replace them via replaceChildren() on data arrival.
+  if (!document.body.classList.contains("view-overview")) boardSkeleton();
+  feedSkeleton();
+  // Load projects + categories first so the rail can render its full tree in any
+  // view (the board views never call loadOverview, which is the other place that
+  // populates `categories`). route() then applies the URL-hash view and opens the
+  // stream; it handles its own board/overview data loads.
+  try {
+    await Promise.all([
+      loadProjects(),
+      loadCategories().catch(() => {}), // rail still works project-only if this fails
+    ]);
+  } catch (e) { setStatus("error: " + e.message, "warn"); }
+  route().catch((e) => setStatus("error: " + e.message, "warn"));
+})();

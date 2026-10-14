@@ -1,6 +1,8 @@
 package main
 
 import (
+	"io/fs"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -9,42 +11,53 @@ import (
 // textContent DOM convention used throughout app.js.
 //
 // WHY THIS EXISTS:
-//   - The project has no JS test runner (keeps the no-npm / single-binary ethos).
+//   - The project has no npm toolchain (single-binary ethos); app.js behavior is
+//     exercised by the node harness in cwf_web_g4_harness_test.go when node is on PATH.
 //   - The dashboard deliberately avoids innerHTML and related sinks; all dynamic
 //     content is built via el() which uses document.createTextNode() for strings,
 //     so agent-supplied titles and comments cannot inject HTML.
-//   - This test locks in that XSS-safe convention at the Go build level. A future
-//     accidental .innerHTML assignment will fail `go test` before it ships.
+//   - It scans every file embedded under web/ (a new script is covered without
+//     editing this list) for the known markup/script sinks below, in dot and
+//     bracket form. It is a pattern scan, not a parser: a sink reached through an
+//     alias or computed name passes. el()'s rule that string on* props are dropped
+//     is checked at runtime by TestCwfWebHarnessElDropsStringHandlers.
 //
-// The patterns checked are dot-prefixed (e.g. ".innerHTML") to avoid triggering
-// on the intentional comment in app.js that says "never innerHTML" (no leading dot).
+// The property patterns are dot- or bracket-prefixed (e.g. ".innerHTML") to avoid
+// triggering on the intentional comment in app.js that says "never innerHTML".
 func TestDashboardNoXSSSinks(t *testing.T) {
-	files := []string{
-		"web/app.js",
-		"web/index.html",
+	sinks := []struct{ re, what string }{
+		{`\.(innerHTML|outerHTML|insertAdjacentHTML)\b`, "HTML property/method"},
+		{`\[\s*["'\x60](innerHTML|outerHTML|insertAdjacentHTML|srcdoc)["'\x60]\s*\]`, "bracket-notation HTML sink"},
+		{`document\.write`, "document.write"},
+		{`\beval\(`, "eval("},
+		{`\bFunction\(`, "Function( / new Function("},
+		{`\bset(Timeout|Interval)\(\s*["'\x60]`, "string-evaluating timer"},
+		{`\bsrcdoc\b`, "iframe srcdoc"},
+		{`createContextualFragment`, "Range.createContextualFragment"},
+		{`(?i)javascript:`, "javascript: URL"},
 	}
-
-	// Dangerous sink patterns. Each is a dot-prefixed property assignment form or
-	// a function call that can execute arbitrary HTML/JS.
-	sinks := []string{
-		".innerHTML",
-		".outerHTML",
-		".insertAdjacentHTML",
-		"document.write",
-		"eval(",
-	}
-
-	for _, name := range files {
+	n := 0
+	err := fs.WalkDir(webFS, "web", func(name string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		n++
 		data, err := webFS.ReadFile(name)
 		if err != nil {
-			t.Fatalf("ReadFile(%q): %v", name, err)
+			return err
 		}
-		content := string(data)
-		for _, sink := range sinks {
-			if strings.Contains(content, sink) {
-				t.Errorf("%s contains dangerous XSS sink %q — use el()/textContent instead", name, sink)
+		for _, s := range sinks {
+			if loc := regexp.MustCompile(s.re).FindIndex(data); loc != nil {
+				t.Errorf("%s contains XSS sink %q (%s) — use el()/textContent instead", name, data[loc[0]:loc[1]], s.what)
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk web/: %v", err)
+	}
+	if n < 3 {
+		t.Fatalf("walked %d files under web/, want app.js, app.css and index.html at least", n)
 	}
 }
 
@@ -74,16 +87,13 @@ func TestDashboardThemeAssets(t *testing.T) {
 	}
 }
 
-// TestDashboardParityAffordances locks in the CLI↔GUI parity affordances at the Go
-// build level (same no-JS-runner rationale as TestDashboardNoXSSSinks): the
-// dashboard assets must carry the create/archive-category, project-category-picker,
-// project-edit, board-filter, editable-meta, and release wiring. A regression that
-// drops any of these fails `go test` before it ships.
+// TestDashboardParityAffordances is a coarse presence test for the CLI↔GUI parity
+// affordances: index.html must carry the filter controls' element ids and app.css
+// the selectors that style each affordance. It matches raw text, so it proves the
+// hooks exist, not that they work. The affordances' behavior (create/archive
+// category, the project category picker, project edit, board filters, editable
+// meta, release) is exercised by TestCwfWebG5HarnessParityAffordances.
 func TestDashboardParityAffordances(t *testing.T) {
-	js, err := webFS.ReadFile("web/app.js")
-	if err != nil {
-		t.Fatalf("ReadFile app.js: %v", err)
-	}
 	html, err := webFS.ReadFile("web/index.html")
 	if err != nil {
 		t.Fatalf("ReadFile index.html: %v", err)
@@ -92,41 +102,17 @@ func TestDashboardParityAffordances(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile app.css: %v", err)
 	}
-	appJS, indexHTML, appCSS := string(js), string(html), string(css)
+	indexHTML, appCSS := string(html), string(css)
 
 	checks := []struct {
 		src    string
 		needle string
 		why    string
 	}{
-		// GAP 1 — create category.
-		{appJS, "openNewCategory", "create-category modal handler"},
-		{appJS, "newCatCard", "dashed add-card in the overview grid"},
-		{appJS, "/api/categories", "category create/list endpoint"},
-		// GAP 2 — category picker on project create.
-		{appJS, "category: csel.value", "new-project POST carries the chosen category"},
-		// GAP 3 — archive/unarchive category in the Manage modal.
-		{appJS, "renderManageCategories", "categories section of the Manage modal"},
-		{appJS, "/api/categories?archived=true", "Manage modal lists archived categories"},
-		{appJS, "/unarchive", "category unarchive action"},
-		// GAP 4 — edit project.
-		{appJS, "openEditProject", "project-edit sub-modal handler"},
-		{appJS, "btn-edit-proj", "per-row Edit button in the Manage modal"},
-		{appJS, "vault_project_id", "project-edit can set the vault project id"},
-		// GAP 5 — board filters.
+		// Board filters: the header button and its popover.
 		{indexHTML, `id="filterBtn"`, "filter button in the header"},
 		{indexHTML, `id="filterPanel"`, "filter popover panel in the header"},
-		{appJS, "filterReady", "ready board-filter state"},
-		{appJS, "filterBlocked", "blocked board-filter state"},
-		{appJS, "filterStale", "stale board-filter state"},
-		{appJS, "filterMetaKey", "meta-key board-filter state"},
-		{appJS, "renderFilterPanel", "filter panel renderer"},
-		// GAP 6 — editable meta.
-		{appJS, "patchMeta", "inline meta set/delete helper"},
-		{appJS, "meta-add-row", "add-meta input row in the task modal"},
-		// GAP 7 — release.
-		{appJS, "btn-release", "one-click release button in the task modal"},
-		// CSS — the affordances must be themed.
+		// Styling: each affordance must be themed.
 		{appCSS, ".filter-panel", "filter popover styling"},
 		{appCSS, ".meta-add-row", "editable-meta row styling"},
 		{appCSS, ".btn-release", "release button styling"},

@@ -786,11 +786,6 @@ select:hover, .field:hover { border-color: var(--line-strong); }
 }
 .btn-danger-task:hover { color: var(--danger); border-color: var(--danger); }
 .btn-danger-task.confirming { color: var(--danger); border-color: var(--danger); background: var(--danger-weak); font-weight: 600; }
-.btn-cancel-del {
-  background: transparent; border: 1px solid var(--line); color: var(--muted);
-  border-radius: 8px; padding: 6px 11px; font-size: 12px;
-}
-.btn-cancel-del:hover { border-color: var(--line-strong); color: var(--fg); }
 
 /* Release button in the task modal (pushes Delete to the right edge of the row) */
 .btn-release {
