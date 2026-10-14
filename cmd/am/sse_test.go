@@ -129,7 +129,7 @@ func TestSSEDeliversLiveEvent(t *testing.T) {
 }
 
 func TestSSEReplayOnReconnect(t *testing.T) {
-	ts := newTestServer(t)
+	ts, store := newTestServerWithStore(t)
 	mustCreateProject(t, ts, "replayproj")
 
 	// --- First connection ---
@@ -181,35 +181,21 @@ func TestSSEReplayOnReconnect(t *testing.T) {
 
 	br2 := bufio.NewReader(resp2.Body)
 
-	// Collect replayed events (we expect exactly 2: Task Two and Task Three).
-	// Gather them via their ids.
-	replayed := make(map[int64]bool)
-	for i := 0; i < 2; i++ {
-		ev := readSSEUntil(t, ctx2, br2, func(e sseEvent) bool {
-			return e.kind == "task.created" && e.id > firstID
-		})
-		if ev.id <= firstID {
-			t.Fatalf("replayed event id %d is not > firstID %d", ev.id, firstID)
-		}
-		replayed[ev.id] = true
+	// Every frame up to the newest event, unfiltered: exactly Task Two and
+	// Task Three, in order — a re-sent firstID or any extra frame fails.
+	maxID, err := store.MaxEventID()
+	if err != nil {
+		t.Fatalf("MaxEventID: %v", err)
+	}
+	ids := cwfStoreCountUntil(t, ctx2, br2, maxID)
+	if len(ids) != 2 || ids[0] <= firstID || ids[1] != maxID {
+		t.Fatalf("replayed ids %v after cursor %d, want the 2 gap events ending at %d", ids, firstID, maxID)
 	}
 
-	if len(replayed) != 2 {
-		t.Fatalf("expected 2 distinct replayed events, got %d", len(replayed))
-	}
-
-	// None of the replayed ids should be firstID (dedupe).
-	if replayed[firstID] {
-		t.Fatalf("first event id %d was re-sent on reconnect (no dedupe)", firstID)
-	}
-
-	cancel2()
-
-	// All replayed ids must be strictly greater than firstID.
-	for id := range replayed {
-		if id <= firstID {
-			t.Errorf("replayed id %d is not > firstID %d", id, firstID)
-		}
+	// Nothing else trails the replay: the next frame is the next live event.
+	mustCreateTask(t, ts, "replayproj", "Task Four")
+	if ev := readSSEUntil(t, ctx2, br2, func(sseEvent) bool { return true }); ev.id != maxID+1 || ev.kind != "task.created" {
+		t.Fatalf("first frame after replay = id %d %q, want the live task.created %d", ev.id, ev.kind, maxID+1)
 	}
 }
 
@@ -272,13 +258,13 @@ func TestSSECategoryScopedStream(t *testing.T) {
 	}
 
 	// project.created carve-out: a new project in bcat still reaches A (so a new
-	// tab can appear live even on a category-scoped dashboard).
+	// tab can appear live even on a category-scoped dashboard). Wait for
+	// bproj2's event specifically; A's own aproj2 arrives first.
 	mustCreateProjectIn(t, ts, "aproj2", "acat")
 	mustCreateProjectIn(t, ts, "bproj2", "bcat")
-	pc := readSSEUntil(t, ctx, brA, func(e sseEvent) bool { return e.kind == "project.created" })
-	if pc.kind != "project.created" {
-		t.Fatalf("subscriber A did not receive project.created carve-out")
-	}
+	readSSEUntil(t, ctx, brA, func(e sseEvent) bool {
+		return e.kind == "project.created" && strings.Contains(e.data, `"slug":"bproj2"`)
+	})
 }
 
 // TestSSECategoryReconnectReplay verifies a category-scoped reconnect replays

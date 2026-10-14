@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -248,7 +250,7 @@ func TestCSRFGuard(t *testing.T) {
 
 	// Cross-site write → 403.
 	r := do(t, ts, http.MethodPost, "/api/tasks",
-		`{"project":"web","title":"x"}`,
+		`{"project":"web","title":"cross site task"}`,
 		map[string]string{"Sec-Fetch-Site": "cross-site"})
 	gotCross := r.StatusCode
 	r.Body.Close()
@@ -256,13 +258,13 @@ func TestCSRFGuard(t *testing.T) {
 		t.Fatalf("cross-site POST = %d, want 403", gotCross)
 	}
 
-	// CLI-like write: no Origin / no Sec-Fetch headers → allowed (not 403).
+	// CLI-like write: no Origin / no Sec-Fetch headers → allowed and created.
 	r = do(t, ts, http.MethodPost, "/api/tasks",
 		`{"project":"web","title":"cli task"}`, nil)
 	gotCLI := r.StatusCode
 	r.Body.Close()
-	if gotCLI == http.StatusForbidden {
-		t.Fatalf("CLI-like POST = 403, want allowed")
+	if gotCLI != http.StatusCreated {
+		t.Fatalf("CLI-like POST = %d, want 201", gotCLI)
 	}
 
 	// Same-origin browser write → allowed.
@@ -271,8 +273,8 @@ func TestCSRFGuard(t *testing.T) {
 		map[string]string{"Sec-Fetch-Site": "same-origin"})
 	gotSame := r.StatusCode
 	r.Body.Close()
-	if gotSame == http.StatusForbidden {
-		t.Fatalf("same-origin POST = 403, want allowed")
+	if gotSame != http.StatusCreated {
+		t.Fatalf("same-origin POST = %d, want 201", gotSame)
 	}
 
 	// Origin check (browsers without Sec-Fetch-Site): a foreign or malformed
@@ -299,7 +301,8 @@ func TestCSRFGuard(t *testing.T) {
 	r = do(t, ts, http.MethodGet, "/api/tasks?project=web", "", nil)
 	b, _ := io.ReadAll(r.Body)
 	r.Body.Close()
-	if strings.Contains(string(b), "evil origin") || strings.Contains(string(b), "malformed origin") {
+	if strings.Contains(string(b), "evil origin") || strings.Contains(string(b), "malformed origin") ||
+		strings.Contains(string(b), "cross site task") {
 		t.Fatalf("a refused cross-origin POST created a task: %s", b)
 	}
 
@@ -650,6 +653,11 @@ func TestEventsBeforeEndpoint(t *testing.T) {
 	if err := json.NewDecoder(r2.Body).Decode(&beforeResp); err != nil {
 		t.Fatalf("decode before response: %v", err)
 	}
+	// Every event but the newest comes back, starting with the second-newest.
+	if len(beforeResp.Events) != len(tailResp.Events)-1 || beforeResp.Events[0].ID != tailResp.Events[1].ID {
+		t.Fatalf("?before=%d returned %+v, want the %d events after the newest of %+v",
+			newestID, beforeResp.Events, len(tailResp.Events)-1, tailResp.Events)
+	}
 	for _, e := range beforeResp.Events {
 		if e.ID >= newestID {
 			t.Errorf("?before=%d returned event id %d >= cutoff", newestID, e.ID)
@@ -913,19 +921,31 @@ func TestWriteErrHidesInternalDetail(t *testing.T) {
 // ---------- D2: requestLogger middleware ----------
 
 func TestRequestLoggerPassesThrough(t *testing.T) {
+	var logged bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTeapot)
 		w.Write([]byte("hello"))
 	})
 	handler := requestLogger(inner)
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req := httptest.NewRequest(http.MethodGet, "/test?secret=1", nil)
+	req.Header.Set("X-Agent", "agent-log")
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusTeapot {
 		t.Fatalf("status = %d, want 418", rec.Code)
 	}
 	if got := rec.Body.String(); got != "hello" {
 		t.Fatalf("body = %q, want hello", got)
+	}
+	// One line: method, path (no query string), status, latency, actor.
+	line := strings.TrimSpace(logged.String())
+	if !strings.Contains(line, "GET /test 418 ") || !strings.HasSuffix(line, " agent-log") ||
+		strings.Contains(line, "secret") || strings.Count(line, "\n") != 0 {
+		t.Fatalf("request log = %q, want one \"GET /test 418 <latency> agent-log\" line", line)
 	}
 }
 
@@ -1056,6 +1076,13 @@ func TestListTasksQueryParam(t *testing.T) {
 	}
 	if len(tasks) != 1 || strconv.FormatInt(tasks[0].ID, 10) != hitID {
 		t.Fatalf("?q=login returned %+v, want only task %s", tasks, hitID)
+	}
+
+	// A query at the limit (500 bytes) is accepted.
+	ra := do(t, ts, http.MethodGet, "/api/tasks?q="+strings.Repeat("a", 500), "", nil)
+	ra.Body.Close()
+	if ra.StatusCode != http.StatusOK {
+		t.Fatalf("GET 500-byte ?q= = %d, want 200", ra.StatusCode)
 	}
 
 	// Oversized query (501 bytes) → 400 validation.
@@ -2092,13 +2119,37 @@ func TestScopeMutationSweep(t *testing.T) {
 		if r.StatusCode != http.StatusForbidden {
 			t.Fatalf("%s out-of-scope = %d, want 403", c.name, r.StatusCode)
 		}
-		// Sanity: the 403 left the work task untouched (still todo/unassigned)
-		// is implied by later legs succeeding against it unscoped elsewhere.
 		ri := do(t, ts, c.method, c.inPath, c.body, hdr)
 		ri.Body.Close()
 		if ri.StatusCode != c.wantInStatus {
 			t.Fatalf("%s in-scope = %d, want %d", c.name, ri.StatusCode, c.wantInStatus)
 		}
+	}
+
+	getTask := func(id string) (Task, int) {
+		r := do(t, ts, http.MethodGet, "/api/tasks/"+id, "", nil)
+		defer r.Body.Close()
+		var tk Task
+		json.NewDecoder(r.Body).Decode(&tk)
+		return tk, r.StatusCode
+	}
+	// Every 403 left the work task exactly as seeded.
+	w, code := getTask(workID)
+	if code != http.StatusOK || w.Status != "todo" || w.Assignee != "" ||
+		strings.Join(w.Labels, ",") != "seed" ||
+		len(w.Comments) != 1 || strconv.FormatInt(w.Comments[0].ID, 10) != workCID ||
+		len(w.DependsOn) != 1 || strconv.FormatInt(w.DependsOn[0].ID, 10) != workID2 {
+		t.Fatalf("work task after denied sweep = %d %+v, want the seeded state", code, w)
+	}
+	// Every in-scope leg took effect.
+	p, code := getTask(personalID)
+	if code != http.StatusOK || p.Status != "doing" || p.Assignee != "agent-p" ||
+		strings.Join(p.Labels, ",") != "bug" ||
+		len(p.Comments) != 1 || p.Comments[0].Body != "hi" || len(p.DependsOn) != 0 {
+		t.Fatalf("personal task after sweep = %d %+v, want doing/agent-p, label bug, comment hi, no deps", code, p)
+	}
+	if _, code := getTask(personalID2); code != http.StatusNotFound {
+		t.Fatalf("deleted personal task = %d, want 404", code)
 	}
 }
 
@@ -2392,11 +2443,35 @@ func TestEventsCategoryFilter(t *testing.T) {
 	if len(got) == 0 {
 		t.Fatalf("?category=acat returned no events")
 	}
+	// Every event in every mode must belong to aproj (acat's only project):
+	// that rules out category.* (NULL project) and all of bproj's events.
+	var aprojID int64
+	r := do(t, ts, http.MethodGet, "/api/projects", "", nil)
+	var projects []Project
+	json.NewDecoder(r.Body).Decode(&projects)
+	r.Body.Close()
+	for _, p := range projects {
+		if p.Slug == "aproj" {
+			aprojID = p.ID
+		}
+	}
+	if aprojID == 0 {
+		t.Fatalf("aproj missing from /api/projects: %+v", projects)
+	}
+	onlyAproj := func(mode string, evs []Event) {
+		t.Helper()
+		if len(evs) == 0 {
+			t.Fatalf("%s with ?category=acat returned no events", mode)
+		}
+		for _, e := range evs {
+			if e.ProjectID != aprojID {
+				t.Fatalf("%s with ?category=acat leaked a non-aproj event: %+v", mode, e)
+			}
+		}
+	}
+	onlyAproj("?since=0", got)
 	aTaskID, _ := strconv.ParseInt(aTask, 10, 64)
 	for _, e := range got {
-		if strings.HasPrefix(e.Kind, "category.") {
-			t.Fatalf("category-level event leaked into ?category=acat: %+v", e)
-		}
 		if e.TaskID != 0 && e.TaskID != aTaskID {
 			t.Fatalf("foreign-task event leaked into ?category=acat: %+v", e)
 		}
@@ -2416,14 +2491,7 @@ func TestEventsCategoryFilter(t *testing.T) {
 
 	// ?tail= (newest-first bootstrap) honors the filter too.
 	tail := eventKinds(t, do(t, ts, http.MethodGet, "/api/events?category=acat&tail=50", "", nil))
-	for _, e := range tail {
-		if strings.HasPrefix(e.Kind, "category.") {
-			t.Fatalf("?tail with category leaked category-level event: %+v", e)
-		}
-		if e.ProjectID == 0 {
-			t.Fatalf("?tail with category leaked NULL-project event: %+v", e)
-		}
-	}
+	onlyAproj("?tail", tail)
 
 	// ?before= (older-page) honors the filter.
 	maxID := int64(0)
@@ -2434,10 +2502,9 @@ func TestEventsCategoryFilter(t *testing.T) {
 	}
 	before := eventKinds(t, do(t, ts, http.MethodGet,
 		"/api/events?category=acat&before="+strconv.FormatInt(maxID+1, 10), "", nil))
-	for _, e := range before {
-		if e.ProjectID == 0 {
-			t.Fatalf("?before with category leaked NULL-project event: %+v", e)
-		}
+	onlyAproj("?before", before)
+	if len(before) != len(got) || len(tail) != len(got) {
+		t.Fatalf("?category=acat: since=%d tail=%d before=%d events, want the same set", len(got), len(tail), len(before))
 	}
 
 	// Unknown category → ErrNotFound surfaces as 404 (the categoryID sentinel).
