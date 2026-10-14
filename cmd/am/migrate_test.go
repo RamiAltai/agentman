@@ -354,8 +354,8 @@ func TestMigrationV4ExistingDB(t *testing.T) {
 
 func TestMigrationV5Fresh(t *testing.T) {
 	st := openTestStore(t)
-	if v, _ := readSchemaVersion(st.db); v != 5 {
-		t.Fatalf("schema_version = %d, want 5", v)
+	if v, _ := readSchemaVersion(st.db); v != currentSchemaVersion {
+		t.Fatalf("schema_version = %d, want %d", v, currentSchemaVersion)
 	}
 	// created_by column exists (probe pattern from the V2/V3 tests).
 	if _, err := st.db.Exec("UPDATE tasks SET created_by=NULL WHERE 1=0"); err != nil {
@@ -448,8 +448,8 @@ func TestMigrationV5ExistingDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenStore on v4 DB: %v", err)
 	}
-	if v, _ := readSchemaVersion(st.db); v != 5 {
-		t.Fatalf("schema_version after migrate = %d, want 5", v)
+	if v, _ := readSchemaVersion(st.db); v != currentSchemaVersion {
+		t.Fatalf("schema_version after migrate = %d, want %d", v, currentSchemaVersion)
 	}
 	var creator sql.NullString
 	if err := st.db.QueryRow("SELECT created_by FROM tasks WHERE title='with-event'").Scan(&creator); err != nil {
@@ -481,7 +481,191 @@ func TestMigrationV5ExistingDB(t *testing.T) {
 		t.Fatalf("reopen OpenStore: %v", err)
 	}
 	defer st2.Close()
-	if v, _ := readSchemaVersion(st2.db); v != 5 {
-		t.Fatalf("schema_version after reopen = %d, want 5", v)
+	if v, _ := readSchemaVersion(st2.db); v != currentSchemaVersion {
+		t.Fatalf("schema_version after reopen = %d, want %d", v, currentSchemaVersion)
+	}
+}
+
+// TestMigrationV6ExistingDB: v6 rebuilds projects/tasks/events as
+// AUTOINCREMENT without cascading into child rows (runMigrations turns
+// foreign_keys off), and seeds each sequence past every id the event log has
+// seen, so ids deleted BEFORE the migration are not reissued either.
+func TestMigrationV6ExistingDB(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "v5.db")
+	if schemaMigrations[3].version != 5 {
+		t.Fatalf("schemaMigrations layout changed; step 4 = v%d, want v5", schemaMigrations[3].version)
+	}
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"+
+		"&_pragma=foreign_keys(1)&_pragma=synchronous(1)", dbPath)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(schemaSQL); err != nil {
+		t.Fatalf("seed schema: %v", err)
+	}
+	if err := runMigrations(db, 5, schemaMigrations[:4]); err != nil {
+		t.Fatalf("migrate to v5: %v", err)
+	}
+	for _, q := range []string{
+		`INSERT INTO projects(slug,name,category_id,uid) VALUES
+		   ('alpha','alpha',(SELECT id FROM categories WHERE slug='general'),'amp_00000000000000a1'),
+		   ('beta','beta',(SELECT id FROM categories WHERE slug='general'),'amp_00000000000000b2')`,
+		`INSERT INTO tasks(project_id,ref,title,created_by) SELECT id, 1, 't1', 'alice' FROM projects WHERE slug='alpha'`,
+		`INSERT INTO tasks(project_id,ref,title) SELECT id, 2, 't2' FROM projects WHERE slug='alpha'`,
+		`INSERT INTO tasks(project_id,ref,title) SELECT id, 3, 't3' FROM projects WHERE slug='alpha'`,
+		`INSERT INTO comments(task_id,author,body) SELECT id,'bob','hi' FROM tasks WHERE title='t2'`,
+		`INSERT INTO task_labels(task_id,label) SELECT id,'bug' FROM tasks WHERE title='t2'`,
+		`INSERT INTO task_meta(task_id,key,value) SELECT id,'k','v' FROM tasks WHERE title='t2'`,
+		`INSERT INTO task_deps(task_id,depends_on_id) SELECT a.id, b.id FROM tasks a, tasks b WHERE a.title='t2' AND b.title='t1'`,
+		`INSERT INTO events(project_id,task_id,actor,kind) SELECT project_id, id, 'alice', 'task.created' FROM tasks`,
+		`INSERT INTO events(project_id,actor,kind) SELECT id, 'alice', 'project.deleted' FROM projects WHERE slug='beta'`,
+		// Highest task and highest project deleted; only the event log remembers their ids.
+		`DELETE FROM tasks WHERE title='t3'`,
+		`DELETE FROM projects WHERE slug='beta'`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("seed %q: %v", q, err)
+		}
+	}
+	var maxTask, maxProject, maxEvent int64
+	db.QueryRow("SELECT MAX(task_id), MAX(project_id), MAX(id) FROM events").Scan(&maxTask, &maxProject, &maxEvent)
+	db.Close()
+
+	st, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatalf("OpenStore on v5 DB: %v", err)
+	}
+	defer st.Close()
+	if v, _ := readSchemaVersion(st.db); v != 6 {
+		t.Fatalf("schema_version = %d, want 6", v)
+	}
+	for _, tbl := range []string{"projects", "tasks", "events"} {
+		var ddl string
+		st.db.QueryRow("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", tbl).Scan(&ddl)
+		if !strings.Contains(ddl, "AUTOINCREMENT") {
+			t.Errorf("%s DDL lacks AUTOINCREMENT: %s", tbl, ddl)
+		}
+	}
+	// Child rows survived the parent rebuild (no cascade).
+	for q, want := range map[string]int{
+		"SELECT COUNT(*) FROM tasks":       2,
+		"SELECT COUNT(*) FROM comments":    1,
+		"SELECT COUNT(*) FROM task_labels": 1,
+		"SELECT COUNT(*) FROM task_meta":   1,
+		"SELECT COUNT(*) FROM task_deps":   1,
+		"SELECT COUNT(*) FROM events":      4,
+	} {
+		var n int
+		if err := st.db.QueryRow(q).Scan(&n); err != nil || n != want {
+			t.Errorf("%s = %d (%v), want %d", q, n, err, want)
+		}
+	}
+	var fk int
+	st.db.QueryRow("PRAGMA foreign_keys").Scan(&fk)
+	if fk != 1 {
+		t.Fatalf("foreign_keys = %d after migration, want 1 (re-enabled)", fk)
+	}
+	var createdBy string
+	st.db.QueryRow("SELECT created_by FROM tasks WHERE title='t1'").Scan(&createdBy)
+	if createdBy != "alice" {
+		t.Fatalf("t1 created_by = %q after rebuild, want alice", createdBy)
+	}
+
+	// New rows get ids past every id the log has seen.
+	tk, _, err := st.CreateTask(CreateTaskInput{Project: "alpha", Title: "t4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tk.ID <= maxTask {
+		t.Errorf("new task id %d reuses a deleted task's id (max seen %d)", tk.ID, maxTask)
+	}
+	p, _, err := st.CreateProject("gamma", "gamma", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.ID <= maxProject {
+		t.Errorf("new project id %d reuses a deleted project's id (max seen %d)", p.ID, maxProject)
+	}
+	if _, err := st.db.Exec("DELETE FROM events"); err != nil { // `am db prune --keep 0`
+		t.Fatal(err)
+	}
+	_, ev, err := st.CreateTask(CreateTaskInput{Project: "alpha", Title: "t5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.ID <= maxEvent {
+		t.Errorf("event id %d after emptying the log restarts below the old cursor %d", ev.ID, maxEvent)
+	}
+}
+
+// TestMigrationV6NoIDReuse: on a fresh DB, deleting the newest task, project
+// or every event never lets the next insert take the freed id.
+func TestMigrationV6NoIDReuse(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("web", "web", ""); err != nil {
+		t.Fatal(err)
+	}
+	t1, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DeleteTask(t1.ID, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	t2, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "two"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if t2.ID == t1.ID {
+		t.Fatalf("task id %d reused after delete", t1.ID)
+	}
+	p1, _, err := st.CreateProject("tmp", "tmp", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DeleteProject("tmp", "", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	p2, _, err := st.CreateProject("tmp2", "tmp2", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p2.ID == p1.ID {
+		t.Fatalf("project id %d reused after delete", p1.ID)
+	}
+}
+
+// TestMigrationV6EventIndexes: GetTask's per-task history and the category
+// stats' recent-activity window are index searches, not event-table scans.
+func TestMigrationV6EventIndexes(t *testing.T) {
+	st := openTestStore(t)
+	plan := func(q string, args ...any) string {
+		rows, err := st.db.Query("EXPLAIN QUERY PLAN "+q, args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var id, parent, unused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, detail)
+		}
+		return strings.Join(out, " | ")
+	}
+	if p := plan(`SELECT id FROM events WHERE task_id=? ORDER BY id DESC LIMIT 50`, 1); !strings.Contains(p, "idx_events_task") {
+		t.Errorf("GetTask events plan = %q, want idx_events_task", p)
+	}
+	if p := plan(`SELECT DISTINCT c.id, events.actor FROM events
+	      JOIN projects p ON p.id = events.project_id
+	      JOIN categories c ON c.id = p.category_id
+	      WHERE events.task_id IS NOT NULL AND events.actor != 'human' AND events.created_at > ?
+	      ORDER BY c.id, events.actor`, "2026-01-01"); !strings.Contains(p, "idx_events_created") {
+		t.Errorf("category stats plan = %q, want idx_events_created", p)
 	}
 }

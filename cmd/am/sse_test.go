@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -317,5 +318,85 @@ func TestSSECategoryReconnectReplay(t *testing.T) {
 	ev := readSSEUntil(t, ctx, br, func(e sseEvent) bool { return e.kind == "task.created" })
 	if !strings.Contains(ev.data, "A Gap") {
 		t.Fatalf("first replayed task.created = %q, want the aproj task (bproj must be excluded)", ev.data)
+	}
+}
+
+// TestSSEStaleCursorResets: a Last-Event-ID beyond the log's end (DB replaced
+// by import, or emptied by prune, while a client kept its cursor) must not
+// dedupe away the live events that follow.
+func TestSSEStaleCursorResets(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "stale")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/api/stream", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Last-Event-ID", "999999")
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	br := bufio.NewReader(resp.Body)
+	waitForRetry(t, ctx, br)
+
+	mustCreateTask(t, ts, "stale", "after reset")
+	ev := readSSEUntil(t, ctx, br, func(e sseEvent) bool { return e.kind == "task.created" })
+	if ev.id <= 0 {
+		t.Fatalf("task.created id = %d", ev.id)
+	}
+}
+
+// blockingWriter stalls the first Write until release is closed, standing in
+// for a client whose TCP window is full; it records everything written.
+type blockingWriter struct {
+	hdr     http.Header
+	release chan struct{}
+	started chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	buf     strings.Builder
+}
+
+func (b *blockingWriter) Header() http.Header { return b.hdr }
+func (b *blockingWriter) WriteHeader(int)     {}
+func (b *blockingWriter) Flush()              {}
+func (b *blockingWriter) Write(p []byte) (int, error) {
+	b.once.Do(func() { close(b.started); <-b.release })
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// TestSSELaggedSubscriberDisconnects: when the hub drops an event because the
+// handler is stalled, handleStream ends the response without writing the
+// buffered events, so the client reconnects from its last id and the replay
+// covers the dropped one (instead of skipping it forever).
+func TestSSELaggedSubscriberDisconnects(t *testing.T) {
+	srv := NewServer(openTestStore(t))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/stream", nil).WithContext(ctx)
+	w := &blockingWriter{hdr: http.Header{}, release: make(chan struct{}), started: make(chan struct{})}
+	done := make(chan struct{})
+	go func() { srv.handleStream(w, req); close(done) }()
+
+	<-w.started // subscribed, now stuck writing the retry preamble
+	for i := 1; i <= 65; i++ {
+		srv.hub.Broadcast(&Event{ID: int64(i), ProjectID: 1, Kind: "task.created", Data: []byte("{}")})
+	}
+	close(w.release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleStream kept a lagged subscriber open")
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if strings.Contains(w.buf.String(), "id: ") {
+		t.Fatalf("lagged stream wrote events past the hole:\n%s", w.buf.String())
 	}
 }

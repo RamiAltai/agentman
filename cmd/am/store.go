@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -9,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -258,7 +260,7 @@ func OpenStore(path string) (*Store, error) {
 // currentSchemaVersion is the version OpenStore migrates to. schema.sql seeds a
 // fresh DB at version 1; runMigrations applies any steps with version > the DB's
 // recorded version to reach this target.
-const currentSchemaVersion = 5
+const currentSchemaVersion = 6
 
 // migration is one forward-only, idempotent step. apply runs inside the same tx
 // that bumps meta.schema_version, so a step + its version bump commit atomically.
@@ -359,6 +361,89 @@ var schemaMigrations = []migration{
 		     WHERE created_by IS NULL`)
 		return err
 	}},
+	// v6: projects, tasks and events become AUTOINCREMENT, so a deleted row's
+	// id is never handed out again. Rowid reuse let a new project inherit a
+	// deleted one's events (category views showed them), let a scope check
+	// on task N authorize a mutation of a different task N, and let `am db
+	// prune --keep 0` restart the event cursor at 1 (stalling SSE clients).
+	// This reverses ADR-015's "ref/id reuse accepted" for ids (per-project
+	// refs still reuse). SQLite cannot add AUTOINCREMENT in place, so each
+	// table is rebuilt (runMigrations runs steps with foreign_keys off). Also
+	// adds the events indexes for GetTask's per-task history and the
+	// category stats' recent-activity window.
+	{version: 6, apply: func(tx *sql.Tx) error {
+		for _, q := range []string{
+			`CREATE TABLE projects_v6 (
+			   id               INTEGER PRIMARY KEY AUTOINCREMENT,
+			   slug             TEXT NOT NULL UNIQUE,
+			   name             TEXT NOT NULL,
+			   created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+			   archived_at      TEXT,
+			   category_id      INTEGER REFERENCES categories(id),
+			   uid              TEXT,
+			   vault_project_id TEXT,
+			   vault_path       TEXT)`,
+			`INSERT INTO projects_v6(id,slug,name,created_at,archived_at,category_id,uid,vault_project_id,vault_path)
+			   SELECT id,slug,name,created_at,archived_at,category_id,uid,vault_project_id,vault_path FROM projects`,
+			"DROP TABLE projects",
+			"ALTER TABLE projects_v6 RENAME TO projects",
+			"CREATE UNIQUE INDEX idx_projects_uid ON projects(uid)",
+			"CREATE INDEX idx_projects_category ON projects(category_id)",
+
+			`CREATE TABLE tasks_v6 (
+			   id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+			   ref        INTEGER NOT NULL,
+			   title      TEXT NOT NULL,
+			   body       TEXT NOT NULL DEFAULT '',
+			   status     TEXT NOT NULL DEFAULT 'todo'
+			              CHECK (status IN ('todo','doing','blocked','done')),
+			   assignee   TEXT,
+			   priority   INTEGER NOT NULL DEFAULT 2,
+			   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+			   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+			   claimed_at TEXT,
+			   created_by TEXT,
+			   UNIQUE (project_id, ref))`,
+			`INSERT INTO tasks_v6(id,project_id,ref,title,body,status,assignee,priority,created_at,updated_at,claimed_at,created_by)
+			   SELECT id,project_id,ref,title,body,status,assignee,priority,created_at,updated_at,claimed_at,created_by FROM tasks`,
+			"DROP TABLE tasks",
+			"ALTER TABLE tasks_v6 RENAME TO tasks",
+			"CREATE INDEX idx_tasks_project_status ON tasks(project_id, status)",
+			"CREATE INDEX idx_tasks_assignee ON tasks(assignee)",
+			"CREATE INDEX idx_tasks_updated ON tasks(updated_at)",
+
+			`CREATE TABLE events_v6 (
+			   id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			   project_id INTEGER,
+			   task_id    INTEGER,
+			   actor      TEXT NOT NULL,
+			   kind       TEXT NOT NULL,
+			   data       TEXT NOT NULL DEFAULT '{}',
+			   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`,
+			`INSERT INTO events_v6(id,project_id,task_id,actor,kind,data,created_at)
+			   SELECT id,project_id,task_id,actor,kind,data,created_at FROM events`,
+			"DROP TABLE events",
+			"ALTER TABLE events_v6 RENAME TO events",
+			"CREATE INDEX idx_events_since ON events(id)",
+			"CREATE INDEX idx_events_task ON events(task_id, id)",
+			"CREATE INDEX idx_events_created ON events(created_at)",
+
+			// Start each sequence above every id already used — including
+			// deleted rows' ids that survive only in the event log — so even
+			// pre-migration deletions are never reissued.
+			"DELETE FROM sqlite_sequence WHERE name IN ('projects','tasks','events')",
+			`INSERT INTO sqlite_sequence(name, seq) VALUES
+			   ('projects', MAX(COALESCE((SELECT MAX(id) FROM projects),0), COALESCE((SELECT MAX(project_id) FROM events),0))),
+			   ('tasks',    MAX(COALESCE((SELECT MAX(id) FROM tasks),0),    COALESCE((SELECT MAX(task_id) FROM events),0))),
+			   ('events',   COALESCE((SELECT MAX(id) FROM events),0))`,
+		} {
+			if _, err := tx.Exec(q); err != nil {
+				return err
+			}
+		}
+		return nil
+	}},
 }
 
 // readSchemaVersion returns the DB's recorded schema version, defaulting to 1 if
@@ -383,22 +468,46 @@ func readSchemaVersion(db *sql.DB) (int, error) {
 // current version, up to target. Each step's apply and the matching
 // meta.schema_version bump run in one tx; on any error the tx is rolled back and
 // the DB is left at the prior version. Re-running is a no-op (integer compare).
-func runMigrations(db *sql.DB, target int, steps []migration) error {
+//
+// Steps run on one pinned connection with foreign_keys OFF: rebuilding a table
+// (create, copy, drop, rename — SQLite's only way to change a column
+// definition) would otherwise cascade the DROP of a parent table into its
+// children. The pragma is a no-op inside a tx, hence the pinned connection;
+// each step must pass foreign_key_check before it commits.
+func runMigrations(db *sql.DB, target int, steps []migration) (err error) {
 	cur, err := readSchemaVersion(db)
 	if err != nil {
 		return err
 	}
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+		return err
+	}
+	defer func() {
+		if _, ferr := conn.ExecContext(ctx, "PRAGMA foreign_keys=ON"); ferr != nil && err == nil {
+			err = ferr
+		}
+	}()
 	for _, m := range steps {
 		if m.version <= cur || m.version > target {
 			continue
 		}
-		tx, err := db.Begin()
+		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
 		if err := m.apply(tx); err != nil {
 			tx.Rollback()
 			return err
+		}
+		if err := foreignKeyCheck(tx); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("migration v%d: %w", m.version, err)
 		}
 		if _, err := tx.Exec(
 			"INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?)",
@@ -413,6 +522,19 @@ func runMigrations(db *sql.DB, target int, steps []migration) error {
 		cur = m.version
 	}
 	return nil
+}
+
+// foreignKeyCheck fails if any row references a missing parent.
+func foreignKeyCheck(tx *sql.Tx) error {
+	rows, err := tx.Query("PRAGMA foreign_key_check")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	if rows.Next() {
+		return errors.New("foreign key violations")
+	}
+	return rows.Err()
 }
 
 func (s *Store) Close() error {
@@ -1614,8 +1736,9 @@ func (s *Store) CreateTask(in CreateTaskInput) (*Task, *Event, error) {
 //
 // Scope note: the handler's scope pre-check (checkTaskMut) runs OUTSIDE this
 // transaction. That is sound only because a task's project (and a project's
-// category) is immutable today — if a task/project move feature ever ships,
-// the scope check must move inside this tx.
+// category) is immutable today and task ids are never reused (AUTOINCREMENT
+// since schema v6), so the checked id is this task or a 404 — if a
+// task/project move feature ever ships, the scope check must move inside this tx.
 func (s *Store) PatchTask(id int64, patch map[string]any, actor string) (*Task, *Event, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -1653,8 +1776,13 @@ func (s *Store) PatchTask(id int64, patch map[string]any, actor string) (*Task, 
 			statusChanged = true
 		}
 	}
+	// Wrong-typed values are rejected rather than read as "": a stray number
+	// would otherwise unassign the task or wipe its body with a 200.
 	if v, ok := patch["assignee"]; ok {
-		as, _ := v.(string)
+		as, ok := v.(string)
+		if !ok {
+			return nil, nil, ErrValidation
+		}
 		if as != cur.Assignee {
 			sets = append(sets, "assignee=?")
 			args = append(args, nullStr(as))
@@ -1681,8 +1809,8 @@ func (s *Store) PatchTask(id int64, patch map[string]any, actor string) (*Task, 
 		}
 	}
 	if v, ok := patch["body"]; ok {
-		bo, _ := v.(string)
-		if len(bo) > maxBodyLen {
+		bo, ok := v.(string)
+		if !ok || len(bo) > maxBodyLen {
 			return nil, nil, ErrValidation
 		}
 		if bo != cur.Body {
@@ -1692,8 +1820,8 @@ func (s *Store) PatchTask(id int64, patch map[string]any, actor string) (*Task, 
 		}
 	}
 	if v, ok := patch["priority"]; ok {
-		pr := toInt(v, cur.Priority)
-		if pr < minPriority || pr > maxPriority {
+		pr, ok := toInt(v)
+		if !ok || pr < minPriority || pr > maxPriority {
 			return nil, nil, ErrValidation
 		}
 		if pr != cur.Priority {
@@ -1789,8 +1917,11 @@ func hasOpenPrereqs(q queryer, taskID int64) ([]int64, error) {
 }
 
 // ClaimTask atomically assigns an unclaimed, non-done task to agent.
-// Returns (task, event, nil) on win; (task, nil, nil) if agent already owns it
-// (idempotent); (nil,nil,*ConflictError) if owned by someone else; ErrNotFound.
+// Returns (task, event, nil) on win — including when the task was already
+// assigned to agent but still todo (pre-assigned via `am new --assign` or
+// `am assign`): claiming it starts it, as ADR-023 directs; (task, nil, nil) if
+// agent already holds it in doing/blocked (idempotent); (nil,nil,*ConflictError)
+// if owned by someone else or done; ErrNotFound.
 // Returns *BlockedError if the task has open prerequisites.
 func (s *Store) ClaimTask(id int64, agent string) (*Task, *Event, error) {
 	if agent == "" {
@@ -1813,6 +1944,7 @@ func (s *Store) ClaimTask(id int64, agent string) (*Task, *Event, error) {
 
 	var newStatus string
 	var pid int64
+	var prev any // previous assignee for the event; nil = was unclaimed
 	err = tx.QueryRow(`
 		UPDATE tasks
 		   SET assignee=?,
@@ -1827,16 +1959,25 @@ func (s *Store) ClaimTask(id int64, agent string) (*Task, *Event, error) {
 		if gerr != nil {
 			return nil, nil, gerr // ErrNotFound or real error
 		}
-		if cur.Assignee == agent {
+		if cur.Assignee != agent || cur.Status == "done" {
+			return nil, nil, &ConflictError{Assignee: orDash(cur.Assignee, cur.Status)}
+		}
+		if cur.Status != "todo" {
 			return cur, nil, tx.Commit() // idempotent re-claim
 		}
-		return nil, nil, &ConflictError{Assignee: orDash(cur.Assignee, cur.Status)}
-	}
-	if err != nil {
+		// Pre-assigned to agent but not started: the claim starts it.
+		if _, err := tx.Exec(`UPDATE tasks
+		   SET claimed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), status='doing',
+		       updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		 WHERE id=?`, id); err != nil {
+			return nil, nil, err
+		}
+		pid, newStatus, prev = cur.ProjectID, "doing", agent
+	} else if err != nil {
 		return nil, nil, err
 	}
 	ev, err := insertEvent(tx, pid, id, agent, "task.claimed",
-		map[string]any{"assignee": []any{nil, agent}, "status": newStatus})
+		map[string]any{"assignee": []any{prev, agent}, "status": newStatus})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1852,7 +1993,9 @@ func (s *Store) ClaimTask(id int64, agent string) (*Task, *Event, error) {
 // degrades to a normal claim. Returns (task, event, nil) on win; (task, nil,
 // nil) if agent already owns it (idempotent); (nil,nil,*NotStaleError) if held
 // by someone else and still fresh; (nil,nil,*ConflictError) if done; ErrNotFound.
-// Returns *BlockedError if the task has open prerequisites.
+// Returns *BlockedError if the task has open prerequisites. When agent already
+// owns the task it is a plain ClaimTask (starts a pre-assigned todo task,
+// conflicts on done).
 func (s *Store) StealStaleClaim(id int64, agent string, staleFor time.Duration) (*Task, *Event, error) {
 	if agent == "" || staleFor <= 0 {
 		return nil, nil, ErrValidation
@@ -1878,7 +2021,8 @@ func (s *Store) StealStaleClaim(id int64, agent string, staleFor time.Duration) 
 		return nil, nil, err // ErrNotFound or real error
 	}
 	if cur.Assignee == agent {
-		return cur, nil, tx.Commit() // idempotent re-claim
+		tx.Rollback() // one connection: release it before ClaimTask opens its tx
+		return s.ClaimTask(id, agent)
 	}
 
 	// Conditional UPDATE is the atomicity guarantee: only one stealer can match
@@ -2078,7 +2222,11 @@ func (s *Store) DeleteComment(taskID, commentID int64, actor string) (*Event, er
 
 // DeleteProject hard-deletes a project (and its tasks+comments via FK cascade)
 // and records a project.deleted event. Returns ErrNotFound if the slug does not exist.
-func (s *Store) DeleteProject(slug, actor string) (*Event, error) {
+// A non-empty category must be the project's category (else ErrOutOfScope):
+// the server passes the caller's scope category so the scope is re-checked in
+// this tx — slugs are reusable after delete, so the handler's earlier check
+// may have seen a different project under the same slug.
+func (s *Store) DeleteProject(slug, category, actor string) (*Event, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
@@ -2086,12 +2234,17 @@ func (s *Store) DeleteProject(slug, actor string) (*Event, error) {
 	defer tx.Rollback()
 
 	var projectID int64
-	err = tx.QueryRow("SELECT id FROM projects WHERE slug=?", slug).Scan(&projectID)
+	var cat string
+	err = tx.QueryRow(`SELECT p.id, COALESCE(c.slug,'') FROM projects p
+	       LEFT JOIN categories c ON c.id=p.category_id WHERE p.slug=?`, slug).Scan(&projectID, &cat)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
+	}
+	if category != "" && cat != category {
+		return nil, ErrOutOfScope
 	}
 
 	ev, err := insertEvent(tx, projectID, 0, actorOr(actor), "project.deleted",
@@ -2688,20 +2841,22 @@ func actorOr(a string) string {
 	return a
 }
 
-func toInt(v any, def int) int {
+// toInt reads an integer from a decoded JSON value (or a Go int in tests).
+// ok is false for non-numeric values and for fractional numbers, which would
+// otherwise be truncated.
+func toInt(v any) (int, bool) {
 	switch n := v.(type) {
 	case float64:
-		return int(n)
+		return int(n), n == math.Trunc(n)
 	case int:
-		return n
+		return n, true
 	case int64:
-		return int(n)
+		return int(n), true
 	case string:
-		if i, err := strconv.Atoi(n); err == nil {
-			return i
-		}
+		i, err := strconv.Atoi(n)
+		return i, err == nil
 	}
-	return def
+	return 0, false
 }
 
 // staleCutoff returns the ISO-8601 UTC timestamp staleFor ago, formatted to

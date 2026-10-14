@@ -92,3 +92,27 @@ func TestHubBroadcastNilNoPanic(t *testing.T) {
 		t.Fatalf("nil broadcast delivered an event")
 	}
 }
+
+// TestHubOverflowMarksLagged: an event dropped on a full buffer flags the
+// subscriber instead of vanishing silently, so its stream can reconnect and
+// replay the gap from the events table.
+func TestHubOverflowMarksLagged(t *testing.T) {
+	h := NewHub()
+	sub := h.Subscribe(subFilter{})
+	defer h.Unsubscribe(sub)
+	for i := 1; i <= cap(sub.ch); i++ {
+		h.Broadcast(&Event{ID: int64(i), ProjectID: 1, Kind: "task.created"})
+	}
+	select {
+	case <-sub.lagged:
+		t.Fatal("lagged before any event was dropped")
+	default:
+	}
+	h.Broadcast(&Event{ID: int64(cap(sub.ch) + 1), ProjectID: 1, Kind: "task.created"})
+	h.Broadcast(&Event{ID: int64(cap(sub.ch) + 2), ProjectID: 1, Kind: "task.created"}) // second drop: no double close
+	select {
+	case <-sub.lagged:
+	default:
+		t.Fatal("overflow dropped an event without marking the subscriber lagged")
+	}
+}

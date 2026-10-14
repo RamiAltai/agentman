@@ -2683,3 +2683,111 @@ func TestCreateTokenResponse(t *testing.T) {
 		t.Fatalf("ls JSON leaked the plaintext token value: %s", s)
 	}
 }
+
+// TestTokenProjectScopeFollowsCategory: a token minted for work/api must not
+// reach a project recreated under the same slug in another category — the
+// project-scoped branches compare the (category, project) pair like
+// scopeAllows does.
+func TestTokenProjectScopeFollowsCategory(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateCategory(t, ts, "work")
+	mustCreateCategory(t, ts, "personal")
+	mustCreateProjectIn(t, ts, "api", "work")
+	tok := mintToken(t, ts, "work/api")
+
+	r := do(t, ts, http.MethodDelete, "/api/projects/api", "", nil)
+	r.Body.Close()
+	mustCreateProjectIn(t, ts, "api", "personal")
+	mustCreateTask(t, ts, "api", "personal task")
+
+	hdr := bearer("agent-a", tok)
+	for _, c := range []struct{ method, path, body string }{
+		{http.MethodPost, "/api/tasks", `{"project":"api","title":"x"}`},
+		{http.MethodPost, "/api/tasks/next", `{"project":"api"}`},
+		{http.MethodGet, "/api/tasks?project=api", ""},
+		{http.MethodPatch, "/api/projects/api", `{"name":"pwned"}`},
+		{http.MethodPost, "/api/projects/api/archive", ""},
+		{http.MethodDelete, "/api/projects/api", ""},
+	} {
+		r := do(t, ts, c.method, c.path, c.body, hdr)
+		r.Body.Close()
+		if r.StatusCode != http.StatusForbidden {
+			t.Errorf("%s %s with stale work/api token = %d, want 403", c.method, c.path, r.StatusCode)
+		}
+	}
+	// Unfiltered next narrows to (work, api): nothing there, so 404 — the
+	// personal task is never handed out.
+	r = do(t, ts, http.MethodPost, "/api/tasks/next", "", hdr)
+	r.Body.Close()
+	if r.StatusCode != http.StatusNotFound {
+		t.Errorf("unfiltered next = %d, want 404", r.StatusCode)
+	}
+}
+
+// TestAuthorizationWithoutBearerTokenRejected: an Authorization header that
+// yields no Bearer token (empty variable, other scheme) is a 401, not a silent
+// downgrade to the unscoped (allow-all) scope.
+func TestAuthorizationWithoutBearerTokenRejected(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+	for _, auth := range []string{"Bearer", "Bearer ", "Basic dXNlcjpwdw==", "Token amt_x"} {
+		r := do(t, ts, http.MethodPost, "/api/tasks", `{"project":"web","title":"x"}`,
+			map[string]string{"Authorization": auth, "Content-Type": "application/json"})
+		r.Body.Close()
+		if r.StatusCode != http.StatusUnauthorized {
+			t.Errorf("Authorization %q = %d, want 401", auth, r.StatusCode)
+		}
+	}
+}
+
+// TestClaimAndNextRejectMalformedBody: a body that is present but not valid
+// JSON is a 400 — it must not degrade to a plain claim or an unfiltered next.
+// An empty body stays allowed.
+func TestClaimAndNextRejectMalformedBody(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+	id := mustCreateTask(t, ts, "web", "t")
+	hdr := map[string]string{"X-Agent": "agent-a", "Content-Type": "application/json"}
+	for _, path := range []string{"/api/tasks/" + id + "/claim", "/api/tasks/next"} {
+		r := do(t, ts, http.MethodPost, path, `{"steal_stale":"1h","project":"web"`, hdr)
+		r.Body.Close()
+		if r.StatusCode != http.StatusBadRequest {
+			t.Errorf("POST %s with truncated JSON = %d, want 400", path, r.StatusCode)
+		}
+	}
+	r := do(t, ts, http.MethodPost, "/api/tasks/"+id+"/claim", "", hdr)
+	r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("claim with empty body = %d, want 200", r.StatusCode)
+	}
+}
+
+// TestListTasksLimitCapped: an absent, negative or oversized limit returns
+// at most maxTaskListLimit rows.
+func TestListTasksLimitCapped(t *testing.T) {
+	ts, st := newTestServerWithStore(t)
+	if _, _, err := st.CreateProject("web", "web", ""); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i <= maxTaskListLimit; i++ {
+		if _, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "t" + strconv.Itoa(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, q := range []string{"", "?limit=0", "?limit=-1", "?limit=100000"} {
+		r := do(t, ts, http.MethodGet, "/api/tasks"+q, "", nil)
+		var tasks []Task
+		json.NewDecoder(r.Body).Decode(&tasks)
+		r.Body.Close()
+		if len(tasks) != maxTaskListLimit {
+			t.Errorf("GET /api/tasks%s returned %d tasks, want %d", q, len(tasks), maxTaskListLimit)
+		}
+	}
+	r := do(t, ts, http.MethodGet, "/api/tasks?limit=3", "", nil)
+	var tasks []Task
+	json.NewDecoder(r.Body).Decode(&tasks)
+	r.Body.Close()
+	if len(tasks) != 3 {
+		t.Errorf("limit=3 returned %d tasks", len(tasks))
+	}
+}

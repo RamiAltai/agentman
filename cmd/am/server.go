@@ -369,6 +369,10 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, p)
 }
 
+// maxTaskListLimit caps GET /api/tasks. It equals the largest page any
+// first-party client asks for (the dashboard's limit=500; the CLI sends 50).
+const maxTaskListLimit = 500
+
 func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	f := TaskFilter{
@@ -408,6 +412,11 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	if f.Project, f.Category, err = s.narrowScope(r, sc, f.Project, f.Category, true); err != nil {
 		writeErr(w, err)
 		return
+	}
+	// Absent, non-positive or oversized limits all mean the cap: the whole
+	// result is built and encoded in memory on the single DB connection.
+	if f.Limit <= 0 || f.Limit > maxTaskListLimit {
+		f.Limit = maxTaskListLimit
 	}
 	ts, err := s.store.ListTasks(f)
 	if err != nil {
@@ -672,7 +681,10 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 		Assignee   string `json:"assignee"`
 		StealStale string `json:"steal_stale"`
 	}
-	_ = decode(r, &in)
+	if err := decode(r, &in); err != nil { // an empty body is fine; malformed JSON is not
+		writeErr(w, ErrValidation)
+		return
+	}
 	if in.Assignee != "" {
 		agent = in.Assignee
 	}
@@ -706,7 +718,10 @@ func (s *Server) handleNext(w http.ResponseWriter, r *http.Request) {
 		Assignee string `json:"assignee"`
 		MetaKey  string `json:"meta_key"`
 	}
-	_ = decode(r, &in)
+	if err := decode(r, &in); err != nil { // an empty body is fine; malformed JSON is not
+		writeErr(w, ErrValidation)
+		return
+	}
 	if in.Assignee != "" {
 		agent = in.Assignee
 	}
@@ -829,7 +844,7 @@ func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	ev, err := s.store.DeleteProject(slug, actorOf(r))
+	ev, err := s.store.DeleteProject(slug, sc.Category, actorOf(r))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -934,8 +949,15 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	// Resume point: Last-Event-ID header (set by EventSource on reconnect) or ?since=.
 	since := atoi64Default(r.Header.Get("Last-Event-ID"), atoi64Default(q.Get("since"), 0))
-	lastSent := since
 	maxAtSub, _ := s.store.MaxEventID()
+	// A cursor beyond the log's end belongs to another history (the DB was
+	// replaced by `am db import`, or emptied by `am db prune`): keeping it
+	// would dedupe away every live event until ids climb past it. Replay
+	// from the start instead.
+	if since > maxAtSub {
+		since = 0
+	}
+	lastSent := since
 
 	fmt.Fprint(w, "retry: 3000\n\n")
 	flusher.Flush()
@@ -970,6 +992,15 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		case e, ok := <-sub.ch:
 			if !ok {
 				return
+			}
+			// The hub dropped an event for this subscriber (buffer full, so
+			// sub.ch is never empty here). Writing anything later would move
+			// the client's cursor past the hole; ending the response instead
+			// makes it reconnect from lastSent, which replays the gap.
+			select {
+			case <-sub.lagged:
+				return
+			default:
 			}
 			if e.ID <= lastSent { // dedupe overlap with replay
 				continue
@@ -1081,12 +1112,18 @@ func actorOf(r *http.Request) string {
 // scopeOf is the SOLE reader of request scope — no handler reads the
 // Authorization header or X-Agent-Scope directly. Precedence (Phase S):
 //   - A bearer token WINS: its server-side bound scope is authoritative and any
-//     X-Agent-Scope header is ignored. An unknown/revoked token is ErrInvalidToken
-//     (→ 401 → exit 9), NEVER a silent fallthrough to the header or zero scope.
+//     X-Agent-Scope header is ignored. An unknown/revoked token — or an
+//     Authorization header that carries no Bearer token at all (empty value,
+//     other scheme) — is ErrInvalidToken (→ 401 → exit 9), NEVER a silent
+//     fallthrough to the header or zero scope.
 //   - With no token, the X-Agent-Scope header is the scope: absent is the zero
 //     (unscoped) Scope; a malformed one is a 400.
 func (s *Server) scopeOf(r *http.Request) (Scope, error) {
-	if tok := bearerToken(r); tok != "" {
+	if r.Header.Get("Authorization") != "" {
+		tok := bearerToken(r)
+		if tok == "" {
+			return Scope{}, ErrInvalidToken
+		}
 		return s.store.ResolveToken(tok)
 	}
 	raw := r.Header.Get("X-Agent-Scope")
@@ -1125,8 +1162,10 @@ func denyScope(r *http.Request, sc Scope) error {
 }
 
 // checkTaskMut gates every mutation of an existing task (claim/steal, patch,
-// delete, deps, labels, comment deletion). Relies on task→project and
-// project→category immutability — see the PatchTask scope note.
+// delete, deps, labels, comment deletion). It reads outside the mutation's
+// tx, which relies on task→project and project→category immutability AND on
+// task ids never being reused (AUTOINCREMENT, schema v6) — see the PatchTask
+// scope note.
 func (s *Server) checkTaskMut(r *http.Request, sc Scope, taskID int64) error {
 	if sc.IsZero() {
 		return nil
@@ -1217,12 +1256,12 @@ func (s *Server) checkCreate(r *http.Request, sc Scope, projectSlug string) erro
 	} else if ok {
 		return nil
 	}
-	if sc.Project != "" {
-		if projectSlug == sc.Project {
-			return nil
-		}
+	if sc.Project != "" && projectSlug != sc.Project {
 		return denyScope(r, sc)
 	}
+	// The category is checked for project scopes too: slugs are freed by
+	// delete, so a same-named project recreated in another category must not
+	// inherit a token minted for the old one (scopeAllows compares the pair).
 	cat, err := s.store.projectCategory(projectSlug)
 	if err != nil {
 		return err // unknown slug stays a 404, matching unscoped create
@@ -1250,18 +1289,17 @@ func (s *Server) checkProjectRead(r *http.Request, sc Scope, slug string) error 
 
 // checkProjectMut gates project mutations (patch/archive/unarchive/delete):
 // the project itself must be in scope — no proposals carve-out (proposing is
-// creating tasks, never reshaping the project).
+// creating tasks, never reshaping the project). Unlike task ids, slugs are
+// reused after a delete, so this read can race a delete+recreate; delete (the
+// irreversible one) re-checks the category inside its own tx.
 func (s *Server) checkProjectMut(r *http.Request, sc Scope, slug string) error {
 	if sc.IsZero() {
 		return nil
 	}
-	if sc.Project != "" {
-		if slug == sc.Project {
-			return nil
-		}
+	if sc.Project != "" && slug != sc.Project {
 		return denyScope(r, sc)
 	}
-	cat, err := s.store.projectCategory(slug)
+	cat, err := s.store.projectCategory(slug) // pair check, as in checkCreate
 	if err != nil {
 		return err // unknown slug stays a 404
 	}
@@ -1296,13 +1334,10 @@ func (s *Server) narrowScope(r *http.Request, sc Scope, proj, cat string, allowP
 				return proj, cat, nil
 			}
 		}
-		if sc.Project != "" {
-			if proj != sc.Project {
-				return "", "", denyScope(r, sc)
-			}
-			return proj, cat, nil
+		if sc.Project != "" && proj != sc.Project {
+			return "", "", denyScope(r, sc)
 		}
-		pcat, err := s.store.projectCategory(proj)
+		pcat, err := s.store.projectCategory(proj) // pair check, as in checkCreate
 		if err != nil {
 			if errors.Is(err, ErrNotFound) {
 				return "", "", denyScope(r, sc) // unknown explicit slug: not provably in scope
@@ -1312,7 +1347,10 @@ func (s *Server) narrowScope(r *http.Request, sc Scope, proj, cat string, allowP
 		if pcat != sc.Category {
 			return "", "", denyScope(r, sc)
 		}
-		return proj, cat, nil
+		// Hand the scope's category to the store as well, so its own query
+		// re-checks the pair (the project could be deleted and its slug
+		// recreated elsewhere between this read and the store call).
+		return proj, sc.Category, nil
 	}
 	return sc.Project, sc.Category, nil
 }

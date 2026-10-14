@@ -1004,7 +1004,7 @@ func TestDeleteProjectCascades(t *testing.T) {
 		t.Fatalf("AddComment: %v", err)
 	}
 
-	ev, err := st.DeleteProject("alpha", "alice")
+	ev, err := st.DeleteProject("alpha", "", "alice")
 	if err != nil {
 		t.Fatalf("DeleteProject: %v", err)
 	}
@@ -1044,7 +1044,7 @@ func TestDeleteProjectCascades(t *testing.T) {
 	}
 
 	// ErrNotFound on re-delete.
-	_, err = st.DeleteProject("alpha", "alice")
+	_, err = st.DeleteProject("alpha", "", "alice")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("DeleteProject re-delete = %v, want ErrNotFound", err)
 	}
@@ -3581,5 +3581,118 @@ func TestRevokeToken(t *testing.T) {
 	}
 	if _, err := st.RevokeToken(tok.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("double revoke err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestPatchTaskRejectsWrongTypes: a wrong-typed assignee/body/priority is a
+// validation error, never read as "" (unassign / wipe) or ignored.
+func TestPatchTaskRejectsWrongTypes(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("web", "web", ""); err != nil {
+		t.Fatal(err)
+	}
+	tk, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "x", Body: "keep me", Assignee: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, patch := range []map[string]any{
+		{"assignee": float64(5)},
+		{"assignee": []any{"a"}},
+		{"assignee": nil},
+		{"body": float64(123)},
+		{"body": nil},
+		{"priority": "high"},
+		{"priority": 1.9},
+		{"priority": nil},
+	} {
+		if _, _, err := st.PatchTask(tk.ID, patch, "bob"); !errors.Is(err, ErrValidation) {
+			t.Errorf("PatchTask(%v) err = %v, want ErrValidation", patch, err)
+		}
+	}
+	got, err := st.GetTask(tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Assignee != "alice" || got.Body != "keep me" || got.Priority != tk.Priority {
+		t.Fatalf("task changed by rejected patches: assignee=%q body=%q priority=%d", got.Assignee, got.Body, got.Priority)
+	}
+	// The documented forms still work: "" unassigns, JSON numbers set priority.
+	got, _, err = st.PatchTask(tk.ID, map[string]any{"assignee": "", "priority": float64(1)}, "bob")
+	if err != nil || got.Assignee != "" || got.Priority != 1 {
+		t.Fatalf("valid patch = %+v, %v; want unassigned, priority 1", got, err)
+	}
+}
+
+// TestClaimPreAssignedTodoStartsIt: claiming a task already assigned to you
+// but still todo (am new --assign / am assign) moves it to doing, stamps
+// claimed_at and emits task.claimed — ADR-023 tells agents to claim these.
+// Re-claiming your own done task is a conflict, via ClaimTask and steal alike.
+func TestClaimPreAssignedTodoStartsIt(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("web", "web", ""); err != nil {
+		t.Fatal(err)
+	}
+	tk, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "x", Assignee: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tk.Status != "todo" {
+		t.Fatalf("pre-assigned task status = %q, want todo", tk.Status)
+	}
+	got, ev, err := st.ClaimTask(tk.ID, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev == nil || ev.Kind != "task.claimed" {
+		t.Fatalf("claim of pre-assigned todo task emitted %v, want task.claimed", ev)
+	}
+	if got.Status != "doing" || got.ClaimedAt == "" {
+		t.Fatalf("after claim: status=%q claimed_at=%q, want doing + timestamp", got.Status, got.ClaimedAt)
+	}
+	// Already doing: idempotent, no event.
+	if _, ev, err := st.ClaimTask(tk.ID, "alice"); err != nil || ev != nil {
+		t.Fatalf("re-claim of doing task = %v, %v; want no event, nil", ev, err)
+	}
+	if _, _, err := st.PatchTask(tk.ID, map[string]any{"status": "done"}, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	var ce *ConflictError
+	if _, _, err := st.ClaimTask(tk.ID, "alice"); !errors.As(err, &ce) {
+		t.Fatalf("owner re-claim of done task err = %v, want ConflictError", err)
+	}
+	if _, _, err := st.StealStaleClaim(tk.ID, "alice", time.Minute); !errors.As(err, &ce) {
+		t.Fatalf("owner steal of done task err = %v, want ConflictError", err)
+	}
+
+	// The steal path starts a pre-assigned todo task the same way.
+	tk2, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "y", Assignee: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ev, err = st.StealStaleClaim(tk2.ID, "alice", time.Minute)
+	if err != nil || ev == nil || got.Status != "doing" {
+		t.Fatalf("owner steal of pre-assigned todo = %+v, %v, %v; want doing + event", got, ev, err)
+	}
+}
+
+// TestDeleteProjectRechecksCategory: the scope category passed by the server
+// is verified inside DeleteProject's tx, so a slug recreated in another
+// category after the handler's check is not deleted.
+func TestDeleteProjectRechecksCategory(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateCategory("work", "Work"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateProject("api", "api", "work"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DeleteProject("api", "general", "agent"); !errors.Is(err, ErrOutOfScope) {
+		t.Fatalf("delete with wrong category err = %v, want ErrOutOfScope", err)
+	}
+	if _, err := st.projectID("api"); err != nil {
+		t.Fatalf("project gone after refused delete: %v", err)
+	}
+	if _, err := st.DeleteProject("api", "work", "agent"); err != nil {
+		t.Fatalf("delete with matching category: %v", err)
 	}
 }
