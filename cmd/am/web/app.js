@@ -79,7 +79,8 @@ function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return n
 function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* ignore */ } }
 
 // el builds DOM safely: string children become text nodes (never innerHTML),
-// so agent-supplied titles/comments can't inject markup.
+// so agent-supplied titles/comments can't inject markup. An on* prop must be a
+// function; a string one would become an inline-script attribute, so it is dropped.
 function el(tag, props, ...kids) {
   const n = document.createElement(tag);
   props = props || {};
@@ -88,7 +89,7 @@ function el(tag, props, ...kids) {
     if (v == null) continue;
     if (k === "class") n.className = v;
     else if (k === "value") n.value = v;
-    else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2).toLowerCase(), v);
+    else if (k.startsWith("on")) { if (typeof v === "function") n.addEventListener(k.slice(2).toLowerCase(), v); }
     else n.setAttribute(k, v);
   }
   for (const kid of kids) {
@@ -1931,7 +1932,7 @@ function describeText(ev) {
     case "category.created": return `${who} created category ${d.slug || ""}`;
     case "category.archived": return `${who} archived category ${d.slug || ""}`;
     case "category.unarchived": return `${who} unarchived category ${d.slug || ""}`;
-    case "task.deleted": return `${who} deleted task`;
+    case "task.deleted": return `${who} deleted ${t}`;
     case "comment.deleted": return `${who} deleted a comment on ${t}`;
     case "project.deleted": return `${who} deleted project ${d.slug || ""}`;
     case "task.dep_added": return `${who} linked ${t} depends on #${d.depends_on || ""}`;
@@ -2287,9 +2288,9 @@ function graphNeighbors(nodeId, edges) {
     const seen = new Set(), via = new Set(), q = [nodeId];
     for (let i = 0; i < q.length; i++) {
       for (const e of adj.get(q[i]) || []) {
+        via.add(e); // every edge at a reached node lies on a path, even when its other end was already seen
         if (seen.has(e[next])) continue;
         seen.add(e[next]);
-        via.add(e);
         q.push(e[next]);
       }
     }
