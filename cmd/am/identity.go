@@ -24,11 +24,8 @@ import (
 // then use `am` normally — no need to repeat its identity on every command.
 //
 // File format: JSON {"agent","scope","token"} (scope and token omitted when
-// empty). A scoped init writes agent+scope; `am token new` merges in token
-// (and writes {"token":"..."} alone, with no agent, before any init). An
-// unscoped init writes the bare agent id as plain text, and any plain-text
-// file — including those from versions before scopes existed — is read as an
-// unscoped identity.
+// empty). `am init` writes agent (+scope); `am token new` merges in token
+// (and writes {"token":"..."} alone, with no agent, before any init).
 
 // identityFile returns this working directory's identity file. Without a home
 // directory or a working directory it errors rather than guess: a relative
@@ -62,22 +59,19 @@ type identityRecord struct {
 }
 
 // readIdentityFile returns the identity file's own agent, scope and token,
-// without env overrides. A JSON record is accepted when any field is set (a
-// token minted before `am init` has no agent); anything else is the legacy
-// plain-text bare agent id. No locatable file reads as no identity.
+// without env overrides. The file is a JSON record (a token minted before
+// `am init` has no agent); a missing, unreadable or non-JSON file reads as no
+// identity.
 func readIdentityFile() (rec identityRecord) {
 	f, err := identityFile()
 	if err != nil {
 		return rec
 	}
 	b, err := os.ReadFile(f)
-	if err != nil {
-		return rec
+	if err != nil || json.Unmarshal(b, &rec) != nil {
+		return identityRecord{}
 	}
-	if json.Unmarshal(b, &rec) == nil && rec != (identityRecord{}) {
-		return rec
-	}
-	return identityRecord{Agent: strings.TrimSpace(string(b))} // legacy plain text = unscoped
+	return rec
 }
 
 // writeIdentityFile replaces the identity file atomically (temp file in the
@@ -179,8 +173,7 @@ func cmdInit(a Args) {
 	if proj != "" && cat == "" {
 		fail(5, "init: -p requires -c (scope is category[/project])")
 	}
-	id := newIdentity(a.at(0))
-	data := []byte(id) // unscoped: legacy bare id
+	rec := identityRecord{Agent: newIdentity(a.at(0))}
 	if cat != "" {
 		raw := cat
 		if proj != "" {
@@ -190,15 +183,16 @@ func cmdInit(a Args) {
 		if err != nil {
 			fail(5, "init: bad scope %q (want category[/project], no spaces)", raw)
 		}
-		data, err = json.Marshal(identityRecord{Agent: id, Scope: sc.String()})
-		if err != nil {
-			fail(1, "init: %v", err)
-		}
+		rec.Scope = sc.String()
+	}
+	data, err := json.Marshal(rec)
+	if err != nil {
+		fail(1, "init: %v", err)
 	}
 	if err := writeIdentityFile(data); err != nil {
 		fail(1, "init: %v", err)
 	}
-	fmt.Println(id) // print only the id, so `id=$(am init bugfix)` works
+	fmt.Println(rec.Agent) // print only the id, so `id=$(am init bugfix)` works
 }
 
 func cmdWhoami() {

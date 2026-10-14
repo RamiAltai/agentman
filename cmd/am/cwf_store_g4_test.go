@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -329,47 +328,6 @@ func TestCwfStoreClaimTaskEdges(t *testing.T) {
 	var ce *ConflictError
 	if _, _, err := st.ClaimTask(tk.ID, "b"); !errors.As(err, &ce) {
 		t.Fatalf("claim of a done task by another agent err = %v, want ConflictError", err)
-	}
-}
-
-// FIND-0157: runMigrations stops at target even when later steps are listed.
-func TestCwfStoreMigrationTargetCap(t *testing.T) {
-	st := openTestStore(t)
-	base := currentSchemaVersion
-	var applied []int
-	var steps []migration
-	for i := 1; i <= 3; i++ {
-		v := base + i
-		steps = append(steps, migration{version: v, apply: func(*sql.Tx) error {
-			applied = append(applied, v)
-			return nil
-		}})
-	}
-	if err := runMigrations(st.db, base+2, steps); err != nil {
-		t.Fatal(err)
-	}
-	if len(applied) != 2 || applied[1] != base+2 {
-		t.Fatalf("applied = %v, want [%d %d]", applied, base+1, base+2)
-	}
-	if v, _ := readSchemaVersion(st.db); v != base+2 {
-		t.Fatalf("schema_version = %d, want %d", v, base+2)
-	}
-}
-
-// FIND-0157: a missing or unparseable schema_version reads as 1.
-func TestCwfStoreReadSchemaVersionFallbacks(t *testing.T) {
-	st := openTestStore(t)
-	if _, err := st.db.Exec("UPDATE meta SET value='abc' WHERE key='schema_version'"); err != nil {
-		t.Fatal(err)
-	}
-	if v, err := readSchemaVersion(st.db); err != nil || v != 1 {
-		t.Fatalf("unparseable version = %d, %v; want 1", v, err)
-	}
-	if _, err := st.db.Exec("DELETE FROM meta WHERE key='schema_version'"); err != nil {
-		t.Fatal(err)
-	}
-	if v, err := readSchemaVersion(st.db); err != nil || v != 1 {
-		t.Fatalf("missing version = %d, %v; want 1", v, err)
 	}
 }
 

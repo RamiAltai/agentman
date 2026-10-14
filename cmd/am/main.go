@@ -117,7 +117,7 @@ func runServe(argv []string) {
 	a := parse(argv)
 	port, dbPath, prop := serveConfig(a)
 	// Bind before touching the DB: a busy port (e.g. a second serve) must fail
-	// before OpenStore runs schema/migrations on a file another server uses.
+	// before OpenStore runs schema.sql on a file another server uses.
 	ln, err := net.Listen("tcp", listenAddr(port))
 	if err != nil {
 		fail(1, "agentman: serve: %v", err)

@@ -1,29 +1,16 @@
--- AgentMan schema. Pragmas are set on the DSN (see store.go), not here,
+-- AgentMan schema: the single, current schema (no migrations — there is no
+-- older data to upgrade). Pragmas are set on the DSN (see store.go), not here,
 -- so journal_mode=WAL is applied at connection open (never inside a tx).
--- projects, tasks and events are rebuilt with AUTOINCREMENT (ids never
--- reused) by migration v6 in store.go; their CREATE TABLEs below stay the
--- frozen v1 baseline. Migration v7 makes idx_tasks_assignee partial (assignee
--- IS NOT NULL) and adds idx_tasks_next and idx_events_project; the
--- IF NOT EXISTS index lines below are then no-ops.
+-- projects, tasks and events use AUTOINCREMENT so a deleted row's id is never
+-- handed out again (ids are wire refs, scope-check keys and the SSE cursor).
 
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
 
--- projects: named boards that group tasks.
--- NOTE: this CREATE TABLE is the frozen v1 baseline — category_id, uid, and the
--- vault binding columns are added by migration v4 (see store.go), never here.
-CREATE TABLE IF NOT EXISTS projects (
-  id         INTEGER PRIMARY KEY,
-  slug       TEXT NOT NULL UNIQUE,        -- short handle agents pass (token-cheap)
-  name       TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-);
-
 -- categories: the layer above projects (instance → category → project → task).
--- projects.category_id is added by migration v4, not here — the projects CREATE
--- TABLE above is the frozen v1 baseline that old snapshots are validated against.
+-- OpenStore seeds the default 'general' category.
 CREATE TABLE IF NOT EXISTS categories (
   id          INTEGER PRIMARY KEY,
   uid         TEXT NOT NULL UNIQUE,   -- stable id, amc_<16 hex>, never changes
@@ -33,9 +20,23 @@ CREATE TABLE IF NOT EXISTS categories (
   archived_at TEXT
 );
 
+-- projects: named boards that group tasks.
+CREATE TABLE IF NOT EXISTS projects (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  slug             TEXT NOT NULL UNIQUE,   -- short handle agents pass (token-cheap)
+  name             TEXT NOT NULL,
+  category_id      INTEGER NOT NULL REFERENCES categories(id),
+  uid              TEXT NOT NULL UNIQUE,   -- stable id, amp_<16 hex>, survives slug renames
+  vault_project_id TEXT,                   -- optional external vault binding
+  vault_path       TEXT,
+  created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  archived_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_projects_category ON projects(category_id);
+
 -- tasks: the tickets.
 CREATE TABLE IF NOT EXISTS tasks (
-  id         INTEGER PRIMARY KEY,         -- global id, the cheap wire ref ("#42")
+  id         INTEGER PRIMARY KEY AUTOINCREMENT, -- global id, the cheap wire ref ("#42")
   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   ref        INTEGER NOT NULL,            -- per-project number for humans ("web-3")
   title      TEXT NOT NULL,
@@ -44,13 +45,20 @@ CREATE TABLE IF NOT EXISTS tasks (
              CHECK (status IN ('todo','doing','blocked','done')),
   assignee   TEXT,                        -- agent id; NULL = unclaimed
   priority   INTEGER NOT NULL DEFAULT 2,  -- 0=urgent..3=low
+  created_by TEXT,                        -- creating actor (proposals carve-out: own-task comments)
+  claimed_at TEXT,                        -- set on (re)assign, cleared on unassign
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   UNIQUE (project_id, ref)
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);
-CREATE INDEX IF NOT EXISTS idx_tasks_assignee       ON tasks(assignee);
-CREATE INDEX IF NOT EXISTS idx_tasks_updated        ON tasks(updated_at);
+-- Partial: every assignee= and stale filter implies assignee IS NOT NULL; a full
+-- index lured the planner into using it for NextTask's assignee IS NULL.
+CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee) WHERE assignee IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_updated ON tasks(updated_at);
+-- NextTask's candidate predicate, so `am next` reads the first eligible row in
+-- (priority, id) order instead of sorting the backlog.
+CREATE INDEX IF NOT EXISTS idx_tasks_next ON tasks(priority, id) WHERE status='todo' AND assignee IS NULL;
 
 -- task_deps: prerequisite edges between tasks (many-to-many, same-project only).
 -- Both FKs cascade on delete so removing a task cleans up its edges automatically.
@@ -81,13 +89,11 @@ CREATE TABLE IF NOT EXISTS task_meta (
 );
 CREATE INDEX IF NOT EXISTS idx_task_meta_key ON task_meta(key);
 
--- tokens: scope-bound bearer credentials (Phase S). A token confines an agent
--- to one scope server-side: the server derives the scope from the presented
--- token and ignores the client-asserted X-Agent-Scope header. Only the sha256
--- HASH of the plaintext is stored — the plaintext (amt_<32 hex>) is shown once
--- at mint and never persisted, so a stolen DB row cannot be replayed as a
--- credential. Created via CREATE TABLE IF NOT EXISTS (no migration; the
--- schema_version stays 5 — a fresh table needs no backfill).
+-- tokens: scope-bound bearer credentials. A token confines an agent to one
+-- scope server-side: the server derives the scope from the presented token and
+-- ignores the client-asserted X-Agent-Scope header. Only the sha256 HASH of the
+-- plaintext is stored — the plaintext (amt_<32 hex>) is shown once at mint and
+-- never persisted, so a stolen DB row cannot be replayed as a credential.
 CREATE TABLE IF NOT EXISTS tokens (
   id          TEXT PRIMARY KEY,          -- tk_<16 hex>, shown in ls/revoke
   token_hash  TEXT NOT NULL UNIQUE,      -- sha256(plaintext) hex; plaintext never stored
@@ -96,7 +102,6 @@ CREATE TABLE IF NOT EXISTS tokens (
   created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   revoked_at  TEXT                       -- NULL = active
 );
-CREATE INDEX IF NOT EXISTS idx_tokens_hash ON tokens(token_hash);
 
 -- comments: discussion thread on a task.
 CREATE TABLE IF NOT EXISTS comments (
@@ -110,7 +115,7 @@ CREATE INDEX IF NOT EXISTS idx_comments_task ON comments(task_id, id);
 
 -- events: append-only log = activity feed + SSE backbone + monotonic cursor.
 CREATE TABLE IF NOT EXISTS events (
-  id         INTEGER PRIMARY KEY,         -- doubles as ?since= cursor and SSE Last-Event-ID
+  id         INTEGER PRIMARY KEY AUTOINCREMENT, -- ?since= cursor and SSE Last-Event-ID; never reused
   project_id INTEGER,
   task_id    INTEGER,
   actor      TEXT NOT NULL,
@@ -118,6 +123,8 @@ CREATE TABLE IF NOT EXISTS events (
   data       TEXT NOT NULL DEFAULT '{}',  -- compact JSON delta, e.g. {"status":["todo","doing"]}
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
-CREATE INDEX IF NOT EXISTS idx_events_since ON events(id);
+CREATE INDEX IF NOT EXISTS idx_events_task    ON events(task_id, id);     -- GetTask's history
+CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id, id);  -- project-filtered replay
+CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);      -- category stats' activity window
 
 INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '1');

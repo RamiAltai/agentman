@@ -26,10 +26,14 @@ func TestInitWritesAndResolves(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
-	contents := strings.TrimSpace(string(data))
+	var rec identityRecord
+	if err := json.Unmarshal(data, &rec); err != nil || rec.Scope != "" || rec.Token != "" {
+		t.Fatalf("identity file %q: want a JSON record with only an agent (err %v)", data, err)
+	}
+	contents := rec.Agent
 	matched, err := regexp.MatchString(`^bugfix_\d{6}_[0-9a-f]{6}$`, contents)
 	if err != nil || !matched {
-		t.Fatalf("identity file contents %q does not match ^bugfix_\\d{6}_[0-9a-f]{6}$", contents)
+		t.Fatalf("identity agent %q does not match ^bugfix_\\d{6}_[0-9a-f]{6}$", contents)
 	}
 
 	// The printed id must match the file.
@@ -170,21 +174,6 @@ func TestInitProjectRequiresCategory(t *testing.T) {
 	}
 }
 
-func TestLegacyPlainIdentityUnscoped(t *testing.T) {
-	idFile := isolateIdentity(t)
-
-	// Pre-Phase-Q file: bare id, trailing newline.
-	if err := os.WriteFile(idFile, []byte("bugfix_010101_0001\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if got := resolveAgent(); got != "bugfix_010101_0001" {
-		t.Fatalf("resolveAgent() = %q, want bugfix_010101_0001", got)
-	}
-	if got := resolveScope(); got != "" {
-		t.Fatalf("resolveScope() = %q, want empty (legacy file is unscoped)", got)
-	}
-}
-
 func TestScopeEnvOverride(t *testing.T) {
 	idFile := isolateIdentity(t)
 
@@ -195,12 +184,12 @@ func TestScopeEnvOverride(t *testing.T) {
 	if got := resolveScope(); got != "work/api" {
 		t.Fatalf("resolveScope() with env override = %q, want work/api", got)
 	}
-	// The env also scopes an otherwise-unscoped (legacy) identity.
-	if err := os.WriteFile(idFile, []byte("plain_010101_0001"), 0o644); err != nil {
+	// The env also scopes an otherwise-unscoped identity.
+	if err := os.WriteFile(idFile, []byte(`{"agent":"plain_010101_0001"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if got := resolveScope(); got != "work/api" {
-		t.Fatalf("resolveScope() legacy+env = %q, want work/api", got)
+		t.Fatalf("resolveScope() unscoped+env = %q, want work/api", got)
 	}
 }
 
@@ -220,7 +209,7 @@ func TestWhoamiPrintsScope(t *testing.T) {
 	}
 
 	// Unscoped identity: id only, no scope line (output shape unchanged).
-	if err := os.WriteFile(idFile, []byte("plain_010101_0001"), 0o644); err != nil {
+	if err := os.WriteFile(idFile, []byte(`{"agent":"plain_010101_0001"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	out = captureStdout(t, func() { cmdWhoami() })
@@ -272,7 +261,7 @@ func TestParseScope(t *testing.T) {
 }
 
 // FIND-0035: a JSON record with a token but no agent (token minted before
-// `am init`) is read as a token, not as a legacy bare agent id.
+// `am init`) is read as a token.
 func TestResolveIdentityTokenOnlyRecord(t *testing.T) {
 	idFile := isolateIdentity(t)
 	if err := os.WriteFile(idFile, []byte(`{"agent":"","token":"amt_secret"}`), 0o600); err != nil {
@@ -282,16 +271,10 @@ func TestResolveIdentityTokenOnlyRecord(t *testing.T) {
 	if agent != "" || scope != "" || token != "amt_secret" {
 		t.Fatalf("resolveIdentity = (%q, %q, %q), want (\"\", \"\", amt_secret)", agent, scope, token)
 	}
-	// Legacy plain text is still a bare agent id.
-	os.WriteFile(idFile, []byte("bugfix_010126_0001\n"), 0o644)
-	if a := resolveAgent(); a != "bugfix_010126_0001" {
-		t.Fatalf("legacy resolveAgent = %q", a)
-	}
 }
 
 // FIND-0123, FIND-0138: what each identity-file shape resolves to, with and
-// without the env overrides. A missing or empty file is no identity; anything
-// that is not a non-empty JSON record is a legacy bare id (so "{bad" is an id).
+// without the env overrides. A missing, empty or non-JSON file is no identity.
 func TestResolveIdentityFileShapes(t *testing.T) {
 	cases := []struct {
 		name                    string
@@ -301,8 +284,8 @@ func TestResolveIdentityFileShapes(t *testing.T) {
 	}{
 		{name: "no file"},
 		{name: "empty file", file: idFileBody("")},
-		{name: "bare id with whitespace", file: idFileBody("  bugfix_010126_0001 \n"), agent: "bugfix_010126_0001"},
-		{name: "corrupt json is a legacy id", file: idFileBody("{bad"), agent: "{bad"},
+		{name: "plain text is no identity", file: idFileBody("bugfix_010126_0001\n")},
+		{name: "corrupt json is no identity", file: idFileBody("{bad")},
 		{name: "token-only record", file: idFileBody(`{"agent":"","token":"x"}`), wantToken: "x"},
 		{name: "full record", file: idFileBody(`{"agent":"a1","scope":"work/api","token":"amt_file"}`),
 			agent: "a1", scope: "work/api", wantToken: "amt_file"},

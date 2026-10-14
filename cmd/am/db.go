@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -185,6 +186,9 @@ func exportDB(dbPath, outPath string) error {
 	return os.Chmod(outPath, 0o600)
 }
 
+// schemaTableRe finds the table names schema.sql defines.
+var schemaTableRe = regexp.MustCompile(`CREATE TABLE IF NOT EXISTS (\w+)`)
+
 // validateImportCandidate sanity-checks a DB file before importing.
 func validateImportCandidate(srcPath string) error {
 	db, err := sql.Open("sqlite", srcPath+"?mode=ro")
@@ -216,16 +220,11 @@ func validateImportCandidate(srcPath string) error {
 		return errors.New("foreign key violations found")
 	}
 
-	// required tables — deliberately the v1 baseline set, NOT the current
-	// schema: later tables (task_deps, task_labels, categories) are created by
-	// schema.sql/migrations on the next OpenStore, so pre-migration snapshots
-	// stay importable. Do not add new tables here.
-	required := map[string]bool{
-		"projects": false,
-		"tasks":    false,
-		"comments": false,
-		"events":   false,
-		"meta":     false,
+	// required tables: every table schema.sql defines (there is only the one
+	// schema, so a snapshot missing one was not written by this am).
+	required := map[string]bool{}
+	for _, m := range schemaTableRe.FindAllStringSubmatch(schemaSQL, -1) {
+		required[m[1]] = false
 	}
 	trows, err := db.Query("SELECT name FROM sqlite_master WHERE type='table'")
 	if err != nil {
@@ -251,16 +250,14 @@ func validateImportCandidate(srcPath string) error {
 		}
 	}
 
-	// schema_version check
+	// schema_version must be exactly this am's: there are no migrations.
 	var raw string
-	verr := db.QueryRow("SELECT value FROM meta WHERE key='schema_version'").Scan(&raw)
-	if verr == nil {
-		v, perr := strconv.Atoi(strings.TrimSpace(raw))
-		if perr == nil && v > currentSchemaVersion {
-			return fmt.Errorf("schema_version %d is newer than supported %d", v, currentSchemaVersion)
-		}
+	if err := db.QueryRow("SELECT value FROM meta WHERE key='schema_version'").Scan(&raw); err != nil {
+		return fmt.Errorf("no schema_version: %w", err)
 	}
-	// missing or unparseable → treat as version 1 (compatible)
+	if v, err := strconv.Atoi(strings.TrimSpace(raw)); err != nil || v != currentSchemaVersion {
+		return fmt.Errorf("schema_version %q, this am supports %d", raw, currentSchemaVersion)
+	}
 
 	return nil
 }

@@ -210,7 +210,7 @@ func TestCwfDbValidateRejections(t *testing.T) {
 		// Re-declare an existing index over a different column: its stored
 		// entries no longer match the table, which integrity_check reports.
 		cwfDbExec(t, p, "PRAGMA writable_schema=ON",
-			"UPDATE sqlite_master SET sql='CREATE INDEX idx_events_since ON events(actor)' WHERE name='idx_events_since'")
+			"UPDATE sqlite_master SET sql='CREATE INDEX idx_events_task ON events(actor)' WHERE name='idx_events_task'")
 		err := validateImportCandidate(p)
 		if err == nil || !strings.Contains(err.Error(), "integrity_check") {
 			t.Fatalf("validate corrupt index: err = %v", err)

@@ -1081,7 +1081,7 @@ func denyScope(r *http.Request, sc Scope) error {
 // checkTaskMut gates every mutation of an existing task (claim/steal, patch,
 // delete, deps, labels, comment deletion). It reads outside the mutation's
 // tx, which relies on task→project and project→category immutability AND on
-// task ids never being reused (AUTOINCREMENT, schema v6) — see the PatchTask
+// task ids never being reused (AUTOINCREMENT) — see the PatchTask
 // scope note.
 func (s *Server) checkTaskMut(r *http.Request, sc Scope, taskID int64) error {
 	if sc.IsZero() {
@@ -1147,8 +1147,7 @@ func (s *Server) checkTaskRead(r *http.Request, sc Scope, taskID int64) error {
 
 // checkComment allows commenting in scope, plus the carve-out: a scoped agent
 // may comment on tasks it CREATED in the proposals project (follow-ups on its
-// own proposals). created_by may be empty for pre-v5 tasks with pruned
-// events — those never match, the safe direction.
+// own proposals). An empty created_by never matches, the safe direction.
 func (s *Server) checkComment(r *http.Request, sc Scope, taskID int64) error {
 	if sc.IsZero() {
 		return nil

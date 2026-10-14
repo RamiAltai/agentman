@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -177,58 +176,6 @@ func TestCwfStoreOpenStoreURIChars(t *testing.T) {
 		if _, err := os.Stat(path); err != nil {
 			t.Errorf("%q: db not created at the literal path: %v", dir, err)
 		}
-	}
-}
-
-// FIND-0473: a failed migration names the step and the version it started from.
-func TestCwfStoreMigrationErrorNamesStep(t *testing.T) {
-	db, err := sql.Open("sqlite", storeDSN(filepath.Join(t.TempDir(), "m.db")))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schemaSQL); err != nil {
-		t.Fatal(err)
-	}
-	boom := errors.New("boom")
-	steps := []migration{
-		{version: 2, apply: func(*sql.Tx) error { return nil }},
-		{version: 3, apply: func(*sql.Tx) error { return boom }},
-	}
-	err = runMigrations(db, 3, steps)
-	if !errors.Is(err, boom) || !strings.Contains(err.Error(), "v2 -> v3") {
-		t.Fatalf("runMigrations err = %v, want boom wrapped with \"v2 -> v3\"", err)
-	}
-	if v, _ := readSchemaVersion(db); v != 2 {
-		t.Fatalf("schema_version after failed v3 = %d, want 2", v)
-	}
-}
-
-// FIND-0474: the v5 created_by backfill finds each task's creation event
-// through an index rather than scanning the event log.
-func TestCwfStoreV5BackfillIndexed(t *testing.T) {
-	db := buildDBAtVersion(t, filepath.Join(t.TempDir(), "v5.db"), 5)
-	defer db.Close()
-	var plan strings.Builder
-	rows, err := db.Query(`EXPLAIN QUERY PLAN SELECT e.actor FROM events e
-	       WHERE e.task_id=1 AND e.kind='task.created' ORDER BY e.id DESC LIMIT 1`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for rows.Next() {
-		var id, parent, unused int
-		var detail string
-		rows.Scan(&id, &parent, &unused, &detail)
-		plan.WriteString(detail + "; ")
-	}
-	rows.Close()
-	if !strings.Contains(plan.String(), "idx_events_task") {
-		t.Fatalf("v5 backfill lookup plan = %q, want idx_events_task", plan.String())
-	}
-	// v6 rebuilds events and recreates the index under the same name.
-	if err := runMigrations(db, currentSchemaVersion, schemaMigrations); err != nil {
-		t.Fatalf("migrate v5 -> current: %v", err)
 	}
 }
 

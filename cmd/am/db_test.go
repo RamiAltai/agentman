@@ -368,63 +368,9 @@ func TestExportContainsCategories(t *testing.T) {
 	}
 }
 
-// TestImportPreCategorySnapshot: a v3-shaped DB (no categories table) passes
-// validation — the required-table set is the v1 baseline on purpose — imports
-// cleanly, and migrates to the current version on the next OpenStore.
-func TestImportPreCategorySnapshot(t *testing.T) {
-	cwfDbNoServer(t)
-
-	// Build a v3 DB from the frozen v3 DDL (not schema.sql, which moves on), with one project.
-	srcDB := filepath.Join(t.TempDir(), "v3src.db")
-	db, err := sql.Open("sqlite", "file:"+srcDB+"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)")
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(cwfDbV3SchemaSQL); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec("INSERT INTO projects(slug,name) VALUES('oldproj','Old')"); err != nil {
-		t.Fatal(err)
-	}
-	if v, err := readSchemaVersion(db); err != nil || v != 3 {
-		t.Fatalf("fixture schema_version = %d (err %v), want 3", v, err)
-	}
-	if n := cwfDbCount(t, db, "SELECT COUNT(*) FROM sqlite_master WHERE name='categories'"); n != 0 {
-		t.Fatal("v3 fixture has a categories table")
-	}
-	db.Close()
-
-	if err := validateImportCandidate(srcDB); err != nil {
-		t.Fatalf("v3 snapshot rejected: %v", err)
-	}
-
-	destDB := filepath.Join(t.TempDir(), "dest.db")
-	if err := importDB(srcDB, destDB, t.TempDir(), true); err != nil {
-		t.Fatalf("importDB: %v", err)
-	}
-
-	// OpenStore migrates the imported DB to the current version.
-	st, err := OpenStore(destDB)
-	if err != nil {
-		t.Fatalf("OpenStore after import: %v", err)
-	}
-	defer st.Close()
-	if v, err := readSchemaVersion(st.db); err != nil || v != currentSchemaVersion {
-		t.Fatalf("schema_version after import+open = %d (err %v), want %d", v, err, currentSchemaVersion)
-	}
-	ps, err := st.ListProjects(false, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(ps) != 1 || ps[0].Slug != "oldproj" || ps[0].Category != "general" {
-		t.Fatalf("imported project = %+v, want oldproj in general", ps)
-	}
-}
-
-// TestImportRejectsNewerSchema: a snapshot stamped with a future schema_version
-// must be refused.
-func TestImportRejectsNewerSchema(t *testing.T) {
+// TestImportRejectsOtherSchema: a snapshot stamped with any schema_version
+// other than this am's is refused (there are no migrations to bridge it).
+func TestImportRejectsOtherSchema(t *testing.T) {
 	srcDB := filepath.Join(t.TempDir(), "future.db")
 	st, err := OpenStore(srcDB)
 	if err != nil {
@@ -435,16 +381,15 @@ func TestImportRejectsNewerSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	st.Close()
-	if err := validateImportCandidate(srcDB); err == nil || !strings.Contains(err.Error(), "newer than supported") {
-		t.Fatalf("schema_version %d snapshot: err = %v, want 'newer than supported'", currentSchemaVersion+1, err)
+	if err := validateImportCandidate(srcDB); err == nil || !strings.Contains(err.Error(), "schema_version") {
+		t.Fatalf("schema_version %d snapshot: err = %v, want a schema_version error", currentSchemaVersion+1, err)
 	}
 }
 
 // TestExportImportWithTokens: a DB carrying tokens round-trips through
 // export/import. The tokens table rides the VACUUM INTO whole-file snapshot
-// (only sha256 hashes travel, never plaintext), and validateImportCandidate is
-// unchanged — its required-table set stays the v1 baseline, so the new table is
-// neither required nor rejected. After import the token still resolves.
+// (only sha256 hashes travel, never plaintext). After import the token still
+// resolves.
 func TestExportImportWithTokens(t *testing.T) {
 	cwfDbNoServer(t)
 

@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"math"
 	"regexp"
 	"sort"
@@ -246,337 +245,41 @@ func OpenStore(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
-	// Refuse a DB written by a newer am: migrations only run forward, so an
-	// older binary would otherwise operate on (and corrupt) too-new data.
-	// Mirrors the ceiling validateImportCandidate applies to import snapshots.
+	// schema.sql is the only schema; a DB stamped with any other version was
+	// written by a different am and is refused rather than misread.
 	if v, err := readSchemaVersion(db); err != nil {
 		db.Close()
 		return nil, err
-	} else if v > currentSchemaVersion {
+	} else if v != currentSchemaVersion {
 		db.Close()
-		return nil, fmt.Errorf("database schema_version %d is newer than supported %d — upgrade am", v, currentSchemaVersion)
+		return nil, fmt.Errorf("database schema_version %d, this am supports %d", v, currentSchemaVersion)
 	}
-	if err := runMigrations(db, currentSchemaVersion, schemaMigrations); err != nil {
+	// Default category, so `am project new` without -c has somewhere to go.
+	if _, err := db.Exec("INSERT INTO categories(uid,slug,name) SELECT ?, 'general', 'General' "+
+		"WHERE NOT EXISTS (SELECT 1 FROM categories WHERE slug='general')", newUID("amc_")); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("migrate schema: %w", err)
+		return nil, fmt.Errorf("seed default category: %w", err)
 	}
 	return &Store{db: db}, nil
 }
 
-// ---------- schema migrations ----------
+// currentSchemaVersion is the version schema.sql stamps into meta. There are no
+// migrations: there is no older data to upgrade. When a live schema first needs
+// to change, add a forward migration step and bump this.
+const currentSchemaVersion = 1
 
-// currentSchemaVersion is the version OpenStore migrates to. schema.sql seeds a
-// fresh DB at version 1; runMigrations applies any steps with version > the DB's
-// recorded version to reach this target.
-const currentSchemaVersion = 7
-
-// migration is one forward-only, idempotent step. apply runs inside the same tx
-// that bumps meta.schema_version, so a step + its version bump commit atomically.
-type migration struct {
-	version int
-	apply   func(*sql.Tx) error
-}
-
-// schemaMigrations is the ordered, forward-only migration list. The first shipped
-// step is v2, which adds the projects.archived_at column for project archiving;
-// further phases append steps like {version: N, apply: func(tx *sql.Tx) error { ... }}.
-// Versions must be strictly increasing and start above 1 (the seed version).
-var schemaMigrations = []migration{
-	{version: 2, apply: func(tx *sql.Tx) error {
-		_, err := tx.Exec("ALTER TABLE projects ADD COLUMN archived_at TEXT")
-		return err
-	}},
-	{version: 3, apply: func(tx *sql.Tx) error {
-		_, err := tx.Exec("ALTER TABLE tasks ADD COLUMN claimed_at TEXT")
-		return err
-	}},
-	// v4: category layer + stable ids + vault binding. The categories table
-	// itself comes from schema.sql (CREATE TABLE IF NOT EXISTS runs before
-	// migrations on both fresh and existing DBs); this step extends projects,
-	// seeds the default category, and backfills.
-	{version: 4, apply: func(tx *sql.Tx) error {
-		// category_id is added WITHOUT NOT NULL: SQLite's ADD COLUMN cannot add
-		// a NOT NULL column unless it has a non-NULL constant default, which is
-		// wrong for an FK. The NOT NULL invariant is enforced by the app instead
-		// (CreateProject always sets it; the UPDATE below backfills old rows).
-		// UNIQUE is likewise not allowed in ADD COLUMN, hence the uid index.
-		for _, q := range []string{
-			"ALTER TABLE projects ADD COLUMN category_id INTEGER REFERENCES categories(id)",
-			"ALTER TABLE projects ADD COLUMN uid TEXT",
-			"ALTER TABLE projects ADD COLUMN vault_project_id TEXT",
-			"ALTER TABLE projects ADD COLUMN vault_path TEXT",
-			"CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_uid ON projects(uid)",
-			"CREATE INDEX IF NOT EXISTS idx_projects_category ON projects(category_id)",
-		} {
-			if _, err := tx.Exec(q); err != nil {
-				return err
-			}
-		}
-		// Default category, created unconditionally so fresh installs have one.
-		if _, err := tx.Exec(
-			"INSERT INTO categories(uid,slug,name) SELECT ?, 'general', 'General' "+
-				"WHERE NOT EXISTS (SELECT 1 FROM categories WHERE slug='general')",
-			newUID("amc_")); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(
-			"UPDATE projects SET category_id=(SELECT id FROM categories WHERE slug='general') WHERE category_id IS NULL"); err != nil {
-			return err
-		}
-		// Backfill stable ids row by row — each project needs a distinct uid.
-		rows, err := tx.Query("SELECT id FROM projects WHERE uid IS NULL")
-		if err != nil {
-			return err
-		}
-		var ids []int64
-		for rows.Next() {
-			var id int64
-			if err := rows.Scan(&id); err != nil {
-				rows.Close()
-				return err
-			}
-			ids = append(ids, id)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		for _, id := range ids {
-			if _, err := tx.Exec("UPDATE projects SET uid=? WHERE id=?", newUID("amp_"), id); err != nil {
-				return err
-			}
-		}
-		return nil
-	}},
-	// v5: tasks.created_by — who created the task, for the Phase Q proposals
-	// carve-out (a scoped agent may comment on its OWN proposal tickets).
-	// Backfill is best-effort from the durable event log: the LATEST
-	// task.created event's actor is the creator — latest, not first, because
-	// tasks.id is a reusable rowid (no AUTOINCREMENT) and DeleteTask leaves a
-	// deleted task's events behind, so an id's oldest creation event may
-	// belong to a deleted predecessor; the newest one is always the current
-	// incarnation's. Tasks whose events were pruned (`am db prune`) stay
-	// NULL — they simply never match the own-proposal comment rule, which is
-	// the safe direction.
-	{version: 5, apply: func(tx *sql.Tx) error {
-		if _, err := tx.Exec("ALTER TABLE tasks ADD COLUMN created_by TEXT"); err != nil {
-			return err
-		}
-		// The backfill looks up each task's latest creation event; without
-		// this index that is a backward scan of the whole log per task. v6
-		// rebuilds events and recreates the index under the same name.
-		if _, err := tx.Exec("CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, id)"); err != nil {
-			return err
-		}
-		_, err := tx.Exec(`UPDATE tasks SET created_by=(
-		       SELECT e.actor FROM events e
-		       WHERE e.task_id=tasks.id AND e.kind='task.created'
-		       ORDER BY e.id DESC LIMIT 1)
-		     WHERE created_by IS NULL`)
-		return err
-	}},
-	// v6: projects, tasks and events become AUTOINCREMENT, so a deleted row's
-	// id is never handed out again. Rowid reuse let a new project inherit a
-	// deleted one's events (category views showed them), let a scope check
-	// on task N authorize a mutation of a different task N, and let `am db
-	// prune --keep 0` restart the event cursor at 1 (stalling SSE clients).
-	// This reverses ADR-015's "ref/id reuse accepted" for ids (per-project
-	// refs still reuse). SQLite cannot add AUTOINCREMENT in place, so each
-	// table is rebuilt (runMigrations runs steps with foreign_keys off). Also
-	// adds the events indexes for GetTask's per-task history and the
-	// category stats' recent-activity window.
-	{version: 6, apply: func(tx *sql.Tx) error {
-		for _, q := range []string{
-			`CREATE TABLE projects_v6 (
-			   id               INTEGER PRIMARY KEY AUTOINCREMENT,
-			   slug             TEXT NOT NULL UNIQUE,
-			   name             TEXT NOT NULL,
-			   created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-			   archived_at      TEXT,
-			   category_id      INTEGER REFERENCES categories(id),
-			   uid              TEXT,
-			   vault_project_id TEXT,
-			   vault_path       TEXT)`,
-			`INSERT INTO projects_v6(id,slug,name,created_at,archived_at,category_id,uid,vault_project_id,vault_path)
-			   SELECT id,slug,name,created_at,archived_at,category_id,uid,vault_project_id,vault_path FROM projects`,
-			"DROP TABLE projects",
-			"ALTER TABLE projects_v6 RENAME TO projects",
-			"CREATE UNIQUE INDEX idx_projects_uid ON projects(uid)",
-			"CREATE INDEX idx_projects_category ON projects(category_id)",
-
-			`CREATE TABLE tasks_v6 (
-			   id         INTEGER PRIMARY KEY AUTOINCREMENT,
-			   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-			   ref        INTEGER NOT NULL,
-			   title      TEXT NOT NULL,
-			   body       TEXT NOT NULL DEFAULT '',
-			   status     TEXT NOT NULL DEFAULT 'todo'
-			              CHECK (status IN ('todo','doing','blocked','done')),
-			   assignee   TEXT,
-			   priority   INTEGER NOT NULL DEFAULT 2,
-			   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-			   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-			   claimed_at TEXT,
-			   created_by TEXT,
-			   UNIQUE (project_id, ref))`,
-			`INSERT INTO tasks_v6(id,project_id,ref,title,body,status,assignee,priority,created_at,updated_at,claimed_at,created_by)
-			   SELECT id,project_id,ref,title,body,status,assignee,priority,created_at,updated_at,claimed_at,created_by FROM tasks`,
-			"DROP TABLE tasks",
-			"ALTER TABLE tasks_v6 RENAME TO tasks",
-			"CREATE INDEX idx_tasks_project_status ON tasks(project_id, status)",
-			"CREATE INDEX idx_tasks_assignee ON tasks(assignee)",
-			"CREATE INDEX idx_tasks_updated ON tasks(updated_at)",
-
-			`CREATE TABLE events_v6 (
-			   id         INTEGER PRIMARY KEY AUTOINCREMENT,
-			   project_id INTEGER,
-			   task_id    INTEGER,
-			   actor      TEXT NOT NULL,
-			   kind       TEXT NOT NULL,
-			   data       TEXT NOT NULL DEFAULT '{}',
-			   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`,
-			`INSERT INTO events_v6(id,project_id,task_id,actor,kind,data,created_at)
-			   SELECT id,project_id,task_id,actor,kind,data,created_at FROM events`,
-			"DROP TABLE events",
-			"ALTER TABLE events_v6 RENAME TO events",
-			"CREATE INDEX idx_events_since ON events(id)",
-			"CREATE INDEX idx_events_task ON events(task_id, id)",
-			"CREATE INDEX idx_events_created ON events(created_at)",
-
-			// Start each sequence above every id already used — including
-			// deleted rows' ids that survive only in the event log — so even
-			// pre-migration deletions are never reissued.
-			"DELETE FROM sqlite_sequence WHERE name IN ('projects','tasks','events')",
-			`INSERT INTO sqlite_sequence(name, seq) VALUES
-			   ('projects', MAX(COALESCE((SELECT MAX(id) FROM projects),0), COALESCE((SELECT MAX(project_id) FROM events),0))),
-			   ('tasks',    MAX(COALESCE((SELECT MAX(id) FROM tasks),0),    COALESCE((SELECT MAX(task_id) FROM events),0))),
-			   ('events',   COALESCE((SELECT MAX(id) FROM events),0))`,
-		} {
-			if _, err := tx.Exec(q); err != nil {
-				return err
-			}
-		}
-		return nil
-	}},
-	// v7: indexes for the two hot scans. idx_tasks_next is partial over
-	// NextTask's candidate predicate, so `am next` reads the first eligible
-	// row in (priority, id) order instead of sorting the whole backlog.
-	// idx_tasks_assignee becomes partial (assignee IS NOT NULL — every
-	// assignee= and stale filter implies it): as a full index the planner
-	// took it for `assignee IS NULL` and sorted every candidate.
-	// idx_events_project serves project-filtered ListEvents (SSE replay,
-	// ?since=) without walking every later event.
-	{version: 7, apply: func(tx *sql.Tx) error {
-		for _, q := range []string{
-			"DROP INDEX IF EXISTS idx_tasks_assignee",
-			"CREATE INDEX idx_tasks_assignee ON tasks(assignee) WHERE assignee IS NOT NULL",
-			"CREATE INDEX IF NOT EXISTS idx_tasks_next ON tasks(priority, id) WHERE status='todo' AND assignee IS NULL",
-			"CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id, id)",
-		} {
-			if _, err := tx.Exec(q); err != nil {
-				return err
-			}
-		}
-		return nil
-	}},
-}
-
-// readSchemaVersion returns the DB's recorded schema version, defaulting to 1 if
-// the meta row is missing or unparseable (a fresh DB is implicitly at version 1).
+// readSchemaVersion returns the DB's recorded schema version. A missing or
+// unparseable value is an error: schema.sql always writes it.
 func readSchemaVersion(db *sql.DB) (int, error) {
 	var raw string
-	err := db.QueryRow("SELECT value FROM meta WHERE key='schema_version'").Scan(&raw)
-	if err == sql.ErrNoRows {
-		return 1, nil
+	if err := db.QueryRow("SELECT value FROM meta WHERE key='schema_version'").Scan(&raw); err != nil {
+		return 0, fmt.Errorf("read schema_version: %w", err)
 	}
+	v, err := strconv.Atoi(strings.TrimSpace(raw))
 	if err != nil {
-		return 0, err
-	}
-	v, perr := strconv.Atoi(strings.TrimSpace(raw))
-	if perr != nil {
-		return 1, nil
+		return 0, fmt.Errorf("bad schema_version %q", raw)
 	}
 	return v, nil
-}
-
-// runMigrations applies, in order, every step whose version exceeds the DB's
-// current version, up to target. Each step's apply and the matching
-// meta.schema_version bump run in one tx; on any error the tx is rolled back and
-// the DB is left at the prior version. Re-running is a no-op (integer compare).
-//
-// Steps run on one pinned connection with foreign_keys OFF: rebuilding a table
-// (create, copy, drop, rename — SQLite's only way to change a column
-// definition) would otherwise cascade the DROP of a parent table into its
-// children. The pragma is a no-op inside a tx, hence the pinned connection;
-// each step must pass foreign_key_check before it commits.
-func runMigrations(db *sql.DB, target int, steps []migration) (err error) {
-	cur, err := readSchemaVersion(db)
-	if err != nil {
-		return err
-	}
-	ctx := context.Background()
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
-		return err
-	}
-	defer func() {
-		if _, ferr := conn.ExecContext(ctx, "PRAGMA foreign_keys=ON"); ferr != nil && err == nil {
-			err = ferr
-		}
-	}()
-	if cur < target {
-		log.Printf("agentman: migrating schema v%d -> v%d", cur, target)
-	}
-	for _, m := range steps {
-		if m.version <= cur || m.version > target {
-			continue
-		}
-		start := time.Now()
-		if err := applyMigration(conn, m); err != nil {
-			return fmt.Errorf("migration v%d -> v%d: %w", cur, m.version, err)
-		}
-		log.Printf("agentman: schema migration v%d applied in %s", m.version, time.Since(start).Round(time.Millisecond))
-		cur = m.version
-	}
-	return nil
-}
-
-// applyMigration runs one step and its schema_version bump in one tx on conn.
-func applyMigration(conn *sql.Conn, m migration) error {
-	tx, err := conn.BeginTx(context.Background(), nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := m.apply(tx); err != nil {
-		return err
-	}
-	if err := foreignKeyCheck(tx); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(
-		"INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?)",
-		strconv.Itoa(m.version)); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-// foreignKeyCheck fails if any row references a missing parent.
-func foreignKeyCheck(tx *sql.Tx) error {
-	rows, err := tx.Query("PRAGMA foreign_key_check")
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	if rows.Next() {
-		return errors.New("foreign key violations")
-	}
-	return rows.Err()
 }
 
 func (s *Store) Close() error {
@@ -1173,8 +876,7 @@ func (s *Store) projectCategory(slug string) (string, error) {
 }
 
 // taskScope returns the category slug, project slug, and creator of a task in
-// one SELECT — everything the server's scope checks need. created_by is empty
-// for pre-v5 tasks whose events were pruned before the backfill.
+// one SELECT — everything the server's scope checks need.
 // ErrNotFound for an unknown task id.
 func (s *Store) taskScope(id int64) (category, project, createdBy string, err error) {
 	err = s.db.QueryRow(`SELECT c.slug, p.slug, COALESCE(t.created_by,'')
@@ -1785,8 +1487,8 @@ func (s *Store) CreateTask(in CreateTaskInput) (*Task, *Event, error) {
 //
 // Scope note: the handler's scope pre-check (checkTaskMut) runs OUTSIDE this
 // transaction. That is sound only because a task's project (and a project's
-// category) is immutable today and task ids are never reused (AUTOINCREMENT
-// since schema v6), so the checked id is this task or a 404 — if a
+// category) is immutable today and task ids are never reused (AUTOINCREMENT),
+// so the checked id is this task or a 404 — if a
 // task/project move feature ever ships, the scope check must move inside this tx.
 func (s *Store) PatchTask(id int64, patch map[string]any, actor string) (*Task, *Event, error) {
 	tx, err := s.db.Begin()

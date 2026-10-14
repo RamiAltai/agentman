@@ -373,7 +373,7 @@ func TestCwfCliIdentityFileDefaultPath(t *testing.T) {
 		}
 	}
 	for file, id := range map[string]string{f1: id1, f2: id2} {
-		if b, err := os.ReadFile(file); err != nil || string(b) != id {
+		if b, err := os.ReadFile(file); err != nil || string(b) != `{"agent":"`+id+`"}` {
 			t.Fatalf("%s = %q (err %v), want %q", file, b, err, id)
 		}
 	}
