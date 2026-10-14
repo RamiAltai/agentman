@@ -159,7 +159,7 @@ convention is loose, it's called out.
 ## Testing
 
 - `go test -race ./cmd/am/` (or `go test ./...`); table-driven tests (see `cmd/am/update_test.go`).
-  Coverage spans pure logic, the store, HTTP, migrations, offline DB tooling, CLI verbs + exit codes,
+  Coverage spans pure logic, the store, HTTP, the schema stamp/version refusal, offline DB tooling, CLI verbs + exit codes,
   scope enforcement, scope tokens (Phase S — store hash-not-plaintext/resolve/revoke, the unscoped
   mint guard, token-scope-wins, 401→exit-9, export/import round-trip), SSE streaming/reconnect (incl.
   category-scoped) + direct hub fan-out unit tests, `am wait`, identity, and the dashboard source
@@ -214,12 +214,10 @@ SVG elements and `el()` for any HTML wrapper elements (e.g., the detail panel ne
 - ❌ Binding beyond `127.0.0.1` without adding authentication first.
 - ❌ Printing chatter to **stdout** in the CLI (breaks `id=$(am new …)` and token budgets).
 - ❌ Editing `cmd/am/web/*` and forgetting to rebuild — the running server serves stale embedded assets.
-- ❌ Adding a **column** to an existing table in `schema.sql` and assuming existing DBs get it —
-  `ALTER TABLE` is needed. Use the forward-only runner: append a `{version, apply}` step to
-  `schemaMigrations` and bump `currentSchemaVersion`; `schema.sql` still seeds fresh DBs.
-  Exception: adding a **new table** with `CREATE TABLE IF NOT EXISTS` propagates automatically on
-  every `OpenStore` without a runner step or version bump (see `task_deps` as the worked example).
-  Never use `CREATE TABLE IF NOT EXISTS` to add a column to an existing table.
+- ❌ Editing a table in `schema.sql` and assuming existing DB files get it — there is **no
+  migration runner** (ADR-033) and `CREATE TABLE IF NOT EXISTS` never alters an existing table, so
+  a changed schema needs a fresh DB. Schema changes are edits to `schema.sql` (still
+  `schema_version` 1); reintroduce migrations only when a live schema first has to change.
 
 ## Unknowns
 

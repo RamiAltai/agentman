@@ -67,13 +67,10 @@ Flag the change if it touches any of these invariants:
 
 ## Data Impact Checklist
 
-- [ ] Schema change? A **forward-only migration runner exists and is exercised** (ADR-010) — append a
-  `{version, apply}` step to `schemaMigrations` and raise `currentSchemaVersion` in `cmd/am/store.go`; do
-  **not** rely on `CREATE TABLE IF NOT EXISTS` to alter existing tables. Copy the latest step in
-  `schemaMigrations` as the template, and add an existing-DB migration test modeled on the latest
-  `TestMigrationV*ExistingDB` in `cmd/am/migrate_test.go`.
-  Note `OpenStore` refuses a DB newer than `currentSchemaVersion` (ADR-025), so version bumps are
-  one-way for any binary that opens the DB.
+- [ ] Schema change? There is **no migration runner** (ADR-033) — edit `cmd/am/schema.sql` (still
+  `schema_version` 1; `OpenStore` refuses any other) and add a `cmd/am/schema_test.go` case. An
+  existing DB file is not altered (`CREATE TABLE IF NOT EXISTS`), so it needs a fresh DB; once a live
+  schema with data to keep has to change, reintroduce migrations first.
 - [ ] New columns threaded through `schema.sql` → `store.go` structs → `CreateTask`/`PatchTask`/
   `getTaskTx` → API → dashboard?
 - [ ] Cascade/ownership rules considered (project→tasks→comments)?

@@ -100,8 +100,8 @@ unfiltered `am ls`/`am next` are silently narrowed to your scope. One carve-out:
 tasks into the **proposals project** (default `meta/proposals`) from any scope — that's the inbox
 for asking another scope's owner to do something. (`AGENTMAN_SCOPE` overrides the file's scope;
 `X-Agent-Scope` is the wire header — a client-asserted label, accident prevention, not auth.)
-**After upgrading:** a pre-Phase-Q identity file is read as **unscoped** — re-run `am init -c …` to
-gain a scope.
+The identity file is JSON (`{"agent","scope","token"}`); a file that is not JSON reads as no
+identity — re-run `am init`.
 
 **Scope tokens (the human mints, the agent uses):** `X-Agent-Scope` alone is a client-asserted label.
 To make the scope server-enforced, a human (an **unscoped** operator) mints a token for the agent:
@@ -268,8 +268,9 @@ am db import <path> [--yes] # validate, back up the current DB, then replace it
 ```
 
 Default export path is a timestamped file in the current directory. `import` validates the
-candidate, **refuses while a server is running**, prompts unless `--yes`, and backs up the
-existing DB into the DB's directory first. Stop `am serve` before importing.
+candidate (every table `schema.sql` defines, `schema_version` exactly 1), **refuses while a
+server is running**, prompts unless `--yes`, and backs up the existing DB into the DB's directory
+first. Stop `am serve` before importing.
 
 `import` and `prune` detect a running server two ways: an HTTP probe of `AGENTMAN_URL` (default
 `http://127.0.0.1:8787`), checked before the prompt, and a lock check on the DB file itself, which

@@ -5,13 +5,11 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 ## Architecture Risks
 
-- **Schema-migration runner: forward-only, no rollback path** (Low). The forward-only runner reads
-  and bumps `meta.schema_version` (ADR-010); each step applies its version bump in one tx and is
-  test-covered (target: `currentSchemaVersion` in `store.go`). Residual: no down-migrations.
-  `OpenStore` refuses a DB recorded at a version newer than the binary supports (clear "upgrade am"
-  error), the same ceiling
-  `validateImportCandidate` applies to snapshots. → `data-model.md`,
-  `decision-records.md` ADR-010/ADR-025.
+- **No schema migrations** (Low, deliberate — ADR-033). `schema.sql` is the single schema at
+  `schema_version` 1; `OpenStore` and `validateImportCandidate` refuse any other version. Residual:
+  a `schema.sql` change does not alter an existing DB file (`CREATE TABLE IF NOT EXISTS`), so until
+  migrations are reintroduced a schema change means a fresh DB. → `data-model.md` (Schema),
+  `decision-records.md` ADR-033.
 - **Single-writer throughput ceiling** (Low for stated scope). `SetMaxOpenConns(1)` serializes all
   writes; correct and simple, but caps write concurrency. → ADR-003.
 - **Module boundaries are by convention only** (Medium, maintainability). One flat `main` package
@@ -24,10 +22,10 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 - **Delete and history residuals** (Low). Hard-delete endpoints exist (`DELETE /api/tasks/{id}`,
   `DELETE /api/tasks/{id}/comments/{cid}`, `DELETE /api/projects/{slug}` cascade via FK; CLI
   `am rm <id>`, `am project rm <slug> --yes`), with these accepted residuals:
-  - **`ref` reuse** — global ids (`tasks.id`, `projects.id`, `events.id`) are `AUTOINCREMENT` since
-    schema v6 and never reused, but a per-project human `ref` (e.g. `web-3`) can be reused if the
+  - **`ref` reuse** — global ids (`tasks.id`, `projects.id`, `events.id`) are `AUTOINCREMENT` and
+    never reused, but a per-project human `ref` (e.g. `web-3`) can be reused if the
     highest-numbered task in a project is deleted and a new task is then created (accepted, no
-    counter/migration added).
+    counter added).
   - **Project slugs are reused after delete** — the scope checks for project patch, archive and
     unarchive (`checkProjectMut`) run outside the store tx, so they can race a delete + recreate of
     the same slug in another category. Delete (the irreversible one) re-checks the category inside
@@ -152,10 +150,8 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   The server cannot prove an unknown slug in-scope, so it fails loud — mild existence ambiguity
   accepted in exchange for a fail-loud default. Same for a project-scoped agent creating into an
   unknown slug.
-- **`created_by` backfill is best-effort** (Low). Tasks whose `task.created` events were pruned
-  (`am db prune`) before the v5 migration stay NULL and never match the own-proposal comment rule
-  (the safe direction). `ListTasks` rows deliberately omit `created_by` (only `GET /task` and the
-  scope checks read it — keeps list payloads stable).
+- **`created_by` is not on list rows** (Low). `ListTasks` rows deliberately omit `created_by`
+  (only `GET /task` and the scope checks read it — keeps list payloads stable).
 - **Exit 8 reachable from a host-guard 403** (Low, cosmetic). `am wait`'s re-checks map any 403 to
   exit 8; a host-allowlist rejection (`hostGuard`) would surface as "out of scope" rather than a
   guard error. Localhost-only, low impact.
@@ -203,7 +199,7 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 ## Testing Gaps
 
-The backend is well covered (store/server/migrate/db/cli/sse/hub/identity/wait/web, `-race`-clean);
+The backend is well covered (store/server/schema/db/cli/sse/hub/identity/wait/web, `-race`-clean);
 for the full test list see `architecture/contribution-guide.md` (Tests). The standing gap is the
 **frontend**: the project adopts **no JS test runner** (preserves the no-npm/single-binary ethos;
 ADR-018), so all behavioral dashboard JS is exercised only by the `web_test.go` source-level guards
@@ -236,7 +232,7 @@ runner. Un-runner-tested behaviors include:
   machine-checked against the code.
 - Some decisions are still **undocumented** — the authoritative list is `decision-records.md`
   "Missing Decisions" (currently: auth/remote-access model, testing coverage targets, `comments`
-  retention, release automation and versioning policy). Migrations (ADR-010), deletes/archive
+  retention, release automation and versioning policy). Schema/no-migrations (ADR-033), deletes/archive
   (ADR-013/ADR-015), the dashboard testing approach (ADR-018) and CI (ADR-019) are recorded.
 
 ## Maintainability Concerns
@@ -268,7 +264,7 @@ runner. Un-runner-tested behaviors include:
 ## Recommended Follow-Ups
 
 1. **Record the open decisions** listed in `decision-records.md` "Missing Decisions" as ADRs once
-   chosen. (Schema changes already follow ADR-010's forward-only runner; see `data-model.md`
-   Migrations.)
+   chosen. (Schema changes are edits to the single `schema.sql`, ADR-033; see `data-model.md`
+   Schema.)
 2. If remote access is ever wanted, treat it as an **auth + CSRF/`Host` + TLS** project per
    `security.md`, not a feature add-on.

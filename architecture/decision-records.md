@@ -76,7 +76,8 @@ record instead.
 - Evidence: `cmd/am/server.go` (`//go:embed web`); `cmd/am/web/app.js el()`.
 
 ### ADR-008: Per-directory agent identity file
-- Status: Active
+- Status: Amended by ADR-033 — the file is JSON only (`{"agent","scope","token"}`); a non-JSON file
+  reads as no identity.
 - Context: Agent runtimes spawn a fresh shell per command, so `export AGENTMAN_AGENT=…` doesn't persist.
 - Decision: `am init <tasktype>` writes a `{tasktype}_{DDMMYY}_{rand}` id to
   `~/.agentman/agents/<sha1(cwd)>`; the CLI reads it (env `AGENTMAN_AGENT` overrides).
@@ -93,7 +94,8 @@ record instead.
 - Evidence: `cmd/am/update.go`; `docs/reference.md` "Updating".
 
 ### ADR-010: Minimal in-code schema-migration runner
-- Status: Amended by ADR-025 — the newer-version case is now refused at open (see Consequences).
+- Status: Superseded by ADR-033 — the runner and steps v2–v7 were removed; `schema.sql` is the
+  single schema at `schema_version` 1.
 - Context: `CREATE TABLE IF NOT EXISTS` cannot add columns to existing DBs (IADR-003); upcoming
   archive (a new column) and DB import (a version-compatibility check) both need a version story.
 - Decision: A forward-only, idempotent runner in `store.go` — `readSchemaVersion` +
@@ -134,7 +136,8 @@ record instead.
   `cmd/am/server_test.go`.
 
 ### ADR-012: DB export/import as CLI-only file operations, no HTTP route
-- Status: Active
+- Status: Amended by ADR-033 — import now requires every table `schema.sql` defines and
+  `schema_version` exactly 1.
 - Context: "Back up = copy one file" (ADR-001) needs a safe, consistent snapshot while the server may
   hold the single WAL connection (ADR-003); restore must not corrupt a live DB.
 - Decision: `am db export [path]` / `am db import <path>` operate **directly on the SQLite file**,
@@ -165,7 +168,8 @@ record instead.
   `cmd/am/cli.go` (`yes` in boolFlags); `cmd/am/db_test.go`.
 
 ### ADR-013: Project archive as a reversible soft-delete (first real migration, v2)
-- Status: Active
+- Status: Amended by ADR-033 — `projects.archived_at` is now declared in `schema.sql`; the v2 step
+  is gone.
 - Context: "Delete / archival semantics" was an open Missing Decision; agents accumulate stale
   projects but their tasks/comments/events must survive (events are the append-only backbone, ADR-004).
 - Decision: Archive is a **reversible soft-delete** via a nullable `projects.archived_at` TEXT column
@@ -205,8 +209,9 @@ record instead.
   `renderBoard` `selected.has(t.project)`, `tab()`/`card()`).
 
 ### ADR-015: Hard-delete endpoints with FK cascade and retained audit log (Phase C1)
-- Status: Amended by schema migration v6 — item 4's global-id reuse no longer happens (`projects`,
-  `tasks`, `events` use `AUTOINCREMENT`); per-project `ref` reuse still does (`data-model.md`).
+- Status: Amended by schema v6, now part of the single schema (ADR-033) — item 4's global-id reuse
+  no longer happens (`projects`, `tasks`, `events` use `AUTOINCREMENT`); per-project `ref` reuse
+  still does (`data-model.md`).
 - Context: No API existed to delete tasks, comments, or projects — removal was only possible by
   editing the SQLite file directly. Archive (ADR-013) is reversible and projects-only; a distinct
   "permanently remove" path was needed. The existing `ON DELETE CASCADE` FKs
@@ -226,9 +231,8 @@ record instead.
      while a task lives, but not unique across the whole history. Likewise a per-project human `ref`
      (e.g. `web-3`) can be reused if the highest-numbered task in a project is deleted and a new
      task is created. No counter/migration was added — acceptable for a personal board.
-     **Reversed for ids by schema v6:** the migration in `store.go` rebuilds `tasks`, `projects` and
-     `events` with `AUTOINCREMENT`, seeding each sequence past every id seen in the table or the event
-     log, so ids are never reused (rowid reuse let a scope check on one task authorize another, a new
+     **Reversed for ids by schema v6:** `tasks`, `projects` and `events` use `AUTOINCREMENT` (the v6
+     migration rebuilt them; since ADR-033 `schema.sql` declares it directly), so ids are never reused (rowid reuse let a scope check on one task authorize another, a new
      project inherit a deleted one's events, and `am db prune --keep 0` reset the SSE cursor).
      Per-project refs can still be reused.
   5. **`am project rm <slug> --yes` requires `--yes`** — without the flag the CLI errors with a
@@ -492,7 +496,7 @@ record instead.
   (4 new graph tests).
 
 ### ADR-022: Stale-claim recovery — staleness from `updated_at`, steal via conditional UPDATE, no lease daemon (Phase K)
-- Status: Active
+- Status: Amended by ADR-033 — `tasks.claimed_at` is declared in `schema.sql`; migration v3 is gone.
 - Context: Agents crash after `am claim`, leaving tasks assigned forever — nothing on the board
   distinguishes "agent is working" from "agent is dead", and other agents have no safe way to take
   the work over (`am assign` is an unconditional overwrite that could rob a live agent).
@@ -657,7 +661,9 @@ record instead.
 
 ### ADR-025: Category layer + stable IDs + vault binding — `amc_`/`amp_` crypto/rand uids, nullable FK with app-enforced NOT NULL, globally-unique slugs, `-c` flag with a `show` carve-out, open-time version ceiling (Phase O)
 - Status: Amended by ADR-028 — item 7 edited in place: `/api/stream` gained `?category=`, but
-  `am wait` still streams unscoped.
+  `am wait` still streams unscoped. Amended by ADR-033 — `projects.category_id` is `NOT NULL` and
+  `projects.uid` `NOT NULL UNIQUE` in `schema.sql` (no v4 migration, no backfill); `OpenStore` seeds
+  `general` and refuses any `schema_version` other than 1, and import requires the full table set.
 - Context: The agentic_brain integration (requirements R1/R2/R3/R8) needs a **category** layer
   above projects (one instance, one DB, agents scoped down later), **stable IDs** the vault can
   bind to across slug renames, **vault binding metadata** on projects, and a migration that
@@ -812,7 +818,8 @@ record instead.
   the 25 Phase P tests.
 
 ### ADR-027: Scoped agent identity & enforcement — client-asserted `X-Agent-Scope`, one `scopeOf` resolution point, hybrid read policy, proposals carve-out by (category, project) pair, `tasks.created_by` via migration v5, denials log-only (Phase Q)
-- Status: Active
+- Status: Amended by ADR-033 — item 6: `tasks.created_by` is declared in `schema.sql`; there is no
+  v5 migration and no backfill.
 - Context: The agentic_brain integration (requirement R4) needs agents **confined** to a slice of
   the board — a category (the common case) or a single project (tighter) — so an autonomous fleet
   can share one instance without one agent mutating another's work. This builds on the category
@@ -1015,7 +1022,9 @@ record instead.
   `TestSSECategoryScopedStream`, `TestSSECategoryReconnectReplay`, `TestListCategoriesCounts`).
 
 ### ADR-029: Scope tokens — token-scope-wins in the single `scopeOf` resolution point, sha256-hash-not-plaintext storage, mint-requires-unscoped, exit-9/401 for bad tokens, no token event kind (Phase S)
-- Status: Active
+- Status: Amended by ADR-033 — item 6: import now requires every `schema.sql` table, `tokens`
+  included, so pre-Phase-S snapshots no longer import; `idx_tokens_hash` was dropped (the `UNIQUE`
+  constraint already indexes `token_hash`).
 - Context: The agentic_brain integration (requirement R5, SHOULD) needs the **client-asserted**
   scope of ADR-027 (`X-Agent-Scope`, accident prevention only — any caller can forge or omit it) to
   become a **server-enforced** boundary: a credential the server binds to a scope, so a
@@ -1313,6 +1322,31 @@ record instead.
   `toggleProject`); `cmd/am/web_test.go` (`TestDashboardNoXSSSinks`, `TestDashboardThemeAssets`,
   `TestDashboardParityAffordances`).
 
+### ADR-033: One schema, no migrations, no legacy formats
+- Status: Active
+- Context: agentman runs on a fresh data set and no older version was ever sustained, so there is
+  no data to upgrade. The migration runner (ADR-010) and steps v2–v7 only kept a frozen v1 baseline
+  alive, and `ALTER TABLE` could not add `NOT NULL`/`UNIQUE` to `projects.category_id`/`uid`.
+- Decision:
+  1. `cmd/am/schema.sql` is the **single current schema** (AUTOINCREMENT ids, `created_by`,
+     `claimed_at`, categories, every index), stamped `schema_version` 1 (`currentSchemaVersion = 1`).
+     `projects.category_id` is `NOT NULL`, `projects.uid` `NOT NULL UNIQUE`; the redundant
+     `idx_events_since` and `idx_tokens_hash` are dropped.
+  2. No migration runner. `OpenStore` runs `schema.sql`, **refuses any DB whose `schema_version` is
+     not 1**, and seeds the default `general` category itself.
+  3. `am db import` (`validateImportCandidate`) requires every table `schema.sql` defines and
+     `schema_version` exactly 1 — older snapshots are not importable.
+  4. The identity file is JSON only (`{"agent","scope","token"}`); the plain-text format is no
+     longer read or written, and a non-JSON file reads as no identity.
+- Rationale: no compatibility requirement exists, so compatibility code is pure cost (runner,
+  17 migration-only tests, a baseline the real schema had to be reconstructed from).
+- Consequences: schema changes are edits to `schema.sql`. **Migrations are reintroduced only when a
+  live schema first has to change** under data someone keeps; until then, a changed schema means a
+  fresh DB. Supersedes ADR-010; amends ADR-008/012/013/015/022/025/027/029.
+- Evidence: `cmd/am/schema.sql`; `cmd/am/store.go` (`OpenStore`, `currentSchemaVersion`);
+  `cmd/am/db.go` (`validateImportCandidate`); `cmd/am/identity.go` (`readIdentityFile`);
+  `cmd/am/schema_test.go` (replaces `migrate_test.go`); commit `0f493c9`.
+
 ## Inferred Decisions
 
 ### IADR-001: SSE chosen over WebSockets
@@ -1333,9 +1367,9 @@ record instead.
 - Confidence: High.
 - Original inference: early code relied on `CREATE TABLE IF NOT EXISTS` only; `meta.schema_version`
   was written but never read; no `ALTER`/migration runner.
-- Now: a forward-only runner reads/bumps `meta.schema_version` and applies ordered steps — see
-  ADR-010 (runner) and ADR-013 (first migration step).
-- Evidence: `cmd/am/store.go` (`runMigrations`, `schemaMigrations`), `cmd/am/migrate_test.go`.
+- Now: back to no migration framework, deliberately — `schema.sql` is the single schema, stamped
+  `schema_version` 1, and `OpenStore` refuses any other version (ADR-033, superseding ADR-010).
+- Evidence: `cmd/am/store.go` (`OpenStore`, `currentSchemaVersion`), `cmd/am/schema_test.go`.
 
 ### IADR-004: Native HTML5 drag-and-drop (no library, no touch)
 - Confidence: High

@@ -52,7 +52,7 @@ Evidence:
   everything; `-c <cat>` / `AGENTMAN_CATEGORY` scope `am ls`/`am next`/`am wait --ready`, and
   archiving a category hides everything under it (creation into it is blocked). Built for the
   agentic_brain integration, where agents are confined to a category (Phase Q below). Evidence:
-  `cmd/am/store.go` (`Category`, migration v4), `cmd/am/cli.go`, `cmd/am/server.go`.
+  `cmd/am/store.go` (`Category`), `cmd/am/schema.sql`, `cmd/am/cli.go`, `cmd/am/server.go`.
 - **Scoped agent identity & enforcement** (Phase Q): an agent can be confined to a category
   (default) or one project (`am init <tasktype> -c CAT [-p PROJ]`). The scope rides as the
   `X-Agent-Scope` header and the server enforces it on every mutation and on named reads — the
@@ -60,10 +60,10 @@ Evidence:
   outside the store tx). Out of scope → `403 out_of_scope` → CLI exit 8; unfiltered lists are
   silently narrowed; any agent may still file into a **proposals** project (default `meta/proposals`).
   The `X-Agent-Scope` header on its own is a client-asserted label (accident prevention, not auth);
-  Phase S scope tokens (below) make the scope server-enforced; `tasks.created_by` (migration v5)
+  Phase S scope tokens (below) make the scope server-enforced; `tasks.created_by`
   backs the "comment on your own proposal" carve-out.
   Built for agentic_brain requirement R4. Evidence: `cmd/am/server.go` (`scopeOf`, `check*`,
-  `narrowScope`), `cmd/am/identity.go`, `cmd/am/store.go` (`Scope`, migration v5).
+  `narrowScope`), `cmd/am/identity.go`, `cmd/am/store.go` (`Scope`).
 - **Category dashboard + scoped feed** (Phase R): the human dashboard opens to a **category-home**
   view (cards per category with task counts + recently-active agents), drills into a single
   category's board, and exposes an **"All"** cross-category view — driven by linkable URL hashes

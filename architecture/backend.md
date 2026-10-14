@@ -251,8 +251,7 @@ the new sentinel **`ErrInvalidToken`** — NEVER a zero (allow-everything) Scope
 silently grant the unscoped boundary to a bad credential (security-critical; `scopeOf` relies on the
 error). `ErrInvalidToken`'s message is `"unauthorized"`, so `writeErr` emits
 `401 {"error":"unauthorized"}` → CLI exit 9. **No event kind** is emitted for mint/revoke (audit via
-`am serve --log`). The `tokens` table is added via `CREATE TABLE IF NOT EXISTS` in `schema.sql`, so
-it needed **no migration step and no `currentSchemaVersion` bump** (`data-model.md` Migrations).
+`am serve --log`). The `tokens` table is declared in `schema.sql` (`data-model.md` Schema).
 
 `ClaimTask` and `PatchTask` call the helper `hasOpenPrereqs` before writing: if any prerequisite
 task is not `done`, they return a `*BlockedError{OpenPrereqs: []int64{…}}`. `ClaimTask` blocks
@@ -460,9 +459,8 @@ project deliberately adopts no JS test runner (preserves the single-binary/no-np
 
 - **New endpoint:** register it in `Server.Handler()` (`server.go`), add a `handleX`, add the
   backing `store.*` method, and (if it mutates) insert an `events` row in the same tx + broadcast.
-- **New task field:** add the column with an `ALTER TABLE` step in `schemaMigrations` and bump
-  `currentSchemaVersion` (`schema.sql`'s `tasks` table is the frozen v1 baseline — `data-model.md`
-  Migrations), add the struct field in `store.go`, thread it
+- **New task field:** add the column to the `tasks` table in `schema.sql` (the single schema, no
+  migrations — `data-model.md` Schema), add the struct field in `store.go`, thread it
   through `CreateTask`/`PatchTask`/`getTaskTx`, the API, and the dashboard (`web/`).
 - **New event kind:** emit via `insertEvent(...)` and handle it in `web/app.js` `evText`/`describeText`.
   Add it to the `kind` comment in `schema.sql` and the catalog in `data-model.md` (`events.kind`),
@@ -472,8 +470,8 @@ project deliberately adopts no JS test runner (preserves the single-binary/no-np
 
 ## Risks and Gaps
 
-- **Migration runner is exercised** end-to-end through v7 (`runMigrations`, ADR-010;
-  `currentSchemaVersion = 7`). A DB *newer* than the binary is **not** accepted silently —
-  `OpenStore` refuses it with a clear "upgrade am" error.
+- **No migrations** (ADR-033): `OpenStore` refuses any DB whose `schema_version` is not 1, and a
+  `schema.sql` edit does not alter an existing DB file (`CREATE TABLE IF NOT EXISTS`), so a schema
+  change means a fresh DB until migrations are reintroduced.
 - **Single-writer** caps write throughput; fine for a personal board, unproven at scale.
 - **No request size/time limits** beyond a 1 MiB body cap and `ReadHeaderTimeout`.

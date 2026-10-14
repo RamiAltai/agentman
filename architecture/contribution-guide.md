@@ -59,9 +59,9 @@ Rough breakdown (run `go test -v` for the live list):
 | `server_test.go` | 58 | HTTP status mapping (404 / 400 / lost-claim 409), Host/CSRF guards + security headers, `writeErr` hiding internal detail, the request logger, and the endpoint surface for filters, labels, categories, meta, scope enforcement, the `?category=` feed filter, and the token admin API. |
 | `cli_test.go` | 53 | CLI command paths + exit-code mapping (3/4/5/6/8/9). Builds a `Client` against an `httptest` server; uses the `captureStdout`/`captureExit` seams (below). Covers terse output, silent mutations, bulk ops, wire encoding of flags, and pure formatter/parse table tests. |
 | `wait_test.go` | 20 | `am wait` — already-satisfied, event-driven, and cross-project `--done` waits; category/meta/scope-filtered `--ready` waits; exit 7 timeout / 3 not-found / 6 server-down; `parseWaitTimeout` table. |
-| `migrate_test.go` | 12 | The forward-only migration runner (apply + version bump, skip ≤ current, idempotency), each schema version's columns, and the open-time version ceiling. |
-| `db_test.go` | 12 | `am db` export/import roundtrip (+ perms, backup, garbage rejection, liveness probe), events prune, and token round-trip. |
-| `identity_test.go` | 11 | `cmdInit`→`resolveAgent` roundtrip, `AGENTMAN_AGENT` override, `sanitizeType`/`parseScope`/`newIdentity`, scoped identity. Uses the `AGENTMAN_AGENT_FILE` seam. |
+| `schema_test.go` | 4 | The fresh `schema_version` 1 stamp and `general` seed, refusal of any other version, id non-reuse after delete, and the event index query plans. |
+| `db_test.go` | 11 | `am db` export/import roundtrip (+ perms, backup, garbage rejection, liveness probe), events prune, and token round-trip. |
+| `identity_test.go` | 14 | `cmdInit`→`resolveAgent` roundtrip, `AGENTMAN_AGENT` override, `sanitizeType`/`parseScope`/`newIdentity`, scoped identity. Uses the `AGENTMAN_AGENT_FILE` seam. |
 | `sse_test.go` | 4 | SSE live delivery, `Last-Event-ID` gap-replay with dedupe, and category-scoped streaming + reconnect replay. |
 | `hub_test.go` | 4 | Direct hub fan-out: category/project/unscoped broadcast targeting and a nil-event no-panic guard. |
 | `update_test.go` | 3 | Version-comparison logic. |
@@ -175,10 +175,11 @@ sink guard in `web_test.go`. Behavioral dashboard JS logic is not automatically 
 
 - Add the column in `schema.sql` and the field in the relevant `store.go` struct; thread it through
   create/patch/get and the API and UI.
-- ✅ A **forward-only migration runner exists** (`runMigrations` in `cmd/am/store.go`, ADR-010). To
-  change an existing table, append a `{version, apply}` step to `schemaMigrations` and raise
-  `currentSchemaVersion`; add a `migrate_test.go` case. `CREATE TABLE IF NOT EXISTS` in `schema.sql`
-  still won't alter existing tables — use the runner for that.
+- There is **no migration runner** (ADR-033): `schema.sql` is the single schema, stamped
+  `schema_version` 1, and `OpenStore` refuses any other version. Change a table by editing
+  `schema.sql` directly — no migration step while there is no live data to keep (`CREATE TABLE IF
+  NOT EXISTS` does not alter an existing DB file, so recreate it). Reintroduce migrations only
+  when a live schema first has to change.
 
 ## Adding Tests
 
@@ -187,8 +188,8 @@ sink guard in `web_test.go`. Behavioral dashboard JS logic is not automatically 
   for the atomic-claim race and events-cursor patterns.
 - For HTTP, use `net/http/httptest` against `Server.Handler()` with a temp `--db` — see
   `server_test.go` for status-mapping and guard examples.
-- For schema changes, follow `migrate_test.go`: assert the runner applies the step and bumps
-  `meta.schema_version`, and that a fresh DB lands on `currentSchemaVersion`.
+- For schema changes, follow `schema_test.go`: open a fresh store and assert the new
+  column/index/constraint (and its query plan, if it is an index).
 - For CLI command paths, construct a `Client` directly against a `newTestServer(t)` and use
   `captureStdout`/`captureExit` — see `cli_test.go` for the pattern.
 - For identity, set `AGENTMAN_AGENT_FILE` via `t.Setenv` to redirect the file to `t.TempDir()` —

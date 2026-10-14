@@ -29,7 +29,7 @@ broadcast → dashboard**. Confirmed via `cmd/am/main.go`, `cmd/am/server.go`, `
 | `cmd/am/identity.go` | Per-directory agent identity + scope + token (`am init`/`am whoami`) | `resolveIdentity`, `resolveAgent`, `resolveScope`, `resolveToken`, `identityRecord` (`{agent,scope,token}`), `identityFile` |
 | `cmd/am/version.go` | Version reporting (`am version`) | `version()`, `injectedVersion` (ldflags) |
 | `cmd/am/update.go` | `am update` + startup update check | `cmdUpdate`, `checkForUpdate` |
-| `cmd/am/*_test.go` | Tests: `update/store/server/migrate/db/cli/sse/hub/identity/wait/web_test` | claim race, HTTP guards, migrations, deletes, CLI/exit codes, SSE replay + category scope, hub fan-out, identity, waits/timeouts, XSS guard |
+| `cmd/am/*_test.go` | Tests: `update/store/server/schema/db/cli/sse/hub/identity/wait/web_test` | claim race, HTTP guards, schema stamp + version refusal, deletes, CLI/exit codes, SSE replay + category scope, hub fan-out, identity, waits/timeouts, XSS guard |
 | `cmd/am/web/` | Embedded dashboard: `index.html`, `app.css`, `app.js` | Vanilla, no build step |
 | `.github/workflows/ci.yml` | GitHub Actions CI — build/vet/gofmt/test(-race)/JS-syntax/govulncheck | Runs on push to `main` and on PRs |
 | `docs/agent-integration.md` | How to wire agents (Claude Code) to the board | User docs |
@@ -142,8 +142,9 @@ identity scope.
   in-memory membership check (no per-event DB hits) — cross-category and category-level
   (NULL-project) events are dropped.
 - **Data layer** — `cmd/am/store.go`: opens SQLite with `SetMaxOpenConns(1)` (single writer),
-  WAL via DSN pragmas; refuses a DB whose `schema_version` is newer than the binary supports
-  (Phase O); all queries parameterized; atomic claim (+ the stale-claim takeover
+  WAL via DSN pragmas; runs the single `schema.sql`, refuses a DB whose `schema_version` is not 1
+  (no migrations, ADR-033) and seeds the `general` category; all queries parameterized; atomic
+  claim (+ the stale-claim takeover
   `StealStaleClaim` and the pick+claim `NextTask`, the same conditional-UPDATE trick); event
   insertion helper. Phase R adds `ListCategoriesWithStats` (counts + active-agents rollups for the
   dashboard's category home), `ProjectIDsInCategory` (the hub's Subscribe-time set), and a
@@ -161,7 +162,7 @@ identity scope.
   `am ls`, `am next`, and `am wait --ready` (`am show <id> -c` still means `--comments` — `main.go
   rewriteShowComments` rewrites it for `show` only).
   Scoped identity (Phase Q): `am init <tasktype> [-c CAT [-p PROJ]]` records a scope in the identity
-  file (JSON when scoped, legacy bare-id plain text when not); `am whoami` prints a `scope:` line
+  file (always JSON `{"agent","scope","token"}`; a non-JSON file reads as no identity); `am whoami` prints a `scope:` line
   when scoped; the resolved scope (`AGENTMAN_SCOPE` overrides the file) rides as `X-Agent-Scope` on
   every request and yields exit 8 on any `403 out_of_scope`.
   Scope tokens (Phase S): `am token new --scope <cat[/proj]>` mints a scope-bound bearer token (the

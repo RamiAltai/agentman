@@ -250,7 +250,8 @@ am db export /backups/board.db   # or pick the path
 am db import /backups/board.db   # restore — stop `am serve` first; backs up the current DB
 ```
 
-`am db import` validates the snapshot, refuses to run while a server is up, and backs up your
+`am db import` validates the snapshot (it must carry every table `schema.sql` defines and
+`schema_version` 1 — there are no migrations), refuses to run while a server is up, and backs up your
 existing DB before swapping it in.
 
 To trim the event log on a long-running instance, use `am db prune` (stop `am serve` first):

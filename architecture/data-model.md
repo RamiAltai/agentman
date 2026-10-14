@@ -13,9 +13,9 @@ lexically.
 
 | Entity | Purpose | Source |
 |--------|---------|--------|
-| `meta` | Key/value config; currently only `schema_version` (the binary migrates to `currentSchemaVersion` — see [Migrations](#migrations)) | `schema.sql` |
+| `meta` | Key/value config; currently only `schema_version` (always `1`; `OpenStore` refuses any other — see [Schema](#schema)) | `schema.sql` |
 | `categories` | The layer above projects (`instance → category → project → task`): `uid` stable id, `slug` unique lowercase, `name`, `archived_at` | `schema.sql`, `store.go Category` |
-| `projects` | Named boards (`slug` unique, `name`, `archived_at`, `category_id`, `uid` stable id, `vault_project_id`/`vault_path` binding) | `schema.sql` + migration v4, `store.go Project` |
+| `projects` | Named boards (`slug` unique, `name`, `archived_at`, `category_id`, `uid` stable id, `vault_project_id`/`vault_path` binding) | `schema.sql`, `store.go Project` |
 | `tasks` | Tickets (status, priority, assignee, dual id) | `schema.sql`, `store.go Task` |
 | `task_deps` | Prerequisite edges between tasks (many-to-many, same-project only) | `schema.sql`, `store.go DepRef` |
 | `task_labels` | Free-form tags on tasks (many-to-many, label text stored inline — no catalog) | `schema.sql`, `store.go Task.Labels` |
@@ -26,22 +26,16 @@ lexically.
 
 ### Important fields
 
-- **`tasks.id`** — the cheap wire reference (`#42`). Since migration v6 it is an
-  `INTEGER PRIMARY KEY AUTOINCREMENT`, so a deleted task's id is never reissued (`projects.id` and
-  `events.id` likewise). Before v6 it was a plain rowid that a later insert could reuse — which is
-  why the v5 `created_by` backfill keys off the *latest* `task.created` event, not the first (see
-  `created_by` below). **`tasks.ref`** — per-project sequence (`web-3`), allocated as `MAX(ref)+1`
+- **`tasks.id`** — the cheap wire reference (`#42`). It is an `INTEGER PRIMARY KEY
+  AUTOINCREMENT`, so a deleted task's id is never reissued (`projects.id` and `events.id`
+  likewise). **`tasks.ref`** — per-project sequence (`web-3`), allocated as `MAX(ref)+1`
   within the project in the insert tx (`store.go CreateTask`); `UNIQUE(project_id, ref)`.
 - **`tasks.created_by`** — TEXT, the actor that created the task (Phase Q, for the proposals
   carve-out: a scoped agent may comment on its OWN proposal tickets). Set on every new task from the
   request actor (`actorOf(r)`, default `"human"`; the store-level `actorOr` fallback `"anon"` is
-  only reachable for direct store callers passing an empty actor). Added by schema **migration v5**
-  (`ALTER TABLE tasks ADD COLUMN created_by TEXT`) with a **best-effort backfill** from the durable
-  event log — the actor of the task's **latest** `task.created` event (latest, not first: before v6
-  `tasks.id` was a reusable rowid, so an id's oldest creation event may belong to a deleted
-  predecessor; the newest always belongs to the current incarnation). Tasks whose events were pruned
-  (`am db prune`)
-  stay NULL and simply never match the own-proposal comment rule (the safe direction). Returned as
+  only reachable for direct store callers passing an empty actor). The column is nullable, but
+  every create sets it; a NULL would simply never match the own-proposal comment rule (the safe
+  direction). Returned as
   `created_by` on `GET /api/tasks/{id}` (omitted when empty); **deliberately NOT carried on list
   rows** — only the single-task read and the server's scope checks (`taskScope`) read it, keeping
   list payloads stable.
@@ -50,8 +44,7 @@ lexically.
 - **`tasks.assignee`** — TEXT, **NULL = unclaimed** (the claim guard depends on this).
 - **`tasks.claimed_at`** — TEXT, **NULL = never claimed / dropped**; set by `ClaimTask`,
   `StealStaleClaim`, `NextTask`, and PATCH-assign; cleared when the assignee is removed (`am drop`).
-  Added by schema **migration v3** (`ALTER TABLE tasks ADD COLUMN claimed_at TEXT` — not in
-  `schema.sql`, same precedent as `projects.archived_at`). Staleness itself is judged from
+  Staleness itself is judged from
   `updated_at` (any activity counts), not `claimed_at`; the stale cutoff is computed in Go by
   `staleCutoff`, which must keep the exact `strftime('%Y-%m-%dT%H:%M:%fZ')` 3-digit-fraction
   format for the lexicographic comparison to hold.
@@ -59,8 +52,7 @@ lexically.
   `tasks.id` with `ON DELETE CASCADE`, so removing a task automatically removes all edges in both
   directions. A reverse index `idx_task_deps_prereq(depends_on_id)` supports the "blocks" query.
   Dependencies are **same-project only** (validated in `AddDep`; cross-project attempt → 400).
-  Cycle detection uses a recursive CTE (`wouldCycle`) so transitive cycles are caught. Added via
-  `schema.sql` alone (see [New tables via `schema.sql`](#migrations)).
+  Cycle detection uses a recursive CTE (`wouldCycle`) so transitive cycles are caught.
 - **`task_labels.(task_id, label)`** — composite PK; `task_id` is an FK to `tasks.id` with
   `ON DELETE CASCADE`. The label TEXT is stored inline (no separate labels catalog — a label
   exists iff some task carries it). Labels are normalized at the boundary (`normalizeLabel`):
@@ -69,8 +61,7 @@ lexically.
   does **not** bump the task's `updated_at` (metadata must not refresh a stale claim). Filterable
   via `GET /api/tasks?label=<l>` (`TaskFilter.Label`); free-text search is the separate
   `?q=<text>` (`TaskFilter.Query`) — a LIKE-with-ESCAPE substring match on title OR body,
-  ASCII-case-insensitive, which does **not** search labels or comments. Added via `schema.sql`
-  alone (ADR-024; see [Migrations](#migrations)).
+  ASCII-case-insensitive, which does **not** search labels or comments (ADR-024).
 - **`task_meta.(task_id, key)`** — composite PK; `task_id` is an FK to `tasks.id` with
   `ON DELETE CASCADE`; index `idx_task_meta_key(key)` supports the presence filter. Like
   `task_labels` there is no separate catalog — a key exists iff some task carries it. Keys are
@@ -83,18 +74,16 @@ lexically.
   (absent-key removal is a silent no-op); at create empty values are rejected. Setting/removing
   meta alone does **not** bump the task's `updated_at` (metadata must not refresh a stale claim —
   the label/dep precedent). List rows include `meta` via a **follow-up SELECT** (values may
-  contain `,`/`=`, so the labels `GROUP_CONCAT` trick is unsafe here). Added via `schema.sql`
-  alone (ADR-026; see [Migrations](#migrations)).
+  contain `,`/`=`, so the labels `GROUP_CONCAT` trick is unsafe here) (ADR-026).
 - **`tokens` (Phase S, ADR-029)** — scope-bound bearer credentials. Columns: `id` (`tk_<16 hex>`,
   shown in `ls`/`revoke`), `token_hash` (`sha256(plaintext)` hex, `NOT NULL UNIQUE`), `category`
   (`NOT NULL` — the bound scope category slug), `project` (NULL = category-wide scope), `created_at`,
-  `revoked_at` (NULL = active). Index `idx_tokens_hash(token_hash)`. **The plaintext token is never
+  `revoked_at` (NULL = active). Lookups use the `UNIQUE` index on `token_hash`. **The plaintext token is never
   stored in the DB** — only its sha256 hash is; the plaintext (`amt_` + 32 lowercase hex, 16 bytes
   of `crypto/rand`) is returned **once** at mint (the `POST /api/tokens` `201` response) and never
   persisted server-side, logged, listed, or printed by `whoami` (the CLI keeps it in the caller's
   identity file, mode `0600` — ADR-029), so a stolen DB row cannot be replayed (the server
-  hashes the **presented** plaintext to compare — `ResolveToken`). Added via `schema.sql` alone
-  (ADR-029; see [Migrations](#migrations)). `category`/`project` mirror a `Scope`;
+  hashes the **presented** plaintext to compare — `ResolveToken`) (ADR-029). `category`/`project` mirror a `Scope`;
   `Token.Scope()` reconstructs it. There is no FK from `tokens` to `categories`/`projects` — the
   bound scope is validated at mint (`CreateToken`: category exists + non-archived, a named project
   exists and belongs to that category), not by a constraint.
@@ -103,14 +92,11 @@ lexically.
   (`UnarchiveProject`). Soft-archive is reversible; default project lists hide archived rows.
 - **`categories.uid` / `projects.uid`** — the **stable IDs** (`amc_<16 hex>` / `amp_<16 hex>`,
   8 bytes of `crypto/rand` via `newUID`). Immutable after creation, survive slug renames — the
-  vault's canonical correlation key (R2). `categories.uid` is `TEXT NOT NULL UNIQUE` in
-  `schema.sql`; `projects.uid` is added by migration v4 with a separate unique index
-  (`idx_projects_uid` — `UNIQUE` isn't allowed in `ADD COLUMN`). Insert paths retry on the
+  vault's canonical correlation key (R2). Both are `TEXT NOT NULL UNIQUE` in `schema.sql`. Insert paths retry on the
   astronomically unlikely UNIQUE collision (`isUniqueErr`).
-- **`projects.category_id`** — `INTEGER REFERENCES categories(id)`, **nullable in SQL but NOT
-  NULL by app invariant**: SQLite's `ALTER TABLE ADD COLUMN` cannot add a NOT NULL column without
-  a constant default (wrong for an FK), so `CreateProject` always sets it, migration v4 backfills
-  all NULLs to the `general` category, and nothing can clear it (`category_id` is not patchable).
+- **`projects.category_id`** — `INTEGER NOT NULL REFERENCES categories(id)`; `CreateProject`
+  always sets it (empty category → `general`, which `OpenStore` seeds) and nothing can change it
+  (`category_id` is not patchable).
   Project slugs remain **globally unique** (no per-category namespacing), so task refs like
   `web-3` and `AGENTMAN_PROJECT` are unambiguous without a category.
 - **`projects.vault_project_id` / `projects.vault_path`** — optional TEXT vault-binding pointers
@@ -121,8 +107,8 @@ lexically.
   projects, with a **cascade**: default views hide projects/tasks/events under an archived
   category, `next` never picks from one, and task/project creation into one is rejected
   (`ErrCategoryArchived`). An explicit `?category=` scope keeps an archived category inspectable.
-- **`events.id`** — monotonic (`AUTOINCREMENT` since v6, so it stays monotonic across `am db
-  prune`, even `--keep 0`); doubles as the `?since=` cursor and the SSE `Last-Event-ID`.
+- **`events.id`** — monotonic (`AUTOINCREMENT`, so it stays monotonic across `am db prune`,
+  even `--keep 0`); doubles as the `?since=` cursor and the SSE `Last-Event-ID`.
 - **`events.kind`** — one of `task.created | task.claimed | task.reclaimed | task.status |
   task.assign | task.patched | task.deleted | task.dep_added | task.dep_removed | task.labeled |
   task.unlabeled | comment.added | comment.deleted | project.created | project.archived |
@@ -155,17 +141,16 @@ excluded. These read straight off `tasks`/`events` — no denormalized counter i
 ### Indexes
 
 `idx_tasks_project_status(project_id,status)`, `idx_tasks_assignee(assignee) WHERE assignee IS
-NOT NULL` (partial since v7), `idx_tasks_next(priority,id) WHERE status='todo' AND assignee IS NULL`
-(v7, NextTask's candidate predicate), `idx_tasks_updated(updated_at)`,
+NOT NULL` (partial), `idx_tasks_next(priority,id) WHERE status='todo' AND assignee IS NULL`
+(NextTask's candidate predicate), `idx_tasks_updated(updated_at)`,
 `idx_task_deps_prereq(depends_on_id)`, `idx_task_labels_label(label)`, `idx_task_meta_key(key)`,
-`idx_comments_task(task_id,id)`, `idx_events_since(id)`, `idx_events_task(task_id,id)` (v5/v6),
-`idx_events_created(created_at)` (v6), `idx_events_project(project_id,id)` (v7),
-`idx_projects_uid(uid)` (UNIQUE), `idx_projects_category(category_id)`, `idx_tokens_hash(token_hash)`.
+`idx_comments_task(task_id,id)`, `idx_events_task(task_id,id)`, `idx_events_project(project_id,id)`,
+`idx_events_created(created_at)`, `idx_projects_category(category_id)`, plus the implicit indexes of
+the `UNIQUE` columns (`categories.uid`/`slug`, `projects.uid`/`slug`, `tokens.token_hash`).
 
 ## Relationships
 
-- `projects.category_id → categories.id` — plain FK (no cascade; nullable in SQL, NOT NULL by
-  app invariant — see Important fields).
+- `projects.category_id → categories.id` — plain FK, `NOT NULL` (no cascade).
 - `tasks.project_id → projects.id` — `ON DELETE CASCADE`.
 - `task_deps.task_id → tasks.id` — `ON DELETE CASCADE`.
 - `task_deps.depends_on_id → tasks.id` — `ON DELETE CASCADE`.
@@ -260,9 +245,8 @@ pruned prefix — anything that replays or backfills from events must tolerate m
   A deleted project has no row, so the JOIN yields NULL, which the `archived_at IS NULL` check
   passes — making the deleted project's earlier event history visible in the feed (acceptable as an
   audit trail; this differs from a *soft-archived* project whose events are hidden while the row exists).
-  **`ref`/`id` reuse:** global ids are **not** reused — migration v6 rebuilt `projects`, `tasks`
-  and `events` with `AUTOINCREMENT`, seeding each sequence above every id already seen (including
-  ids that survive only in the event log). A per-project human `ref` (e.g. `web-3`) **can** still be
+  **`ref`/`id` reuse:** global ids are **not** reused — `projects`, `tasks` and `events` use
+  `AUTOINCREMENT`. A per-project human `ref` (e.g. `web-3`) **can** still be
   reused if the highest-numbered task in a project is deleted and a new task is then created (no
   ref counter was added — acceptable for a personal board).
   CLI: `am rm <id>` (silent success; exit 3 if not found); `am project rm <slug> --yes` (requires
@@ -274,51 +258,15 @@ pruned prefix — anything that replays or backfills from events must tolerate m
   individually via the hard-delete endpoint (Phase C1). The dashboard caps the "Done" column render at
   50 and the feed at ~200 nodes (`web/app.js`), but the DB retains everything until explicitly pruned.
 
-## Migrations
+## Schema
 
-**A forward-only migration runner exists (Phase 0, ADR-010).** `OpenStore` executes `schema.sql`
-(`CREATE TABLE IF NOT EXISTS` + `INSERT OR IGNORE … schema_version`) and then calls
-`runMigrations(db, currentSchemaVersion, schemaMigrations)`. Each step applies its change **and**
-bumps `meta.schema_version` in one transaction; steps are integer-ordered and idempotent.
-
-To add a column/table change, append a `{version, apply}` step to `schemaMigrations` and raise
-`currentSchemaVersion` (`cmd/am/store.go`) — that constant is the one source for the current
-version (7 at the time of writing; the step list below is history). `schemaMigrations` is **no
-longer empty**: its first real step is `{version: 2}`, which runs `ALTER TABLE projects ADD COLUMN
-archived_at TEXT`;
-Phase K added `{version: 3}`, which runs `ALTER TABLE tasks ADD COLUMN claimed_at TEXT`;
-Phase O added `{version: 4}` — the category/stable-ID/vault-binding migration: it adds
-`projects.category_id`, `projects.uid` (+ unique index), `projects.vault_project_id`,
-`projects.vault_path`, and `idx_projects_category`; seeds the default category `general`
-**unconditionally** (fresh installs get it too); attaches every existing project to it; and
-backfills a distinct `amp_` uid per project (task ids/refs/`claimed_at`/labels untouched); and
-Phase Q added `{version: 5}` — `ALTER TABLE tasks ADD COLUMN created_by TEXT`, then a best-effort
-backfill of `created_by` from each task's **latest** `task.created` event actor (latest, not first,
-because `tasks.id` was then a reusable rowid — see `created_by` above; pruned-events tasks stay
-NULL); `{version: 6}` rebuilds `projects`, `tasks` and `events` with `AUTOINCREMENT` (ids never
-reused; reverses ADR-015's id-reuse acceptance) and adds `idx_events_task`/`idx_events_created`; and
-`{version: 7}` adds the partial `idx_tasks_next` (NextTask's candidate predicate), makes
-`idx_tasks_assignee` partial (`assignee IS NOT NULL`) and adds `idx_events_project`. The
-`categories` table itself ships in `schema.sql` (`CREATE TABLE IF NOT EXISTS` runs before
-migrations on both fresh and existing DBs); the projects and tasks `CREATE TABLE` statements in
-`schema.sql` stay the **frozen v1 baseline** — the added columns come only from the migration steps
-(projects' from v4, `tasks.created_by` from v5, `AUTOINCREMENT` from v6).
-`schema.sql` still seeds a fresh DB at version 1, so the forward-only runner is **exercised
-end-to-end** — each step applies its change and commits the `meta.schema_version` bump in the same
-transaction (was foundation-only in Phase 0). Known limitations: forward-only (no down-migrations);
-an unparseable `schema_version` defaults to 1. A DB at a **newer** version than the binary is no
-longer accepted silently: `OpenStore` refuses it with `database schema_version N is newer than
-supported M — upgrade am` (Phase O), the same ceiling `validateImportCandidate` applies to
-import snapshots.
-
-**New tables via `schema.sql` (no migration-runner step, no version bump)** — the one statement of
-this rule; the per-table notes above refer here. When a change adds an
-entirely new table (rather than altering an existing one), placing a `CREATE TABLE IF NOT EXISTS`
-in `schema.sql` is sufficient — `OpenStore` runs `schema.sql` on every start, so the new table
-appears in existing DBs automatically. The migration runner is only needed for `ALTER TABLE` on
-existing tables (where `IF NOT EXISTS` can't help). Examples: `task_deps` (Phase H),
-`task_labels` (Phase M, ADR-024), `task_meta` (Phase P, ADR-026), and `tokens` (Phase S, ADR-029)
-were all added this way, with no `schemaMigrations` step and no `currentSchemaVersion` bump.
+**One schema, no migrations.** `cmd/am/schema.sql` is the single current schema, stamped
+`schema_version` `1` (`currentSchemaVersion = 1` in `store.go`). `OpenStore` executes it
+(`CREATE TABLE IF NOT EXISTS` + `INSERT OR IGNORE … schema_version`), **refuses any DB whose
+`schema_version` is not 1** (`database schema_version N, this am supports 1`; an unreadable version
+is an error too), and seeds the default `general` category itself. There is no migration runner:
+there is no older data to keep (ADR-033). To change the schema, edit `schema.sql`; a migration step
+comes back only when a live schema first has to change.
 
 Backup/restore:
 
@@ -326,12 +274,9 @@ Backup/restore:
 - **`am db export [path]`** — writes a consistent snapshot via SQLite `VACUUM INTO`, `chmod 0o600`,
   and prints the output path (`cmd/am/db.go exportDB`).
 - **`am db import <path>`** — validates the candidate (PRAGMA `integrity_check`, `foreign_key_check`,
-  required tables, `schema_version <= currentSchemaVersion`), **refuses while a server is running**,
-  backs up the current DB (`0o600`) into the DB's directory, then atomically replaces it
-  (`cmd/am/db.go importDB`). The required-table set is **deliberately the v1 baseline** (no
-  `categories`/`task_deps`/`task_labels`/`tokens`) — later tables are created by `schema.sql`/
-  migrations on the next `OpenStore`, so pre-v4 (and pre-Phase-S) snapshots stay importable and gain
-  the missing tables on open. Export needs no special handling for new tables (`VACUUM INTO` snapshots
+  every table `schema.sql` defines, `schema_version` exactly `1`), **refuses while a server is
+  running**, backs up the current DB (`0o600`) into the DB's directory, then atomically replaces it
+  (`cmd/am/db.go importDB`). Export needs no special handling for new tables (`VACUUM INTO` snapshots
   everything — categories and the `tokens` table included; the latter is acceptable because token
   hashes are non-replayable, ADR-029).
 - **`am db prune (--before <YYYY-MM-DD> | --keep <N>) [--db PATH] [--yes]`** — offline maintenance
@@ -362,7 +307,7 @@ erDiagram
   }
   projects {
     int id PK
-    int category_id FK "nullable in SQL, NOT NULL by app invariant"
+    int category_id FK "NOT NULL"
     text uid UK "amp_<16 hex>, immutable"
     text slug UK "globally unique"
     text name
@@ -379,7 +324,7 @@ erDiagram
     text body
     text status "todo|doing|blocked|done"
     text assignee "NULL = unclaimed"
-    text created_by "actor that created it; NULL = unknown (pruned events)"
+    text created_by "actor that created it"
     int priority "0..3"
     text created_at
     text updated_at
@@ -433,4 +378,4 @@ erDiagram
   hard-delete. For `events`: offline pruning is available via `am db prune` (see Backup/restore).
 - **Per-project `ref` is not gap-free after deletes** — `MAX(ref)+1` reuses the number if the
   highest-numbered task in a project is deleted and a new task is created. Accepted for a personal
-  board (no counter/migration added, Phase C1 decision).
+  board (no counter added, Phase C1 decision).
