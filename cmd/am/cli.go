@@ -238,7 +238,7 @@ func cmdLs(c *Client, a Args) {
 
 	data := c.doOrFail("GET", "/api/tasks?"+qs.Encode(), nil)
 	var tasks []Task
-	json.Unmarshal(data, &tasks)
+	decodeResp(data, &tasks)
 	truncated := limit > 0 && len(tasks) >= limit
 	hint := fmt.Sprintf("… %d shown; narrow with --status or -p, or raise --limit (0 = all)", limit)
 	if a.has("json") {
@@ -261,7 +261,7 @@ func cmdShow(c *Client, a Args) {
 	id := needID(a, "show")
 	data := c.doOrFail("GET", "/api/tasks/"+id, nil)
 	var t Task
-	json.Unmarshal(data, &t)
+	decodeResp(data, &t)
 	if a.has("json") {
 		printJSON(t)
 		return
@@ -332,7 +332,7 @@ func cmdNew(c *Client, a Args) {
 	}
 	data := c.doOrFail("POST", "/api/tasks", body)
 	var t Task
-	json.Unmarshal(data, &t)
+	decodeResp(data, &t)
 	fmt.Println(t.ID) // print only the id
 }
 
@@ -349,7 +349,7 @@ func cmdClaim(c *Client, a Args) {
 	switch {
 	case st >= 200 && st < 300:
 		var t Task
-		json.Unmarshal(data, &t)
+		decodeResp(data, &t)
 		fmt.Println(t.ID)
 	case st == 404:
 		fail(3, "claim: #%s not found", id)
@@ -359,7 +359,7 @@ func cmdClaim(c *Client, a Args) {
 			Assignee    string  `json:"assignee"`
 			OpenPrereqs []int64 `json:"open_prereqs"`
 		}
-		json.Unmarshal(data, &e)
+		json.Unmarshal(data, &e) // error body: a bad shape falls back to the generic message
 		if e.Error == "blocked" {
 			// Format the open prereq IDs for a clear error message.
 			parts := make([]string, len(e.OpenPrereqs))
@@ -407,7 +407,7 @@ func cmdNext(c *Client, a Args) {
 	switch {
 	case st >= 200 && st < 300:
 		var t Task
-		json.Unmarshal(data, &t)
+		decodeResp(data, &t)
 		if a.has("json") {
 			printJSON(t)
 			return
@@ -517,7 +517,7 @@ func cmdProjects(c *Client, a Args) {
 	}
 	data := c.doOrFail("GET", path, nil)
 	var ps []Project
-	json.Unmarshal(data, &ps)
+	decodeResp(data, &ps)
 	if a.has("json") {
 		printJSON(ps)
 		return
@@ -549,7 +549,7 @@ func cmdProject(c *Client, a Args) {
 		}
 		data := c.doOrFail("POST", "/api/projects", map[string]any{"slug": slug, "name": name, "category": cat})
 		var p Project
-		json.Unmarshal(data, &p)
+		decodeResp(data, &p)
 		fmt.Println(p.Slug)
 	case "edit":
 		slug := a.at(1)
@@ -605,7 +605,7 @@ func cmdCategories(c *Client, a Args) {
 	}
 	data := c.doOrFail("GET", path, nil)
 	var cs []Category
-	json.Unmarshal(data, &cs)
+	decodeResp(data, &cs)
 	if a.has("json") {
 		printJSON(cs)
 		return
@@ -632,7 +632,7 @@ func cmdCategory(c *Client, a Args) {
 		}
 		data := c.doOrFail("POST", "/api/categories", map[string]any{"slug": slug, "name": name})
 		var cat Category
-		json.Unmarshal(data, &cat)
+		decodeResp(data, &cat)
 		fmt.Println(cat.Slug)
 	case "archive":
 		if a.at(1) == "" {
@@ -662,7 +662,10 @@ func cmdToken(c *Client, a Args) {
 			Scope string `json:"scope"`
 			Token string `json:"token"`
 		}
-		json.Unmarshal(data, &resp)
+		decodeResp(data, &resp)
+		if resp.Token == "" { // never overwrite a stored token with an empty one
+			fail(1, "token new: server response has no token")
+		}
 		// Plaintext on stdout line 1 so `tok=$(am token new --scope work)` works.
 		// Printed BEFORE persisting: the server returns it exactly once, so a
 		// failed write must not lose it.
@@ -675,7 +678,7 @@ func cmdToken(c *Client, a Args) {
 	case "ls":
 		data := tokenDo(c, "GET", "/api/tokens", nil)
 		var toks []Token
-		json.Unmarshal(data, &toks)
+		decodeResp(data, &toks)
 		if a.has("json") {
 			printJSON(toks)
 			return
@@ -788,7 +791,7 @@ func cmdLabel(c *Client, argv []string) {
 	if len(argv) == 1 {
 		data := c.doOrFail("GET", "/api/tasks/"+id, nil)
 		var t Task
-		json.Unmarshal(data, &t)
+		decodeResp(data, &t)
 		if len(t.Labels) > 0 {
 			fmt.Println(strings.Join(t.Labels, " "))
 		}
@@ -891,8 +894,20 @@ func plural(n int) string {
 }
 
 func printJSON(v any) {
-	b, _ := json.Marshal(v)
+	b, err := json.Marshal(v)
+	if err != nil {
+		fail(1, "agentman: %v", err)
+	}
 	fmt.Println(string(b))
+}
+
+// decodeResp decodes a 2xx response body into v. A body that is not the
+// expected JSON exits 1, so a proxy page or API drift never reads as a
+// zero-valued success (task id 0, empty token).
+func decodeResp(data []byte, v any) {
+	if err := json.Unmarshal(data, v); err != nil {
+		fail(1, "agentman: bad response from server: %v", err)
+	}
 }
 
 func fail(code int, format string, args ...any) {

@@ -216,8 +216,13 @@ func semverParts(v string) [3]int {
 	return out
 }
 
-// pseudoStamp returns the 14-digit timestamp from a pseudo-version like
-// v0.0.0-20260605203447-0327a4ce5320, or "" if not a pseudo-version.
+// pseudoStamp returns the 14-digit timestamp from a no-tag pseudo-version like
+// v0.0.0-20260605203447-0327a4ce5320, or "" otherwise. It deliberately does
+// not match post-tag pseudo-versions (v0.5.1-0.20260605203447-abc,
+// v0.5.0-rc1.0.20260605203447-abc), where the timestamp follows a '.': those
+// compare correctly in updateAvailable's prerelease branch because the
+// timestamp leads the fixed-width suffix, while reading their stamp here
+// would make a pre-release pseudo-version look older than its own base tag.
 func pseudoStamp(v string) string {
 	for _, part := range strings.Split(v, "-") {
 		if len(part) == 14 && isDigits(part) {

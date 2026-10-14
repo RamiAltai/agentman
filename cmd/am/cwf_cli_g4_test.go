@@ -143,7 +143,7 @@ func TestCwfCliNextJSON(t *testing.T) {
 	mustCreateProject(t, ts, "nextproj")
 	want := mustCreateTask(t, ts, "nextproj", "Pick Me")
 	t.Setenv("AGENTMAN_AGENT", "tester")
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 	out := captureStdout(t, func() { cmdNext(c, parse([]string{"-p", "nextproj", "--json"})) })
 	var tk Task
 	if err := json.Unmarshal([]byte(out), &tk); err != nil {
@@ -169,7 +169,7 @@ func TestCwfCliDepShowAndBlockedClaim(t *testing.T) {
 	bID := mustCreateTask(t, ts, "dp", "prereq b")
 	cID := mustCreateTask(t, ts, "dp", "prereq c")
 	t.Setenv("AGENTMAN_AGENT", "tester")
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 
 	if code := captureExit(t, func() { cmdDep(c, parse([]string{"add", aID, bID, cID})) }); code != -1 {
 		t.Fatalf("dep add exit = %d", code)
@@ -218,7 +218,7 @@ func TestCwfCliClaimBadRequestAndOther(t *testing.T) {
 		{500, `{"error":"db_locked"}`, 1},
 	} {
 		stub := cwfCliStub(t, tc.status, tc.body)
-		c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+		c := newTestClient(stub.URL, stub.Client())
 		var code int
 		msg := captureStderr(t, func() { code = captureExit(t, func() { cmdClaim(c, parse([]string{"7"})) }) })
 		var e struct{ Error string }
@@ -234,7 +234,7 @@ func TestCwfCliProjectArchiveAndRm(t *testing.T) {
 	ts := newTestServer(t)
 	mustCreateProject(t, ts, "web")
 	id := mustCreateTask(t, ts, "web", "doomed")
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 
 	cmdProject(c, parse([]string{"archive", "web"}))
 	if p := cwfCliProjects(t, ts)["web"]; p.ArchivedAt == "" {
@@ -313,7 +313,7 @@ func TestCwfCliExitCodeTableAndDoOrFail(t *testing.T) {
 		{500, ``, "error 500", 1},
 	} {
 		stub := cwfCliStub(t, tc.status, tc.body)
-		c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+		c := newTestClient(stub.URL, stub.Client())
 		var code int
 		msg := captureStderr(t, func() { code = captureExit(t, func() { c.doOrFail("POST", "/api/tasks/1/claim", nil) }) })
 		if code != tc.code || !strings.Contains(msg, tc.msg) {

@@ -155,19 +155,28 @@ func runServe(argv []string) {
 	checkForUpdate() // non-blocking; logs once if a newer version is published
 
 	log.Printf("agentman: dashboard on http://%s   (db: %s)", ln.Addr(), dbPath)
-	go func() {
-		if err := httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("agentman: serve: %v", err)
-		}
-	}()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- httpServer.Serve(ln) }()
 
-	<-ctx.Done()
-	log.Printf("agentman: shutting down")
+	// A signal and a Serve failure leave through the same cleanup below.
+	var failed error
+	select {
+	case <-ctx.Done():
+		log.Printf("agentman: shutting down")
+	case failed = <-serveErr: // never ErrServerClosed: Shutdown has not run yet
+	}
 	cancelBase() // unblock long-lived SSE handlers
 	shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	httpServer.Shutdown(shutCtx)
-	store.Close()
+	if err := httpServer.Shutdown(shutCtx); err != nil {
+		log.Printf("agentman: shutdown: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		log.Printf("agentman: close db: %v", err)
+	}
+	if failed != nil {
+		fail(1, "agentman: serve: %v", failed)
+	}
 }
 
 // rewriteShowComments rewrites -c tokens to --comments for `am show` only:
@@ -248,10 +257,14 @@ Scope: 'am init <tasktype> -c CAT [-p PROJ]' confines this identity — out-of-s
      mutations/reads are rejected (exit 8); creating tasks in the proposals
      project (default meta/proposals) is allowed from any scope.
 Env: AGENTMAN_URL (default http://127.0.0.1:8787), AGENTMAN_PROJECT (default project),
+     AGENTMAN_AGENT (override the identity file's agent id),
+     AGENTMAN_AGENT_FILE (use this identity file instead of the per-directory one),
      AGENTMAN_CATEGORY (default category scope for ls/next/wait/project new),
      AGENTMAN_SCOPE (override the identity file's scope, e.g. work or work/api),
      AGENTMAN_TOKEN (override the identity file's bearer token; sent as Authorization: Bearer),
-     AGENTMAN_PROPOSALS (serve: the carve-out project, default meta/proposals).
+     AGENTMAN_PORT, AGENTMAN_DB, AGENTMAN_PROPOSALS (serve: defaults for --port, --db,
+     --proposals), AGENTMAN_LOG (serve: any value = --log),
+     AGENTMAN_NO_UPDATE_CHECK (serve: any value skips the startup update check).
      Add --json to any read to parse output.
 Args: '--' ends the flags (am note 12 -- "-x done"); --flag=VALUE passes a value starting with '-'.
 Exit codes: 0 ok · 3 not found · 4 already claimed · 5 invalid (incl. any usage error) · 6 server down · 7 timed out · 8 out of scope · 9 bad token · 1 other.

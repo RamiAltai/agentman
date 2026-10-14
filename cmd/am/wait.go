@@ -56,18 +56,27 @@ func cmdWait(c *Client, a Args) {
 	// check and subscribe is replayed via ?since= (no check/subscribe race).
 	cursor := w.cursor()
 
-	var taskID int64 // resolved numeric id, for matching events under --done
 	check := func() (*Task, bool) {
 		if waitDone {
-			t, met := w.checkDone(id)
-			taskID = t.ID
-			return t, met
+			return w.checkDone(id)
 		}
 		return w.checkReady(project, category, metaKey)
 	}
-	if t, met := check(); met {
+	t, met := check()
+	if met {
 		waitPrint(a, t, waitReady)
 		return
+	}
+	// Relevance gate: --done only re-checks on events for this task (its
+	// numeric id, resolved by the first check); --ready re-checks on any event
+	// in scope (already project-filtered).
+	relevant := func([]byte) bool { return true }
+	if waitDone {
+		taskID := t.ID
+		relevant = func(data []byte) bool {
+			var e Event
+			return json.Unmarshal(data, &e) == nil && e.TaskID == taskID
+		}
 	}
 
 	for { // (re)connect loop; ctx deadline bounds everything
@@ -99,47 +108,15 @@ func cmdWait(c *Client, a Args) {
 			connCancel()
 			fail(1, "wait: stream: %s", apiErr(data, "error "+strconv.Itoa(resp.StatusCode)))
 		}
-		if t, met := check(); met {
+		t, met := check()
+		if !met {
+			t, met = watchStream(bufio.NewReader(resp.Body), &cursor, relevant, check)
+		}
+		if met {
 			resp.Body.Close()
 			connCancel()
 			waitPrint(a, t, waitReady)
 			return
-		}
-		br := bufio.NewReader(resp.Body)
-		pending := false // a relevant event whose re-check is deferred
-		for {
-			evID, data, err := readSSEFrame(br)
-			if err != nil {
-				break // disconnect (or deadline) → reconnect from cursor
-			}
-			if evID > cursor {
-				cursor = evID
-			}
-			// Relevance gate: --done only re-checks on events for this task;
-			// --ready re-checks on any event in scope (already project-filtered).
-			if waitDone {
-				var e struct {
-					TaskID int64 `json:"task_id"`
-				}
-				if json.Unmarshal(data, &e) == nil && e.TaskID == taskID {
-					pending = true
-				}
-			} else {
-				pending = true
-			}
-			// Coalesce a burst: frames already buffered are read first, so k
-			// queued events cost one re-check, not k. The deferred re-check
-			// runs once the buffer drains, even if the last frame is irrelevant.
-			if !pending || eventBuffered(br) {
-				continue
-			}
-			pending = false
-			if t, met := check(); met {
-				resp.Body.Close()
-				connCancel()
-				waitPrint(a, t, waitReady)
-				return
-			}
 		}
 		resp.Body.Close()
 		rotated := connCtx.Err() != nil // planned re-check cycle, not a drop
@@ -196,6 +173,34 @@ func waitPrint(a Args, t *Task, ready bool) {
 	}
 	if ready && t != nil {
 		fmt.Println(t.ID)
+	}
+}
+
+// watchStream reads SSE frames from one connection, advancing *cursor, and
+// re-checks the condition after relevant events. It returns the satisfying
+// task when met, or (nil, false) when the connection ends (disconnect or
+// deadline) and the caller should reconnect from *cursor.
+func watchStream(br *bufio.Reader, cursor *int64, relevant func([]byte) bool, check func() (*Task, bool)) (*Task, bool) {
+	pending := false // a relevant event whose re-check is deferred
+	for {
+		evID, data, err := readSSEFrame(br)
+		if err != nil {
+			return nil, false
+		}
+		if evID > *cursor {
+			*cursor = evID
+		}
+		pending = pending || relevant(data)
+		// Coalesce a burst: frames already buffered are read first, so k
+		// queued events cost one re-check, not k. The deferred re-check
+		// runs once the buffer drains, even if the last frame is irrelevant.
+		if !pending || eventBuffered(br) {
+			continue
+		}
+		pending = false
+		if t, met := check(); met {
+			return t, true
+		}
 	}
 }
 

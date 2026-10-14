@@ -22,6 +22,12 @@ func TestPseudoStamp(t *testing.T) {
 	if s := pseudoStamp("v0.2.0"); s != "" {
 		t.Fatalf("pseudoStamp tag = %q, want empty", s)
 	}
+	// Post-tag forms are left to the prerelease comparison (see pseudoStamp).
+	for _, v := range []string{"v0.5.1-0.20260605203447-0327a4ce5320", "v0.5.0-rc1.0.20260605203447-0327a4ce5320"} {
+		if s := pseudoStamp(v); s != "" {
+			t.Fatalf("pseudoStamp(%q) = %q, want empty", v, s)
+		}
+	}
 }
 
 func TestUpdateAvailable(t *testing.T) {
@@ -41,14 +47,25 @@ func TestUpdateAvailable(t *testing.T) {
 		{"v0.0.0-20260604000000-aaaa", "v0.0.0-20260605203447-bbbb", false}, // older pseudo
 		{"", "v0.1.0", false},
 		{"v0.2.0", "devel", false},
-		{"v0.5.0", "v0.5.0-rc1", true},       // stable beats prerelease
-		{"v0.5.0-rc1", "v0.5.0", false},      // prerelease does not beat stable
-		{"v0.5.0-rc2", "v0.5.0-rc1", true},   // newer prerelease
-		{"v0.5.0-rc1", "v0.5.0-rc1", false},  // same prerelease
-		{"v0.5.0-rc10", "v0.5.0-rc2", false}, // prereleases order lexically (documented): rc10 < rc2
-		{"garbage", "v0.1.0", false},         // unparsable reads as 0.0.0
-		{"v0.1.0", "garbage", true},          // ...on either side
-		{"v1", "v0.9.9", true},               // short version: missing parts are 0
+		{"v0.5.0", "v0.5.0-rc1", true},         // stable beats prerelease
+		{"v0.5.0-rc1", "v0.5.0", false},        // prerelease does not beat stable
+		{"v0.5.0-rc2", "v0.5.0-rc1", true},     // newer prerelease
+		{"v0.5.0-rc1", "v0.5.0-rc1", false},    // same prerelease
+		{"v0.5.0-rc10", "v0.5.0-rc2", false},   // prereleases order lexically (documented): rc10 < rc2
+		{"garbage", "v0.1.0", false},           // unparsable reads as 0.0.0
+		{"v0.1.0", "garbage", true},            // ...on either side
+		{"v1", "v0.9.9", true},                 // short version: missing parts are 0
+		{"v0.5.0-rc.10", "v0.5.0-rc.9", false}, // dotted prereleases order lexically too (documented)
+		// Post-tag pseudo-versions (vX.Y.Z-0.<ts>-<hash>, vX.Y.Z-pre.0.<ts>-<hash>)
+		// take the prerelease branch; pseudoStamp does not read them.
+		{"v0.5.1", "v0.5.1-0.20260605203447-0327a4ce5320", true},                       // tag beats its pseudo
+		{"v0.5.1-0.20260605203447-0327a4ce5320", "v0.5.1", false},                      // pseudo never beats tag
+		{"v0.5.1-0.20260606000000-aaaa", "v0.5.1-0.20260605203447-bbbb", true},         // newer post-tag pseudo
+		{"v0.5.1-0.20260604000000-aaaa", "v0.5.1-0.20260605203447-bbbb", false},        // older post-tag pseudo
+		{"v0.5.1-0.20260605203447-0327a4ce5320", "v0.5.0", true},                       // higher triple
+		{"v0.5.0-rc1", "v0.5.0-rc1.0.20260605203447-0327a4ce5320", false},              // base tag is older
+		{"v0.5.0-rc2", "v0.5.0-rc1.0.20260605203447-0327a4ce5320", true},               // next prerelease
+		{"v0.5.0-rc1.0.20260606000000-aaaa", "v0.5.0-rc1.0.20260605203447-bbbb", true}, // newer pre pseudo
 	}
 	for _, c := range cases {
 		if got := updateAvailable(c.latest, c.cur); got != c.want {

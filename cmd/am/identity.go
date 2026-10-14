@@ -12,19 +12,23 @@ import (
 	"time"
 )
 
-// Identity resolution for the CLI, in priority order:
-//  1. AGENTMAN_AGENT / AGENTMAN_SCOPE env (explicit overrides; win, e.g. for
-//     parallel agents in one dir)
+// Identity resolution for the CLI, in priority order (each of agent, scope
+// and token resolves independently):
+//  1. AGENTMAN_AGENT / AGENTMAN_SCOPE / AGENTMAN_TOKEN env (explicit
+//     overrides; win, e.g. for parallel agents in one dir — an env token
+//     silently supersedes the file's)
 //  2. a per-working-directory file written by `am init` (survives across the
 //     fresh shells the agent harness spawns, since env does not)
 //
 // This lets an agent run `am init <tasktype>` once at the start of a session and
 // then use `am` normally — no need to repeat its identity on every command.
 //
-// File format: a scoped init writes JSON {"agent":"...","scope":"cat[/proj]"};
-// `am token new` adds "token" (and writes {"token":"..."} alone before any
-// init); an unscoped init keeps the legacy bare-id plain text, and any
-// pre-Phase-Q plain-text file is read as an unscoped identity (R8 compatibility).
+// File format: JSON {"agent","scope","token"} (scope and token omitted when
+// empty). A scoped init writes agent+scope; `am token new` merges in token
+// (and writes {"token":"..."} alone, with no agent, before any init). An
+// unscoped init writes the bare agent id as plain text, and any plain-text
+// file — including those from versions before scopes existed — is read as an
+// unscoped identity.
 
 // identityFile returns this working directory's identity file. Without a home
 // directory or a working directory it errors rather than guess: a relative
@@ -46,10 +50,11 @@ func identityFile() (string, error) {
 	return filepath.Join(home, ".agentman", "agents", hex.EncodeToString(sum[:])[:12]), nil
 }
 
-// identityRecord is the JSON identity-file shape used when a scope or token is
-// set. A token (Phase S) is the bearer credential the server binds to a scope;
-// it is stored here so an agent that ran `am token new` keeps sending it on
-// every command without re-supplying it.
+// identityRecord is the JSON identity-file shape, written by a scoped init
+// and by storeToken (which may write it with an empty agent). The token is
+// the bearer credential the server binds to a scope; it is stored here so an
+// agent that ran `am token new` keeps sending it on every command without
+// re-supplying it.
 type identityRecord struct {
 	Agent string `json:"agent"`
 	Scope string `json:"scope,omitempty"`

@@ -17,33 +17,48 @@ import (
 // exitCode is a sentinel panic value used by captureExit.
 type exitCode int
 
-// captureStdout redirects os.Stdout to a pipe, calls fn, restores Stdout, and
-// returns everything fn wrote to stdout as a string. Safe to use in tests that
-// also call t.Setenv, because each call captures its own pipe.
+// captureStdout returns everything fn wrote to os.Stdout (see captureFile).
 func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	return captureFile(t, &os.Stdout, fn)
+}
+
+// captureStderr returns everything fn wrote to os.Stderr (fail() writes there).
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	return captureFile(t, &os.Stderr, fn)
+}
+
+// captureFile redirects *f (os.Stdout or os.Stderr) to a pipe, calls fn,
+// restores *f, and returns everything fn wrote to it. Safe to use in tests that
+// also call t.Setenv, because each call captures its own pipe.
+func captureFile(t *testing.T, f **os.File, fn func()) string {
 	t.Helper()
 	r, w, err := os.Pipe()
 	if err != nil {
-		t.Fatalf("captureStdout: Pipe: %v", err)
+		t.Fatalf("captureFile: Pipe: %v", err)
 	}
-	orig := os.Stdout
-	os.Stdout = w
+	orig := *f
+	*f = w
 
 	// Drain the pipe concurrently so large output can't deadlock on the buffer.
 	outCh := make(chan string, 1)
 	go func() {
-		b, _ := io.ReadAll(r)
+		b, err := io.ReadAll(r)
+		if err != nil {
+			t.Errorf("captureFile: read: %v", err) // Errorf is goroutine-safe
+		}
 		r.Close()
 		outCh <- string(b)
 	}()
 
-	// Run fn in an inner scope so os.Stdout is restored and the writer is closed
-	// even if fn panics — e.g. a fail()->osExit panic when nested under
+	// Run fn in an inner scope so *f is restored and the writer is closed even
+	// if fn panics — e.g. a fail()->osExit panic when nested under
 	// captureExit. The reader goroutine then unblocks (EOF) and the panic
 	// propagates past this helper without leaking the redirect.
 	func() {
 		defer func() {
-			os.Stdout = orig
+			*f = orig
 			w.Close()
 		}()
 		fn()
@@ -52,32 +67,30 @@ func captureStdout(t *testing.T, fn func()) string {
 	return <-outCh
 }
 
-// captureStderr mirrors captureStdout for os.Stderr (fail() writes there).
-func captureStderr(t *testing.T, fn func()) string {
+// newTestClient builds a Client the way most CLI tests need it: agent
+// "tester", no scope or token. Tests needing other identity fields set them
+// on the result or keep a literal.
+func newTestClient(base string, hc *http.Client) *Client {
+	return &Client{base: base, agent: "tester", http: hc}
+}
+
+// recordedCall is one request seen by recordingStub.
+type recordedCall struct{ method, path, body string }
+
+// recordingStub is an API stub that records every request and answers 200
+// with reply. Read the calls after the CLI call returns (the response orders
+// the handler's append before it).
+func recordingStub(t *testing.T, reply string) (*httptest.Server, *[]recordedCall) {
 	t.Helper()
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("captureStderr: Pipe: %v", err)
-	}
-	orig := os.Stderr
-	os.Stderr = w
-
-	outCh := make(chan string, 1)
-	go func() {
-		b, _ := io.ReadAll(r)
-		r.Close()
-		outCh <- string(b)
-	}()
-
-	func() {
-		defer func() {
-			os.Stderr = orig
-			w.Close()
-		}()
-		fn()
-	}()
-
-	return <-outCh
+	var calls []recordedCall
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		calls = append(calls, recordedCall{r.Method, r.URL.Path, string(b)})
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(reply))
+	}))
+	t.Cleanup(stub.Close)
+	return stub, &calls
 }
 
 // captureExit stubs osExit so that fail() panics instead of killing the
@@ -109,7 +122,7 @@ func captureExit(t *testing.T, fn func()) (code int) {
 func TestCmdNewPrintsOnlyID(t *testing.T) {
 	ts := newTestServer(t)
 	mustCreateProject(t, ts, "myproj")
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 
 	out := captureStdout(t, func() {
 		cmdNew(c, parse([]string{"a title", "-p", "myproj"}))
@@ -126,7 +139,7 @@ func TestCmdLsTerse(t *testing.T) {
 	id1 := mustCreateTask(t, ts, "lsproj", "First Task")
 	id2 := mustCreateTask(t, ts, "lsproj", "Second Task")
 
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 	out := captureStdout(t, func() {
 		cmdLs(c, parse([]string{"-p", "lsproj"}))
 	})
@@ -157,7 +170,7 @@ func TestCmdMutationsSilent(t *testing.T) {
 	ts := newTestServer(t)
 	mustCreateProject(t, ts, "mutproj")
 	id := mustCreateTask(t, ts, "mutproj", "Mutation Task")
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 
 	// cmdStatus
 	statusOut := captureStdout(t, func() {
@@ -195,7 +208,7 @@ func TestCmdMutationsSilent(t *testing.T) {
 
 func TestExitNotFound(t *testing.T) {
 	ts := newTestServer(t)
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 
 	code := captureExit(t, func() {
 		cmdShow(c, parse([]string{"99999"}))
@@ -268,7 +281,7 @@ func TestStaleFlagsWireFormat(t *testing.T) {
 	}))
 	t.Cleanup(stub.Close)
 	t.Setenv("AGENTMAN_AGENT", "tester")
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 
 	captureStdout(t, func() { cmdLs(c, parse([]string{"--stale", "2h"})) })
 	if !strings.Contains(lsQuery, "stale=2h") {
@@ -287,7 +300,7 @@ func TestExitValidation(t *testing.T) {
 	mustCreateProject(t, ts, "archvalproj")
 	do(t, ts, http.MethodPost, "/api/projects/archvalproj/archive", "", nil)
 
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 	code := captureExit(t, func() {
 		cmdNew(c, parse([]string{"should fail", "-p", "archvalproj"}))
 	})
@@ -298,7 +311,7 @@ func TestExitValidation(t *testing.T) {
 
 func TestExitServerDown(t *testing.T) {
 	// Point at a port that has nothing listening.
-	c := &Client{base: "http://127.0.0.1:1", agent: "tester", http: &http.Client{Timeout: time.Second}}
+	c := newTestClient("http://127.0.0.1:1", &http.Client{Timeout: time.Second})
 
 	code := captureExit(t, func() {
 		cmdLs(c, parse([]string{}))
@@ -480,7 +493,7 @@ func TestCmdNextPrintsOnlyID(t *testing.T) {
 	want := mustCreateTask(t, ts, "nextproj", "Pick Me")
 
 	t.Setenv("AGENTMAN_AGENT", "tester")
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 	out := captureStdout(t, func() {
 		cmdNext(c, parse([]string{"-p", "nextproj"}))
 	})
@@ -492,7 +505,7 @@ func TestCmdNextPrintsOnlyID(t *testing.T) {
 func TestExitNextNoneReady(t *testing.T) {
 	ts := newTestServer(t)
 	t.Setenv("AGENTMAN_AGENT", "tester")
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 
 	code := captureExit(t, func() {
 		cmdNext(c, parse([]string{}))
@@ -503,22 +516,20 @@ func TestExitNextNoneReady(t *testing.T) {
 }
 
 func TestCmdStatusBulk(t *testing.T) {
-	var patched []string
-	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPatch {
-			patched = append(patched, strings.TrimPrefix(r.URL.Path, "/api/tasks/"))
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"id":1}`))
-	}))
-	t.Cleanup(stub.Close)
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	stub, calls := recordingStub(t, `{"id":1}`)
+	c := newTestClient(stub.URL, stub.Client())
 
 	out := captureStdout(t, func() {
 		cmdStatus(c, parse([]string{"1", "2", "3", "done"}))
 	})
 	if strings.TrimSpace(out) != "" {
 		t.Errorf("bulk cmdStatus stdout = %q, want empty", out)
+	}
+	var patched []string
+	for _, cl := range *calls {
+		if cl.method == http.MethodPatch {
+			patched = append(patched, strings.TrimPrefix(cl.path, "/api/tasks/"))
+		}
 	}
 	if len(patched) != 3 || patched[0] != "1" || patched[1] != "2" || patched[2] != "3" {
 		t.Fatalf("patched ids = %v, want [1 2 3]", patched)
@@ -539,7 +550,7 @@ func TestCmdStatusBulkPartialFailure(t *testing.T) {
 		w.Write([]byte(`{"id":1}`))
 	}))
 	t.Cleanup(stub.Close)
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 
 	var code int
 	msg := captureStderr(t, func() {
@@ -559,21 +570,22 @@ func TestCmdStatusBulkPartialFailure(t *testing.T) {
 }
 
 func TestCmdAssignBulk(t *testing.T) {
-	var bodies []string
-	var ids []string
-	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		bodies = append(bodies, string(b))
-		ids = append(ids, strings.TrimPrefix(r.URL.Path, "/api/tasks/"))
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"id":1}`))
-	}))
-	t.Cleanup(stub.Close)
+	stub, calls := recordingStub(t, `{"id":1}`)
 	t.Setenv("AGENTMAN_AGENT", "tester")
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
+	// assign runs one cmdAssign and returns the ids and bodies it sent.
+	assign := func(args ...string) (ids, bodies []string) {
+		*calls = nil
+		cmdAssign(c, parse(args))
+		for _, cl := range *calls {
+			ids = append(ids, strings.TrimPrefix(cl.path, "/api/tasks/"))
+			bodies = append(bodies, cl.body)
+		}
+		return ids, bodies
+	}
 
 	// Last positional is the assignee; the rest are ids.
-	cmdAssign(c, parse([]string{"1", "2", "bob"}))
+	ids, bodies := assign("1", "2", "bob")
 	if len(ids) != 2 || ids[0] != "1" || ids[1] != "2" {
 		t.Fatalf("assigned ids = %v, want [1 2]", ids)
 	}
@@ -584,22 +596,19 @@ func TestCmdAssignBulk(t *testing.T) {
 	}
 
 	// "me" resolves to the current agent.
-	bodies, ids = nil, nil
-	cmdAssign(c, parse([]string{"3", "me"}))
+	_, bodies = assign("3", "me")
 	if len(bodies) != 1 || !strings.Contains(bodies[0], `"assignee":"tester"`) {
 		t.Fatalf("assign me bodies = %v, want assignee tester", bodies)
 	}
 
 	// "-" unassigns.
-	bodies, ids = nil, nil
-	cmdAssign(c, parse([]string{"4", "-"}))
+	_, bodies = assign("4", "-")
 	if len(bodies) != 1 || !strings.Contains(bodies[0], `"assignee":""`) {
 		t.Fatalf("assign - bodies = %v, want empty assignee", bodies)
 	}
 
 	// Single-id regression: `am assign <id> <agent>` still works.
-	bodies, ids = nil, nil
-	cmdAssign(c, parse([]string{"5", "alice"}))
+	ids, bodies = assign("5", "alice")
 	if len(ids) != 1 || ids[0] != "5" || !strings.Contains(bodies[0], `"assignee":"alice"`) {
 		t.Fatalf("single assign = ids %v bodies %v", ids, bodies)
 	}
@@ -617,7 +626,7 @@ func TestCmdLsGrepWireFormat(t *testing.T) {
 		w.Write([]byte("[]"))
 	}))
 	t.Cleanup(stub.Close)
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 
 	captureStdout(t, func() { cmdLs(c, parse([]string{"--grep", "x y"})) })
 	if !strings.Contains(lsQuery, "q=x+y") {
@@ -636,16 +645,8 @@ func TestCmdLsGrepWireFormat(t *testing.T) {
 }
 
 func TestCmdLabelAddRemove(t *testing.T) {
-	type call struct{ method, path, body string }
-	var calls []call
-	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		calls = append(calls, call{r.Method, r.URL.Path, string(b)})
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status":"ok"}`))
-	}))
-	t.Cleanup(stub.Close)
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	stub, recorded := recordingStub(t, `{"status":"ok"}`)
+	c := newTestClient(stub.URL, stub.Client())
 
 	var code int
 	out := captureStdout(t, func() {
@@ -657,7 +658,8 @@ func TestCmdLabelAddRemove(t *testing.T) {
 	if out != "" {
 		t.Fatalf("cmdLabel stdout = %q, want silent", out)
 	}
-	want := []call{
+	calls := *recorded
+	want := []recordedCall{
 		{http.MethodPost, "/api/tasks/12/labels", `{"label":"a"}`},
 		{http.MethodDelete, "/api/tasks/12/labels/bug", ""},
 		{http.MethodPost, "/api/tasks/12/labels", `{"label":"c"}`},
@@ -678,7 +680,7 @@ func TestCmdLabelPrintsLabels(t *testing.T) {
 		w.Write([]byte(`{"id":12,"labels":["a","b"]}`))
 	}))
 	t.Cleanup(stub.Close)
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 
 	out := captureStdout(t, func() { cmdLabel(c, []string{"12"}) })
 	if out != "a b\n" {
@@ -687,7 +689,7 @@ func TestCmdLabelPrintsLabels(t *testing.T) {
 }
 
 func TestCmdLabelUsage(t *testing.T) {
-	c := &Client{base: "http://127.0.0.1:1", agent: "tester", http: &http.Client{Timeout: time.Second}}
+	c := newTestClient("http://127.0.0.1:1", &http.Client{Timeout: time.Second})
 
 	// Missing id → exit 5 (usage).
 	code := captureExit(t, func() { cmdLabel(c, nil) })
@@ -724,7 +726,7 @@ func TestCmdLabelUsage(t *testing.T) {
 
 func TestCmdCategoryVerbs(t *testing.T) {
 	ts := newTestServer(t)
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 
 	// am category new prints only the slug.
 	out := captureStdout(t, func() {
@@ -769,7 +771,7 @@ func TestCmdCategoryVerbs(t *testing.T) {
 
 func TestCmdProjectNewRequiresCategory(t *testing.T) {
 	ts := newTestServer(t)
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 
 	// Without -c and without AGENTMAN_CATEGORY → exit 5.
 	t.Setenv("AGENTMAN_CATEGORY", "")
@@ -808,7 +810,7 @@ func TestCmdProjectNewRequiresCategory(t *testing.T) {
 func TestCmdProjectEdit(t *testing.T) {
 	ts := newTestServer(t)
 	mustCreateProject(t, ts, "web")
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 
 	// Silent success for rename + vault binding.
 	out := captureStdout(t, func() {
@@ -854,7 +856,7 @@ func TestCmdLsCategoryWireFormat(t *testing.T) {
 		w.Write([]byte("[]"))
 	}))
 	t.Cleanup(stub.Close)
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 
 	captureStdout(t, func() { cmdLs(c, parse([]string{"-c", "work"})) })
 	if !strings.Contains(lsQuery, "category=work") {
@@ -877,7 +879,7 @@ func TestCmdNextCategory(t *testing.T) {
 	ts := newTestServer(t)
 	mustCreateCategory(t, ts, "work")
 	t.Setenv("AGENTMAN_AGENT", "tester")
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 
 	// No ready task in the category → exit 3.
 	code := captureExit(t, func() {
@@ -918,7 +920,7 @@ func TestCmdShowDashCStillPrintsComments(t *testing.T) {
 		map[string]string{"Content-Type": "application/json", "X-Agent": "alice"})
 	r.Body.Close()
 
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 	out := captureStdout(t, func() {
 		cmdShow(c, parse(rewriteShowComments([]string{id, "-c"})))
 	})
@@ -969,7 +971,7 @@ func TestCmdNewMetaWireFormat(t *testing.T) {
 		w.Write([]byte(`{"id":1}`))
 	}))
 	t.Cleanup(stub.Close)
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 
 	captureStdout(t, func() {
 		cmdNew(c, parse([]string{"title", "-p", "web", "--meta", "a=1", "--meta", "b=2"}))
@@ -1016,7 +1018,7 @@ func TestCmdEditMetaSinglePatch(t *testing.T) {
 		w.Write([]byte(`{"id":1}`))
 	}))
 	t.Cleanup(stub.Close)
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 
 	// Two sets and one removal — the dispatcher's atomic auto+packet flip —
 	// must ride in exactly ONE PATCH.
@@ -1060,7 +1062,7 @@ func TestCmdNextMetaWireFormat(t *testing.T) {
 	}))
 	t.Cleanup(stub.Close)
 	t.Setenv("AGENTMAN_AGENT", "tester")
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 
 	out := captureStdout(t, func() { cmdNext(c, parse([]string{"--meta", "auto"})) })
 	if !strings.Contains(body, `"meta_key":"auto"`) {
@@ -1093,7 +1095,7 @@ func TestCmdLsMetaWireFormat(t *testing.T) {
 		w.Write([]byte("[]"))
 	}))
 	t.Cleanup(stub.Close)
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 
 	captureStdout(t, func() { cmdLs(c, parse([]string{"--meta", "auto"})) })
 	if !strings.Contains(lsQuery, "meta_key=auto") {
@@ -1126,7 +1128,7 @@ func TestCmdShowPrintsMeta(t *testing.T) {
 	}
 	r.Body.Close()
 
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 	out := captureStdout(t, func() {
 		cmdShow(c, parse([]string{strconv.FormatInt(tk.ID, 10)}))
 	})
@@ -1216,7 +1218,7 @@ func TestClientSendsScopeHeader(t *testing.T) {
 	if got != "work/api" {
 		t.Fatalf("X-Agent-Scope = %q, want work/api", got)
 	}
-	c = &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c = newTestClient(stub.URL, stub.Client())
 	captureStdout(t, func() { cmdLs(c, parse([]string{})) })
 	if calls != 2 || got != "" {
 		t.Fatalf("unscoped X-Agent-Scope = %q, want absent", got)
@@ -1400,7 +1402,7 @@ func TestDoOrFailUnauthorized(t *testing.T) {
 	}))
 	t.Cleanup(stub.Close)
 
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 	code := captureExit(t, func() {
 		captureStderr(t, func() { c.doOrFail("POST", "/api/tasks/1/claim", nil) })
 	})
@@ -1471,7 +1473,7 @@ func TestCmdNoteDashText(t *testing.T) {
 		w.Write([]byte(`{}`))
 	}))
 	t.Cleanup(stub.Close)
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 	code := captureExit(t, func() {
 		captureStderr(t, func() { cmdNote(c, parse([]string{"12", "- fixed parser"})) })
 	})
@@ -1493,7 +1495,7 @@ func TestParseMissingValueAndBadPriority(t *testing.T) {
 			t.Errorf("parse(%q) exit = %d, want 5", argv, code)
 		}
 	}
-	c := &Client{base: "http://127.0.0.1:1", agent: "tester", http: &http.Client{Timeout: time.Second}}
+	c := newTestClient("http://127.0.0.1:1", &http.Client{Timeout: time.Second})
 	code := captureExit(t, func() {
 		captureStderr(t, func() { cmdNew(c, parse([]string{"x", "-p", "proj", "--priority", "high"})) })
 	})
@@ -1510,7 +1512,7 @@ func TestParseMissingValueAndBadPriority(t *testing.T) {
 
 // FIND-0055: every missing/malformed-argument error exits 5, whatever the verb.
 func TestUsageErrorsExit5(t *testing.T) {
-	c := &Client{base: "http://127.0.0.1:1", agent: "tester", http: &http.Client{Timeout: time.Second}}
+	c := newTestClient("http://127.0.0.1:1", &http.Client{Timeout: time.Second})
 	cases := map[string]func(){
 		"show":        func() { cmdShow(c, parse(nil)) },
 		"claim":       func() { cmdClaim(c, parse(nil)) },
@@ -1553,7 +1555,7 @@ func TestCmdLsLimitAndJSONTruncationHint(t *testing.T) {
 		json.NewEncoder(w).Encode(tasks)
 	}))
 	t.Cleanup(stub.Close)
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 
 	var out string
 	msg := captureStderr(t, func() {
