@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -18,9 +19,50 @@ func main() {
 		usage()
 		os.Exit(5) // usage error
 	}
-	cmd := os.Args[1]
-	rest := os.Args[2:]
+	dispatch(os.Args[1], os.Args[2:])
+}
 
+// localCmds are the verbs that never talk to the server.
+var localCmds = map[string]func(Args){
+	"init":      cmdInit,
+	"whoami":    func(Args) { cmdWhoami() },
+	"version":   func(Args) { cmdVersion() },
+	"--version": func(Args) { cmdVersion() },
+	"-v":        func(Args) { cmdVersion() },
+	"update":    cmdUpdate,
+	"upgrade":   cmdUpdate,
+	"db":        cmdDB,
+}
+
+// clientCmds are the verbs that call `am serve` through a Client.
+var clientCmds = map[string]func(*Client, Args){
+	"ls":         cmdLs,
+	"list":       cmdLs,
+	"show":       cmdShow,
+	"new":        cmdNew,
+	"claim":      cmdClaim,
+	"next":       cmdNext,
+	"wait":       cmdWait,
+	"status":     cmdStatus,
+	"assign":     cmdAssign,
+	"note":       cmdNote,
+	"comment":    cmdNote,
+	"edit":       cmdEdit,
+	"drop":       cmdDrop,
+	"rm":         cmdRm,
+	"projects":   cmdProjects,
+	"project":    cmdProject,
+	"categories": cmdCategories,
+	"category":   cmdCategory,
+	"token":      cmdToken,
+	"dep":        cmdDep,
+	"help":       func(*Client, Args) { usage() },
+	"-h":         func(*Client, Args) { usage() },
+	"--help":     func(*Client, Args) { usage() },
+}
+
+// dispatch runs one verb with the arguments after it.
+func dispatch(cmd string, rest []string) {
 	if cmd == "serve" {
 		runServe(rest)
 		return
@@ -36,79 +78,46 @@ func main() {
 	}
 
 	a := parse(rest)
-	switch cmd {
-	case "init":
-		cmdInit(a)
-		return
-	case "whoami":
-		cmdWhoami()
-		return
-	case "version", "--version", "-v":
-		cmdVersion()
-		return
-	case "update", "upgrade":
-		cmdUpdate(a)
-		return
-	case "db":
-		cmdDB(a)
+	if f, ok := localCmds[cmd]; ok {
+		f(a)
 		return
 	}
-
 	c := NewClient()
-	switch cmd {
-	case "ls", "list":
-		cmdLs(c, a)
-	case "show":
-		cmdShow(c, a)
-	case "new":
-		cmdNew(c, a)
-	case "claim":
-		cmdClaim(c, a)
-	case "next":
-		cmdNext(c, a)
-	case "wait":
-		cmdWait(c, a)
-	case "status":
-		cmdStatus(c, a)
-	case "assign":
-		cmdAssign(c, a)
-	case "note", "comment":
-		cmdNote(c, a)
-	case "edit":
-		cmdEdit(c, a)
-	case "drop":
-		cmdDrop(c, a)
-	case "rm":
-		cmdRm(c, a)
-	case "projects":
-		cmdProjects(c, a)
-	case "project":
-		cmdProject(c, a)
-	case "categories":
-		cmdCategories(c, a)
-	case "category":
-		cmdCategory(c, a)
-	case "token":
-		cmdToken(c, a)
-	case "dep":
-		cmdDep(c, a)
-	case "help", "-h", "--help":
-		usage()
-	default:
+	f, ok := clientCmds[cmd]
+	if !ok {
 		usageErr("unknown command: %s (try `am help`)", cmd)
 	}
+	f(c, a)
+}
+
+// serveConfig resolves serve's port, DB path and proposals carve-out project:
+// flag, then env, then default.
+func serveConfig(a Args) (port, dbPath, proposals string) {
+	if port = a.flag("port"); port == "" {
+		port = envOr("AGENTMAN_PORT", "8787")
+	}
+	if dbPath = a.flag("db"); dbPath == "" {
+		dbPath = envOr("AGENTMAN_DB", defaultDBPath())
+	}
+	if proposals = a.flag("proposals"); proposals == "" {
+		proposals = envOr("AGENTMAN_PROPOSALS", "meta/proposals")
+	}
+	return port, dbPath, proposals
+}
+
+// proposalsScope parses the proposals carve-out project. Both segments are
+// required — a bare category would turn the carve-out into a category-wide hole.
+func proposalsScope(raw string) (Scope, error) {
+	sc, err := parseScope(raw)
+	if err == nil && sc.Project == "" {
+		err = errors.New("missing project")
+	}
+	return sc, err
 }
 
 func runServe(argv []string) {
 	a := parse(argv)
-	port := envOr("AGENTMAN_PORT", "8787")
-	if v := a.flag("port"); v != "" {
-		port = v
-	}
-	dbPath := a.flag("db")
-	if dbPath == "" {
-		dbPath = envOr("AGENTMAN_DB", defaultDBPath())
-	}
+	port, dbPath, prop := serveConfig(a)
 	// Bind before touching the DB: a busy port (e.g. a second serve) must fail
 	// before OpenStore runs schema/migrations on a file another server uses.
 	ln, err := net.Listen("tcp", listenAddr(port))
@@ -124,15 +133,8 @@ func runServe(argv []string) {
 	}
 
 	srv := NewServer(store)
-	// The proposals carve-out project: --proposals flag, then AGENTMAN_PROPOSALS
-	// env, default meta/proposals. Both segments are required — a bare category
-	// would turn the carve-out into a category-wide hole.
-	prop := envOr("AGENTMAN_PROPOSALS", "meta/proposals")
-	if v := a.flag("proposals"); v != "" {
-		prop = v
-	}
-	psc, err := parseScope(prop)
-	if err != nil || psc.Project == "" {
+	psc, err := proposalsScope(prop)
+	if err != nil {
 		fail(1, "agentman: bad proposals project %q (want category/project)", prop)
 	}
 	srv.proposals = psc

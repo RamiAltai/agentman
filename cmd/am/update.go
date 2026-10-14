@@ -104,31 +104,42 @@ func goEnv(goBin, key string) string {
 // version exists. Non-blocking and silent on any error; opt out with
 // AGENTMAN_NO_UPDATE_CHECK=1.
 func checkForUpdate() {
+	if updateCheckWanted() {
+		go reportUpdate(proxyURL, version())
+	}
+}
+
+// proxyURL is the module proxy checkForUpdate queries.
+const proxyURL = "https://proxy.golang.org"
+
+// updateCheckWanted is false when the user opted out or the binary is a local
+// build — nothing meaningful to compare against.
+func updateCheckWanted() bool {
 	if os.Getenv("AGENTMAN_NO_UPDATE_CHECK") != "" {
+		return false
+	}
+	return version() != "devel" && !localBuild()
+}
+
+// reportUpdate asks the proxy at base for the latest version and logs when it
+// is newer than cur.
+func reportUpdate(base, cur string) {
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Get(base + "/" + escapeModule(modulePath) + "/@latest")
+	if err != nil || resp == nil {
 		return
 	}
-	cur := version()
-	if cur == "devel" || localBuild() {
-		return // local build — nothing meaningful to compare against
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return
 	}
-	go func() {
-		client := &http.Client{Timeout: 4 * time.Second}
-		resp, err := client.Get("https://proxy.golang.org/" + escapeModule(modulePath) + "/@latest")
-		if err != nil || resp == nil {
-			return
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return
-		}
-		var info struct{ Version string }
-		if json.NewDecoder(resp.Body).Decode(&info) != nil {
-			return
-		}
-		if updateAvailable(info.Version, cur) {
-			log.Printf("agentman: update available — %s (you have %s). Run `am update`.", info.Version, cur)
-		}
-	}()
+	var info struct{ Version string }
+	if json.NewDecoder(resp.Body).Decode(&info) != nil {
+		return
+	}
+	if updateAvailable(info.Version, cur) {
+		log.Printf("agentman: update available — %s (you have %s). Run `am update`.", info.Version, cur)
+	}
 }
 
 // escapeModule encodes a module path for the Go module proxy: uppercase letters
