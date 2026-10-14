@@ -226,6 +226,11 @@ record instead.
      while a task lives, but not unique across the whole history. Likewise a per-project human `ref`
      (e.g. `web-3`) can be reused if the highest-numbered task in a project is deleted and a new
      task is created. No counter/migration was added — acceptable for a personal board.
+     **Reversed for ids by schema v6:** the migration in `store.go` rebuilds `tasks`, `projects` and
+     `events` with `AUTOINCREMENT`, seeding each sequence past every id seen in the table or the event
+     log, so ids are never reused (rowid reuse let a scope check on one task authorize another, a new
+     project inherit a deleted one's events, and `am db prune --keep 0` reset the SSE cursor).
+     Per-project refs can still be reused.
   5. **`am project rm <slug> --yes` requires `--yes`** — without the flag the CLI errors with a
      hint and a non-zero exit (destructive cascade; guard against accidents). `am rm <id>` is silent
      on success (agent-friendly), exits 3 if not found.
@@ -337,27 +342,32 @@ record instead.
 - Context: No CI existed (no `.github/`), so format drift, vet failures, test regressions, and
   dependency vulnerabilities went undetected between manual runs. The project had a working
   `govulncheck`-clean codebase but no automated enforcement.
-- Decision: Add `.github/workflows/ci.yml` — a single `ubuntu-latest` job triggered on **push to
-  `main`** and on **pull_request**. Steps in order:
+- Decision: Add `.github/workflows/ci.yml` — two `ubuntu-latest` jobs triggered on **push to
+  `main`** and on **pull_request**. Job `ci` (`timeout-minutes: 15`), steps in order:
   1. `actions/checkout@v4`
-  2. `actions/setup-go@v5` with `go-version: 'stable'` and `cache: true` — build/test on the
-     latest stable Go (always carrying current stdlib security patches), NOT the exact version
-     pinned in `go.mod`. (An exact pin makes `govulncheck` red as stdlib CVEs accrue against that
-     frozen patch version; `go.mod` still declares the `1.25.11` *minimum* for users.)
+  2. `actions/setup-go@v5` with `cache: true`, run as a matrix (`fail-fast: false`) of
+     `go-version: 'stable'` and `go-version-file: go.mod`, with `GOTOOLCHAIN=local` so `go` never
+     downloads a newer toolchain — the declared `1.25.11` minimum is built and tested, and code that
+     needs a newer Go than users are promised fails here.
   3. **Build** — `go build ./...`
   4. **Vet** — `go vet ./...`
   5. **gofmt** — `gofmt -l .` fails if any file is unformatted (enforces the zero-drift state)
   6. **Test (race)** — `go test -race -count=1 ./...` (matches the local command in contribution-guide.md)
   7. **JS syntax check** — `node --check cmd/am/web/app.js` (Node is preinstalled on `ubuntu-latest`)
-  8. **govulncheck** — `go install golang.org/x/vuln/cmd/govulncheck@latest` then
-     `govulncheck ./...`; **blocks on reachable vulnerabilities only**. `@latest` ensures the
-     advisory DB is always current without pinning a version that would need manual bumps.
+
+  Job `govulncheck` (`timeout-minutes: 10`, `go-version: 'stable'`): `go install
+  golang.org/x/vuln/cmd/govulncheck@v1.8.0` then `govulncheck ./...`; **blocks on reachable
+  vulnerabilities only**.
 - Rationale: closes the long-standing "no CI" and "no dependency vulnerability scanning" gaps
-  (see `known-risks-and-gaps.md`). Single job keeps setup simple. `govulncheck`'s reachability
-  analysis means transitive-but-unused advisories do not break CI; only exploitable paths block —
-  but note that stdlib advisories ARE reachable, so CI must run on a patched toolchain
-  (`go-version: 'stable'`), not a frozen patch version (lesson learned: pinning `go 1.25.0` made CI
-  red against 21 accrued stdlib CVEs even though the code was unaffected when built with a current Go).
+  (see `known-risks-and-gaps.md`). The separate `govulncheck` job keeps a newly published advisory
+  or a vuln DB outage from failing build/test on unchanged code; pinning the tool keeps a tool
+  release from changing the verdict (the advisory DB is still fetched live). `govulncheck`'s
+  reachability analysis means transitive-but-unused advisories do not break CI; only exploitable
+  paths block — but note that stdlib advisories ARE reachable, so the vuln job runs on a patched
+  toolchain (`go-version: 'stable'`), not a frozen patch version (lesson learned: pinning
+  `go 1.25.0` made CI red against 21 accrued stdlib CVEs even though the code was unaffected when
+  built with a current Go). With the scan in its own job, that reason no longer forces build/test
+  onto `stable` only.
 - Known advisory (non-blocking): **`GO-2026-5024`** in `golang.org/x/sys@v0.42.0` (integer
   overflow in `windows.NewNTUnicodeString`). Windows-only; **not reachable** from agentman
   (govulncheck's symbol/package scan finds nothing). Transitive dep via `modernc.org/libc`.
@@ -848,7 +858,8 @@ record instead.
   6. **`tasks.created_by` via migration v5, best-effort backfill from the event log.**
      `currentSchemaVersion` 4 → 5 (`schema.sql` stays the frozen v1 baseline): `ALTER TABLE tasks
      ADD COLUMN created_by TEXT`, then backfill from the **LATEST** `task.created` event's actor —
-     **latest, not first**, because `tasks.id` is a reusable SQLite rowid (no `AUTOINCREMENT`) and
+     **latest, not first**, because `tasks.id` was a reusable SQLite rowid before v6 (no
+     `AUTOINCREMENT`; v6 ended id reuse — ADR-015 item 4) and
      `DeleteTask` leaves a deleted task's events behind, so an id's oldest creation event may belong
      to a deleted predecessor; the newest is always the current incarnation's. Tasks whose events
      were pruned stay NULL and never match the own-proposal comment rule (the safe direction). New
@@ -1042,10 +1053,12 @@ record instead.
   5. **Mint requires UNSCOPED (the boundary crux).** The three token-admin endpoints
      (`POST/GET /api/tokens`, `POST /api/tokens/{id}/revoke`) refuse ANY request carrying a scope —
      whether an `X-Agent-Scope` header OR a (valid) bearer token — via the shared
-     `(s *Server) tokenAdminGuard(w, r)` helper (`if !sc.IsZero() → denyScope`, the
+     `(s *Server) unscopedGuard(w, r)` helper (`if !sc.IsZero() → denyScope`, the
      `handleCreateCategory` precedent). Only a fully unscoped caller (the human at the CLI/dashboard)
      administers tokens, so a confined agent can never mint a token for another scope. A bad bearer
-     token still 401s at the guard rather than being mistaken for "unscoped".
+     token still 401s at the guard rather than being mistaken for "unscoped". (The helper was
+     later renamed from `tokenAdminGuard` and now also gates `POST /api/categories` and category
+     archive/unarchive.)
   6. **DB export carries token hashes, deliberately un-scrubbed.** `exportDB` uses `VACUUM INTO`
      (a whole-file snapshot), so the `tokens` table rides along — acceptable precisely because only
      non-replayable sha256 hashes are stored (see choice 3). `validateImportCandidate`'s required-table
@@ -1075,7 +1088,7 @@ record instead.
   Residuals).
 - Evidence: `cmd/am/store.go` (`Token`/`Token.Scope`, `ErrInvalidToken`, `CreateToken`/`ListTokens`/
   `RevokeToken`/`ResolveToken`, `newToken`/`hashToken`); `cmd/am/schema.sql` (`tokens` +
-  `idx_tokens_hash`); `cmd/am/server.go` (`(s *Server) scopeOf`/`bearerToken`, `tokenAdminGuard`,
+  `idx_tokens_hash`); `cmd/am/server.go` (`(s *Server) scopeOf`/`bearerToken`, `unscopedGuard`,
   `handleCreateToken`/`handleListTokens`/`handleRevokeToken`, the `/api/tokens` routes,
   `ErrInvalidToken` → 401 in `writeErr`); `cmd/am/client.go` (`token` field, `Authorization: Bearer`
   send + `X-Agent-Scope` drop, `exitCodeFor(401)==9`, `doOrFail` 9 case); `cmd/am/identity.go`

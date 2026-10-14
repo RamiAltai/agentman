@@ -91,11 +91,11 @@ Agents need an identity to claim/own tasks. Because agent runtimes spawn a fresh
 automatically:
 
 ```sh
-am init refactor     # → refactor_130626_3391, remembered for this working directory
+am init refactor     # → refactor_130626_3b91c0, remembered for this working directory
 am whoami            # show current identity (+ scope / token state)
 ```
 
-Format: `{tasktype}_{DDMMYY}_{4 digits}`. `AGENTMAN_AGENT` overrides it (useful for several agents
+Format: `{tasktype}_{DDMMYY}_{6 hex}` (24 random bits). `AGENTMAN_AGENT` overrides it (useful for several agents
 in one directory). `AGENTMAN_AGENT` carries only the id; to give each of several agents in one
 directory its own scope or token, point each at its own identity file with `AGENTMAN_AGENT_FILE`.
 
@@ -120,7 +120,7 @@ overrides the file. The board stores only the token's sha256 hash.
 
 | Command | What it does |
 |---|---|
-| `am ls [--mine] [--status S] [-p P] [-c CAT] [--all] [--ready] [--blocked] [--stale D] [--grep TEXT] [--label L] [--meta KEY]` | list tasks (hides done; `--all` = every task board-wide: shows `done` **and ignores `-p`/`-c` (and `AGENTMAN_PROJECT`/`AGENTMAN_CATEGORY`)** — for one project's done tasks use `-p P --status done`, not `--all`; `-c` = category scope; `--ready` = todo with no open prereqs; `--blocked` = ≥1 open prereq; `--stale D` = assigned, not done, no activity for D — Go duration, e.g. `30m`, `48h`; `--grep` = substring match on title or body, ASCII-case-insensitive; `--label`/`-l` = tasks carrying that label; `--meta KEY` = tasks carrying that meta key; alias: `list`) |
+| `am ls [--mine] [--status S] [-p P] [-c CAT] [--all] [--ready] [--blocked] [--stale D] [--grep TEXT] [--label L] [--meta KEY] [--limit N]` | list tasks (hides done; `--all` = every task board-wide: shows `done` **and ignores `-p`/`-c` (and `AGENTMAN_PROJECT`/`AGENTMAN_CATEGORY`)** — for one project's done tasks use `-p P --status done`, not `--all`; `-c` = category scope; `--ready` = todo with no open prereqs; `--blocked` = ≥1 open prereq; `--stale D` = assigned, not done, no activity for D — Go duration, e.g. `30m`, `48h`; `--grep` = substring match on title or body, ASCII-case-insensitive; `--label`/`-l` = tasks carrying that label; `--meta KEY` = tasks carrying that meta key; `--limit N` = at most N rows, default 50; `0` or anything above 500 means the server cap of 500; a full page prints a `… N shown` truncation hint — on stderr with `--json`; alias: `list`) |
 | `am show <id> [-c]` | task detail + `depends on:` / `blocks:` / `meta:` lines; comments with `-c` (for `show` only, `-c` means comments, not category) |
 | `am new "title" [--body B] [-p P] [--priority N] [--assign A] [--meta k=v]...` | create a task; prints the new id (the project determines the category; `--assign`/`-a` takes an agent name or `me` — the task is created `todo` but pre-assigned to someone, which `am next` never picks; `--meta` is repeatable) |
 | `am claim <id> [--steal-stale D]` | atomic: assign me + → doing (exit 4 if already taken **or** has open prereqs); `--steal-stale D` takes over a claim idle for ≥ D (exit 4 with `not stale yet` if still fresh) |
@@ -143,7 +143,7 @@ overrides the file. The board stores only the token's sha256 hash.
 | `am categories [--all]` · `am category new <slug> [name]` | list (`--all` includes archived) / create categories |
 | `am category archive <slug>` · `am category unarchive <slug>` | soft-archive a category (hides its projects/tasks; blocks new tasks/projects under it) / restore it |
 | `am init <tasktype> [-c CAT [-p PROJ]]` · `am whoami` | identity (optionally **scoped** to a category or one project; out-of-scope ops exit 8); `whoami` adds a `scope:` line when scoped and a `token: set` line when a token is configured |
-| `am token new --scope <cat[/proj]>` · `am token ls [--json]` · `am token revoke <id>` | **scope tokens** (the human mints, the agent uses): `new` mints a scope-bound bearer token, prints it once, and stores it in this directory's identity; `ls` lists tokens (id / scope / created / [revoked], never the value); `revoke` revokes one. Minting requires an **unscoped** caller. An invalid/revoked token → exit 9 |
+| `am token new --scope <cat[/proj]>` · `am token ls [--json]` · `am token revoke <id>` | **scope tokens** (the human mints, the agent uses): `new` mints a scope-bound bearer token, prints it once, and stores it in this directory's identity; `ls` lists tokens (id / scope / created / [revoked], never the value); `revoke` revokes one. Minting requires an **unscoped** caller. Run `new`/`ls`/`revoke` from an identity that holds **no** token — not the directory where `am token new` stored one (a stored token makes token admin return 403/401); use another directory or `AGENTMAN_AGENT_FILE=<other file>`. An invalid/revoked token → exit 9 |
 | `am serve [--port 8787] [--db PATH] [--log] [--proposals CAT/PROJ]` | run the dashboard + API (`--proposals` = the scope carve-out project; default `meta/proposals`) |
 | `am db export [path] [--db PATH]` | write a consistent DB snapshot (prints the path) |
 | `am db import <path> [--db PATH] [--yes]` | restore a snapshot (stop `am serve` first; backs up current DB) |
@@ -152,10 +152,14 @@ overrides the file. The board stores only the token's sha256 hash.
 
 `<id>` accepts a global id (`13`) or a project ref (`web-3`). `--status` accepts a comma list.
 Priority is `0` urgent … `3` low (default `2`). Durations use Go syntax (`30m`, `48h` — not `2d`).
-Add `--json` to any read to parse.
+Add `--json` to any read to parse. Flags and positionals mix in any order; a bare `--` ends the
+flags (`am note 12 -- "-x done"`), a dash-leading argument containing spaces (`"- fixed parser"`)
+is text, not a flag, and `--flag=VALUE` passes a value that starts with `-`.
 
 **Exit codes:** `0` ok · `3` not found · `4` already claimed, blocked, or not stale yet · `5` invalid ·
 `6` server down · `7` wait timed out · `8` out of scope · `9` bad token (invalid or revoked).
+Every usage error (missing or malformed argument, unknown command or subcommand, a value flag with
+no value) exits `5`; `1` means any other failure.
 
 ---
 

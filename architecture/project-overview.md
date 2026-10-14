@@ -25,7 +25,7 @@ Evidence:
 ## Main Users
 
 - **AI agents** (primary) — e.g. Claude Code sessions — invoking the `am` CLI or HTTP API.
-  Each agent has a human-readable identity like `bugfix_050626_4821` (`cmd/am/identity.go`).
+  Each agent has a human-readable identity like `bugfix_050626_4f21a9` (`cmd/am/identity.go`).
 - **A human operator** (secondary) — runs `am serve` and watches/edits the board in the browser
   dashboard (`cmd/am/web/`).
 - **Maintainer/contributor** — single-owner OSS project (module `github.com/RamiAltai/agentman`).
@@ -81,7 +81,7 @@ Evidence:
   non-replayably. Built for agentic_brain requirement R5 (the final phase). It is loopback-only — not
   auth against an arbitrary local process (a filesystem read of the identity file = token possession).
   Evidence: `cmd/am/store.go` (`Token`, `CreateToken`/`ResolveToken`/`RevokeToken`, `hashToken`),
-  `cmd/am/server.go` (`scopeOf`, `tokenAdminGuard`, `/api/tokens`), `cmd/am/cli.go` (`cmdToken`),
+  `cmd/am/server.go` (`scopeOf`, `unscopedGuard`, `/api/tokens`), `cmd/am/cli.go` (`cmdToken`),
   `cmd/am/identity.go` (`token` field, `AGENTMAN_TOKEN`).
 - **Stable IDs + vault binding** (Phase O): categories and projects carry an immutable `uid`
   (`amc_`/`amp_` + 16 hex) that survives slug renames (`am project edit --slug`), and projects
@@ -164,7 +164,7 @@ Evidence:
   ≤ 500 bytes). Key presence — never the value — is the filterable unit; no separate catalog.
 - **Event** — an append-only record of every mutation; powers the activity feed, SSE stream, and
   reconnect replay (`events.id` is the cursor / SSE `Last-Event-ID`).
-- **Agent identity** — `{tasktype}_{DDMMYY}_{4 digits}`, attached as the actor on writes; the
+- **Agent identity** — `{tasktype}_{DDMMYY}_{6 hex}`, attached as the actor on writes; the
   per-directory identity record may also carry an optional scope and (Phase S) a bearer **token**.
 - **Token** (Phase S) — a scope-bound bearer credential (`amt_…`) the server binds to a scope. Stored
   only as a sha256 hash; sent as `Authorization: Bearer`; its scope wins over `X-Agent-Scope`. Minted

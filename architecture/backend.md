@@ -23,37 +23,38 @@ POST  /api/projects                 handleCreateProject     {slug,name,category?
 PATCH /api/projects/{slug}          handlePatchProject      {slug?,name?,vault_project_id?,vault_path?} (uid/category never patchable; empty string clears a vault field; no-op → 200, no event; dup slug → 409)
 POST  /api/projects/{slug}/archive    handleArchiveProject
 POST  /api/projects/{slug}/unarchive  handleUnarchiveProject
-GET   /api/tasks                    handleListTasks         ?project=&category=&status=&assignee=&limit=&ready=true|&blocked=true|&stale=<dur>|&q=<text>|&label=<l>|&meta_key=<k>  (no scope ⇒ hides archived-project AND archived-category tasks; category composes with every other filter; stale = assigned + not done + no activity for ≥ dur; q = substring match on title OR body, ASCII-case-insensitive, > 500 bytes → 400; label = exact match after normalization, invalid → 400; meta_key = key-presence match after normalization, invalid → 400; rows include meta)
+GET   /api/tasks                    handleListTasks         ?project=&category=&status=&assignee=&limit=&ready=true|&blocked=true|&stale=<dur>|&q=<text>|&label=<l>|&meta_key=<k>  (limit absent, ≤ 0 or > 500 ⇒ 500, the server-side cap; no scope ⇒ hides archived-project AND archived-category tasks; category composes with every other filter; stale = assigned + not done + no activity for ≥ dur; q = substring match on title OR body, ASCII-case-insensitive, > 500 bytes → 400; label = exact match after normalization, invalid → 400; meta_key = key-presence match after normalization, invalid → 400; rows include meta)
 POST  /api/tasks                    handleCreateTask        {project,title,body?,priority?,assignee?,meta?}  (archived category → 400 category_archived; empty meta values → 400)
 GET   /api/tasks/{id}               handleGetTask           (task + comments + recent events + depends_on + blocks + meta)
 PATCH /api/tasks/{id}               handlePatchTask         {status?,assignee?,title?,body?,priority?,meta?}  (hard-blocked if open prereqs + doing/done target; meta upsert — empty value removes the key; meta-only patch doesn't bump updated_at)
-POST  /api/tasks/next               handleNext              {project?,category?,assignee?,meta_key?} atomic pick+claim of the best ready task (todo, unassigned, no open prereqs, non-archived project AND category, carrying meta_key if given); 404 when none qualifies (or bad slug)
-POST  /api/tasks/{id}/claim         handleClaim             (atomic; X-Agent = claimant; hard-blocked if open prereqs → 409 blocked; body {"steal_stale":"<dur>"} → StealStaleClaim stale takeover, 409 not_stale if still fresh)
+POST  /api/tasks/next               handleNext              {project?,category?,assignee?,meta_key?} atomic pick+claim of the best ready task (todo, unassigned, no open prereqs, non-archived project AND category, carrying meta_key if given); 404 when none qualifies (or bad slug); malformed JSON body → 400 (empty body allowed)
+POST  /api/tasks/{id}/claim         handleClaim             (atomic; X-Agent = claimant; hard-blocked if open prereqs → 409 blocked; body {"steal_stale":"<dur>"} → StealStaleClaim stale takeover, 409 not_stale if still fresh; malformed JSON body → 400, empty body allowed)
 POST  /api/tasks/{id}/comments      handleComment           {body}
 POST  /api/tasks/{id}/deps          handleAddDep            {depends_on: <id-or-ref>}  add prerequisite edge
 DELETE /api/tasks/{id}/deps/{depId} handleRemoveDep         remove prerequisite edge
 POST  /api/tasks/{id}/labels        handleAddLabel          {label}  attach a label (idempotent; normalized)
 DELETE /api/tasks/{id}/labels/{label} handleRemoveLabel     detach a label (idempotent no-op if absent)
 GET   /api/events                   handleEvents            ?since=  | ?tail=  | ?before=  | ?project=  | ?category=  (no project ⇒ hides archived-project events; ?category= scopes to the category's projects and EXCLUDES category-level NULL-project events; unknown category → 404)
-GET   /api/stream                   handleStream            text/event-stream (SSE); ?project= or ?category= scopes the live stream + gap-replay (same NULL-project exclusion; project.created delivered regardless; unknown category ignored silently → unfiltered)
+GET   /api/stream                   handleStream            text/event-stream (SSE); ?project= or ?category= scopes the live stream + gap-replay (same NULL-project exclusion; project.created delivered regardless; unknown project or category ignored silently → unfiltered, for both live stream and replay; gap replay is paged (500/page) up to the max event id at subscribe time, no total cap; a Last-Event-ID/?since= past the log's end, e.g. after importing an older snapshot, gets `event: reset` (data {}) right after the `retry:` line and resumes from the log's end instead of replaying)
 DELETE /api/tasks/{id}              handleDeleteTask        hard-delete task + comments + dep edges (cascade); 200 {"status":"deleted"}
 DELETE /api/tasks/{id}/comments/{cid} handleDeleteComment  hard-delete one comment; 200 {"status":"deleted"}
 DELETE /api/projects/{slug}         handleDeleteProject     hard-delete project + tasks + comments (cascade); 200 {"status":"deleted"}
 GET   /api/projects/{slug}/graph    handleProjectGraph      {nodes:[]Task, edges:[]GraphEdge{from,to}}; 404 on missing project; read-only (no events)
-POST  /api/tokens                   handleCreateToken       {scope:"cat[/proj]"} mint a scope-bound bearer token; 201 {id,scope,token,created_at} — the ONLY response carrying the plaintext token; requires an UNSCOPED caller (tokenAdminGuard → 403 if scoped); scope validated (unknown cat/proj → 404, cross-category bind/archived cat → 400)
+POST  /api/tokens                   handleCreateToken       {scope:"cat[/proj]"} mint a scope-bound bearer token; 201 {id,scope,token,created_at} — the ONLY response carrying the plaintext token; requires an UNSCOPED caller (unscopedGuard → 403 if scoped); scope validated (unknown cat/proj → 404, cross-category bind/archived cat → 400)
 GET   /api/tokens                   handleListTokens        []Token {id,category,project?,created_at,revoked_at?}; never token/token_hash; requires unscoped
 POST  /api/tokens/{id}/revoke       handleRevokeToken       200 with the token metadata; 404 unknown/already-revoked; requires unscoped
 /                                   http.FileServer(embed)  serves cmd/am/web/
 ```
 
-**Token-admin guard (Phase S / ADR-029).** The three `/api/tokens` routes share
-`(s *Server) tokenAdminGuard(w, r)`: it runs `scopeOf(r)` and refuses **any** request carrying a scope
-— whether an `X-Agent-Scope` header OR a valid bearer token — with `denyScope` → `403`. Only a fully
+**Unscoped guard (Phase S / ADR-029).** `(s *Server) unscopedGuard(w, r)` gates six routes: the
+three `/api/tokens` routes (`POST /api/tokens`, `GET /api/tokens`, `POST /api/tokens/{id}/revoke`)
+and the category writes (`POST /api/categories`, `POST /api/categories/{slug}/archive`,
+`POST /api/categories/{slug}/unarchive`). It runs `scopeOf(r)` and refuses **any** request carrying
+a scope — whether an `X-Agent-Scope` header OR a valid bearer token — with `denyScope` → `403`. Only a fully
 unscoped caller (the human at the CLI/dashboard) administers tokens, so a confined agent can never
 mint a token for another scope (the boundary crux). A bad/revoked bearer token still 401s here
-(`scopeOf` surfaces `ErrInvalidToken`) rather than being mistaken for "unscoped". It mirrors the
-`handleCreateCategory` `if !sc.IsZero() → denyScope` precedent. An invalid/revoked bearer token →
-`ErrInvalidToken` → `401 {"error":"unauthorized"}` on every endpoint that resolves scope through
+(`scopeOf` surfaces `ErrInvalidToken`) rather than being mistaken for "unscoped". An
+invalid/revoked bearer token → `ErrInvalidToken` → `401 {"error":"unauthorized"}` on every endpoint that resolves scope through
 `scopeOf` → CLI **exit 9**. `GET /api/events`, `GET /api/stream`, `GET /api/projects` and
 `GET /api/categories` never call `scopeOf`, so they do not validate the token (see `security.md`).
 
@@ -95,9 +96,9 @@ picture:
   (empty body category = `general`); 403 for any other category and for project-scoped agents.
 - **`PATCH/DELETE /api/projects/{slug}`, archive/unarchive** — `checkProjectMut` (project in scope;
   no proposals carve-out).
-- **`POST /api/categories`, archive/unarchive** — 403 for ANY scoped agent (the category layer is
-  above every scope).
-- **`POST/GET /api/tokens`, `POST /api/tokens/{id}/revoke`** — `tokenAdminGuard`: 403 for ANY scoped
+- **`POST /api/categories`, archive/unarchive** — `unscopedGuard`: 403 for ANY scoped caller (the
+  category layer is above every scope); a bad bearer token 401s.
+- **`POST/GET /api/tokens`, `POST /api/tokens/{id}/revoke`** — `unscopedGuard`: 403 for ANY scoped
   caller (header OR a valid bearer token); only an unscoped caller mints/lists/revokes (mint-requires-
   unscoped, Phase S). A bad bearer token 401s here, not 403.
 - **Untouched by scope enforcement:** `GET /api/events`, `GET /api/stream`, `GET /api/projects`,
@@ -266,8 +267,11 @@ UPDATE tasks SET assignee=?, status=CASE WHEN status='todo' THEN 'doing' ELSE st
 RETURNING project_id, status;
 ```
 
-Zero rows ⇒ loser; the code then distinguishes idempotent re-claim by the same agent (returns the
-task, no event) from `*ConflictError` (owned by someone else) and `ErrNotFound`.
+Zero rows ⇒ loser; the code then distinguishes a re-claim by the same agent from `*ConflictError`
+(owned by someone else, or `done` even if owned → `409 already_claimed`) and `ErrNotFound`. A
+same-agent re-claim of a `todo` task (pre-assigned via `am new --assign`/`am assign`) starts it:
+`doing`, `claimed_at` set, `task.claimed` event with `assignee` `[agent, agent]`; of a `doing` or
+`blocked` task it returns the task with no event (idempotent, even if a prerequisite was added since).
 
 **Stale-claim takeover** (`StealStaleClaim`, Phase K / ADR-022) reuses the same trick with a
 staleness predicate: `UPDATE … WHERE id=? AND status!='done' AND (assignee IS NULL OR updated_at <
@@ -276,7 +280,7 @@ exact `strftime('%Y-%m-%dT%H:%M:%fZ')` 3-digit-fraction format, so the lexicogra
 comparison holds). Exactly one concurrent stealer wins; a still-fresh claim loses with a typed
 `*NotStaleError{Assignee}`; a `done` task → `*ConflictError`; open prerequisites hard-block like a
 normal claim; on an unclaimed task it degrades to a normal claim (plain `task.claimed` event);
-re-stealing your own claim is an idempotent no-op (no event, `updated_at` untouched). A successful
+a steal by the current owner is a plain `ClaimTask` (same re-claim rules as above). A successful
 takeover emits `task.reclaimed` with `{"assignee":[prev,new],"status":…,"stale_for":…}` in the same
 tx. Both claim paths set `tasks.claimed_at`; `am drop` (unassign) clears it. The staleness filter
 (`TaskFilter.Stale`, `?stale=<dur>` / `am ls --stale <dur>`) uses `updated_at`, not `claimed_at` —
@@ -356,9 +360,10 @@ ADR-029 in `decision-records.md`).
 
 - Status validated against `validStatus` map and a SQL `CHECK (status IN (...))` constraint
   (`store.go`, `schema.sql`).
-- Empty title / slug / comment body rejected with `ErrValidation`; slug must not contain spaces
-  (`CreateProject`, `CreateCategory` — category slugs are additionally trimmed + lowercased
-  server-side; `PatchProject` validates a new slug the same way).
+- Empty title / slug / comment body rejected with `ErrValidation`; slug must not contain spaces,
+  `/` or tabs (`CreateProject`, `CreateCategory`). Category and project slugs are both trimmed +
+  lowercased server-side (project slugs via `normalizeProjectSlug`, shared by `CreateProject` and
+  `PatchProject`, which also caps them at 500 bytes).
 - Priority coerced via `toInt`. Unknown PATCH keys are ignored (only known fields applied in
   `PatchTask`).
 - Meta keys validated by `normalizeMetaKey` (1–50 chars of `a-z 0-9 . _ -` after trim+lowercase);
@@ -467,8 +472,8 @@ project deliberately adopts no JS test runner (preserves the single-binary/no-np
 
 ## Risks and Gaps
 
-- **Migration runner is exercised** end-to-end through v5 (`runMigrations`, ADR-010;
-  `currentSchemaVersion = 5`). A DB *newer* than the binary is **not** accepted silently —
+- **Migration runner is exercised** end-to-end through v7 (`runMigrations`, ADR-010;
+  `currentSchemaVersion = 7`). A DB *newer* than the binary is **not** accepted silently —
   `OpenStore` refuses it with a clear "upgrade am" error.
 - **Single-writer** caps write throughput; fine for a personal board, unproven at scale.
 - **No request size/time limits** beyond a 1 MiB body cap and `ReadHeaderTimeout`.

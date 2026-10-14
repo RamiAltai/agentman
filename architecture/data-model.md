@@ -121,7 +121,8 @@ lexically.
   projects, with a **cascade**: default views hide projects/tasks/events under an archived
   category, `next` never picks from one, and task/project creation into one is rejected
   (`ErrCategoryArchived`). An explicit `?category=` scope keeps an archived category inspectable.
-- **`events.id`** — monotonic; doubles as the `?since=` cursor and the SSE `Last-Event-ID`.
+- **`events.id`** — monotonic (`AUTOINCREMENT` since v6, so it stays monotonic across `am db
+  prune`, even `--keep 0`); doubles as the `?since=` cursor and the SSE `Last-Event-ID`.
 - **`events.kind`** — one of `task.created | task.claimed | task.reclaimed | task.status |
   task.assign | task.patched | task.deleted | task.dep_added | task.dep_removed | task.labeled |
   task.unlabeled | comment.added | comment.deleted | project.created | project.archived |
@@ -153,11 +154,13 @@ excluded. These read straight off `tasks`/`events` — no denormalized counter i
 
 ### Indexes
 
-`idx_tasks_project_status(project_id,status)`, `idx_tasks_assignee(assignee)`,
-`idx_tasks_updated(updated_at)`, `idx_task_deps_prereq(depends_on_id)`,
-`idx_task_labels_label(label)`, `idx_task_meta_key(key)`, `idx_comments_task(task_id,id)`,
-`idx_events_since(id)`, `idx_projects_uid(uid)` (UNIQUE), `idx_projects_category(category_id)`,
-`idx_tokens_hash(token_hash)`.
+`idx_tasks_project_status(project_id,status)`, `idx_tasks_assignee(assignee) WHERE assignee IS
+NOT NULL` (partial since v7), `idx_tasks_next(priority,id) WHERE status='todo' AND assignee IS NULL`
+(v7, NextTask's candidate predicate), `idx_tasks_updated(updated_at)`,
+`idx_task_deps_prereq(depends_on_id)`, `idx_task_labels_label(label)`, `idx_task_meta_key(key)`,
+`idx_comments_task(task_id,id)`, `idx_events_since(id)`, `idx_events_task(task_id,id)` (v5/v6),
+`idx_events_created(created_at)` (v6), `idx_events_project(project_id,id)` (v7),
+`idx_projects_uid(uid)` (UNIQUE), `idx_projects_category(category_id)`, `idx_tokens_hash(token_hash)`.
 
 ## Relationships
 

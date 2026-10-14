@@ -19,9 +19,10 @@ go build -o am ./cmd/am
 ```
 
 There is no Makefile or Dockerfile — `go` is the whole build toolchain. CI is configured in
-`.github/workflows/ci.yml` (GitHub Actions): it runs `go build`, `go vet`, `gofmt -l`,
-`go test -race -count=1 ./...`, `node --check cmd/am/web/app.js`, and `govulncheck` on
-every push to `main` and on every pull request. Contributors should expect CI to gate PRs.
+`.github/workflows/ci.yml` (GitHub Actions): job `ci` runs `go build`, `go vet`, `gofmt -l`,
+`go test -race -count=1 ./...` and `node --check cmd/am/web/app.js` on both latest stable Go and
+`go.mod`'s minimum (`GOTOOLCHAIN=local`), and job `govulncheck` runs a pinned `govulncheck` on
+stable, on every push to `main` and on every pull request. Contributors should expect CI to gate PRs.
 
 ## Commands
 

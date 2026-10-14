@@ -311,6 +311,8 @@ re-fetches and re-renders (`onEvent`). The graph overlay uses its own debounced 
   a category board → `category`; `#/all`/overview → unfiltered, filtered client-side via
   `selected.has(t.project)`). The stream is **re-opened on every view change** (`applyView` calls
   `connect()` after loading), so the live scope always matches the view. `onmessage` → `onEvent`;
+  a `reset` event (the server's answer to a cursor past the log's end) sets `cursor = 0` and
+  reloads over REST (`resyncNow()`);
   `onerror` → close + reconnect with exponential backoff (1s→10s) and a "reconnecting…" status.
   `loadFeed()` bootstraps from `/api/events?tail=50` (same `qstr` rule). On the **overview**,
   `onEvent` keeps the global feed live and, on any `task.*`/`project.*`/`category.*` event,

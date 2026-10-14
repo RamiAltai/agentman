@@ -45,7 +45,7 @@ The live dashboard runs at http://127.0.0.1:8787. Use the board when working on 
 tasks or when the user wants progress visible — don't create tickets for trivial requests.
 
 Set your identity once at the start of a task:
-    am init <tasktype>              # e.g. `am init bugfix` → bugfix_060626_4821 (this directory)
+    am init <tasktype>              # e.g. `am init bugfix` → bugfix_060626_4f21a9 (this directory)
     am init <tasktype> -c CAT [-p PROJ]   # SCOPED: confine this identity to a category (or one project)
 Then use `am` normally (`am whoami` shows the id, plus a `scope:` line when scoped).
 The commands below are the work-loop subset. `am help` is the canonical, complete list of
@@ -116,7 +116,10 @@ writes, `am next`/`claim`, `am wait`, project/category changes, token admin — 
 token)**, distinct from exit 8 (out of scope); treat it as "ask the human for a fresh token", not "loop
 again". The plain listings `am projects` / `am categories` and the event feed never check the token, so
 they keep working with a revoked one (see `architecture/security.md`, Known coverage gaps). The human
-manages tokens with `am token ls` / `am token revoke <id>`. `AGENTMAN_TOKEN` overrides the file's
+manages tokens with `am token ls` / `am token revoke <id>` — run `am token new`/`ls`/`revoke` from an
+identity that holds **no** token, not from the directory where `am token new` stored one (a stored
+token makes token admin return 403, or 401 once revoked); use another directory or
+`AGENTMAN_AGENT_FILE=<other file>`. `AGENTMAN_TOKEN` overrides the file's
 token.
 
 **The work loop:** `am next` is the pickup verb — it atomically picks AND claims the

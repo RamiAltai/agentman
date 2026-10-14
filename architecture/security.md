@@ -37,11 +37,14 @@ and no scope header.
   scope-bound, revocable credential. An invalid or
   revoked token → `401 {"error":"unauthorized"}` (CLI **exit 9**) on any endpoint that resolves scope
   (calls `scopeOf`) — never a silent fallthrough to unscoped, so a bad credential hard-fails there
-  (distinct from exit 8's per-id scope-skip). The four unscoped reads listed under Known coverage gaps
+  (distinct from exit 8's per-id scope-skip). The same `401` applies to an `Authorization` header
+  that yields no Bearer token (`Bearer` with an empty token, or another scheme such as `Basic`) — it
+  is not treated as unscoped; only an absent (or entirely empty-valued) header falls through to
+  `X-Agent-Scope`. The four unscoped reads listed under Known coverage gaps
   never resolve the token, so they answer `200` even to a revoked one.
 - **Mint-requires-unscoped (the boundary crux).** All three token-admin endpoints
   (`POST/GET /api/tokens`, `POST /api/tokens/{id}/revoke`) refuse ANY request carrying a scope —
-  header OR a valid bearer token (`tokenAdminGuard` → `403`). Only a fully **unscoped** caller (the
+  header OR a valid bearer token (`unscopedGuard` → `403`). Only a fully **unscoped** caller (the
   human at the CLI/dashboard) administers tokens, so a confined agent can never mint a token for
   another scope.
 

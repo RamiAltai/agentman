@@ -67,7 +67,7 @@ am serve                                 # dashboard + API at http://127.0.0.1:8
 Open **http://127.0.0.1:8787** in your browser. Then, from any project directory:
 
 ```sh
-am init bugfix                           # set this session's identity (e.g. bugfix_060626_4821)
+am init bugfix                           # set this session's identity (e.g. bugfix_060626_4f21a9)
 am project new web "Web" -c general      # every DB starts with a 'general' category
 id=$(am new "fix login" -p web)          # create a task, capture its id
 am claim "$id"                           # take it atomically (exit 4 if already taken)

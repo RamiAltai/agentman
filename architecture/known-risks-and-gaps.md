@@ -24,12 +24,14 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 - **Delete and history residuals** (Low). Hard-delete endpoints exist (`DELETE /api/tasks/{id}`,
   `DELETE /api/tasks/{id}/comments/{cid}`, `DELETE /api/projects/{slug}` cascade via FK; CLI
   `am rm <id>`, `am project rm <slug> --yes`), with these accepted residuals:
-  - **`ref`/`id` reuse** — `tasks.id` is a SQLite rowid (no `AUTOINCREMENT`), so a deleted task's id
-    can be reused by a later insert: wire references are stable while a task lives, but not unique
-    across the whole history (the v5 `created_by` backfill compensates by reading the latest creation
-    event). Likewise a per-project human `ref` (e.g. `web-3`) can be reused if the highest-numbered
-    task in a project is deleted and a new task is then created (accepted, no counter/migration
-    added).
+  - **`ref` reuse** — global ids (`tasks.id`, `projects.id`, `events.id`) are `AUTOINCREMENT` since
+    schema v6 and never reused, but a per-project human `ref` (e.g. `web-3`) can be reused if the
+    highest-numbered task in a project is deleted and a new task is then created (accepted, no
+    counter/migration added).
+  - **Project slugs are reused after delete** — the scope checks for project patch, archive and
+    unarchive (`checkProjectMut`) run outside the store tx, so they can race a delete + recreate of
+    the same slug in another category. Delete (the irreversible one) re-checks the category inside
+    its own tx.
   - **Deleted-project events reappear in the unfiltered feed** — because the archived-event filter is
     `LEFT JOIN projects … p.archived_at IS NULL`, and a deleted project has no row (JOIN yields NULL,
     treated as "not archived"). The `project.deleted` event and the deleted project's earlier history
@@ -119,8 +121,9 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
   read values from `am show <id> --json`.
 - **List-row meta stitch adds one bind variable per returned row** (Low). `ListTasks` fills
   `meta` via a follow-up `SELECT … WHERE task_id IN (?,?,…)` — one placeholder per row, bounded
-  by the list `limit` (the CLI sends 50; the dashboard 500), far below SQLite's bind-variable
-  ceiling. Revisit if the limit cap is ever raised dramatically.
+  by the list `limit` (the CLI sends 50 by default; the dashboard 500), which `GET /api/tasks` caps
+  server-side at 500 (`maxTaskListLimit`; absent or ≤ 0 also means 500), far below SQLite's
+  bind-variable ceiling. Revisit if the cap is ever raised dramatically.
 - **List payloads are no longer strictly terse** (Low). List rows now carry each task's full
   `meta` map (values ≤ 500 bytes each) — a deliberate widening of the "terse projection"
   convention so filters and workers don't need a per-task `GET`. Tasks with many large meta
@@ -131,7 +134,7 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 - **Scope is token-backed but still loopback-only** (Medium, by design). `X-Agent-Scope` alone is
   a client-asserted label (forgeable/omittable, accident prevention). Scope tokens turn it into a
   server-derived credential — a server-minted, scope-bound bearer token whose scope wins over the
-  header, minted only by an unscoped caller (`tokenAdminGuard`), resolved in the single `scopeOf(r)`
+  header, minted only by an unscoped caller (`unscopedGuard`), resolved in the single `scopeOf(r)`
   point. This confines a *token-following* agent that cannot forge another scope's token
   (bad token → 401 → exit 9). **Residual**: not auth against an arbitrary local process — see
   *Scope-Token Residuals* below. → `security.md`, ADR-027, ADR-029.

@@ -75,7 +75,7 @@ to the token's server-bound scope (`store.ResolveToken`) and ignores any header;
 token → `ErrInvalidToken` → `401 unauthorized` → CLI exit 9 (never a silent fallthrough). With no
 token the `X-Agent-Scope` header is the scope. Each handler then runs a `check*`/`narrowScope` helper
 before touching the store. `am next` merges the scope into the `NextFilter` *inside* the atomic
-pick+claim. Token mint/revoke is unscoped-only (`tokenAdminGuard`) and emits **no event**; denials
+pick+claim. Token mint/revoke is unscoped-only (`unscopedGuard`) and emits **no event**; denials
 are logged (`denyScope`) and never broadcast.
 
 **Human action on the dashboard:** identical path — the browser calls the same JSON API; its
@@ -131,7 +131,7 @@ identity scope.
   silently),
   `POST /api/tokens` (mint a scope-bound bearer token — `201` with the plaintext once),
   `GET /api/tokens` (list — never plaintext/hash), `POST /api/tokens/{id}/revoke` (revoke) — all
-  three **require an unscoped caller** (`tokenAdminGuard`; Phase S), and `/` → `http.FileServer` over
+  three **require an unscoped caller** (`unscopedGuard`; Phase S), and `/` → `http.FileServer` over
   `go:embed web`.
   All three DELETE routes return `200 {"status":"deleted"}`; `ErrNotFound` → 404.
   (Uses Go 1.22+ method+pattern ServeMux, e.g. `"GET /api/tasks/{id}"`.)

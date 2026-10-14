@@ -57,9 +57,10 @@ convention is loose, it's called out.
   a *config-following* agent that cannot forge another scope's token — but it is **not** a security
   control against an arbitrary local process (a filesystem read of the identity file = token
   possession). `X-Agent-Scope` alone is purely client-asserted accident prevention (`security.md`).
-- **Mint-requires-unscoped.** `tokenAdminGuard` refuses `POST/GET /api/tokens` and
+- **Mint-requires-unscoped.** `unscopedGuard` refuses `POST/GET /api/tokens` and
   `POST /api/tokens/{id}/revoke` for ANY scoped caller (header OR a valid token) with `denyScope`
-  (the `handleCreateCategory` precedent), so only an unscoped human administers tokens.
+  so only an unscoped human administers tokens. The same guard gates the category writes
+  (`POST /api/categories`, archive/unarchive).
 - **Denials are log-only.** `denyScope` logs `agentman: out_of_scope: actor=<id> scope=<scope>
   <METHOD> <PATH>` and returns `ErrOutOfScope`. **No `scope.denied` event kind** — never feed
   denials into the SSE stream (noise + a partial-information leak). The event catalog stays at 21.
@@ -188,8 +189,9 @@ gofmt -w cmd/am             # auto-format
 
 **Before submitting:** `gofmt -w`, `go vet ./...`, `go test ./...` all clean, and update the
 matching `architecture/` doc. (`gofmt -l cmd/am` is currently empty — no outstanding format drift.)
-CI (`.github/workflows/ci.yml`) enforces the same checks — build, vet, gofmt, test(-race),
-JS syntax (`node --check`), and `govulncheck` — on every push to `main` and on every PR.
+CI (`.github/workflows/ci.yml`) enforces the same checks — build, vet, gofmt, test(-race) and
+JS syntax (`node --check`) on both latest stable Go and `go.mod`'s minimum (`GOTOOLCHAIN=local`),
+plus `govulncheck` in a separate job on stable — on every push to `main` and on every PR.
 
 ## SVG Convention
 
