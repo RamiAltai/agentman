@@ -106,6 +106,7 @@ func cmdWait(c *Client, a Args) {
 			return
 		}
 		br := bufio.NewReader(resp.Body)
+		pending := false // a relevant event whose re-check is deferred
 		for {
 			evID, data, err := readSSEFrame(br)
 			if err != nil {
@@ -120,15 +121,19 @@ func cmdWait(c *Client, a Args) {
 				var e struct {
 					TaskID int64 `json:"task_id"`
 				}
-				if json.Unmarshal(data, &e) != nil || e.TaskID != taskID {
-					continue
+				if json.Unmarshal(data, &e) == nil && e.TaskID == taskID {
+					pending = true
 				}
+			} else {
+				pending = true
 			}
 			// Coalesce a burst: frames already buffered are read first, so k
-			// queued events cost one re-check (the last one), not k.
-			if eventBuffered(br) {
+			// queued events cost one re-check, not k. The deferred re-check
+			// runs once the buffer drains, even if the last frame is irrelevant.
+			if !pending || eventBuffered(br) {
 				continue
 			}
+			pending = false
 			if t, met := check(); met {
 				resp.Body.Close()
 				connCancel()
