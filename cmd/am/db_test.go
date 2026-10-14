@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -243,7 +244,9 @@ func TestExportImportRoundtrip(t *testing.T) {
 	}
 }
 
-// TestImportCreatesBackup: importing over an existing DB creates a backup.
+// TestImportCreatesBackup: importing over an existing DB backs up the OLD
+// contents (0600) and leaves the NEW contents at dest. Both DBs carry a
+// distinct project so a swapped or empty backup cannot pass.
 func TestImportCreatesBackup(t *testing.T) {
 	// Point away from any live server so isServerRunning returns false.
 	t.Setenv("AGENTMAN_URL", "http://127.0.0.1:19999")
@@ -251,6 +254,9 @@ func TestImportCreatesBackup(t *testing.T) {
 	srcDB := filepath.Join(t.TempDir(), "src.db")
 	store, err := OpenStore(srcDB)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.CreateProject("newproj", "New", ""); err != nil {
 		t.Fatal(err)
 	}
 	store.Close()
@@ -266,6 +272,9 @@ func TestImportCreatesBackup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, _, err := store2.CreateProject("oldproj", "Old", ""); err != nil {
+		t.Fatal(err)
+	}
 	store2.Close()
 
 	backupDir := t.TempDir()
@@ -273,19 +282,23 @@ func TestImportCreatesBackup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A backup file should exist in backupDir
+	// Exactly one backup file, 0600, holding the pre-import data.
 	entries, err := os.ReadDir(backupDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) == 0 {
-		t.Error("expected backup file in backupDir, got none")
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 backup file in backupDir, got %d", len(entries))
 	}
-	for _, e := range entries {
-		info, _ := e.Info()
-		if info.Mode().Perm() != 0o600 {
-			t.Errorf("backup %s perm = %o, want 0o600", e.Name(), info.Mode().Perm())
-		}
+	info, _ := entries[0].Info()
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("backup %s perm = %o, want 0o600", entries[0].Name(), info.Mode().Perm())
+	}
+	if got := cwfDbProjects(t, filepath.Join(backupDir, entries[0].Name())); len(got) != 1 || got[0] != "oldproj" {
+		t.Errorf("backup projects = %v, want [oldproj]", got)
+	}
+	if got := cwfDbProjects(t, destDB); len(got) != 1 || got[0] != "newproj" {
+		t.Errorf("dest projects after import = %v, want [newproj]", got)
 	}
 }
 
@@ -297,8 +310,8 @@ func TestValidateImportCandidateRejectsGarbage(t *testing.T) {
 	}
 	f.WriteString("this is not a sqlite database at all")
 	f.Close()
-	if err := validateImportCandidate(f.Name()); err == nil {
-		t.Error("expected error validating garbage file, got nil")
+	if err := validateImportCandidate(f.Name()); err == nil || !strings.Contains(err.Error(), "integrity_check") {
+		t.Errorf("validating garbage file: err = %v, want an integrity_check error", err)
 	}
 }
 
@@ -430,8 +443,8 @@ func TestImportRejectsNewerSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	st.Close()
-	if err := validateImportCandidate(srcDB); err == nil {
-		t.Fatalf("schema_version %d snapshot accepted, want rejection", currentSchemaVersion+1)
+	if err := validateImportCandidate(srcDB); err == nil || !strings.Contains(err.Error(), "newer than supported") {
+		t.Fatalf("schema_version %d snapshot: err = %v, want 'newer than supported'", currentSchemaVersion+1, err)
 	}
 }
 

@@ -9,15 +9,25 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Build/test on the latest stable Go (the toolchain the govulncheck job scans with) AND on
+    # go.mod's declared minimum, so code needing a newer Go than users are promised fails here.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - go-version: 'stable'
+          - go-version-file: 'go.mod'
+    env:
+      # Never let `go` silently download a newer toolchain: that would hide a too-new API.
+      GOTOOLCHAIN: local
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          # Build/test on the latest stable Go, the same toolchain the govulncheck job scans
-          # with (see there). go.mod still declares the 1.25.11 *minimum* for users.
-          go-version: 'stable'
+          go-version: ${{ matrix.go-version }}
+          go-version-file: ${{ matrix.go-version-file }}
           cache: true
 
       - name: Build
