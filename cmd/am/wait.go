@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -122,6 +123,11 @@ func cmdWait(c *Client, a Args) {
 				if json.Unmarshal(data, &e) != nil || e.TaskID != taskID {
 					continue
 				}
+			}
+			// Coalesce a burst: frames already buffered are read first, so k
+			// queued events cost one re-check (the last one), not k.
+			if eventBuffered(br) {
+				continue
 			}
 			if t, met := check(); met {
 				resp.Body.Close()
@@ -290,6 +296,14 @@ func (w *waiter) checkReady(project, category, metaKey string) (*Task, bool) {
 		return nil, false
 	}
 	return &tasks[0], true
+}
+
+// eventBuffered reports whether br already holds a complete event frame, so
+// reading it cannot block. A false negative only costs an extra re-check.
+func eventBuffered(br *bufio.Reader) bool {
+	b, _ := br.Peek(br.Buffered())
+	i := bytes.Index(b, []byte("data: "))
+	return i >= 0 && bytes.Contains(b[i:], []byte("\n\n"))
 }
 
 // readSSEFrame reads one SSE event (id + data, terminated by a blank line),
