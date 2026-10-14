@@ -294,6 +294,14 @@ func TestSSEStaleCursorResets(t *testing.T) {
 	resp, br := dialStream(t, ctx, ts, "/api/stream", map[string]string{"Last-Event-ID": "999999"})
 	defer resp.Body.Close()
 	waitForRetry(t, ctx, br)
+	// The stale cursor is announced (so the dashboard reloads) instead of
+	// replaying the whole log.
+	for _, want := range []string{"", "event: reset", "data: {}"} {
+		line, err := br.ReadString('\n')
+		if got := strings.TrimRight(line, "\r\n"); err != nil || got != want {
+			t.Fatalf("after retry: line %q (err %v), want %q", got, err, want)
+		}
+	}
 
 	mustCreateTask(t, ts, "stale", "after reset")
 	ev := readSSEUntil(t, ctx, br, func(e sseEvent) bool { return e.kind == "task.created" })

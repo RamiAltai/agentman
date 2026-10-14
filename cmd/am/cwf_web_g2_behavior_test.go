@@ -75,7 +75,7 @@ func TestCwfWebGraphPanZoomUniformScale(t *testing.T) {
 func TestCwfWebGraphPanKeepsSelection(t *testing.T) {
 	p := cwfWebFunc(t, cwfWebAppJS(t), "installGraphPanZoom")
 	cwfWebHas(t, "installGraphPanZoom mousemove", p, "graphDragMoved = true")
-	cwfWebHas(t, "installGraphPanZoom", p, `if (graphDragMoved) { graphDragMoved = false; ev.stopPropagation(); }
+	cwfWebHas(t, "installGraphPanZoom", p, `if (graphDragMoved) { graphDragMoved = false; ev.stopImmediatePropagation(); }
   }, true);`)
 }
 

@@ -836,15 +836,20 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	since := atoi64Default(r.Header.Get("Last-Event-ID"), atoi64Default(q.Get("since"), 0))
 	maxAtSub, _ := s.store.MaxEventID()
 	// A cursor beyond the log's end belongs to another history (the DB was
-	// replaced by `am db import`, or emptied by `am db prune`): keeping it
-	// would dedupe away every live event until ids climb past it. Replay
-	// from the start instead.
-	if since > maxAtSub {
-		since = 0
+	// replaced by an older snapshot via `am db import`): keeping it would
+	// dedupe away every live event until ids climb past it, and replaying the
+	// whole log would flood the client. Resume from the log's end and send a
+	// "reset" event so the client reloads its snapshot over REST.
+	reset := since > maxAtSub
+	if reset {
+		since = maxAtSub
 	}
 	lastSent := since
 
 	fmt.Fprint(w, "retry: 3000\n\n")
+	if reset {
+		fmt.Fprint(w, "event: reset\ndata: {}\n\n")
+	}
 	flusher.Flush()
 
 	// Replay the gap (since, maxAtSub] from the durable log, page by page:

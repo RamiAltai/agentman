@@ -1663,6 +1663,9 @@ function connect() {
     if (streamDropped) { streamDropped = false; resyncNow(); }
   };
   es.onmessage = (m) => { let ev; try { ev = JSON.parse(m.data); } catch (e) { return; } onEvent(ev); };
+  // The server's log no longer reaches our cursor (an older snapshot was
+  // imported): drop the cursor so new, lower ids are accepted, and reload.
+  es.addEventListener("reset", () => { cursor = 0; resyncNow(); });
   es.onerror = () => {
     es.close();
     streamDropped = true;
@@ -2647,8 +2650,10 @@ function installGraphPanZoom(svgEl) {
   svgEl.addEventListener("mouseleave", () => { graphDragState = null; graphDragMoved = false; });
   // A pan ends in a click on the surface; swallow it (capture phase, before the
   // surface/svg deselect handlers) so panning keeps the selected node and its path.
+  // stopImmediatePropagation: when the pan started on bare canvas the svg itself is
+  // the target, and its own deselect listener below would still run.
   svgEl.addEventListener("click", (ev) => {
-    if (graphDragMoved) { graphDragMoved = false; ev.stopPropagation(); }
+    if (graphDragMoved) { graphDragMoved = false; ev.stopImmediatePropagation(); }
   }, true);
   svgEl.addEventListener("click", (ev) => { if (ev.target === svgEl) selectGraphNode(null); });
 }

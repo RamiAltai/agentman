@@ -24,7 +24,7 @@ type Client struct {
 }
 
 func NewClient() *Client {
-	base := envOr("AGENTMAN_URL", "http://127.0.0.1:8787")
+	base := serverURL()
 	return &Client{
 		base:  strings.TrimRight(base, "/"),
 		agent: resolveAgent(),

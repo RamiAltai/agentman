@@ -108,7 +108,7 @@ func cmdDB(a Args) {
 	case "import":
 		srcPath := a.at(1)
 		if srcPath == "" {
-			fail(1, "am db import: missing source path")
+			usageErr("am db import: missing source path")
 		}
 		dbPath := dbPathFromArgs(a)
 		backupDir := filepath.Dir(dbPath)
@@ -124,18 +124,18 @@ func cmdDB(a Args) {
 
 		// Require exactly one of --before / --keep.
 		if (beforeDate == "") == (keepStr == "") {
-			fail(1, "am db prune: provide exactly one of --before <YYYY-MM-DD> or --keep <N>")
+			usageErr("am db prune: provide exactly one of --before <YYYY-MM-DD> or --keep <N>")
 		}
 		// Validate the date up front (before the confirmation prompt); a typo
 		// like 2026-13-99 would otherwise silently prune the wrong rows.
 		if beforeDate != "" && !validDate(beforeDate) {
-			fail(1, "am db prune: --before must be a valid YYYY-MM-DD date (got %q)", beforeDate)
+			usageErr("am db prune: --before must be a valid YYYY-MM-DD date (got %q)", beforeDate)
 		}
 		var keepN int
 		if keepStr != "" {
 			v, err := strconv.Atoi(keepStr)
 			if err != nil || v < 1 {
-				fail(1, "am db prune: --keep must be a positive integer")
+				usageErr("am db prune: --keep must be a positive integer")
 			}
 			keepN = v
 		}
@@ -162,7 +162,7 @@ func cmdDB(a Args) {
 		}
 		fmt.Fprintf(os.Stderr, "pruned %d events\n", n)
 	default:
-		fail(1, "usage: am db <export|import|prune> ...")
+		usageErr("usage: am db <export|import|prune> ...")
 	}
 }
 

@@ -96,9 +96,7 @@ func serveConfig(a Args) (port, dbPath, proposals string) {
 	if port = a.flag("port"); port == "" {
 		port = envOr("AGENTMAN_PORT", "8787")
 	}
-	if dbPath = a.flag("db"); dbPath == "" {
-		dbPath = envOr("AGENTMAN_DB", defaultDBPath())
-	}
+	dbPath = dbPathFromArgs(a) // shared with `am db`, so both act on the same file
 	if proposals = a.flag("proposals"); proposals == "" {
 		proposals = envOr("AGENTMAN_PROPOSALS", "meta/proposals")
 	}

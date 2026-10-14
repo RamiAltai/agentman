@@ -217,8 +217,10 @@ function defaultRoute(path) {
 }
 const streams = [];
 class FakeEventSource {
-  constructor(url) { this.url = url; this.readyState = 1; streams.push(this); }
+  constructor(url) { this.url = url; this.readyState = 1; this.listeners = {}; streams.push(this); }
   close() { this.readyState = 2; }
+  addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
+  emit(type, data) { (this.listeners[type] || []).forEach((fn) => fn({ data })); }
 }
 const store = new Map();
 
@@ -398,7 +400,14 @@ assert(coalesceTimers.overview, "overview refresh scheduled");
 assert(!coalesceTimers.board, "no board reconcile on the overview");
 H.fetchLog.length = 0;
 H.runTimers(); await H.settle();
-assert(H.fetchLog.some((f) => f.path === "/api/categories"), "overview reloads categories");`)
+assert(H.fetchLog.some((f) => f.path === "/api/categories"), "overview reloads categories");
+// A "reset" frame (server log no longer reaches our cursor) drops the cursor and reloads.
+H.fetchLog.length = 0;
+H.streams[H.streams.length - 1].emit("reset", "{}");
+await H.settle();
+assert(H.fetchLog.some((f) => f.path.startsWith("/api/events")), "reset reloads the feed");
+onEvent({ id: 3, kind: "task.created", task_id: 3, actor: "bob" });
+eq(feed.children[0].dataset.id, "3", "after reset a lower id is accepted");`)
 }
 
 // FIND-0387: the edit-project form PATCHes only the changed fields, follows a
@@ -633,6 +642,9 @@ drag(svgEl.querySelector(".graph-pan-surface"), 100, 50);
 const u = 1 / Math.min(1000 / v0.width, 640 / v0.height);
 eq([graphViewState.x, graphViewState.y], [v0.x - 100 * u, v0.y - 50 * u], "pan moves the view by the uniform scale");
 eq(graphSelectedId, 2, "pan keeps the selection");
+// A pan that starts on bare canvas (the svg itself is the target) keeps it too.
+drag(svgEl, -100, -50);
+eq(graphSelectedId, 2, "canvas pan keeps the selection");
 // A plain click on the canvas clears it.
 H.fire(svgEl, "click", {});
 eq(graphSelectedId, null, "background click deselects");

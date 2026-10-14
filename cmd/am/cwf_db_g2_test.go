@@ -311,22 +311,23 @@ func TestCwfDbCmdDB(t *testing.T) {
 		name string
 		argv []string
 		want string
+		code int // usage errors exit 5 like every other verb (FIND-0055); I/O errors exit 1
 	}{
-		{"no subcommand", nil, "usage: am db"},
-		{"unknown subcommand", []string{"nuke"}, "usage: am db"},
-		{"import without source", []string{"import", "--db", db}, "missing source path"},
-		{"prune neither flag", []string{"prune", "--db", db}, "exactly one of"},
-		{"prune both flags", []string{"prune", "--db", db, "--keep", "1", "--before", "2024-01-01"}, "exactly one of"},
-		{"prune bad date", []string{"prune", "--db", db, "--before", "2026-13-99", "--yes"}, "valid YYYY-MM-DD"},
-		{"prune zero keep", []string{"prune", "--db", db, "--keep", "0", "--yes"}, "positive integer"},
-		{"prune negative keep", []string{"prune", "--db", db, "--keep=-1", "--yes"}, "positive integer"},
-		{"prune non-numeric keep", []string{"prune", "--db", db, "--keep", "abc", "--yes"}, "positive integer"},
-		{"export missing source", []string{"export", filepath.Join(t.TempDir(), "o.db"), "--db", filepath.Join(t.TempDir(), "nope.db")}, "not found"},
+		{"no subcommand", nil, "usage: am db", 5},
+		{"unknown subcommand", []string{"nuke"}, "usage: am db", 5},
+		{"import without source", []string{"import", "--db", db}, "missing source path", 5},
+		{"prune neither flag", []string{"prune", "--db", db}, "exactly one of", 5},
+		{"prune both flags", []string{"prune", "--db", db, "--keep", "1", "--before", "2024-01-01"}, "exactly one of", 5},
+		{"prune bad date", []string{"prune", "--db", db, "--before", "2026-13-99", "--yes"}, "valid YYYY-MM-DD", 5},
+		{"prune zero keep", []string{"prune", "--db", db, "--keep", "0", "--yes"}, "positive integer", 5},
+		{"prune negative keep", []string{"prune", "--db", db, "--keep=-1", "--yes"}, "positive integer", 5},
+		{"prune non-numeric keep", []string{"prune", "--db", db, "--keep", "abc", "--yes"}, "positive integer", 5},
+		{"export missing source", []string{"export", filepath.Join(t.TempDir(), "o.db"), "--db", filepath.Join(t.TempDir(), "nope.db")}, "not found", 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			code, stderr := run(tc.argv...)
-			if code != 1 || !strings.Contains(stderr, tc.want) {
-				t.Fatalf("cmdDB(%q) = exit %d, stderr %q; want exit 1 with %q", tc.argv, code, stderr, tc.want)
+			if code != tc.code || !strings.Contains(stderr, tc.want) {
+				t.Fatalf("cmdDB(%q) = exit %d, stderr %q; want exit %d with %q", tc.argv, code, stderr, tc.code, tc.want)
 			}
 			if got := cwfDbEventCount(t, db); got != total {
 				t.Fatalf("events = %d after a refused command, want %d", got, total)
