@@ -22,7 +22,7 @@ lexically.
 | `task_meta` | Free-form `key → value` pairs on tasks (values opaque; key PRESENCE is the filterable unit; no catalog) | `schema.sql`, `store.go Task.Meta` |
 | `tokens` | Scope-bound bearer credentials (Phase S): stores only the **sha256 hash** of each token, never the plaintext | `schema.sql`, `store.go Token` |
 | `comments` | Threaded notes on a task | `schema.sql`, `store.go Comment` |
-| `events` | Append-only mutation log = activity feed + SSE backbone + cursor | `schema.sql`, `store.go Event` |
+| `events` | Append-only mutation log = activity feed + SSE backbone + cursor (rows removed only by the offline `am db prune`) | `schema.sql`, `store.go Event` |
 
 ### Important fields
 
@@ -178,7 +178,9 @@ Ownership: a category groups projects (no delete cascade — categories are only
 a project owns its tasks; a task owns its comments, its labels, its meta pairs, and its dependency
 edges (both directions cascade). Cascade deletes flow project → tasks → comments; deleting a task
 also removes its `task_labels` and `task_meta` rows and all `task_deps` rows where it is either
-the dependent or the prerequisite. **Events are never deleted** (append-only).
+the dependent or the prerequisite. **Events are never deleted by task/project/comment deletes**
+(append-only); they are removed only by the offline `am db prune`, so the event history can have a
+pruned prefix — anything that replays or backfills from events must tolerate missing rows.
 
 ## Sensitive Data
 

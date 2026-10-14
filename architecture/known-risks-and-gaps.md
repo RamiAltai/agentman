@@ -39,10 +39,11 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
     running) exist, but:
     - `am db prune` is **manual and offline** — no automated compaction; a long-running instance
       still grows until an operator runs it.
-    - The `isServerRunning` offline guard checks `AGENTMAN_URL` (default `http://127.0.0.1:8787`). A
-      server running on a non-default port with `AGENTMAN_URL` unset/mismatched would **not** be
-      detected, so `am db import` and `am db prune` could run against a live DB. The documented
-      instruction is "stop `am serve` first"; the guard is bypassable on non-default ports.
+    - The offline guard has two layers: the `isServerRunning` HTTP probe checks only `AGENTMAN_URL`
+      (default `http://127.0.0.1:8787`), and `ensureDBNotInUse` then takes an exclusive lock on the
+      DB file, which refuses while any process (a server on any port included) holds it open. The
+      lock check runs after the confirmation prompt, so a server on a non-default port with
+      `AGENTMAN_URL` unset is refused only after the user confirms — late, but before any write.
     - The dashboard's paginated feed (`feedPaginated = true`) **disables `trimFeed`** — a
       long-running tab that has clicked "Load older" can grow the feed unbounded until the next reload.
   - **`comments` growth is still unbounded** — comments are only removed individually via the

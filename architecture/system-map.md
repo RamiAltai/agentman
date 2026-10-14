@@ -43,8 +43,9 @@ Unknown/absent: no `internal/`, `pkg/`, `Makefile`, `Dockerfile`, or `.gorelease
 
 - **Process entry:** `cmd/am/main.go` `func main()`. It reads `os.Args[1]` and dispatches.
   Local-only verbs (`init`, `whoami`, `version`, `update`, `db`) run without a server — `db`
-  dispatches before the `Client` is built, operating directly on the SQLite file (`export`,
-  `import`, and `prune` all refuse while a server is running); everything else
+  dispatches before the `Client` is built, operating directly on the SQLite file (`import` and
+  `prune` refuse while a server is running; `export` is a `VACUUM INTO` snapshot that works
+  alongside one); everything else
   constructs a `Client` (`NewClient()`); `serve` calls `runServe()`.
 - **Server entry:** `runServe()` opens the store, builds `Server` (`NewServer`), sets the proposals
   carve-out project from `--proposals CAT/PROJ` / `AGENTMAN_PROPOSALS` (default `meta/proposals`;

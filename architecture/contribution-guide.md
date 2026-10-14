@@ -138,13 +138,25 @@ sink guard in `web_test.go`. Behavioral dashboard JS logic is not automatically 
 
 ## Adding Backend Functionality (e.g. a new endpoint)
 
-1. Register the route in `Server.Handler()` (`server.go`), e.g. `mux.HandleFunc("DELETE /api/tasks/{id}", s.handleDeleteTask)`.
-2. Write `handleDeleteTask` — decode/validate, call a store method, `writeErr` on error.
-3. Add the store method in `store.go` — parameterized SQL, mutation + `events` row in one tx,
-   return `(result, *Event, error)`.
-4. In the handler, `hub.Broadcast(ev)` **after** the store call returns.
-5. Add the new event kind to the dashboard (`web/app.js evText`/`describeText`) if it should show.
-6. (Recommended) add a test for the new behavior.
+1. Register the route in `Server.Handler()` (`server.go`), e.g. a hypothetical
+   `mux.HandleFunc("POST /api/tasks/{id}/pin", s.handlePinTask)`. Model the handler on a real one
+   such as `handleDeleteTask`.
+2. **Resolve and check scope before any store call.** Call `sc, err := s.scopeOf(r)` (the only place
+   a bad or revoked token becomes `401` → exit 9), then gate with the matching helper:
+   `checkTaskMut`/`checkTaskRead`, `checkProjectMut`/`checkProjectRead`, `checkCreate`,
+   `checkComment` for a named target; `narrowScope` for a list/pickup filter; `unscopedGuard` for
+   unscoped-only admin. Mutating an existing task or project? `s.mutableTask(w, r)` /
+   `s.mutableProject(w, r, slug)` do the resolve + `scopeOf` + check in one call (as
+   `handleDeleteTask` does). A route that skips this is open to every scope (ADR-027) — only do that
+   for a deliberate unscoped read, and list it under `security.md` Known coverage gaps.
+3. Write the rest of the handler — decode/validate, call the store method inside
+   `s.publish(func() (*Event, error) { … })`, `writeErr` on error.
+4. Add the store method in `store.go` — parameterized SQL, mutation + `events` row in one tx,
+   return `(…, *Event, error)`.
+5. `s.publish` broadcasts the returned event **after** the store call commits, under `commitMu` so
+   events reach the hub in id order — do not call `hub.Broadcast` yourself.
+6. Add the new event kind to the dashboard (`web/app.js evText`/`describeText`) if it should show.
+7. (Recommended) add a test for the new behavior, including a scoped caller being refused.
 
 ## Adding Frontend Functionality
 
@@ -185,7 +197,9 @@ sink guard in `web_test.go`. Behavioral dashboard JS logic is not automatically 
 
 - Forgetting to rebuild after a `web/` edit (stale embedded UI).
 - Printing to stdout in a CLI command (breaks `id=$(am new …)` and wastes agent tokens).
-- Broadcasting before commit, or doing SQL in a handler instead of the store.
+- Broadcasting before commit (or outside `s.publish`), or doing SQL in a handler instead of the store.
+- Skipping the scope pre-check (`scopeOf` + a `check*`/`narrowScope` helper) in a new handler — the
+  route then serves every scope and never returns `401` for a revoked token.
 - Assuming a schema change reaches existing DBs (it won't).
 - Running `am serve` against your real `~/.agentman/agentman.db` while testing — use `--db /tmp/...`.
 

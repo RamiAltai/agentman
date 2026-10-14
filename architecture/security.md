@@ -37,9 +37,10 @@ and no scope header.
   a token is set). The token is **server-minted and bound to a scope**, so a config-following agent
   that holds only its own token **cannot forge a token for another scope** — a server-minted,
   scope-bound, revocable credential. An invalid or
-  revoked token → `401 {"error":"unauthorized"}` (CLI **exit 9**) on ANY endpoint — `scopeOf` surfaces
-  it, never a silent fallthrough to unscoped, so a bad credential hard-fails (distinct from exit 8's
-  per-id scope-skip).
+  revoked token → `401 {"error":"unauthorized"}` (CLI **exit 9**) on any endpoint that resolves scope
+  (calls `scopeOf`) — never a silent fallthrough to unscoped, so a bad credential hard-fails there
+  (distinct from exit 8's per-id scope-skip). The four unscoped reads listed under Known coverage gaps
+  never resolve the token, so they answer `200` even to a revoked one.
 - **Mint-requires-unscoped (the boundary crux).** All three token-admin endpoints
   (`POST/GET /api/tokens`, `POST /api/tokens/{id}/revoke`) refuse ANY request carrying a scope —
   header OR a valid bearer token (`tokenAdminGuard` → `403`). Only a fully **unscoped** caller (the
@@ -75,6 +76,10 @@ alone, no handler touches it.
 - `GET /api/projects` and `GET /api/categories` list endpoints are **not** narrowed — board
   metadata (slugs/names) is visible to any scope; task *data* is the enforcement point
   (`/api/categories` is unscoped on purpose — it serves the unscoped human dashboard).
+- `GET /api/events`, `GET /api/stream`, `GET /api/projects` and `GET /api/categories` also **skip
+  token validation** — they never call `scopeOf`, so an invalid or revoked bearer token gets `200`,
+  not `401`, and `am projects` / `am categories` never exit 9. A revoked token is caught on the next
+  scope-checked call (any task read/write, `am wait`'s re-check, a project/category mutation).
 - An explicit unknown `?project=` for a scoped agent returns 403 (not 404/empty) — the server
   cannot prove it in-scope, so it fails loud (mild existence ambiguity, accepted).
 

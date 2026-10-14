@@ -249,7 +249,8 @@ without evidence.
   surface (ADR-011) and avoids fighting the single-writer connection (ADR-003). Events-only scope
   is intentional — tasks/comments already have hard-delete; event rows are denormalized (ADR-004),
   so pruning them doesn't break referential integrity.
-- Residuals: prune is manual, the `isServerRunning` guard is bypassable on non-default ports, and a
+- Residuals: prune is manual, the `isServerRunning` HTTP probe misses non-default ports (the
+  `ensureDBNotInUse` file-lock check behind it catches them, after the prompt), and a
   paginated feed disables `trimFeed` — all catalogued in `known-risks-and-gaps.md`.
 - Evidence: `cmd/am/store.go` (`ListEventsBefore`); `cmd/am/server.go` (`handleEvents` `?before=`
   branch); `cmd/am/db.go` (`pruneEvents`, `cmdDB` prune case); `cmd/am/web/app.js`

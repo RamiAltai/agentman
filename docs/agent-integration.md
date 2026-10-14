@@ -105,13 +105,17 @@ gain a scope.
 To make the scope server-enforced, a human (an **unscoped** operator) mints a token for the agent:
 `tok=$(am token new --scope work)` (or `work/api` for one project). That prints the token once on
 stdout, stores it in this directory's identity, and from then on the agent's CLI sends it as
-`Authorization: Bearer` on every request — the server derives the scope from the token (it **wins
-over** any header), so a config-following agent that holds only its own token cannot act as another
-scope. The agent never mints its own token (minting requires an unscoped caller — a scoped agent gets
-exit 8). `am whoami` shows `token: set` (never the value). If a token is **invalid or revoked**, every
-command fails with **exit 9 (bad token)** — distinct from exit 8 (out of scope); treat it as "ask the
-human for a fresh token", not "loop again". The human manages tokens with `am token ls` / `am token
-revoke <id>`. `AGENTMAN_TOKEN` overrides the file's token.
+`Authorization: Bearer` on every request (`am wait`'s stream and re-checks included) — the server
+derives the scope from the token (it **wins over** any header), so a config-following agent that holds
+only its own token cannot act as another scope. The agent never mints its own token (minting requires
+an unscoped caller — a scoped agent gets exit 8). `am whoami` shows `token: set` (never the value). If
+a token is **invalid or revoked**, every command that reaches a scope-checked endpoint — task reads and
+writes, `am next`/`claim`, `am wait`, project/category changes, token admin — fails with **exit 9 (bad
+token)**, distinct from exit 8 (out of scope); treat it as "ask the human for a fresh token", not "loop
+again". The plain listings `am projects` / `am categories` and the event feed never check the token, so
+they keep working with a revoked one (see `architecture/security.md`, Known coverage gaps). The human
+manages tokens with `am token ls` / `am token revoke <id>`. `AGENTMAN_TOKEN` overrides the file's
+token.
 
 **The work loop:** `am next` is the pickup verb — it atomically picks AND claims the
 highest-priority ready task (FIFO within a priority), so two agents calling it concurrently
@@ -121,9 +125,11 @@ prerequisite someone else owns? `am wait <id> --done` blocks until that task is 
 (`--timeout 5m` to bound it; exit 7 = timed out, condition not met). `am next` skips tasks
 already assigned to you — claim those explicitly with `am claim <id>`. Note the ready filter
 (`am ls --ready`, `am wait --ready`) is wider than `am next`: it includes todo tasks that are
-pre-assigned to someone, which `am next` never picks — so a `wait --ready && next` loop can
-wake on a pre-assigned task and get exit 3 from `next`. Treat exit 3 there as "loop again",
-not an error.
+pre-assigned to someone, and (with an explicit `-p`/`-c`) tasks in an archived project or
+category — `am next` picks neither. While such a task stays ready, `am wait --ready` returns
+at once and `next` exits 3, so a `wait --ready && next` loop that retries immediately spins
+against the server. Treat exit 3 there as "nothing for me yet": sleep before looping again
+(see the worker loop below), and `am claim` any task pre-assigned to you.
 
 **Metadata & the worker loop:** tasks can carry free-form `key=value` metadata
 (`am new … --meta auto=true --meta packet=plan.md`, `am edit <id> --meta k=v`; `--meta k=`
@@ -131,15 +137,18 @@ removes). `--meta KEY` on `ls`/`next`/`wait --ready` filters by the KEY's **pres
 are opaque to the board and never filtered on. A worker that should only handle tasks marked for
 it loops like this:
 
-    am wait --ready --meta auto    # block until a ready task carrying `auto` exists
-    id=$(am next --meta auto)      # atomically claim it (exit 3 = someone else got it → loop again)
-    am show "$id" --json           # read the values from the "meta" object (e.g. packet=plan.md)
+    while :; do
+      am wait --ready --meta auto >/dev/null; rc=$?  # block until a ready task carrying `auto` exists
+      [ $rc = 7 ] && continue                        # timed out (default 10m) → wait again
+      [ $rc = 0 ] || break                           # 6 server down, 9 bad token, … → stop
+      id=$(am next --meta auto) || { sleep 5; continue; }  # exit 3: taken, or not pickable → back off
+      am show "$id" --json                           # read the "meta" object (e.g. packet=plan.md)
+    done
 
-`wait --ready --meta K` and `next --meta K` apply the **same predicate**, so a task that releases
-the wait is always pickable by `next` and the loop never hot-spins on ready tasks that don't carry
-the key. The pre-assigned caveat above still applies (`wait --ready` can wake on a task
-pre-assigned to someone, which `next` never picks) — treat exit 3 from `next` as "loop again",
-not an error.
+`--meta K` narrows `wait --ready` and `next` by the same key-presence filter, so a ready task
+*without* the key never wakes the loop. The two still differ on the rest of the predicate (the
+pre-assigned / archived caveat above): `wait --ready` can return for a task `next` will never
+pick, which is why the loop sleeps on exit 3 instead of retrying at once.
 
 **Dependencies:** if a task has unfinished prerequisites, claiming it fails with exit 4 and a
 message like `claim: #5 blocked — prereqs not done (#2 #3)`. `am next` only returns tasks with
@@ -256,6 +265,12 @@ am db import <path> [--yes] # validate, back up the current DB, then replace it
 Default export path is a timestamped file in the current directory. `import` validates the
 candidate, **refuses while a server is running**, prompts unless `--yes`, and backs up the
 existing DB into the DB's directory first. Stop `am serve` before importing.
+
+`import` and `prune` detect a running server two ways: an HTTP probe of `AGENTMAN_URL` (default
+`http://127.0.0.1:8787`), checked before the prompt, and a lock check on the DB file itself, which
+catches a server on any port (`--port`/`AGENTMAN_PORT`) but runs after the prompt. So with a server
+on a non-default port and `AGENTMAN_URL` unset, the refusal comes only after you confirm; set
+`AGENTMAN_URL` to get it up front.
 
 To trim old events on a long-running instance (stop `am serve` first):
 
