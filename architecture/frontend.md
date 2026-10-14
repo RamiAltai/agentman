@@ -9,10 +9,11 @@ not use it.
 
 **None — intentional.** Vanilla HTML/CSS/JavaScript, no framework, no bundler, no npm, no build
 step. The only DOM construction helpers are `el(tag, props, ...kids)` (HTML) and `svg(tag, attrs)`
-(SVG) in `app.js`. Both append string content as **text nodes** via `.textContent` (never
-`innerHTML`) so agent-supplied text can't inject markup. `svg()` is parallel to `el()` and is
-implemented as `document.createElementNS(SVG_NS, tag)` — the same technique used for the
-dependency-graph overlay.
+(SVG) in `app.js`; neither uses `innerHTML`. `el()` appends each non-node child as a text node
+(`document.createTextNode(String(kid))`), so agent-supplied text can't inject markup. `svg()`
+creates the element with `document.createElementNS` (SVG namespace) and **only sets attributes** —
+it takes no children or text, so the caller must append children itself and set any text with
+`.textContent` (as the dependency-graph overlay does for every `text`/`tspan`).
 
 ## Routing
 
@@ -63,7 +64,11 @@ All built imperatively in `app.js` (no component framework):
   reflecting the active scope. Clicking a project calls `goProject(p)`, which selects **only** that
   project: if already in the project's category/All view it swaps `selected` in place and reloads;
   otherwise it stashes the slug in `pendingProject` and navigates to the project's category board,
-  where `applyView` re-selects it. `toggleProject` is retained only as a vestigial helper.
+  where `applyView` re-selects it. `toggleProject(slug)` is **still live**: it adds or removes one
+  slug in `selected` within the current view (empty slug clears it) and reloads. The rail no longer
+  calls it, but the new-task save handler does (it adds the new task's project to the selection
+  when a different single project is selected) and so does the new-project save handler (it adds
+  the new project to the selection). Migrate those two callers to `goProject` before removing it.
   Clicking **⋯ Manage** calls `openManage` (the former `openManageProjects`, kept as a back-compat
   alias), which opens the reused `#sheet` modal (same focus-trap / Esc-to-close infrastructure as the
   task modal) with two sections:
@@ -244,7 +249,8 @@ All built imperatively in `app.js` (no component framework):
     `task.status`, `task.created`, `task.deleted`, `task.assign`, `task.patched`,
     `task.reclaimed` — the `GRAPH_REFRESH_KINDS` set). It
     **debounces** re-fetches and **preserves the current pan/zoom state and selection**.
-  - **XSS-safe** — SVG built via `svg()` + `.textContent`; the detail panel via `el()`. No
+  - **XSS-safe** — SVG elements via `svg()` (attributes only), their text set by the caller with
+    `.textContent`; the detail panel via `el()`. No
     `innerHTML` anywhere in the graph code (the `TestDashboardNoXSSSinks` guard passes).
 - **Delete affordances** — three inline two-step confirms (no native `confirm()`/`prompt()` — they
   are blocked in webviews; all DOM built via `el()`, no `innerHTML`):

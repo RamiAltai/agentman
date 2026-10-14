@@ -7,8 +7,9 @@ Centralized uncertainty. Severity is the author's judgment for the project's sta
 
 - **Schema-migration runner: forward-only, no rollback path** (Low). The forward-only runner reads
   and bumps `meta.schema_version` (ADR-010); each step applies its version bump in one tx and is
-  test-covered (`currentSchemaVersion = 5`). Residual: no down-migrations. `OpenStore` refuses a DB
-  recorded at a version newer than the binary supports (clear "upgrade am" error), the same ceiling
+  test-covered (target: `currentSchemaVersion` in `store.go`). Residual: no down-migrations.
+  `OpenStore` refuses a DB recorded at a version newer than the binary supports (clear "upgrade am"
+  error), the same ceiling
   `validateImportCandidate` applies to snapshots. → `data-model.md`,
   `decision-records.md` ADR-010/ADR-025.
 - **Single-writer throughput ceiling** (Low for stated scope). `SetMaxOpenConns(1)` serializes all
@@ -230,8 +231,10 @@ runner. Un-runner-tested behaviors include:
 
 - CI gates code/format/test regressions, but **prose-doc drift** is still possible — docs are not
   machine-checked against the code.
-- Several decisions are **undocumented** (auth model, testing strategy, migrations, deletes, CI,
-  versioning) → `decision-records.md` "Missing Decisions".
+- Some decisions are still **undocumented** — the authoritative list is `decision-records.md`
+  "Missing Decisions" (currently: auth/remote-access model, testing coverage targets, `comments`
+  retention, release automation and versioning policy). Migrations (ADR-010), deletes/archive
+  (ADR-013/ADR-015), the dashboard testing approach (ADR-018) and CI (ADR-019) are recorded.
 
 ## Maintainability Concerns
 
@@ -261,7 +264,8 @@ runner. Un-runner-tested behaviors include:
 
 ## Recommended Follow-Ups
 
-1. **Decide & document the migration strategy** before any schema change to an existing table.
-2. **Record the missing decisions** (auth, testing, deletes, CI, versioning) as ADRs once chosen.
-3. If remote access is ever wanted, treat it as an **auth + CSRF/`Host` + TLS** project per
+1. **Record the open decisions** listed in `decision-records.md` "Missing Decisions" as ADRs once
+   chosen. (Schema changes already follow ADR-010's forward-only runner; see `data-model.md`
+   Migrations.)
+2. If remote access is ever wanted, treat it as an **auth + CSRF/`Host` + TLS** project per
    `security.md`, not a feature add-on.

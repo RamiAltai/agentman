@@ -48,10 +48,12 @@ and no scope header.
   another scope.
 
 **Token storage & transport (security-relevant):**
-- **sha256 hash stored, plaintext never.** The plaintext token (`amt_` + 32 hex) is shown **once** at
-  mint and never persisted, logged, listed (`am token ls` shows only `id/scope/created/[revoked]`), or
-  printed by `am whoami` (`token: set`). The DB stores only `sha256(plaintext)` (`tokens.token_hash`,
-  UNIQUE); the server hashes the **presented** plaintext to compare, so a stolen DB row cannot be
+- **sha256 hash stored, plaintext never (server side).** The plaintext token (`amt_` + 32 hex) is
+  shown **once** at mint; the server never persists, logs or lists it (`am token ls` shows only
+  `id/scope/created/[revoked]`), and `am whoami` prints only `token: set`. The CLI keeps the plaintext
+  in the caller's identity file (mode `0600`; see the residual note below). The DB stores only
+  `sha256(plaintext)` (`tokens.token_hash`, UNIQUE); the server hashes the **presented** plaintext
+  to compare, so a stolen DB row cannot be
   replayed as a credential.
 - **DB export carries hashes, non-replayable.** `am db export` (`VACUUM INTO`) snapshots the whole
   file, `tokens` included — acceptable because the hashes are not replayable (see above); no scrubbing

@@ -233,7 +233,9 @@ curl -s -H 'X-Agent: claude-1' -X POST 127.0.0.1:8787/api/tasks/13/claim
 
 ## Backups
 
-The whole board is one SQLite file, so backing up is copying it. For a guaranteed-consistent
+The board lives in one SQLite database, `agentman.db`, opened in WAL mode: recent commits can sit
+in the `agentman.db-wal` sidecar until they are checkpointed. To back up by copying, stop `am serve`
+first and copy `agentman.db` together with its `-wal`/`-shm` files. For a guaranteed-consistent
 snapshot (even while `am serve` is running), use `am db export`:
 
 ```sh

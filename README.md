@@ -139,8 +139,9 @@ Full CLI reference, the HTTP/SSE API, and the configuration matrix →
 agentman binds **127.0.0.1** and ships with **no auth** — it's a personal, local board, not a
 multi-tenant service. Don't expose the port to a network you don't trust. To confine agents to a
 category or project, scoped identities and server-enforced scope tokens are available
-([docs/reference.md](docs/reference.md)). Back up the board by copying one SQLite file, or run
-`am db export` for a consistent snapshot even while serving.
+([docs/reference.md](docs/reference.md)). Back up the board by stopping the server and copying
+`agentman.db` together with its `-wal`/`-shm` files, or run `am db export` for a consistent snapshot
+even while serving.
 
 ## License
 

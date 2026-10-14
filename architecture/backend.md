@@ -53,8 +53,9 @@ unscoped caller (the human at the CLI/dashboard) administers tokens, so a confin
 mint a token for another scope (the boundary crux). A bad/revoked bearer token still 401s here
 (`scopeOf` surfaces `ErrInvalidToken`) rather than being mistaken for "unscoped". It mirrors the
 `handleCreateCategory` `if !sc.IsZero() → denyScope` precedent. An invalid/revoked bearer token →
-`ErrInvalidToken` → `401 {"error":"unauthorized"}` on **any** endpoint (every handler inherits it
-through `scopeOf`) → CLI **exit 9**.
+`ErrInvalidToken` → `401 {"error":"unauthorized"}` on every endpoint that resolves scope through
+`scopeOf` → CLI **exit 9**. `GET /api/events`, `GET /api/stream`, `GET /api/projects` and
+`GET /api/categories` never call `scopeOf`, so they do not validate the token (see `security.md`).
 
 `{id}` accepts a global id (`13`) or a project ref (`web-3`), resolved by `store.resolveTaskID`.
 Responses are JSON via `writeJSON`; errors via `writeErr`.
@@ -248,9 +249,9 @@ it returns the **plaintext once** plus the public `*Token` metadata — the plai
 the new sentinel **`ErrInvalidToken`** — NEVER a zero (allow-everything) Scope on a miss, which would
 silently grant the unscoped boundary to a bad credential (security-critical; `scopeOf` relies on the
 error). `ErrInvalidToken`'s message is `"unauthorized"`, so `writeErr` emits
-`401 {"error":"unauthorized"}` → CLI exit 9. **No event kind** is emitted for mint/revoke (the catalog
-stays 21; audit via `am serve --log`). The `tokens` table is added via `CREATE TABLE IF NOT EXISTS`,
-so **no migration and `currentSchemaVersion` stays 5**.
+`401 {"error":"unauthorized"}` → CLI exit 9. **No event kind** is emitted for mint/revoke (audit via
+`am serve --log`). The `tokens` table is added via `CREATE TABLE IF NOT EXISTS` in `schema.sql`, so
+it needed **no migration step and no `currentSchemaVersion` bump** (`data-model.md` Migrations).
 
 `ClaimTask` and `PatchTask` call the helper `hasOpenPrereqs` before writing: if any prerequisite
 task is not `done`, they return a `*BlockedError{OpenPrereqs: []int64{…}}`. `ClaimTask` blocks
@@ -285,18 +286,23 @@ any activity (claim, patch, status, comment) keeps a claim fresh.
 `UPDATE … WHERE id = (SELECT t.id … WHERE t.status='todo' AND t.assignee IS NULL AND
 p.archived_at IS NULL AND c.archived_at IS NULL [AND t.project_id=?] [AND p.category_id=?]
 [AND EXISTS (task_meta key)] AND NOT EXISTS (<open-prereq>) ORDER BY t.priority ASC,
-t.id ASC LIMIT 1) RETURNING id, project_id`. The open-prereq `NOT EXISTS` matches ListTasks' Ready
-filter exactly; ordering is priority ASC (0 = most urgent) with an id-ASC FIFO tiebreak
-(deliberately not `am ls`'s `updated_at DESC` display order — a pickup queue drains oldest-first).
+t.id ASC LIMIT 1) RETURNING id, project_id`. The open-prereq test is the shared `openPrereqExpr`
+constant, the same one ListTasks' Ready filter uses; ordering is priority ASC (0 = most urgent)
+with an id-ASC FIFO tiebreak (deliberately not `am ls`'s `updated_at DESC` display order — a
+pickup queue drains oldest-first).
 The archived-category exclusion is **unconditional** (scoped or not), like the archived-project
 rule. Since Phase P the signature is **`NextTask(f NextFilter, agent string)`** with
 `NextFilter{Project, Category, MetaKey}`. **Scope contract (Phase Q):** a scoped caller's
 `X-Agent-Scope` is merged into `f` by the handler (`narrowScope`) **before** `NextTask` runs, so the
 agent's scope is part of the candidate predicate **inside** the atomic pick+claim — a scoped agent
 can never be handed an out-of-scope task, even racing unscoped callers. The `MetaKey` predicate is
-**textually identical
-to ListTasks'** (the wait/next invariant: a task that releases `am wait --ready --meta K` must be
-pickable by `am next --meta K`; enforced by comment at both sites).
+the shared `metaKeyExpr` constant, also used by ListTasks. **Only the meta-key and open-prereq
+predicates are shared** — NextTask's candidate set is deliberately narrower than ListTasks'
+`Ready` filter (`status='todo' AND NOT openPrereqExpr`): it also requires `assignee IS NULL`, and it
+excludes archived projects and categories even when `-p`/`-c` names one (ListTasks keeps an
+explicitly named archived project or category inspectable). So `am wait --ready` (which re-checks
+via ListTasks) can release on a pre-assigned task, or on a task in an explicitly selected archived
+project or category, that `am next` will never return.
 Zero rows ⇒ `ErrNotFound` (nothing ready, no carrier of the meta key, or — same 404, accepted
 ambiguity — a bad project or category slug).
 Emits the existing `task.claimed` event with the same payload shape as `ClaimTask`. Tasks already
@@ -410,7 +416,10 @@ typed `*ConflictError{Assignee}`, typed `*BlockedError{OpenPrereqs []int64}`, an
 stderr — it is never sent to the client). Delete handlers (`handleDeleteTask`,
 `handleDeleteComment`, `handleDeleteProject`) return `404` via `writeErr` when the target is
 missing (`ErrNotFound`). The CLI re-maps HTTP status to **exit codes** via `client.go
-exitCodeFor` (the single source, used by `doOrFail` and the bulk `status`/`assign` loop):
+exitCodeFor` (used by `doOrFail`/`orFail`, the bulk `status`/`assign` loop and `am token`). It is
+**not** the only mapping: `cmdClaim`, `cmdNext` (`cli.go`) and `wait.go` switch on the status
+themselves (for their own messages) and each carries its own `401` → `9` case, so a change to the
+convention must be made in `exitCodeFor` **and** in those three places:
 `3` not found · `4` conflict/blocked/not-stale · `5` validation/project_archived · `6` server down
 · `8` out of scope (any 403) · `9` bad token (401, invalid/revoked bearer) · `1` other; plus `7` =
 `am wait` timeout (CLI-side, no HTTP status involved). Exit 9 is **distinct from 8 on purpose**: a bad
@@ -446,14 +455,13 @@ project deliberately adopts no JS test runner (preserves the single-binary/no-np
 
 - **New endpoint:** register it in `Server.Handler()` (`server.go`), add a `handleX`, add the
   backing `store.*` method, and (if it mutates) insert an `events` row in the same tx + broadcast.
-- **New task field:** add the column in `schema.sql`, the struct field in `store.go`, thread it
+- **New task field:** add the column with an `ALTER TABLE` step in `schemaMigrations` and bump
+  `currentSchemaVersion` (`schema.sql`'s `tasks` table is the frozen v1 baseline — `data-model.md`
+  Migrations), add the struct field in `store.go`, thread it
   through `CreateTask`/`PatchTask`/`getTaskTx`, the API, and the dashboard (`web/`).
 - **New event kind:** emit via `insertEvent(...)` and handle it in `web/app.js` `evText`/`describeText`.
-  Current kinds (21 total): `task.created`, `task.claimed`, `task.reclaimed`, `task.status`,
-  `task.assign`, `task.patched`, `task.deleted`, `task.dep_added`, `task.dep_removed`,
-  `task.labeled`, `task.unlabeled`, `comment.added`, `comment.deleted`, `project.created`,
-  `project.archived`, `project.unarchived`, `project.patched`, `project.deleted`,
-  `category.created`, `category.archived`, `category.unarchived`. Events with no project ref
+  Add it to the `kind` comment in `schema.sql` and the catalog in `data-model.md` (`events.kind`),
+  the one documented list. Events with no project ref
   (the `category.*` kinds) need explicit `evText`/`describeText` cases — the default branch
   renders a literal "null" ref.
 

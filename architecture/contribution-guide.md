@@ -6,8 +6,9 @@ Practical onboarding. Pair this with `engineering-conventions.md` (how to write 
 ## Setup
 
 - Install **Go 1.25.11+** (`go.mod` requires `go 1.25.11` for a security-patched stdlib; older
-  1.25.x auto-upgrades via the Go toolchain). No other toolchain — no
-  npm/node, no C compiler (pure-Go SQLite).
+  1.25.x auto-upgrades via the Go toolchain). Nothing else is needed to build or run — no npm, no
+  C compiler (pure-Go SQLite). **Node** is optional: only to run CI's JS syntax check
+  (`node --check cmd/am/web/app.js`) locally before pushing a dashboard change.
 - Clone and build:
 
 ```sh
@@ -17,7 +18,7 @@ go build -o am ./cmd/am
 ./am version
 ```
 
-There is no Makefile or Dockerfile — `go` is the whole toolchain. CI is configured in
+There is no Makefile or Dockerfile — `go` is the whole build toolchain. CI is configured in
 `.github/workflows/ci.yml` (GitHub Actions): it runs `go build`, `go vet`, `gofmt -l`,
 `go test -race -count=1 ./...`, `node --check cmd/am/web/app.js`, and `govulncheck` on
 every push to `main` and on every pull request. Contributors should expect CI to gate PRs.
@@ -28,8 +29,9 @@ every push to `main` and on every pull request. Contributors should expect CI to
 go build -o am ./cmd/am                 # build the single binary (CLI + server)
 go vet ./...                            # static analysis
 go test ./...                           # run tests
-gofmt -l cmd/am                         # list unformatted files (should be empty)
+gofmt -l .                              # list unformatted files (should be empty; CI runs this)
 gofmt -w cmd/am                         # format
+node --check cmd/am/web/app.js          # JS syntax check (CI runs this; needs node)
 ./am serve --db /tmp/dev.db --port 8788 # run a throwaway server (never touch your real DB)
 ./am help                               # full CLI surface
 ```
