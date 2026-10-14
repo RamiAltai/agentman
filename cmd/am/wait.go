@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -22,7 +23,7 @@ import (
 // Exactly these two conditions. Exit 0 when met (--done prints nothing;
 // --ready prints one ready task id; --json prints the satisfying task JSON);
 // exit 7 on timeout (default 10m); exit 3 if the task does not exist; exit 6
-// if the server is unreachable. The wait is entirely client-side — the server
+// if the server is unreachable; exit 9 on an invalid or revoked token. The wait is entirely client-side — the server
 // is untouched (ADR-023); events only trigger a REST re-check, their payloads
 // are never trusted as state.
 func cmdWait(c *Client, a Args) {
@@ -30,7 +31,7 @@ func cmdWait(c *Client, a Args) {
 	metaKey := metaKeyArg(a, "wait") // >1 key or key=value → exit 5
 	if waitDone == waitReady || (waitDone && id == "") || (waitReady && id != "") ||
 		(waitDone && metaKey != "") { // --meta scopes --ready only
-		fail(1, "usage: am wait <id> --done | am wait --ready [-p P] [-c CAT] [--meta KEY]  [--timeout D]")
+		usageErr("usage: am wait <id> --done | am wait --ready [-p P] [-c CAT] [--meta KEY]  [--timeout D]")
 	}
 
 	timeout := 10 * time.Minute
@@ -45,8 +46,9 @@ func cmdWait(c *Client, a Args) {
 	defer cancel()
 
 	// Client.http has a 10s Timeout that would kill a long SSE read; the wait
-	// uses its own un-timed http.Client and is bounded by ctx instead.
-	w := &waiter{base: c.base, agent: c.agent, scope: c.scope, hc: &http.Client{}, ctx: ctx}
+	// uses its own un-timed http.Client and is bounded by ctx instead. The
+	// headers (X-Agent, then Bearer token or X-Agent-Scope) come from c.
+	w := &waiter{c: c, hc: &http.Client{}, ctx: ctx}
 	project := projectFor(a)
 	category := categoryFor(a) // scopes --ready only; ignored under --done like -p
 
@@ -54,18 +56,27 @@ func cmdWait(c *Client, a Args) {
 	// check and subscribe is replayed via ?since= (no check/subscribe race).
 	cursor := w.cursor()
 
-	var taskID int64 // resolved numeric id, for matching events under --done
 	check := func() (*Task, bool) {
 		if waitDone {
-			t, met := w.checkDone(id)
-			taskID = t.ID
-			return t, met
+			return w.checkDone(id)
 		}
 		return w.checkReady(project, category, metaKey)
 	}
-	if t, met := check(); met {
+	t, met := check()
+	if met {
 		waitPrint(a, t, waitReady)
 		return
+	}
+	// Relevance gate: --done only re-checks on events for this task (its
+	// numeric id, resolved by the first check); --ready re-checks on any event
+	// in scope (already project-filtered).
+	relevant := func([]byte) bool { return true }
+	if waitDone {
+		taskID := t.ID
+		relevant = func(data []byte) bool {
+			var e Event
+			return json.Unmarshal(data, &e) == nil && e.TaskID == taskID
+		}
 	}
 
 	for { // (re)connect loop; ctx deadline bounds everything
@@ -82,38 +93,54 @@ func cmdWait(c *Client, a Args) {
 		if waitReady && project != "" {
 			qs.Set("project", project)
 		}
-		resp := w.stream("/api/stream?" + qs.Encode())
-		br := bufio.NewReader(resp.Body)
-		for {
-			evID, data, err := readSSEFrame(br)
-			if err != nil {
-				break // disconnect (or deadline) → reconnect from cursor
-			}
-			if evID > cursor {
-				cursor = evID
-			}
-			// Relevance gate: --done only re-checks on events for this task;
-			// --ready re-checks on any event in scope (already project-filtered).
-			if waitDone {
-				var e struct {
-					TaskID int64 `json:"task_id"`
-				}
-				if json.Unmarshal(data, &e) != nil || e.TaskID != taskID {
-					continue
-				}
-			}
-			if t, met := check(); met {
-				resp.Body.Close()
-				waitPrint(a, t, waitReady)
-				return
-			}
+		// Each connection lives at most waitRecheckEvery, and the condition is
+		// re-checked right after every (re)open. The stream is not lossless (the
+		// hub drops events for a full subscriber, concurrent broadcasts can
+		// arrive out of order, replay is capped), so a dropped event costs at
+		// most one interval instead of the whole timeout.
+		connCtx, connCancel := context.WithTimeout(ctx, waitRecheckEvery)
+		resp := w.stream(connCtx, "/api/stream?"+qs.Encode())
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			// Not a live SSE body (e.g. 500 streaming_unsupported): reading it as
+			// SSE would hit EOF and reconnect in a tight loop until the timeout.
+			data, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			connCancel()
+			fail(1, "wait: stream: %s", apiErr(data, "error "+strconv.Itoa(resp.StatusCode)))
+		}
+		t, met := check()
+		if !met {
+			t, met = watchStream(bufio.NewReader(resp.Body), &cursor, relevant, check)
+		}
+		if met {
+			resp.Body.Close()
+			connCancel()
+			waitPrint(a, t, waitReady)
+			return
 		}
 		resp.Body.Close()
+		rotated := connCtx.Err() != nil // planned re-check cycle, not a drop
+		connCancel()
 		if ctx.Err() != nil {
 			fail(7, "wait: timeout")
 		}
+		if !rotated { // the server closed the stream: back off before reconnecting
+			select {
+			case <-ctx.Done():
+				fail(7, "wait: timeout")
+			case <-time.After(waitReconnectDelay):
+			}
+		}
 	}
 }
+
+// waitRecheckEvery bounds one stream connection (then reconnect + REST
+// re-check); waitReconnectDelay is the pause after the server ends a stream.
+// Variables so tests can shorten them.
+var (
+	waitRecheckEvery   = 30 * time.Second
+	waitReconnectDelay = time.Second
+)
 
 // parseWaitTimeout accepts a Go duration ("5m") or a bare integer of seconds
 // ("300"). Non-positive or unparseable values error.
@@ -149,44 +176,70 @@ func waitPrint(a Args, t *Task, ready bool) {
 	}
 }
 
+// watchStream reads SSE frames from one connection, advancing *cursor, and
+// re-checks the condition after relevant events. It returns the satisfying
+// task when met, or (nil, false) when the connection ends (disconnect or
+// deadline) and the caller should reconnect from *cursor.
+func watchStream(br *bufio.Reader, cursor *int64, relevant func([]byte) bool, check func() (*Task, bool)) (*Task, bool) {
+	pending := false // a relevant event whose re-check is deferred
+	for {
+		evID, data, err := readSSEFrame(br)
+		if err != nil {
+			return nil, false
+		}
+		if evID > *cursor {
+			*cursor = evID
+		}
+		pending = pending || relevant(data)
+		// Coalesce a burst: frames already buffered are read first, so k
+		// queued events cost one re-check, not k. The deferred re-check
+		// runs once the buffer drains, even if the last frame is irrelevant.
+		if !pending || eventBuffered(br) {
+			continue
+		}
+		pending = false
+		if t, met := check(); met {
+			return t, true
+		}
+	}
+}
+
 // waiter wraps the streaming-capable HTTP plumbing for cmdWait.
 type waiter struct {
-	base  string
-	agent string
-	scope string // sent as X-Agent-Scope; scopes the REST re-checks, never the stream
-	hc    *http.Client
-	ctx   context.Context
+	c   *Client // identity + credential headers (Client.newRequest); scope the REST re-checks
+	hc  *http.Client
+	ctx context.Context
 }
 
 // get performs a ctx-bounded GET; transport errors map to exit 7 (deadline)
 // or exit 6 (server down), like the rest of the CLI.
 func (w *waiter) get(path string) (int, []byte) {
-	resp := w.request(path)
+	resp := w.request(w.ctx, path)
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, data
 }
 
-// stream opens a long-lived GET (SSE); the caller closes the body.
-func (w *waiter) stream(path string) *http.Response { return w.request(path) }
+// stream opens a long-lived GET (SSE) bounded by ctx (a child of w.ctx); the
+// caller closes the body.
+func (w *waiter) stream(ctx context.Context, path string) *http.Response {
+	return w.request(ctx, path)
+}
 
-func (w *waiter) request(path string) *http.Response {
-	req, err := http.NewRequestWithContext(w.ctx, http.MethodGet, w.base+path, nil)
-	if err != nil {
-		fail(1, "agentman: %v", err)
-	}
-	if w.agent != "" {
-		req.Header.Set("X-Agent", w.agent)
-	}
-	if w.scope != "" {
-		req.Header.Set("X-Agent-Scope", w.scope)
-	}
-	resp, err := w.hc.Do(req)
+func (w *waiter) request(ctx context.Context, path string) *http.Response {
+	resp, err := w.hc.Do(w.c.newRequest(ctx, http.MethodGet, path, nil))
 	if err != nil {
 		if w.ctx.Err() != nil {
 			fail(7, "wait: timeout")
 		}
-		fail(6, "agentman: cannot reach server at %s (is `am serve` running?)", w.base)
+		transportFail(w.c.base, http.MethodGet, err)
+	}
+	// A bad credential hard-fails on any request (stream included), so a
+	// revoked token can neither pass a re-check nor spin the reconnect loop.
+	if resp.StatusCode == http.StatusUnauthorized {
+		data, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		fail(9, "wait: %s", apiErr(data, "invalid or revoked token"))
 	}
 	return resp
 }
@@ -200,7 +253,9 @@ func (w *waiter) cursor() int64 {
 	var out struct {
 		LastID int64 `json:"last_id"`
 	}
-	json.Unmarshal(data, &out)
+	if err := json.Unmarshal(data, &out); err != nil {
+		fail(1, "wait: bad response from server: %v", err)
+	}
 	return out.LastID
 }
 
@@ -216,7 +271,9 @@ func (w *waiter) checkDone(id string) (*Task, bool) {
 		fail(1, "wait: %s", apiErr(data, "error "+strconv.Itoa(st)))
 	}
 	var t Task
-	json.Unmarshal(data, &t)
+	if err := json.Unmarshal(data, &t); err != nil {
+		fail(1, "wait: bad response from server: %v", err)
+	}
 	return &t, t.Status == "done"
 }
 
@@ -242,11 +299,21 @@ func (w *waiter) checkReady(project, category, metaKey string) (*Task, bool) {
 		fail(1, "wait: %s", apiErr(data, "error "+strconv.Itoa(st)))
 	}
 	var tasks []Task
-	json.Unmarshal(data, &tasks)
+	if err := json.Unmarshal(data, &tasks); err != nil {
+		fail(1, "wait: bad response from server: %v", err)
+	}
 	if len(tasks) == 0 {
 		return nil, false
 	}
 	return &tasks[0], true
+}
+
+// eventBuffered reports whether br already holds a complete event frame, so
+// reading it cannot block. A false negative only costs an extra re-check.
+func eventBuffered(br *bufio.Reader) bool {
+	b, _ := br.Peek(br.Buffered())
+	i := bytes.Index(b, []byte("data: "))
+	return i >= 0 && bytes.Contains(b[i:], []byte("\n\n"))
 }
 
 // readSSEFrame reads one SSE event (id + data, terminated by a blank line),

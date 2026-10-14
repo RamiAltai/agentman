@@ -3,17 +3,13 @@ package main
 import (
 	"encoding/json"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 )
 
 func TestInitWritesAndResolves(t *testing.T) {
-	// Redirect the identity file to a temp location.
-	idFile := filepath.Join(t.TempDir(), "id")
-	t.Setenv("AGENTMAN_AGENT_FILE", idFile)
-	t.Setenv("AGENTMAN_AGENT", "") // ensure env override is not active
+	idFile := isolateIdentity(t)
 
 	out := captureStdout(t, func() {
 		cmdInit(parse([]string{"bugfix"}))
@@ -31,9 +27,9 @@ func TestInitWritesAndResolves(t *testing.T) {
 		t.Fatalf("ReadFile: %v", err)
 	}
 	contents := strings.TrimSpace(string(data))
-	matched, err := regexp.MatchString(`^bugfix_\d{6}_\d{4}$`, contents)
+	matched, err := regexp.MatchString(`^bugfix_\d{6}_[0-9a-f]{6}$`, contents)
 	if err != nil || !matched {
-		t.Fatalf("identity file contents %q does not match ^bugfix_\\d{6}_\\d{4}$", contents)
+		t.Fatalf("identity file contents %q does not match ^bugfix_\\d{6}_[0-9a-f]{6}$", contents)
 	}
 
 	// The printed id must match the file.
@@ -48,6 +44,7 @@ func TestInitWritesAndResolves(t *testing.T) {
 }
 
 func TestAgentEnvOverrides(t *testing.T) {
+	isolateIdentity(t)
 	t.Setenv("AGENTMAN_AGENT", "override-1")
 	if got := resolveAgent(); got != "override-1" {
 		t.Fatalf("resolveAgent() = %q, want override-1", got)
@@ -67,13 +64,8 @@ func TestSanitizeType(t *testing.T) {
 		{"--start", "start"}, // leading dashes trimmed
 		{"end--", "end"},     // trailing dashes trimmed
 		{"123abc", "123abc"}, // digits allowed
-	}
-
-	// A long input (>20 chars) must be truncated.
-	long := "abcdefghijklmnopqrstuvwxyz" // 26 chars
-	got := sanitizeType(long)
-	if len([]rune(got)) > 20 {
-		t.Errorf("sanitizeType(long) len=%d > 20", len(got))
+		{"abcdefghijklmnopqrstuvwxyz", "abcdefghijklmnopqrst"}, // cut at exactly 20
+		{"abcdefghijklmnopqrs tuv", "abcdefghijklmnopqrs"},     // cut lands on a separator: trimmed
 	}
 
 	for _, c := range cases {
@@ -86,9 +78,9 @@ func TestSanitizeType(t *testing.T) {
 
 func TestNewIdentityFormat(t *testing.T) {
 	id := newIdentity("deploy")
-	matched, err := regexp.MatchString(`^deploy_\d{6}_\d{4}$`, id)
+	matched, err := regexp.MatchString(`^deploy_\d{6}_[0-9a-f]{6}$`, id)
 	if err != nil || !matched {
-		t.Fatalf("newIdentity(deploy) = %q, want ^deploy_\\d{6}_\\d{4}$", id)
+		t.Fatalf("newIdentity(deploy) = %q, want ^deploy_\\d{6}_[0-9a-f]{6}$", id)
 	}
 
 	// Empty type falls back to "agent" prefix.
@@ -96,28 +88,25 @@ func TestNewIdentityFormat(t *testing.T) {
 	if !strings.HasPrefix(id2, "agent_") {
 		t.Fatalf("newIdentity(\"\") = %q, want agent_ prefix", id2)
 	}
-	matched2, err := regexp.MatchString(`^agent_\d{6}_\d{4}$`, id2)
+	matched2, err := regexp.MatchString(`^agent_\d{6}_[0-9a-f]{6}$`, id2)
 	if err != nil || !matched2 {
-		t.Fatalf("newIdentity(\"\") = %q, want ^agent_\\d{6}_\\d{4}$", id2)
+		t.Fatalf("newIdentity(\"\") = %q, want ^agent_\\d{6}_[0-9a-f]{6}$", id2)
 	}
 }
 
 // ---------- Phase Q: scoped identity ----------
 
 func TestInitScopedWritesJSON(t *testing.T) {
-	idFile := filepath.Join(t.TempDir(), "id")
-	t.Setenv("AGENTMAN_AGENT_FILE", idFile)
-	t.Setenv("AGENTMAN_AGENT", "")
-	t.Setenv("AGENTMAN_SCOPE", "")
+	idFile := isolateIdentity(t)
 
 	out := captureStdout(t, func() {
 		cmdInit(parse([]string{"bugfix", "-c", "personal"}))
 	})
 	id := strings.TrimSpace(out)
 	// Stdout stays just the id, so `id=$(am init bugfix -c personal)` works.
-	matched, err := regexp.MatchString(`^bugfix_\d{6}_\d{4}$`, id)
+	matched, err := regexp.MatchString(`^bugfix_\d{6}_[0-9a-f]{6}$`, id)
 	if err != nil || !matched {
-		t.Fatalf("printed id %q does not match ^bugfix_\\d{6}_\\d{4}$", id)
+		t.Fatalf("printed id %q does not match ^bugfix_\\d{6}_[0-9a-f]{6}$", id)
 	}
 
 	data, err := os.ReadFile(idFile)
@@ -140,10 +129,7 @@ func TestInitScopedWritesJSON(t *testing.T) {
 }
 
 func TestInitScopedCategoryProject(t *testing.T) {
-	idFile := filepath.Join(t.TempDir(), "id")
-	t.Setenv("AGENTMAN_AGENT_FILE", idFile)
-	t.Setenv("AGENTMAN_AGENT", "")
-	t.Setenv("AGENTMAN_SCOPE", "")
+	isolateIdentity(t)
 
 	captureStdout(t, func() {
 		cmdInit(parse([]string{"bugfix", "-c", "Work", "-p", "API"}))
@@ -155,8 +141,7 @@ func TestInitScopedCategoryProject(t *testing.T) {
 }
 
 func TestInitProjectRequiresCategory(t *testing.T) {
-	idFile := filepath.Join(t.TempDir(), "id")
-	t.Setenv("AGENTMAN_AGENT_FILE", idFile)
+	idFile := isolateIdentity(t)
 
 	var code int
 	msg := captureStderr(t, func() {
@@ -186,10 +171,7 @@ func TestInitProjectRequiresCategory(t *testing.T) {
 }
 
 func TestLegacyPlainIdentityUnscoped(t *testing.T) {
-	idFile := filepath.Join(t.TempDir(), "id")
-	t.Setenv("AGENTMAN_AGENT_FILE", idFile)
-	t.Setenv("AGENTMAN_AGENT", "")
-	t.Setenv("AGENTMAN_SCOPE", "")
+	idFile := isolateIdentity(t)
 
 	// Pre-Phase-Q file: bare id, trailing newline.
 	if err := os.WriteFile(idFile, []byte("bugfix_010101_0001\n"), 0o644); err != nil {
@@ -204,10 +186,7 @@ func TestLegacyPlainIdentityUnscoped(t *testing.T) {
 }
 
 func TestScopeEnvOverride(t *testing.T) {
-	idFile := filepath.Join(t.TempDir(), "id")
-	t.Setenv("AGENTMAN_AGENT_FILE", idFile)
-	t.Setenv("AGENTMAN_AGENT", "")
-	t.Setenv("AGENTMAN_SCOPE", "")
+	idFile := isolateIdentity(t)
 
 	captureStdout(t, func() {
 		cmdInit(parse([]string{"bugfix", "-c", "personal"}))
@@ -226,10 +205,7 @@ func TestScopeEnvOverride(t *testing.T) {
 }
 
 func TestWhoamiPrintsScope(t *testing.T) {
-	idFile := filepath.Join(t.TempDir(), "id")
-	t.Setenv("AGENTMAN_AGENT_FILE", idFile)
-	t.Setenv("AGENTMAN_AGENT", "")
-	t.Setenv("AGENTMAN_SCOPE", "")
+	idFile := isolateIdentity(t)
 
 	var id string
 	captureStdout(t, func() {
@@ -292,5 +268,95 @@ func TestParseScope(t *testing.T) {
 	}
 	if !(Scope{}).IsZero() || (Scope{Category: "work"}).IsZero() {
 		t.Error("IsZero misclassifies")
+	}
+}
+
+// FIND-0035: a JSON record with a token but no agent (token minted before
+// `am init`) is read as a token, not as a legacy bare agent id.
+func TestResolveIdentityTokenOnlyRecord(t *testing.T) {
+	idFile := isolateIdentity(t)
+	if err := os.WriteFile(idFile, []byte(`{"agent":"","token":"amt_secret"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	agent, scope, token := resolveIdentity()
+	if agent != "" || scope != "" || token != "amt_secret" {
+		t.Fatalf("resolveIdentity = (%q, %q, %q), want (\"\", \"\", amt_secret)", agent, scope, token)
+	}
+	// Legacy plain text is still a bare agent id.
+	os.WriteFile(idFile, []byte("bugfix_010126_0001\n"), 0o644)
+	if a := resolveAgent(); a != "bugfix_010126_0001" {
+		t.Fatalf("legacy resolveAgent = %q", a)
+	}
+}
+
+// FIND-0123, FIND-0138: what each identity-file shape resolves to, with and
+// without the env overrides. A missing or empty file is no identity; anything
+// that is not a non-empty JSON record is a legacy bare id (so "{bad" is an id).
+func TestResolveIdentityFileShapes(t *testing.T) {
+	cases := []struct {
+		name                    string
+		file                    *string // nil = no file
+		env                     map[string]string
+		agent, scope, wantToken string
+	}{
+		{name: "no file"},
+		{name: "empty file", file: idFileBody("")},
+		{name: "bare id with whitespace", file: idFileBody("  bugfix_010126_0001 \n"), agent: "bugfix_010126_0001"},
+		{name: "corrupt json is a legacy id", file: idFileBody("{bad"), agent: "{bad"},
+		{name: "token-only record", file: idFileBody(`{"agent":"","token":"x"}`), wantToken: "x"},
+		{name: "full record", file: idFileBody(`{"agent":"a1","scope":"work/api","token":"amt_file"}`),
+			agent: "a1", scope: "work/api", wantToken: "amt_file"},
+		{name: "env token overrides file", file: idFileBody(`{"agent":"a1","token":"amt_file"}`),
+			env: map[string]string{"AGENTMAN_TOKEN": " amt_env "}, agent: "a1", wantToken: "amt_env"},
+		{name: "env token without file", env: map[string]string{"AGENTMAN_TOKEN": "amt_env"}, wantToken: "amt_env"},
+		{name: "env agent and scope override file", file: idFileBody(`{"agent":"a1","scope":"work"}`),
+			env: map[string]string{"AGENTMAN_AGENT": "a2", "AGENTMAN_SCOPE": "home"}, agent: "a2", scope: "home"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			idFile := isolateIdentity(t)
+			if c.file != nil {
+				if err := os.WriteFile(idFile, []byte(*c.file), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for k, v := range c.env {
+				t.Setenv(k, v)
+			}
+			agent, scope, token := resolveIdentity()
+			if agent != c.agent || scope != c.scope || token != c.wantToken {
+				t.Fatalf("resolveIdentity = (%q, %q, %q), want (%q, %q, %q)", agent, scope, token, c.agent, c.scope, c.wantToken)
+			}
+			if got := resolveToken(); got != c.wantToken {
+				t.Fatalf("resolveToken = %q, want %q", got, c.wantToken)
+			}
+		})
+	}
+}
+
+// idFileBody makes the optional file body for the table above.
+func idFileBody(s string) *string { return &s }
+
+// FIND-0138: whoami with no identity exits 5 with the init hint.
+func TestWhoamiNoIdentityExit5(t *testing.T) {
+	isolateIdentity(t)
+	var code int
+	msg := captureStderr(t, func() {
+		code = captureExit(t, func() { cmdWhoami() })
+	})
+	if code != 5 || !strings.Contains(msg, "am init <tasktype>") {
+		t.Fatalf("whoami exit = %d, stderr %q; want 5 with the init hint", code, msg)
+	}
+}
+
+// FIND-0141: whoami reports a stored token as "token: set", never its value.
+func TestWhoamiTokenLine(t *testing.T) {
+	idFile := isolateIdentity(t)
+	if err := os.WriteFile(idFile, []byte(`{"agent":"a1","token":"amt_secret"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() { cmdWhoami() })
+	if out != "a1\ntoken: set\n" {
+		t.Fatalf("whoami output = %q, want id then 'token: set'", out)
 	}
 }

@@ -11,38 +11,54 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // exitCode is a sentinel panic value used by captureExit.
 type exitCode int
 
-// captureStdout redirects os.Stdout to a pipe, calls fn, restores Stdout, and
-// returns everything fn wrote to stdout as a string. Safe to use in tests that
-// also call t.Setenv, because each call captures its own pipe.
+// captureStdout returns everything fn wrote to os.Stdout (see captureFile).
 func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	return captureFile(t, &os.Stdout, fn)
+}
+
+// captureStderr returns everything fn wrote to os.Stderr (fail() writes there).
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	return captureFile(t, &os.Stderr, fn)
+}
+
+// captureFile redirects *f (os.Stdout or os.Stderr) to a pipe, calls fn,
+// restores *f, and returns everything fn wrote to it. Safe to use in tests that
+// also call t.Setenv, because each call captures its own pipe.
+func captureFile(t *testing.T, f **os.File, fn func()) string {
 	t.Helper()
 	r, w, err := os.Pipe()
 	if err != nil {
-		t.Fatalf("captureStdout: Pipe: %v", err)
+		t.Fatalf("captureFile: Pipe: %v", err)
 	}
-	orig := os.Stdout
-	os.Stdout = w
+	orig := *f
+	*f = w
 
 	// Drain the pipe concurrently so large output can't deadlock on the buffer.
 	outCh := make(chan string, 1)
 	go func() {
-		b, _ := io.ReadAll(r)
+		b, err := io.ReadAll(r)
+		if err != nil {
+			t.Errorf("captureFile: read: %v", err) // Errorf is goroutine-safe
+		}
 		r.Close()
 		outCh <- string(b)
 	}()
 
-	// Run fn in an inner scope so os.Stdout is restored and the writer is closed
-	// even if fn panics — e.g. a fail()->osExit panic when nested under
+	// Run fn in an inner scope so *f is restored and the writer is closed even
+	// if fn panics — e.g. a fail()->osExit panic when nested under
 	// captureExit. The reader goroutine then unblocks (EOF) and the panic
 	// propagates past this helper without leaking the redirect.
 	func() {
 		defer func() {
-			os.Stdout = orig
+			*f = orig
 			w.Close()
 		}()
 		fn()
@@ -51,32 +67,30 @@ func captureStdout(t *testing.T, fn func()) string {
 	return <-outCh
 }
 
-// captureStderr mirrors captureStdout for os.Stderr (fail() writes there).
-func captureStderr(t *testing.T, fn func()) string {
+// newTestClient builds a Client the way most CLI tests need it: agent
+// "tester", no scope or token. Tests needing other identity fields set them
+// on the result or keep a literal.
+func newTestClient(base string, hc *http.Client) *Client {
+	return &Client{base: base, agent: "tester", http: hc}
+}
+
+// recordedCall is one request seen by recordingStub.
+type recordedCall struct{ method, path, body string }
+
+// recordingStub is an API stub that records every request and answers 200
+// with reply. Read the calls after the CLI call returns (the response orders
+// the handler's append before it).
+func recordingStub(t *testing.T, reply string) (*httptest.Server, *[]recordedCall) {
 	t.Helper()
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("captureStderr: Pipe: %v", err)
-	}
-	orig := os.Stderr
-	os.Stderr = w
-
-	outCh := make(chan string, 1)
-	go func() {
-		b, _ := io.ReadAll(r)
-		r.Close()
-		outCh <- string(b)
-	}()
-
-	func() {
-		defer func() {
-			os.Stderr = orig
-			w.Close()
-		}()
-		fn()
-	}()
-
-	return <-outCh
+	var calls []recordedCall
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		calls = append(calls, recordedCall{r.Method, r.URL.Path, string(b)})
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(reply))
+	}))
+	t.Cleanup(stub.Close)
+	return stub, &calls
 }
 
 // captureExit stubs osExit so that fail() panics instead of killing the
@@ -108,7 +122,7 @@ func captureExit(t *testing.T, fn func()) (code int) {
 func TestCmdNewPrintsOnlyID(t *testing.T) {
 	ts := newTestServer(t)
 	mustCreateProject(t, ts, "myproj")
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 
 	out := captureStdout(t, func() {
 		cmdNew(c, parse([]string{"a title", "-p", "myproj"}))
@@ -125,7 +139,7 @@ func TestCmdLsTerse(t *testing.T) {
 	id1 := mustCreateTask(t, ts, "lsproj", "First Task")
 	id2 := mustCreateTask(t, ts, "lsproj", "Second Task")
 
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 	out := captureStdout(t, func() {
 		cmdLs(c, parse([]string{"-p", "lsproj"}))
 	})
@@ -156,7 +170,7 @@ func TestCmdMutationsSilent(t *testing.T) {
 	ts := newTestServer(t)
 	mustCreateProject(t, ts, "mutproj")
 	id := mustCreateTask(t, ts, "mutproj", "Mutation Task")
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 
 	// cmdStatus
 	statusOut := captureStdout(t, func() {
@@ -173,13 +187,20 @@ func TestCmdMutationsSilent(t *testing.T) {
 	if strings.TrimSpace(noteOut) != "" {
 		t.Errorf("cmdNote stdout = %q, want empty", noteOut)
 	}
+	if tk := cwfCliGetTask(t, ts, id); len(tk.Comments) != 1 || tk.Comments[0].Body != "a comment" || tk.Comments[0].Author != "tester" {
+		t.Errorf("comments after note = %+v, want one 'a comment' by tester", tk.Comments)
+	}
 
-	// cmdDrop (resets to todo)
+	// cmdDrop (releases the claim and resets to todo)
+	cmdAssign(c, parse([]string{id, "tester"}))
 	dropOut := captureStdout(t, func() {
 		cmdDrop(c, parse([]string{id}))
 	})
 	if strings.TrimSpace(dropOut) != "" {
 		t.Errorf("cmdDrop stdout = %q, want empty", dropOut)
+	}
+	if tk := cwfCliGetTask(t, ts, id); tk.Status != "todo" || tk.Assignee != "" {
+		t.Errorf("after drop status = %q assignee = %q, want todo and unassigned", tk.Status, tk.Assignee)
 	}
 }
 
@@ -187,7 +208,7 @@ func TestCmdMutationsSilent(t *testing.T) {
 
 func TestExitNotFound(t *testing.T) {
 	ts := newTestServer(t)
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 
 	code := captureExit(t, func() {
 		cmdShow(c, parse([]string{"99999"}))
@@ -260,7 +281,7 @@ func TestStaleFlagsWireFormat(t *testing.T) {
 	}))
 	t.Cleanup(stub.Close)
 	t.Setenv("AGENTMAN_AGENT", "tester")
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 
 	captureStdout(t, func() { cmdLs(c, parse([]string{"--stale", "2h"})) })
 	if !strings.Contains(lsQuery, "stale=2h") {
@@ -279,7 +300,7 @@ func TestExitValidation(t *testing.T) {
 	mustCreateProject(t, ts, "archvalproj")
 	do(t, ts, http.MethodPost, "/api/projects/archvalproj/archive", "", nil)
 
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 	code := captureExit(t, func() {
 		cmdNew(c, parse([]string{"should fail", "-p", "archvalproj"}))
 	})
@@ -290,7 +311,7 @@ func TestExitValidation(t *testing.T) {
 
 func TestExitServerDown(t *testing.T) {
 	// Point at a port that has nothing listening.
-	c := &Client{base: "http://127.0.0.1:1", agent: "tester", http: &http.Client{Timeout: time.Second}}
+	c := newTestClient("http://127.0.0.1:1", &http.Client{Timeout: time.Second})
 
 	code := captureExit(t, func() {
 		cmdLs(c, parse([]string{}))
@@ -368,7 +389,7 @@ func TestParseShortAlias(t *testing.T) {
 
 func TestTaskLine(t *testing.T) {
 	tk := Task{ID: 7, Status: "doing", Title: "Fix the thing", Assignee: "alice", NComments: 2, Project: "web"}
-	line := taskLine(tk, true)
+	line := taskLine(tk, true, "me-agent")
 	if !strings.Contains(line, "7") {
 		t.Errorf("taskLine missing id: %q", line)
 	}
@@ -383,6 +404,16 @@ func TestTaskLine(t *testing.T) {
 	}
 	if !strings.Contains(line, "2c") {
 		t.Errorf("taskLine missing comment count: %q", line)
+	}
+
+	// Prereq markers, @me for the caller, and no project suffix when scoped.
+	tk = Task{ID: 8, Status: "todo", Title: "t", Assignee: "me-agent", Project: "web", NPrereqs: 3, NOpenPrereqs: 2}
+	if line := taskLine(tk, false, "me-agent"); !strings.Contains(line, "@me [blk:2]") || strings.HasSuffix(line, "web") {
+		t.Errorf("blocked taskLine = %q, want '@me [blk:2]' and no project", line)
+	}
+	tk.NOpenPrereqs = 0
+	if line := taskLine(tk, true, "other"); !strings.HasSuffix(line, "@me-agent [ready] web") {
+		t.Errorf("ready taskLine = %q, want '@me-agent [ready] web' suffix", line)
 	}
 }
 
@@ -402,12 +433,16 @@ func TestStatusShort(t *testing.T) {
 
 func TestAssignee(t *testing.T) {
 	// Unassigned.
-	if got := assignee(""); got != "-" {
+	if got := assignee("", ""); got != "-" {
 		t.Errorf("assignee(\"\") = %q, want -", got)
 	}
 	// Other agent.
-	if got := assignee("bob"); got != "@bob" {
+	if got := assignee("bob", "alice"); got != "@bob" {
 		t.Errorf("assignee(bob) = %q, want @bob", got)
+	}
+	// The caller's own id renders as @me.
+	if got := assignee("alice", "alice"); got != "@me" {
+		t.Errorf("assignee(alice) as alice = %q, want @me", got)
 	}
 }
 
@@ -421,6 +456,9 @@ func TestTrunc(t *testing.T) {
 		{"hello world", 8, "hello w…"},
 		{"ab", 2, "ab"},
 		{"abc", 2, "a…"},
+		{"abc", 1, "a"},
+		{"abc", 0, ""},
+		{"line one\nline two", 20, "line one line two"},
 	}
 	for _, c := range cases {
 		if got := trunc(c.s, c.n); got != c.want {
@@ -455,7 +493,7 @@ func TestCmdNextPrintsOnlyID(t *testing.T) {
 	want := mustCreateTask(t, ts, "nextproj", "Pick Me")
 
 	t.Setenv("AGENTMAN_AGENT", "tester")
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 	out := captureStdout(t, func() {
 		cmdNext(c, parse([]string{"-p", "nextproj"}))
 	})
@@ -467,7 +505,7 @@ func TestCmdNextPrintsOnlyID(t *testing.T) {
 func TestExitNextNoneReady(t *testing.T) {
 	ts := newTestServer(t)
 	t.Setenv("AGENTMAN_AGENT", "tester")
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 
 	code := captureExit(t, func() {
 		cmdNext(c, parse([]string{}))
@@ -478,22 +516,20 @@ func TestExitNextNoneReady(t *testing.T) {
 }
 
 func TestCmdStatusBulk(t *testing.T) {
-	var patched []string
-	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPatch {
-			patched = append(patched, strings.TrimPrefix(r.URL.Path, "/api/tasks/"))
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"id":1}`))
-	}))
-	t.Cleanup(stub.Close)
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	stub, calls := recordingStub(t, `{"id":1}`)
+	c := newTestClient(stub.URL, stub.Client())
 
 	out := captureStdout(t, func() {
 		cmdStatus(c, parse([]string{"1", "2", "3", "done"}))
 	})
 	if strings.TrimSpace(out) != "" {
 		t.Errorf("bulk cmdStatus stdout = %q, want empty", out)
+	}
+	var patched []string
+	for _, cl := range *calls {
+		if cl.method == http.MethodPatch {
+			patched = append(patched, strings.TrimPrefix(cl.path, "/api/tasks/"))
+		}
 	}
 	if len(patched) != 3 || patched[0] != "1" || patched[1] != "2" || patched[2] != "3" {
 		t.Fatalf("patched ids = %v, want [1 2 3]", patched)
@@ -514,7 +550,7 @@ func TestCmdStatusBulkPartialFailure(t *testing.T) {
 		w.Write([]byte(`{"id":1}`))
 	}))
 	t.Cleanup(stub.Close)
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 
 	var code int
 	msg := captureStderr(t, func() {
@@ -534,21 +570,22 @@ func TestCmdStatusBulkPartialFailure(t *testing.T) {
 }
 
 func TestCmdAssignBulk(t *testing.T) {
-	var bodies []string
-	var ids []string
-	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		bodies = append(bodies, string(b))
-		ids = append(ids, strings.TrimPrefix(r.URL.Path, "/api/tasks/"))
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"id":1}`))
-	}))
-	t.Cleanup(stub.Close)
+	stub, calls := recordingStub(t, `{"id":1}`)
 	t.Setenv("AGENTMAN_AGENT", "tester")
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
+	// assign runs one cmdAssign and returns the ids and bodies it sent.
+	assign := func(args ...string) (ids, bodies []string) {
+		*calls = nil
+		cmdAssign(c, parse(args))
+		for _, cl := range *calls {
+			ids = append(ids, strings.TrimPrefix(cl.path, "/api/tasks/"))
+			bodies = append(bodies, cl.body)
+		}
+		return ids, bodies
+	}
 
 	// Last positional is the assignee; the rest are ids.
-	cmdAssign(c, parse([]string{"1", "2", "bob"}))
+	ids, bodies := assign("1", "2", "bob")
 	if len(ids) != 2 || ids[0] != "1" || ids[1] != "2" {
 		t.Fatalf("assigned ids = %v, want [1 2]", ids)
 	}
@@ -559,22 +596,19 @@ func TestCmdAssignBulk(t *testing.T) {
 	}
 
 	// "me" resolves to the current agent.
-	bodies, ids = nil, nil
-	cmdAssign(c, parse([]string{"3", "me"}))
+	_, bodies = assign("3", "me")
 	if len(bodies) != 1 || !strings.Contains(bodies[0], `"assignee":"tester"`) {
 		t.Fatalf("assign me bodies = %v, want assignee tester", bodies)
 	}
 
 	// "-" unassigns.
-	bodies, ids = nil, nil
-	cmdAssign(c, parse([]string{"4", "-"}))
+	_, bodies = assign("4", "-")
 	if len(bodies) != 1 || !strings.Contains(bodies[0], `"assignee":""`) {
 		t.Fatalf("assign - bodies = %v, want empty assignee", bodies)
 	}
 
 	// Single-id regression: `am assign <id> <agent>` still works.
-	bodies, ids = nil, nil
-	cmdAssign(c, parse([]string{"5", "alice"}))
+	ids, bodies = assign("5", "alice")
 	if len(ids) != 1 || ids[0] != "5" || !strings.Contains(bodies[0], `"assignee":"alice"`) {
 		t.Fatalf("single assign = ids %v bodies %v", ids, bodies)
 	}
@@ -592,7 +626,7 @@ func TestCmdLsGrepWireFormat(t *testing.T) {
 		w.Write([]byte("[]"))
 	}))
 	t.Cleanup(stub.Close)
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 
 	captureStdout(t, func() { cmdLs(c, parse([]string{"--grep", "x y"})) })
 	if !strings.Contains(lsQuery, "q=x+y") {
@@ -611,16 +645,8 @@ func TestCmdLsGrepWireFormat(t *testing.T) {
 }
 
 func TestCmdLabelAddRemove(t *testing.T) {
-	type call struct{ method, path, body string }
-	var calls []call
-	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		calls = append(calls, call{r.Method, r.URL.Path, string(b)})
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status":"ok"}`))
-	}))
-	t.Cleanup(stub.Close)
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	stub, recorded := recordingStub(t, `{"status":"ok"}`)
+	c := newTestClient(stub.URL, stub.Client())
 
 	var code int
 	out := captureStdout(t, func() {
@@ -632,7 +658,8 @@ func TestCmdLabelAddRemove(t *testing.T) {
 	if out != "" {
 		t.Fatalf("cmdLabel stdout = %q, want silent", out)
 	}
-	want := []call{
+	calls := *recorded
+	want := []recordedCall{
 		{http.MethodPost, "/api/tasks/12/labels", `{"label":"a"}`},
 		{http.MethodDelete, "/api/tasks/12/labels/bug", ""},
 		{http.MethodPost, "/api/tasks/12/labels", `{"label":"c"}`},
@@ -653,7 +680,7 @@ func TestCmdLabelPrintsLabels(t *testing.T) {
 		w.Write([]byte(`{"id":12,"labels":["a","b"]}`))
 	}))
 	t.Cleanup(stub.Close)
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 
 	out := captureStdout(t, func() { cmdLabel(c, []string{"12"}) })
 	if out != "a b\n" {
@@ -662,12 +689,12 @@ func TestCmdLabelPrintsLabels(t *testing.T) {
 }
 
 func TestCmdLabelUsage(t *testing.T) {
-	c := &Client{base: "http://127.0.0.1:1", agent: "tester", http: &http.Client{Timeout: time.Second}}
+	c := newTestClient("http://127.0.0.1:1", &http.Client{Timeout: time.Second})
 
-	// Missing id → exit 1.
+	// Missing id → exit 5 (usage).
 	code := captureExit(t, func() { cmdLabel(c, nil) })
-	if code != 1 {
-		t.Fatalf("missing id exit = %d, want 1", code)
+	if code != 5 {
+		t.Fatalf("missing id exit = %d, want 5", code)
 	}
 
 	// Empty token after prefix strip → exit 5 (before any request is made).
@@ -699,7 +726,7 @@ func TestCmdLabelUsage(t *testing.T) {
 
 func TestCmdCategoryVerbs(t *testing.T) {
 	ts := newTestServer(t)
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 
 	// am category new prints only the slug.
 	out := captureStdout(t, func() {
@@ -731,20 +758,20 @@ func TestCmdCategoryVerbs(t *testing.T) {
 		t.Fatalf("category unarchive stdout = %q, want empty", out)
 	}
 
-	// Usage errors exit 1.
+	// Usage errors exit 5.
 	code := captureExit(t, func() { cmdCategory(c, parse([]string{"new"})) })
-	if code != 1 {
-		t.Fatalf("category new (no slug) exit = %d, want 1", code)
+	if code != 5 {
+		t.Fatalf("category new (no slug) exit = %d, want 5", code)
 	}
 	code = captureExit(t, func() { cmdCategory(c, parse([]string{"bogus"})) })
-	if code != 1 {
-		t.Fatalf("category bogus exit = %d, want 1", code)
+	if code != 5 {
+		t.Fatalf("category bogus exit = %d, want 5", code)
 	}
 }
 
 func TestCmdProjectNewRequiresCategory(t *testing.T) {
 	ts := newTestServer(t)
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 
 	// Without -c and without AGENTMAN_CATEGORY → exit 5.
 	t.Setenv("AGENTMAN_CATEGORY", "")
@@ -783,7 +810,7 @@ func TestCmdProjectNewRequiresCategory(t *testing.T) {
 func TestCmdProjectEdit(t *testing.T) {
 	ts := newTestServer(t)
 	mustCreateProject(t, ts, "web")
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 
 	// Silent success for rename + vault binding.
 	out := captureStdout(t, func() {
@@ -814,10 +841,10 @@ func TestCmdProjectEdit(t *testing.T) {
 		t.Fatalf("vault_path after clear = %q, want empty", ps[0].VaultPath)
 	}
 
-	// Nothing to change → exit 1.
+	// Nothing to change → exit 5 (usage).
 	code := captureExit(t, func() { cmdProject(c, parse([]string{"edit", "frontend"})) })
-	if code != 1 {
-		t.Fatalf("project edit (no flags) exit = %d, want 1", code)
+	if code != 5 {
+		t.Fatalf("project edit (no flags) exit = %d, want 5", code)
 	}
 }
 
@@ -829,7 +856,7 @@ func TestCmdLsCategoryWireFormat(t *testing.T) {
 		w.Write([]byte("[]"))
 	}))
 	t.Cleanup(stub.Close)
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 
 	captureStdout(t, func() { cmdLs(c, parse([]string{"-c", "work"})) })
 	if !strings.Contains(lsQuery, "category=work") {
@@ -852,7 +879,7 @@ func TestCmdNextCategory(t *testing.T) {
 	ts := newTestServer(t)
 	mustCreateCategory(t, ts, "work")
 	t.Setenv("AGENTMAN_AGENT", "tester")
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 
 	// No ready task in the category → exit 3.
 	code := captureExit(t, func() {
@@ -893,7 +920,7 @@ func TestCmdShowDashCStillPrintsComments(t *testing.T) {
 		map[string]string{"Content-Type": "application/json", "X-Agent": "alice"})
 	r.Body.Close()
 
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 	out := captureStdout(t, func() {
 		cmdShow(c, parse(rewriteShowComments([]string{id, "-c"})))
 	})
@@ -944,7 +971,7 @@ func TestCmdNewMetaWireFormat(t *testing.T) {
 		w.Write([]byte(`{"id":1}`))
 	}))
 	t.Cleanup(stub.Close)
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 
 	captureStdout(t, func() {
 		cmdNew(c, parse([]string{"title", "-p", "web", "--meta", "a=1", "--meta", "b=2"}))
@@ -991,7 +1018,7 @@ func TestCmdEditMetaSinglePatch(t *testing.T) {
 		w.Write([]byte(`{"id":1}`))
 	}))
 	t.Cleanup(stub.Close)
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 
 	// Two sets and one removal — the dispatcher's atomic auto+packet flip —
 	// must ride in exactly ONE PATCH.
@@ -1020,8 +1047,8 @@ func TestCmdEditMetaSinglePatch(t *testing.T) {
 	code := captureExit(t, func() {
 		captureStderr(t, func() { cmdEdit(c, parse([]string{"1"})) })
 	})
-	if code != 1 {
-		t.Fatalf("edit with nothing exit = %d, want 1", code)
+	if code != 5 {
+		t.Fatalf("edit with nothing exit = %d, want 5", code)
 	}
 }
 
@@ -1035,7 +1062,7 @@ func TestCmdNextMetaWireFormat(t *testing.T) {
 	}))
 	t.Cleanup(stub.Close)
 	t.Setenv("AGENTMAN_AGENT", "tester")
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 
 	out := captureStdout(t, func() { cmdNext(c, parse([]string{"--meta", "auto"})) })
 	if !strings.Contains(body, `"meta_key":"auto"`) {
@@ -1068,7 +1095,7 @@ func TestCmdLsMetaWireFormat(t *testing.T) {
 		w.Write([]byte("[]"))
 	}))
 	t.Cleanup(stub.Close)
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 
 	captureStdout(t, func() { cmdLs(c, parse([]string{"--meta", "auto"})) })
 	if !strings.Contains(lsQuery, "meta_key=auto") {
@@ -1101,7 +1128,7 @@ func TestCmdShowPrintsMeta(t *testing.T) {
 	}
 	r.Body.Close()
 
-	c := &Client{base: ts.URL, agent: "tester", http: ts.Client()}
+	c := newTestClient(ts.URL, ts.Client())
 	out := captureStdout(t, func() {
 		cmdShow(c, parse([]string{strconv.FormatInt(tk.ID, 10)}))
 	})
@@ -1191,7 +1218,7 @@ func TestClientSendsScopeHeader(t *testing.T) {
 	if got != "work/api" {
 		t.Fatalf("X-Agent-Scope = %q, want work/api", got)
 	}
-	c = &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c = newTestClient(stub.URL, stub.Client())
 	captureStdout(t, func() { cmdLs(c, parse([]string{})) })
 	if calls != 2 || got != "" {
 		t.Fatalf("unscoped X-Agent-Scope = %q, want absent", got)
@@ -1232,11 +1259,16 @@ func TestCmdStatusBulkOutOfScope(t *testing.T) {
 			t.Fatalf("task #%s status = %q, want done (loop continues past 403)", id, tk.Status)
 		}
 	}
+	// The rejected out-of-scope task is untouched.
+	if st := cwfCliGetTask(t, ts, workID).Status; st != "todo" {
+		t.Fatalf("out-of-scope task #%s status = %q after a 403, want todo (unchanged)", workID, st)
+	}
 
 	// 404 before 403: exit code = 3 (first failure), both lines on stderr.
+	// "doing" (not the starting todo) so a leaked PATCH would show.
 	msg = captureStderr(t, func() {
 		code = captureExit(t, func() {
-			cmdStatus(c, parse([]string{"99999", workID, "todo"}))
+			cmdStatus(c, parse([]string{"99999", workID, "doing"}))
 		})
 	})
 	if code != 3 {
@@ -1244,6 +1276,9 @@ func TestCmdStatusBulkOutOfScope(t *testing.T) {
 	}
 	if !strings.Contains(msg, "#99999") || !strings.Contains(msg, "#"+workID) {
 		t.Fatalf("stderr = %q, want lines for #99999 and #%s", msg, workID)
+	}
+	if st := cwfCliGetTask(t, ts, workID).Status; st != "todo" {
+		t.Fatalf("out-of-scope task #%s status = %q after a 403, want todo (unchanged)", workID, st)
 	}
 }
 
@@ -1367,11 +1402,311 @@ func TestDoOrFailUnauthorized(t *testing.T) {
 	}))
 	t.Cleanup(stub.Close)
 
-	c := &Client{base: stub.URL, agent: "tester", http: stub.Client()}
+	c := newTestClient(stub.URL, stub.Client())
 	code := captureExit(t, func() {
 		captureStderr(t, func() { c.doOrFail("POST", "/api/tasks/1/claim", nil) })
 	})
 	if code != 9 {
 		t.Fatalf("doOrFail on 401 exit = %d, want 9", code)
+	}
+}
+
+// ---------- Code Witness g1 fixes ----------
+
+// unauthorizedStub answers every request 401, like a revoked/unknown token.
+func unauthorizedStub(t *testing.T) *httptest.Server {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"invalid_token"}`))
+	}))
+	t.Cleanup(stub.Close)
+	return stub
+}
+
+// FIND-0034: claim and next map 401 to exit 9 like every other verb.
+func TestCmdClaimNextUnauthorizedExit9(t *testing.T) {
+	stub := unauthorizedStub(t)
+	t.Setenv("AGENTMAN_AGENT", "tester")
+	c := &Client{base: stub.URL, agent: "tester", token: "amt_revoked", http: stub.Client()}
+	for name, fn := range map[string]func(){
+		"claim": func() { cmdClaim(c, parse([]string{"7"})) },
+		"next":  func() { cmdNext(c, parse(nil)) },
+	} {
+		var code int
+		msg := captureStderr(t, func() { code = captureExit(t, fn) })
+		if code != 9 || !strings.Contains(msg, "invalid_token") {
+			t.Errorf("%s on 401: exit = %d, stderr = %q, want 9 with invalid_token", name, code, msg)
+		}
+	}
+}
+
+// FIND-0038: `--` ends the flags, and dash-leading text with whitespace is a
+// positional, so notes/titles like "- fixed parser" survive.
+func TestParseDashText(t *testing.T) {
+	a := parse([]string{"12", "- fixed parser"})
+	if len(a.pos) != 2 || a.at(1) != "- fixed parser" {
+		t.Fatalf("pos = %q, want [12 \"- fixed parser\"]", a.pos)
+	}
+	a = parse([]string{"-x crashes", "-p", "proj"})
+	if a.at(0) != "-x crashes" || a.flag("project") != "proj" {
+		t.Fatalf("pos = %q project = %q, want title '-x crashes' and project proj", a.pos, a.flag("project"))
+	}
+	a = parse([]string{"12", "--json", "--", "-x", "--json"})
+	if !a.has("json") || len(a.pos) != 3 || a.at(1) != "-x" || a.at(2) != "--json" {
+		t.Fatalf("after --: pos = %q bools = %v, want [12 -x --json] with json set", a.pos, a.bools)
+	}
+	// --body=VALUE still carries spaces and a leading dash.
+	a = parse([]string{"--body=-x y z"})
+	if a.flag("body") != "-x y z" {
+		t.Fatalf("body = %q, want '-x y z'", a.flag("body"))
+	}
+}
+
+// FIND-0038: the dash-led note reaches the server instead of a usage error.
+func TestCmdNoteDashText(t *testing.T) {
+	var body string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		body = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(stub.Close)
+	c := newTestClient(stub.URL, stub.Client())
+	code := captureExit(t, func() {
+		captureStderr(t, func() { cmdNote(c, parse([]string{"12", "- fixed parser"})) })
+	})
+	if code != -1 || !strings.Contains(body, `"body":"- fixed parser"`) {
+		t.Fatalf("exit = %d comment body = %q, want normal return with '- fixed parser'", code, body)
+	}
+}
+
+// FIND-0056: a value flag with no value, or followed by another flag, and a
+// non-integer --priority are usage errors (exit 5), not silently dropped.
+func TestParseMissingValueAndBadPriority(t *testing.T) {
+	for _, argv := range [][]string{
+		{"5", "--steal-stale"},
+		{"-p", "--json"},
+		{"--meta"},
+	} {
+		code := captureExit(t, func() { captureStderr(t, func() { parse(argv) }) })
+		if code != 5 {
+			t.Errorf("parse(%q) exit = %d, want 5", argv, code)
+		}
+	}
+	c := newTestClient("http://127.0.0.1:1", &http.Client{Timeout: time.Second})
+	code := captureExit(t, func() {
+		captureStderr(t, func() { cmdNew(c, parse([]string{"x", "-p", "proj", "--priority", "high"})) })
+	})
+	if code != 5 {
+		t.Fatalf("new --priority high exit = %d, want 5", code)
+	}
+	code = captureExit(t, func() {
+		captureStderr(t, func() { cmdEdit(c, parse([]string{"1", "--priority", "high"})) })
+	})
+	if code != 5 {
+		t.Fatalf("edit --priority high exit = %d, want 5", code)
+	}
+}
+
+// FIND-0055: every missing/malformed-argument error exits 5, whatever the verb.
+func TestUsageErrorsExit5(t *testing.T) {
+	c := newTestClient("http://127.0.0.1:1", &http.Client{Timeout: time.Second})
+	cases := map[string]func(){
+		"show":        func() { cmdShow(c, parse(nil)) },
+		"claim":       func() { cmdClaim(c, parse(nil)) },
+		"note no id":  func() { cmdNote(c, parse(nil)) },
+		"note no txt": func() { cmdNote(c, parse([]string{"1"})) },
+		"drop":        func() { cmdDrop(c, parse(nil)) },
+		"rm":          func() { cmdRm(c, parse(nil)) },
+		"project":     func() { cmdProject(c, parse([]string{"archive"})) },
+		"project rm":  func() { cmdProject(c, parse([]string{"rm", "web"})) },
+		"category":    func() { cmdCategory(c, parse(nil)) },
+		"token":       func() { cmdToken(c, parse([]string{"revoke"})) },
+		"dep add":     func() { cmdDep(c, parse([]string{"add", "1"})) },
+		"dep rm":      func() { cmdDep(c, parse([]string{"rm", "1"})) },
+		"dep":         func() { cmdDep(c, parse(nil)) },
+		"ls --limit":  func() { cmdLs(c, parse([]string{"--limit", "x"})) },
+	}
+	for name, fn := range cases {
+		code := captureExit(t, func() { captureStderr(t, fn) })
+		if code != 5 {
+			t.Errorf("%s usage error exit = %d, want 5", name, code)
+		}
+	}
+}
+
+// FIND-0040: --limit reaches the query (0 = all), and a truncated --json list
+// says so on stderr while stdout stays one JSON array.
+func TestCmdLsLimitAndJSONTruncationHint(t *testing.T) {
+	var query string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query = r.URL.RawQuery
+		n, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		if n == 0 {
+			n = 3
+		}
+		tasks := make([]Task, n)
+		for i := range tasks {
+			tasks[i] = Task{ID: int64(i + 1), Title: "t", Status: "todo"}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(tasks)
+	}))
+	t.Cleanup(stub.Close)
+	c := newTestClient(stub.URL, stub.Client())
+
+	var out string
+	msg := captureStderr(t, func() {
+		out = captureStdout(t, func() { cmdLs(c, parse([]string{"--json"})) })
+	})
+	if !strings.Contains(query, "limit=50") || !strings.Contains(msg, "50 shown") {
+		t.Fatalf("query = %q stderr = %q, want limit=50 and a truncation hint", query, msg)
+	}
+	var got []Task
+	if err := json.Unmarshal([]byte(out), &got); err != nil || len(got) != 50 {
+		t.Fatalf("stdout not a 50-task JSON array: %v %q", err, out)
+	}
+
+	msg = captureStderr(t, func() {
+		captureStdout(t, func() { cmdLs(c, parse([]string{"--json", "--limit", "0"})) })
+	})
+	if !strings.Contains(query, "limit=0") || msg != "" {
+		t.Fatalf("--limit 0: query = %q stderr = %q, want limit=0 and no hint", query, msg)
+	}
+}
+
+// FIND-0041: trunc counts runes, so multibyte text is never cut mid-sequence.
+func TestTruncMultibyte(t *testing.T) {
+	cases := []struct {
+		s    string
+		n    int
+		want string
+	}{
+		{"привет мир", 10, "привет мир"},
+		{"привет мир!", 10, "привет ми…"},
+		{"日本語のタイトル", 5, "日本語の…"},
+		{"🙂🙂🙂", 1, "🙂"},
+	}
+	for _, c := range cases {
+		got := trunc(c.s, c.n)
+		if got != c.want || !utf8.ValidString(got) {
+			t.Errorf("trunc(%q,%d) = %q, want %q", c.s, c.n, got, c.want)
+		}
+	}
+}
+
+// isolateIdentity points the identity file at a temp path and clears env.
+func isolateIdentity(t *testing.T) string {
+	idFile := filepath.Join(t.TempDir(), "id")
+	t.Setenv("AGENTMAN_AGENT_FILE", idFile)
+	t.Setenv("AGENTMAN_AGENT", "")
+	t.Setenv("AGENTMAN_SCOPE", "")
+	t.Setenv("AGENTMAN_TOKEN", "")
+	return idFile
+}
+
+// FIND-0035: a token minted before `am init` is stored as {"token":...} and
+// read back as a TOKEN — never as a bare agent id carrying the plaintext.
+func TestCmdTokenNewBeforeInit(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateCategory(t, ts, "work")
+	isolateIdentity(t)
+
+	c := &Client{base: ts.URL, http: ts.Client()}
+	out := captureStdout(t, func() {
+		captureStderr(t, func() { cmdToken(c, parse([]string{"new", "--scope", "work"})) })
+	})
+	plain := strings.TrimSpace(out)
+	agent, scope, token := resolveIdentity()
+	if agent != "" || scope != "" || token != plain {
+		t.Fatalf("resolveIdentity = (%q, %q, %q), want (\"\", \"\", %q)", agent, scope, token, plain)
+	}
+	// FIND-0065: whoami on the token-only record asks for `am init` (exit 5)
+	// and never echoes the plaintext.
+	var code int
+	msg := captureStderr(t, func() {
+		out = captureStdout(t, func() { code = captureExit(t, cmdWhoami) })
+	})
+	if code != 5 || !strings.Contains(msg, "am init") || strings.Contains(out+msg, plain) {
+		t.Fatalf("whoami: exit = %d stdout = %q stderr = %q, want exit 5 asking for am init, no token", code, out, msg)
+	}
+}
+
+// FIND-0467: storeToken persists the FILE's identity, not env overrides, and
+// replaces the file atomically (no temp file left behind, 0600).
+func TestStoreTokenIgnoresEnvAndIsAtomic(t *testing.T) {
+	idFile := isolateIdentity(t)
+	seed, _ := json.Marshal(identityRecord{Agent: "file-agent", Scope: "work"})
+	if err := os.WriteFile(idFile, seed, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENTMAN_AGENT", "shell-agent")
+	t.Setenv("AGENTMAN_SCOPE", "personal")
+
+	storeToken("amt_x")
+
+	var rec identityRecord
+	data, _ := os.ReadFile(idFile)
+	if err := json.Unmarshal(data, &rec); err != nil {
+		t.Fatalf("identity not JSON: %v %s", err, data)
+	}
+	if rec != (identityRecord{Agent: "file-agent", Scope: "work", Token: "amt_x"}) {
+		t.Fatalf("record = %+v, want file agent/scope kept and env ignored", rec)
+	}
+	entries, _ := os.ReadDir(filepath.Dir(idFile))
+	if len(entries) != 1 {
+		t.Fatalf("dir has %d entries, want only the identity file (temp file left?)", len(entries))
+	}
+	if fi, _ := os.Stat(idFile); fi.Mode().Perm() != 0o600 {
+		t.Fatalf("identity mode = %v, want 0600", fi.Mode().Perm())
+	}
+}
+
+// FIND-0047: if the identity cannot be written, the once-only plaintext is
+// still printed before the failure.
+func TestCmdTokenNewPrintsTokenWhenStoreFails(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"tk_1","scope":"work","token":"amt_once"}`))
+	}))
+	t.Cleanup(stub.Close)
+	isolateIdentity(t)
+	blocker := filepath.Join(t.TempDir(), "file")
+	os.WriteFile(blocker, nil, 0o644)
+	t.Setenv("AGENTMAN_AGENT_FILE", filepath.Join(blocker, "id")) // parent is a file → write fails
+
+	c := &Client{base: stub.URL, http: stub.Client()}
+	var code int
+	var msg string
+	out := captureStdout(t, func() {
+		msg = captureStderr(t, func() {
+			code = captureExit(t, func() { cmdToken(c, parse([]string{"new", "--scope", "work"})) })
+		})
+	})
+	if code != 1 || strings.TrimSpace(out) != "amt_once" || !strings.Contains(msg, "NOT stored") {
+		t.Fatalf("exit = %d stdout = %q stderr = %q, want 1, the token on stdout, and a NOT stored error", code, out, msg)
+	}
+}
+
+// FIND-0465: from an identity holding a (scope-bound) token, token admin is
+// refused by the server; the CLI says where to run it instead.
+func TestCmdTokenAdminFromTokenIdentity(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateCategory(t, ts, "work")
+	isolateIdentity(t)
+	human := &Client{base: ts.URL, http: ts.Client()}
+	tok := strings.TrimSpace(captureStdout(t, func() {
+		captureStderr(t, func() { cmdToken(human, parse([]string{"new", "--scope", "work"})) })
+	}))
+
+	agentDir := &Client{base: ts.URL, token: tok, http: ts.Client()}
+	var code int
+	msg := captureStderr(t, func() {
+		code = captureExit(t, func() { cmdToken(agentDir, parse([]string{"ls"})) })
+	})
+	if code != 8 || !strings.Contains(msg, "AGENTMAN_AGENT_FILE") {
+		t.Fatalf("token ls with a stored token: exit = %d stderr = %q, want 8 with a where-to-run hint", code, msg)
 	}
 }

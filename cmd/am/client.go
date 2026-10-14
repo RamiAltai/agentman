@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -31,15 +34,16 @@ func NewClient() *Client {
 	}
 }
 
-// do performs a request. A transport error (server down) is reported by
-// returning status 0, which callers map to exit code 6.
-func (c *Client) do(method, path string, body any) (int, []byte) {
+// newRequest builds a request carrying the identity and credential headers.
+// It is the single place that decides them, shared by do() and the streaming
+// waiter (wait.go), so the two cannot drift apart.
+func (c *Client) newRequest(ctx context.Context, method, path string, body any) *http.Request {
 	var rdr io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
 		rdr = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, c.base+path, rdr)
+	req, err := http.NewRequestWithContext(ctx, method, c.base+path, rdr)
 	if err != nil {
 		fail(1, "agentman: %v", err)
 	}
@@ -58,26 +62,55 @@ func (c *Client) do(method, path string, body any) (int, []byte) {
 	} else if c.scope != "" {
 		req.Header.Set("X-Agent-Scope", c.scope)
 	}
-	resp, err := c.http.Do(req)
+	return req
+}
+
+// do performs a request. Two failures are terminal for every caller and so
+// are decided here, once: a transport error exits 6 (transportFail), and a 403
+// from the server's Host/Origin guards exits 1 — it means AGENTMAN_URL or a
+// proxy is misconfigured, not that the task is out of scope (exit 8 is kept
+// for the out_of_scope 403 only).
+func (c *Client) do(method, path string, body any) (int, []byte) {
+	resp, err := c.http.Do(c.newRequest(context.Background(), method, path, body))
 	if err != nil {
-		return 0, nil
+		transportFail(c.base, method, err)
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusForbidden {
+		switch e := apiErr(data, ""); e {
+		case "forbidden_host", "cross_origin":
+			fail(1, "agentman: server at %s refused the request (%s) — point AGENTMAN_URL at http://127.0.0.1:<port> directly, not through a hostname alias or proxy", c.base, e)
+		}
+	}
 	return resp.StatusCode, data
 }
 
-// exitCodeFor maps an HTTP status (0 = transport error) to the CLI exit-code
-// convention: 0 ok · 3 not found · 4 conflict · 5 validation · 6 server down ·
-// 8 out of scope · 9 bad token · 1 other. Single source for doOrFail and the
-// bulk verbs. 9 is distinct from 8 on purpose: a bad credential must hard-fail,
+// transportFail exits 6 for a request that got no HTTP response, keeping the
+// underlying error. A failed dial never reached the server; any other error
+// (timeout, reset) may have happened after the server received a mutation,
+// so for non-GET requests the message says the outcome is unknown.
+func transportFail(base, method string, err error) {
+	var op *net.OpError
+	switch {
+	case errors.As(err, &op) && op.Op == "dial":
+		fail(6, "agentman: cannot reach server at %s (is `am serve` running?): %v", base, err)
+	case method == http.MethodGet:
+		fail(6, "agentman: request to %s failed: %v", base, err)
+	default:
+		fail(6, "agentman: %s to %s failed after it was sent (%v) — the outcome is unknown; check the task's state before retrying", method, base, err)
+	}
+}
+
+// exitCodeFor maps an HTTP status to the CLI exit-code convention: 0 ok ·
+// 3 not found · 4 conflict · 5 validation · 8 out of scope · 9 bad token ·
+// 1 other (6 server down never gets here: do() exits on a transport error).
+// Single source for doOrFail and the bulk verbs. 9 is distinct from 8 on purpose: a bad credential must hard-fail,
 // not be swallowed as a per-id scope-skip in a bulk loop.
 func exitCodeFor(st int) int {
 	switch {
 	case st >= 200 && st < 300:
 		return 0
-	case st == 0:
-		return 6
 	case st == 401:
 		return 9
 	case st == 404:
@@ -94,15 +127,19 @@ func exitCodeFor(st int) int {
 }
 
 // doOrFail returns the body on 2xx, otherwise prints a terse error and exits
-// with the convention: 3 not found · 4 conflict · 5 validation · 6 server down ·
-// 8 out of scope.
+// with the convention: 3 not found · 4 conflict · 5 validation · 8 out of
+// scope (6 server down is decided in do()).
 func (c *Client) doOrFail(method, path string, body any) []byte {
 	st, data := c.do(method, path, body)
+	return c.orFail(st, data)
+}
+
+// orFail is doOrFail's status mapping, for callers that inspect the status
+// before falling back to the convention.
+func (c *Client) orFail(st int, data []byte) []byte {
 	switch exitCodeFor(st) {
 	case 0:
 		return data
-	case 6:
-		fail(6, "agentman: cannot reach server at %s (is `am serve` running?)", c.base)
 	case 3:
 		fail(3, "%s", apiErr(data, "not found"))
 	case 4:

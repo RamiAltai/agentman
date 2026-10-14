@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -16,11 +17,52 @@ import (
 func main() {
 	if len(os.Args) < 2 {
 		usage()
-		os.Exit(1)
+		os.Exit(5) // usage error
 	}
-	cmd := os.Args[1]
-	rest := os.Args[2:]
+	dispatch(os.Args[1], os.Args[2:])
+}
 
+// localCmds are the verbs that never talk to the server.
+var localCmds = map[string]func(Args){
+	"init":      cmdInit,
+	"whoami":    func(Args) { cmdWhoami() },
+	"version":   func(Args) { cmdVersion() },
+	"--version": func(Args) { cmdVersion() },
+	"-v":        func(Args) { cmdVersion() },
+	"update":    cmdUpdate,
+	"upgrade":   cmdUpdate,
+	"db":        cmdDB,
+}
+
+// clientCmds are the verbs that call `am serve` through a Client.
+var clientCmds = map[string]func(*Client, Args){
+	"ls":         cmdLs,
+	"list":       cmdLs,
+	"show":       cmdShow,
+	"new":        cmdNew,
+	"claim":      cmdClaim,
+	"next":       cmdNext,
+	"wait":       cmdWait,
+	"status":     cmdStatus,
+	"assign":     cmdAssign,
+	"note":       cmdNote,
+	"comment":    cmdNote,
+	"edit":       cmdEdit,
+	"drop":       cmdDrop,
+	"rm":         cmdRm,
+	"projects":   cmdProjects,
+	"project":    cmdProject,
+	"categories": cmdCategories,
+	"category":   cmdCategory,
+	"token":      cmdToken,
+	"dep":        cmdDep,
+	"help":       func(*Client, Args) { usage() },
+	"-h":         func(*Client, Args) { usage() },
+	"--help":     func(*Client, Args) { usage() },
+}
+
+// dispatch runs one verb with the arguments after it.
+func dispatch(cmd string, rest []string) {
 	if cmd == "serve" {
 		runServe(rest)
 		return
@@ -36,78 +78,51 @@ func main() {
 	}
 
 	a := parse(rest)
-	switch cmd {
-	case "init":
-		cmdInit(a)
-		return
-	case "whoami":
-		cmdWhoami()
-		return
-	case "version", "--version", "-v":
-		cmdVersion()
-		return
-	case "update", "upgrade":
-		cmdUpdate(a)
-		return
-	case "db":
-		cmdDB(a)
+	if f, ok := localCmds[cmd]; ok {
+		f(a)
 		return
 	}
-
 	c := NewClient()
-	switch cmd {
-	case "ls", "list":
-		cmdLs(c, a)
-	case "show":
-		cmdShow(c, a)
-	case "new":
-		cmdNew(c, a)
-	case "claim":
-		cmdClaim(c, a)
-	case "next":
-		cmdNext(c, a)
-	case "wait":
-		cmdWait(c, a)
-	case "status":
-		cmdStatus(c, a)
-	case "assign":
-		cmdAssign(c, a)
-	case "note", "comment":
-		cmdNote(c, a)
-	case "edit":
-		cmdEdit(c, a)
-	case "drop":
-		cmdDrop(c, a)
-	case "rm":
-		cmdRm(c, a)
-	case "projects":
-		cmdProjects(c, a)
-	case "project":
-		cmdProject(c, a)
-	case "categories":
-		cmdCategories(c, a)
-	case "category":
-		cmdCategory(c, a)
-	case "token":
-		cmdToken(c, a)
-	case "dep":
-		cmdDep(c, a)
-	case "help", "-h", "--help":
-		usage()
-	default:
-		fail(1, "unknown command: %s (try `am help`)", cmd)
+	f, ok := clientCmds[cmd]
+	if !ok {
+		usageErr("unknown command: %s (try `am help`)", cmd)
 	}
+	f(c, a)
+}
+
+// serveConfig resolves serve's port, DB path and proposals carve-out project:
+// flag, then env, then default.
+func serveConfig(a Args) (port, dbPath, proposals string) {
+	if port = a.flag("port"); port == "" {
+		port = envOr("AGENTMAN_PORT", "8787")
+	}
+	if dbPath = a.flag("db"); dbPath == "" {
+		dbPath = envOr("AGENTMAN_DB", defaultDBPath())
+	}
+	if proposals = a.flag("proposals"); proposals == "" {
+		proposals = envOr("AGENTMAN_PROPOSALS", "meta/proposals")
+	}
+	return port, dbPath, proposals
+}
+
+// proposalsScope parses the proposals carve-out project. Both segments are
+// required — a bare category would turn the carve-out into a category-wide hole.
+func proposalsScope(raw string) (Scope, error) {
+	sc, err := parseScope(raw)
+	if err == nil && sc.Project == "" {
+		err = errors.New("missing project")
+	}
+	return sc, err
 }
 
 func runServe(argv []string) {
 	a := parse(argv)
-	port := envOr("AGENTMAN_PORT", "8787")
-	if v := a.flag("port"); v != "" {
-		port = v
-	}
-	dbPath := a.flag("db")
-	if dbPath == "" {
-		dbPath = envOr("AGENTMAN_DB", defaultDBPath())
+	port, dbPath, prop := serveConfig(a)
+	// Bind before touching the DB: a busy port (e.g. a second serve) must fail
+	// before OpenStore runs schema/migrations on a file another server uses.
+	ln, err := net.Listen("tcp", listenAddr(port))
+	if err != nil {
+		fail(1, "agentman: serve: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		fail(1, "agentman: %v", err)
@@ -118,15 +133,8 @@ func runServe(argv []string) {
 	}
 
 	srv := NewServer(store)
-	// The proposals carve-out project: --proposals flag, then AGENTMAN_PROPOSALS
-	// env, default meta/proposals. Both segments are required — a bare category
-	// would turn the carve-out into a category-wide hole.
-	prop := envOr("AGENTMAN_PROPOSALS", "meta/proposals")
-	if v := a.flag("proposals"); v != "" {
-		prop = v
-	}
-	psc, err := parseScope(prop)
-	if err != nil || psc.Project == "" {
+	psc, err := proposalsScope(prop)
+	if err != nil {
 		fail(1, "agentman: bad proposals project %q (want category/project)", prop)
 	}
 	srv.proposals = psc
@@ -136,7 +144,6 @@ func runServe(argv []string) {
 	}
 	baseCtx, cancelBase := context.WithCancel(context.Background())
 	httpServer := &http.Server{
-		Addr:              listenAddr(port),
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		BaseContext:       func(net.Listener) context.Context { return baseCtx },
@@ -147,20 +154,29 @@ func runServe(argv []string) {
 
 	checkForUpdate() // non-blocking; logs once if a newer version is published
 
-	go func() {
-		log.Printf("agentman: dashboard on http://%s   (db: %s)", httpServer.Addr, dbPath)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("agentman: serve: %v", err)
-		}
-	}()
+	log.Printf("agentman: dashboard on http://%s   (db: %s)", ln.Addr(), dbPath)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- httpServer.Serve(ln) }()
 
-	<-ctx.Done()
-	log.Printf("agentman: shutting down")
+	// A signal and a Serve failure leave through the same cleanup below.
+	var failed error
+	select {
+	case <-ctx.Done():
+		log.Printf("agentman: shutting down")
+	case failed = <-serveErr: // never ErrServerClosed: Shutdown has not run yet
+	}
 	cancelBase() // unblock long-lived SSE handlers
 	shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	httpServer.Shutdown(shutCtx)
-	store.Close()
+	if err := httpServer.Shutdown(shutCtx); err != nil {
+		log.Printf("agentman: shutdown: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		log.Printf("agentman: close db: %v", err)
+	}
+	if failed != nil {
+		fail(1, "agentman: serve: %v", failed)
+	}
 }
 
 // rewriteShowComments rewrites -c tokens to --comments for `am show` only:
@@ -200,7 +216,7 @@ func usage() {
   am init <tasktype> [-c CAT [-p PROJ]]  set this session's identity, optionally scoped to a category or project
   am whoami                              print the current identity (+ scope when set)
 
-  am ls [--mine] [--status S] [-p P] [-c CAT] [--all] [--ready] [--blocked] [--stale DUR] [--grep TEXT] [--label L] [--meta KEY]   list tasks (hides done; --all = every task board-wide, ignores -p/-c; alias: list)
+  am ls [--mine] [--status S] [-p P] [-c CAT] [--all] [--ready] [--blocked] [--stale DUR] [--grep TEXT] [--label L] [--meta KEY] [--limit N]   list tasks (hides done; --all = every task board-wide, ignores -p/-c; --limit default 50, 0 = all; alias: list)
   am show <id> [-c]                            task detail (+comments +deps)
   am new "title" [--body B] [-p P] [--priority N] [--assign A] [--meta k=v]...   create, prints id
   am claim <id> [--steal-stale DUR]           assign me + ->doing (atomic; DUR is Go syntax, e.g. 30m, 48h)
@@ -226,6 +242,8 @@ func usage() {
   am category archive <slug>             soft-archive a category (hides its projects)
   am category unarchive <slug>           restore an archived category
   am token new --scope <cat[/proj]>           mint a scope-bound bearer token (prints it once; stored in identity)
+                                              token new/ls/revoke need an identity with no token: run them elsewhere
+                                              than where a token is stored (or set AGENTMAN_AGENT_FILE)
   am token ls [--json]                        list tokens (id / scope / created / [revoked])
   am token revoke <id>                        revoke a token (silent success)
   am version                                  print version (also --version, -v)
@@ -239,11 +257,16 @@ Scope: 'am init <tasktype> -c CAT [-p PROJ]' confines this identity — out-of-s
      mutations/reads are rejected (exit 8); creating tasks in the proposals
      project (default meta/proposals) is allowed from any scope.
 Env: AGENTMAN_URL (default http://127.0.0.1:8787), AGENTMAN_PROJECT (default project),
+     AGENTMAN_AGENT (override the identity file's agent id),
+     AGENTMAN_AGENT_FILE (use this identity file instead of the per-directory one),
      AGENTMAN_CATEGORY (default category scope for ls/next/wait/project new),
      AGENTMAN_SCOPE (override the identity file's scope, e.g. work or work/api),
      AGENTMAN_TOKEN (override the identity file's bearer token; sent as Authorization: Bearer),
-     AGENTMAN_PROPOSALS (serve: the carve-out project, default meta/proposals).
+     AGENTMAN_PORT, AGENTMAN_DB, AGENTMAN_PROPOSALS (serve: defaults for --port, --db,
+     --proposals), AGENTMAN_LOG (serve: any value = --log),
+     AGENTMAN_NO_UPDATE_CHECK (serve: any value skips the startup update check).
      Add --json to any read to parse output.
-Exit codes: 0 ok · 3 not found · 4 already claimed · 5 invalid · 6 server down · 7 timed out · 8 out of scope · 9 bad token.
+Args: '--' ends the flags (am note 12 -- "-x done"); --flag=VALUE passes a value starting with '-'.
+Exit codes: 0 ok · 3 not found · 4 already claimed · 5 invalid (incl. any usage error) · 6 server down · 7 timed out · 8 out of scope · 9 bad token · 1 other.
 `)
 }

@@ -1,68 +1,118 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 )
 
-// Identity resolution for the CLI, in priority order:
-//  1. AGENTMAN_AGENT / AGENTMAN_SCOPE env (explicit overrides; win, e.g. for
-//     parallel agents in one dir)
+// Identity resolution for the CLI, in priority order (each of agent, scope
+// and token resolves independently):
+//  1. AGENTMAN_AGENT / AGENTMAN_SCOPE / AGENTMAN_TOKEN env (explicit
+//     overrides; win, e.g. for parallel agents in one dir — an env token
+//     silently supersedes the file's)
 //  2. a per-working-directory file written by `am init` (survives across the
 //     fresh shells the agent harness spawns, since env does not)
 //
 // This lets an agent run `am init <tasktype>` once at the start of a session and
 // then use `am` normally — no need to repeat its identity on every command.
 //
-// File format: a scoped init writes JSON {"agent":"...","scope":"cat[/proj]"};
-// an unscoped init keeps the legacy bare-id plain text, and any pre-Phase-Q
-// plain-text file is read as an unscoped identity (R8 compatibility).
+// File format: JSON {"agent","scope","token"} (scope and token omitted when
+// empty). A scoped init writes agent+scope; `am token new` merges in token
+// (and writes {"token":"..."} alone, with no agent, before any init). An
+// unscoped init writes the bare agent id as plain text, and any plain-text
+// file — including those from versions before scopes existed — is read as an
+// unscoped identity.
 
-func identityFile() string {
+// identityFile returns this working directory's identity file. Without a home
+// directory or a working directory it errors rather than guess: a relative
+// "./.agentman" would put a bearer token inside the project tree, and a shared
+// fallback name would merge distinct directories' identities.
+func identityFile() (string, error) {
 	if f := os.Getenv("AGENTMAN_AGENT_FILE"); f != "" {
-		return f
+		return f, nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		home = "."
+		return "", fmt.Errorf("no home directory (%v); set AGENTMAN_AGENT_FILE or AGENTMAN_AGENT", err)
 	}
 	wd, err := os.Getwd()
 	if err != nil {
-		wd = "default"
+		return "", fmt.Errorf("no working directory (%v); set AGENTMAN_AGENT_FILE or AGENTMAN_AGENT", err)
 	}
 	sum := sha1.Sum([]byte(wd))
-	return filepath.Join(home, ".agentman", "agents", hex.EncodeToString(sum[:])[:12])
+	return filepath.Join(home, ".agentman", "agents", hex.EncodeToString(sum[:])[:12]), nil
 }
 
-// identityRecord is the JSON identity-file shape used when a scope or token is
-// set. A token (Phase S) is the bearer credential the server binds to a scope;
-// it is stored here so an agent that ran `am token new` keeps sending it on
-// every command without re-supplying it.
+// identityRecord is the JSON identity-file shape, written by a scoped init
+// and by storeToken (which may write it with an empty agent). The token is
+// the bearer credential the server binds to a scope; it is stored here so an
+// agent that ran `am token new` keeps sending it on every command without
+// re-supplying it.
 type identityRecord struct {
 	Agent string `json:"agent"`
 	Scope string `json:"scope,omitempty"`
 	Token string `json:"token,omitempty"`
 }
 
+// readIdentityFile returns the identity file's own agent, scope and token,
+// without env overrides. A JSON record is accepted when any field is set (a
+// token minted before `am init` has no agent); anything else is the legacy
+// plain-text bare agent id. No locatable file reads as no identity.
+func readIdentityFile() (rec identityRecord) {
+	f, err := identityFile()
+	if err != nil {
+		return rec
+	}
+	b, err := os.ReadFile(f)
+	if err != nil {
+		return rec
+	}
+	if json.Unmarshal(b, &rec) == nil && rec != (identityRecord{}) {
+		return rec
+	}
+	return identityRecord{Agent: strings.TrimSpace(string(b))} // legacy plain text = unscoped
+}
+
+// writeIdentityFile replaces the identity file atomically (temp file in the
+// same directory, then rename), so an interrupted write never leaves a
+// truncated identity. The temp file is created 0600: the record may hold a
+// bearer token.
+func writeIdentityFile(data []byte) error {
+	f, err := identityFile()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(f), ".identity-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // no-op after a successful rename
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), f)
+}
+
 // resolveIdentity returns the agent id, scope, and token ("" when unset), each
 // independently overridable by env (AGENTMAN_AGENT / AGENTMAN_SCOPE /
 // AGENTMAN_TOKEN).
 func resolveIdentity() (agent, scope, token string) {
-	if b, err := os.ReadFile(identityFile()); err == nil {
-		var rec identityRecord
-		if json.Unmarshal(b, &rec) == nil && rec.Agent != "" {
-			agent, scope, token = rec.Agent, rec.Scope, rec.Token
-		} else {
-			agent = strings.TrimSpace(string(b)) // legacy plain text = unscoped
-		}
-	}
+	rec := readIdentityFile()
+	agent, scope, token = rec.Agent, rec.Scope, rec.Token
 	if a := strings.TrimSpace(os.Getenv("AGENTMAN_AGENT")); a != "" {
 		agent = a
 	}
@@ -90,13 +140,18 @@ func resolveToken() string {
 	return t
 }
 
-// newIdentity builds a human-readable id like "bugfix_050626_4821".
+// newIdentity builds a human-readable id like "bugfix_050626_4f21a9". The
+// suffix is 24 random bits from crypto/rand: the server treats a claim by the
+// same agent string as idempotent, so two agents that drew the same id would
+// silently share a task (a 4-digit suffix collided at ~n²/20000 per day).
 func newIdentity(taskType string) string {
 	t := sanitizeType(taskType)
 	if t == "" {
 		t = "agent"
 	}
-	return fmt.Sprintf("%s_%s_%04d", t, time.Now().Format("020106"), rand.Intn(10000))
+	var b [3]byte
+	rand.Read(b[:]) // never fails (crypto/rand panics rather than return short)
+	return fmt.Sprintf("%s_%s_%s", t, time.Now().Format("020106"), hex.EncodeToString(b[:]))
 }
 
 func sanitizeType(s string) string {
@@ -140,11 +195,7 @@ func cmdInit(a Args) {
 			fail(1, "init: %v", err)
 		}
 	}
-	f := identityFile()
-	if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
-		fail(1, "init: %v", err)
-	}
-	if err := os.WriteFile(f, data, 0o644); err != nil {
+	if err := writeIdentityFile(data); err != nil {
 		fail(1, "init: %v", err)
 	}
 	fmt.Println(id) // print only the id, so `id=$(am init bugfix)` works

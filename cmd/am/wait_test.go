@@ -3,31 +3,42 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
-// newWaitClient builds the Client cmdWait needs (it only reads base + agent;
-// the SSE connection uses its own un-timed http.Client).
+// newWaitClient builds an unscoped Client for cmdWait. cmdWait reads base,
+// agent, scope and token (the last three through Client.newRequest, for the
+// REST re-checks and the stream); this sets base and agent only. The SSE
+// connection uses its own un-timed http.Client.
 func newWaitClient(base string) *Client {
-	return &Client{base: base, agent: "tester", http: &http.Client{Timeout: time.Second}}
+	return newTestClient(base, &http.Client{Timeout: time.Second})
 }
 
-// patchTask issues a raw PATCH without test helpers, safe from goroutines
-// (no t.Fatalf off the test goroutine).
-func patchTask(base, id, body string) {
-	req, err := http.NewRequest(http.MethodPatch, base+"/api/tasks/"+id, strings.NewReader(body))
+// rawDo issues a raw JSON request without test helpers, safe from goroutines
+// (no t.Fatalf off the test goroutine). Errors are dropped: a failed setup
+// request shows up as the waiter's timeout.
+func rawDo(base, method, path, body string, headers map[string]string) {
+	req, err := http.NewRequest(method, base+path, strings.NewReader(body))
 	if err != nil {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Agent", "patcher")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err == nil {
 		resp.Body.Close()
 	}
+}
+
+// patchTask issues a raw PATCH (see rawDo).
+func patchTask(base, id, body string) {
+	rawDo(base, http.MethodPatch, "/api/tasks/"+id, body, map[string]string{"X-Agent": "patcher"})
 }
 
 func TestWaitDoneAlreadySatisfied(t *testing.T) {
@@ -193,8 +204,8 @@ func TestWaitUsageErrors(t *testing.T) {
 	}
 	for _, argv := range cases {
 		code := captureExit(t, func() { cmdWait(c, parse(argv)) })
-		if code != 1 {
-			t.Errorf("cmdWait(%v) exit = %d, want 1 (usage)", argv, code)
+		if code != 5 {
+			t.Errorf("cmdWait(%v) exit = %d, want 5 (usage)", argv, code)
 		}
 	}
 }
@@ -240,19 +251,9 @@ func TestWaitBadTimeoutExit5(t *testing.T) {
 
 // ---------- Phase O: wait --ready -c ----------
 
-// createTaskRaw creates a task without test helpers, safe from goroutines
-// (no t.Fatalf off the test goroutine).
+// createTaskRaw creates a task via rawDo (goroutine-safe).
 func createTaskRaw(base, project, title string) {
-	req, err := http.NewRequest(http.MethodPost, base+"/api/tasks",
-		strings.NewReader(`{"project":"`+project+`","title":"`+title+`"}`))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err == nil {
-		resp.Body.Close()
-	}
+	rawDo(base, http.MethodPost, "/api/tasks", `{"project":"`+project+`","title":"`+title+`"}`, nil)
 }
 
 // TestWaitReadyCategoryScoped: a ready task in another category must NOT
@@ -261,12 +262,8 @@ func createTaskRaw(base, project, title string) {
 // though /api/stream accepts it — ADR-028) — the REST re-check carries the scope.
 func TestWaitReadyCategoryScoped(t *testing.T) {
 	ts := newTestServer(t)
-	r := do(t, ts, http.MethodPost, "/api/categories", `{"slug":"work"}`,
-		map[string]string{"Content-Type": "application/json"})
-	r.Body.Close()
-	r = do(t, ts, http.MethodPost, "/api/projects", `{"slug":"wproj","category":"work"}`,
-		map[string]string{"Content-Type": "application/json"})
-	r.Body.Close()
+	mustCreateCategory(t, ts, "work")
+	mustCreateProjectIn(t, ts, "wproj", "work")
 	mustCreateProject(t, ts, "gproj") // lands in general
 
 	// Out-of-category ready task exists BEFORE the wait starts: must not satisfy it.
@@ -303,12 +300,8 @@ func TestWaitReadyCategoryScoped(t *testing.T) {
 
 func TestWaitReadyCategoryEnv(t *testing.T) {
 	ts := newTestServer(t)
-	r := do(t, ts, http.MethodPost, "/api/categories", `{"slug":"work"}`,
-		map[string]string{"Content-Type": "application/json"})
-	r.Body.Close()
-	r = do(t, ts, http.MethodPost, "/api/projects", `{"slug":"wproj","category":"work"}`,
-		map[string]string{"Content-Type": "application/json"})
-	r.Body.Close()
+	mustCreateCategory(t, ts, "work")
+	mustCreateProjectIn(t, ts, "wproj", "work")
 	id := mustCreateTask(t, ts, "wproj", "already ready")
 
 	t.Setenv("AGENTMAN_CATEGORY", "work")
@@ -329,9 +322,7 @@ func TestWaitReadyCategoryEnv(t *testing.T) {
 
 func TestWaitReadyCategoryTimeout(t *testing.T) {
 	ts := newTestServer(t)
-	r := do(t, ts, http.MethodPost, "/api/categories", `{"slug":"work"}`,
-		map[string]string{"Content-Type": "application/json"})
-	r.Body.Close()
+	mustCreateCategory(t, ts, "work")
 	mustCreateProject(t, ts, "gproj")
 	mustCreateTask(t, ts, "gproj", "general ready") // out of scope forever
 
@@ -346,19 +337,9 @@ func TestWaitReadyCategoryTimeout(t *testing.T) {
 
 // ---------- Phase P: wait --ready --meta ----------
 
-// createMetaTaskRaw mirrors createTaskRaw but attaches a meta object;
-// goroutine-safe (no t.Fatalf off the test goroutine).
+// createMetaTaskRaw is createTaskRaw with a meta object (goroutine-safe).
 func createMetaTaskRaw(base, project, title, metaJSON string) {
-	req, err := http.NewRequest(http.MethodPost, base+"/api/tasks",
-		strings.NewReader(`{"project":"`+project+`","title":"`+title+`","meta":`+metaJSON+`}`))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err == nil {
-		resp.Body.Close()
-	}
+	rawDo(base, http.MethodPost, "/api/tasks", `{"project":"`+project+`","title":"`+title+`","meta":`+metaJSON+`}`, nil)
 }
 
 // A pre-existing ready task WITHOUT the key must not satisfy the wait, and
@@ -462,12 +443,12 @@ func TestWaitReadyMetaReleasedByPrereqDone(t *testing.T) {
 func TestWaitMetaUsageErrors(t *testing.T) {
 	c := newWaitClient("http://127.0.0.1:1") // never reached
 
-	// --meta only scopes --ready; with --done it is a usage error (exit 1).
+	// --meta only scopes --ready; with --done it is a usage error (exit 5).
 	code := captureExit(t, func() {
 		captureStderr(t, func() { cmdWait(c, parse([]string{"5", "--done", "--meta", "auto"})) })
 	})
-	if code != 1 {
-		t.Fatalf("wait --done --meta exit = %d, want 1", code)
+	if code != 5 {
+		t.Fatalf("wait --done --meta exit = %d, want 5", code)
 	}
 	// Two --meta keys → exit 5.
 	code = captureExit(t, func() {
@@ -487,9 +468,11 @@ func TestWaitMetaUsageErrors(t *testing.T) {
 
 // ---------- Phase Q: scoped wait --ready ----------
 
-// newScopedWaitClient mirrors newWaitClient with an X-Agent-Scope.
+// newScopedWaitClient is newWaitClient with an X-Agent-Scope.
 func newScopedWaitClient(base, scope string) *Client {
-	return &Client{base: base, agent: "tester", scope: scope, http: &http.Client{Timeout: time.Second}}
+	c := newWaitClient(base)
+	c.scope = scope
+	return c
 }
 
 // A ready task that exists only OUTSIDE the agent's scope must never release
@@ -564,5 +547,56 @@ func TestWaitReadyExplicitOutOfScopeExit8(t *testing.T) {
 	}
 	if !strings.Contains(msg, "out_of_scope") {
 		t.Fatalf("stderr = %q, want out_of_scope", msg)
+	}
+}
+
+// ---------- Code Witness g1: wait carries the bearer token ----------
+
+// FIND-0332 / FIND-0071: the waiter builds requests with Client.newRequest,
+// so a token identity sends Authorization: Bearer (and no X-Agent-Scope) on
+// the cursor and re-check requests, exactly like every other verb.
+func TestWaitSendsBearerToken(t *testing.T) {
+	var auth, scopeHdr []string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth = append(auth, r.Header.Get("Authorization"))
+		scopeHdr = append(scopeHdr, r.Header.Get("X-Agent-Scope"))
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/api/events") {
+			w.Write([]byte(`{"last_id":0}`))
+			return
+		}
+		w.Write([]byte(`{"id":5,"status":"done"}`))
+	}))
+	t.Cleanup(stub.Close)
+
+	c := &Client{base: stub.URL, agent: "tester", scope: "work", token: "amt_abc", http: stub.Client()}
+	code := captureExit(t, func() { cmdWait(c, parse([]string{"5", "--done"})) })
+	if code != -1 {
+		t.Fatalf("wait --done exit = %d, want normal return", code)
+	}
+	if len(auth) != 2 {
+		t.Fatalf("requests = %d, want 2 (cursor + check)", len(auth))
+	}
+	for i := range auth {
+		if auth[i] != "Bearer amt_abc" || scopeHdr[i] != "" {
+			t.Fatalf("request %d: Authorization = %q X-Agent-Scope = %q, want Bearer and no scope header", i, auth[i], scopeHdr[i])
+		}
+	}
+}
+
+// FIND-0332: a revoked/invalid token makes wait exit 9, not 1.
+func TestWaitUnauthorizedExit9(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"invalid_token"}`))
+	}))
+	t.Cleanup(stub.Close)
+	c := &Client{base: stub.URL, agent: "tester", token: "amt_revoked", http: stub.Client()}
+	for _, argv := range [][]string{{"5", "--done"}, {"--ready"}} {
+		code := captureExit(t, func() { captureStderr(t, func() { cmdWait(c, parse(argv)) }) })
+		if code != 9 {
+			t.Errorf("wait %v on 401 exit = %d, want 9", argv, code)
+		}
 	}
 }
