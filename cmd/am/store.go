@@ -260,7 +260,7 @@ func OpenStore(path string) (*Store, error) {
 // currentSchemaVersion is the version OpenStore migrates to. schema.sql seeds a
 // fresh DB at version 1; runMigrations applies any steps with version > the DB's
 // recorded version to reach this target.
-const currentSchemaVersion = 6
+const currentSchemaVersion = 7
 
 // migration is one forward-only, idempotent step. apply runs inside the same tx
 // that bumps meta.schema_version, so a step + its version bump commit atomically.
@@ -437,6 +437,27 @@ var schemaMigrations = []migration{
 			   ('projects', MAX(COALESCE((SELECT MAX(id) FROM projects),0), COALESCE((SELECT MAX(project_id) FROM events),0))),
 			   ('tasks',    MAX(COALESCE((SELECT MAX(id) FROM tasks),0),    COALESCE((SELECT MAX(task_id) FROM events),0))),
 			   ('events',   COALESCE((SELECT MAX(id) FROM events),0))`,
+		} {
+			if _, err := tx.Exec(q); err != nil {
+				return err
+			}
+		}
+		return nil
+	}},
+	// v7: indexes for the two hot scans. idx_tasks_next is partial over
+	// NextTask's candidate predicate, so `am next` reads the first eligible
+	// row in (priority, id) order instead of sorting the whole backlog.
+	// idx_tasks_assignee becomes partial (assignee IS NOT NULL — every
+	// assignee= and stale filter implies it): as a full index the planner
+	// took it for `assignee IS NULL` and sorted every candidate.
+	// idx_events_project serves project-filtered ListEvents (SSE replay,
+	// ?since=) without walking every later event.
+	{version: 7, apply: func(tx *sql.Tx) error {
+		for _, q := range []string{
+			"DROP INDEX IF EXISTS idx_tasks_assignee",
+			"CREATE INDEX idx_tasks_assignee ON tasks(assignee) WHERE assignee IS NOT NULL",
+			"CREATE INDEX IF NOT EXISTS idx_tasks_next ON tasks(priority, id) WHERE status='todo' AND assignee IS NULL",
+			"CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id, id)",
 		} {
 			if _, err := tx.Exec(q); err != nil {
 				return err
@@ -954,18 +975,43 @@ func (s *Store) UnarchiveProject(slug, actor string) (*Project, *Event, error) {
 	return p, ev, tx.Commit()
 }
 
-// CreateProject creates a project inside a category (empty category defaults
-// to "general"). Project slugs are globally unique — a slug names exactly one
-// project regardless of category, so existing task refs like "web-3" stay
-// unambiguous. Returns ErrNotFound for an unknown category and
-// ErrCategoryArchived for an archived one.
+// normalizeProjectSlug trims, lowercases and validates a project slug for
+// both CreateProject and PatchProject. Lowercased like category slugs because
+// parseScope lowercases every scope segment: a mixed-case slug could never be
+// matched by a project scope (and "Web" and "web" could coexist).
+func normalizeProjectSlug(slug string) (string, error) {
+	slug = strings.ToLower(strings.TrimSpace(slug))
+	if slug == "" || strings.ContainsAny(slug, " /\t") || len(slug) > maxTitleLen {
+		return "", ErrValidation
+	}
+	return slug, nil
+}
+
+// validProjectName is the project-name rule shared by create and patch.
+func validProjectName(name string) bool {
+	return strings.TrimSpace(name) != "" && len(name) <= maxTitleLen
+}
+
+// CreateProject is CreateProjectAs attributed to the dashboard user.
 func (s *Store) CreateProject(slug, name, category string) (*Project, *Event, error) {
-	slug = strings.TrimSpace(slug)
-	if slug == "" || strings.ContainsAny(slug, " /\t") {
-		return nil, nil, ErrValidation
+	return s.CreateProjectAs(slug, name, category, "human")
+}
+
+// CreateProjectAs creates a project inside a category (empty category defaults
+// to "general") and records project.created by actor. Project slugs are
+// globally unique — a slug names exactly one project regardless of category,
+// so existing task refs like "web-3" stay unambiguous. Returns ErrNotFound for
+// an unknown category and ErrCategoryArchived for an archived one.
+func (s *Store) CreateProjectAs(slug, name, category, actor string) (*Project, *Event, error) {
+	slug, err := normalizeProjectSlug(slug)
+	if err != nil {
+		return nil, nil, err
 	}
 	if name == "" {
 		name = slug
+	}
+	if !validProjectName(name) {
+		return nil, nil, ErrValidation
 	}
 	if category == "" {
 		category = "general"
@@ -1004,7 +1050,7 @@ func (s *Store) CreateProject(slug, name, category string) (*Project, *Event, er
 		id, _ = res.LastInsertId()
 		break
 	}
-	ev, err := insertEvent(tx, id, 0, "human", "project.created", map[string]any{"slug": slug})
+	ev, err := insertEvent(tx, id, 0, actorOr(actor), "project.created", map[string]any{"slug": slug})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1067,9 +1113,9 @@ func (s *Store) PatchProject(slug string, patch map[string]any, actor string) (*
 
 	if v, ok := patch["slug"]; ok {
 		ns, _ := v.(string)
-		ns = strings.TrimSpace(ns)
-		if ns == "" || strings.ContainsAny(ns, " /\t") || len(ns) > maxTitleLen {
-			return nil, nil, ErrValidation
+		ns, err := normalizeProjectSlug(ns)
+		if err != nil {
+			return nil, nil, err
 		}
 		if ns != cur.Slug {
 			var exists int
@@ -1084,7 +1130,7 @@ func (s *Store) PatchProject(slug string, patch map[string]any, actor string) (*
 	}
 	if v, ok := patch["name"]; ok {
 		nm, _ := v.(string)
-		if strings.TrimSpace(nm) == "" || len(nm) > maxTitleLen {
+		if !validProjectName(nm) {
 			return nil, nil, ErrValidation
 		}
 		if nm != cur.Name {
@@ -1094,8 +1140,10 @@ func (s *Store) PatchProject(slug string, patch map[string]any, actor string) (*
 		}
 	}
 	if v, ok := patch["vault_project_id"]; ok {
-		vid, _ := v.(string)
-		if len(vid) > maxTitleLen {
+		// "" or null clears; any other non-string is a client error, never
+		// a silent clear.
+		vid, isStr := v.(string)
+		if (!isStr && v != nil) || len(vid) > maxTitleLen {
 			return nil, nil, ErrValidation
 		}
 		if vid != cur.VaultProjectID {
@@ -1105,8 +1153,8 @@ func (s *Store) PatchProject(slug string, patch map[string]any, actor string) (*
 		}
 	}
 	if v, ok := patch["vault_path"]; ok {
-		vp, _ := v.(string)
-		if len(vp) > maxTitleLen {
+		vp, isStr := v.(string)
+		if (!isStr && v != nil) || len(vp) > maxTitleLen {
 			return nil, nil, ErrValidation
 		}
 		if vp != cur.VaultPath {
@@ -1416,40 +1464,52 @@ func (s *Store) ListTasks(f TaskFilter) ([]Task, error) {
 		return nil, err
 	}
 
-	// Stitch meta with one follow-up SELECT. Values are opaque (may contain
+	// Stitch meta with follow-up SELECTs. Values are opaque (may contain
 	// ',' or '='), so the GROUP_CONCAT trick used for labels is unsafe here.
-	if len(out) > 0 {
-		idx := make(map[int64]int, len(out))
-		ph := make([]string, len(out))
-		margs := make([]any, len(out))
-		for i := range out {
-			idx[out[i].ID] = i
-			ph[i] = "?"
-			margs[i] = out[i].ID
-		}
-		mrows, err := s.db.Query(
-			"SELECT task_id, key, value FROM task_meta WHERE task_id IN ("+strings.Join(ph, ",")+")", margs...)
-		if err != nil {
-			return nil, err
-		}
-		defer mrows.Close()
-		for mrows.Next() {
-			var tid int64
-			var k, v string
-			if err := mrows.Scan(&tid, &k, &v); err != nil {
-				return nil, err
-			}
-			i := idx[tid]
-			if out[i].Meta == nil {
-				out[i].Meta = map[string]string{}
-			}
-			out[i].Meta[k] = v
-		}
-		if err := mrows.Err(); err != nil {
+	// Chunked: an unlimited list (ProjectGraph) must not exceed SQLite's
+	// bound-variable cap with one placeholder per task.
+	idx := make(map[int64]int, len(out))
+	for i := range out {
+		idx[out[i].ID] = i
+	}
+	for start := 0; start < len(out); start += metaChunk {
+		if err := s.stitchMeta(out, idx, out[start:min(start+metaChunk, len(out))]); err != nil {
 			return nil, err
 		}
 	}
 	return out, nil
+}
+
+// metaChunk bounds the task ids per ListTasks meta query.
+const metaChunk = 500
+
+// stitchMeta loads the meta of the tasks in chunk into out (idx maps id → index).
+func (s *Store) stitchMeta(out []Task, idx map[int64]int, chunk []Task) error {
+	ph := make([]string, len(chunk))
+	margs := make([]any, len(chunk))
+	for i := range chunk {
+		ph[i] = "?"
+		margs[i] = chunk[i].ID
+	}
+	mrows, err := s.db.Query(
+		"SELECT task_id, key, value FROM task_meta WHERE task_id IN ("+strings.Join(ph, ",")+")", margs...)
+	if err != nil {
+		return err
+	}
+	defer mrows.Close()
+	for mrows.Next() {
+		var tid int64
+		var k, v string
+		if err := mrows.Scan(&tid, &k, &v); err != nil {
+			return err
+		}
+		i := idx[tid]
+		if out[i].Meta == nil {
+			out[i].Meta = map[string]string{}
+		}
+		out[i].Meta[k] = v
+	}
+	return mrows.Err()
 }
 
 func (s *Store) getTaskTx(q queryer, id int64) (*Task, error) {
@@ -1700,14 +1760,19 @@ func (s *Store) CreateTask(in CreateTaskInput) (*Task, *Event, error) {
 	if err := tx.QueryRow("SELECT COALESCE(MAX(ref),0)+1 FROM tasks WHERE project_id=?", pid).Scan(&ref); err != nil {
 		return nil, nil, err
 	}
-	res, err := tx.Exec(`INSERT INTO tasks(project_id,ref,title,body,priority,assignee,created_by)
-	         VALUES(?,?,?,?,?,?,?)`, pid, ref, in.Title, in.Body, in.Priority, nullStr(in.Assignee),
-		actorOr(in.Actor))
+	// A pre-assigned task gets claimed_at like every other assignment path
+	// (PatchTask, claim, steal, next); its status stays todo.
+	res, err := tx.Exec(`INSERT INTO tasks(project_id,ref,title,body,priority,assignee,created_by,claimed_at)
+	         VALUES(?,?,?,?,?,?,?,CASE WHEN ?6 IS NULL THEN NULL ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END)`,
+		pid, ref, in.Title, in.Body, in.Priority, nullStr(in.Assignee), actorOr(in.Actor))
 	if err != nil {
 		return nil, nil, err
 	}
 	id, _ := res.LastInsertId()
 	evData := map[string]any{"title": in.Title}
+	if in.Assignee != "" {
+		evData["assignee"] = in.Assignee
+	}
 	if len(meta) > 0 {
 		keys := make([]string, 0, len(meta))
 		for k := range meta {

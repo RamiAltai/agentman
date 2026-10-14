@@ -538,8 +538,8 @@ func TestMigrationV6ExistingDB(t *testing.T) {
 		t.Fatalf("OpenStore on v5 DB: %v", err)
 	}
 	defer st.Close()
-	if v, _ := readSchemaVersion(st.db); v != 6 {
-		t.Fatalf("schema_version = %d, want 6", v)
+	if v, _ := readSchemaVersion(st.db); v != currentSchemaVersion {
+		t.Fatalf("schema_version = %d, want %d", v, currentSchemaVersion)
 	}
 	for _, tbl := range []string{"projects", "tasks", "events"} {
 		var ddl string
