@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,11 +45,25 @@ func (a Args) at(i int) string {
 
 // parse splits argv into positionals, value flags, and boolean flags in any
 // order, so `am new "title" --body x` and `am new --body x "title"` both work.
+// A bare `--` ends the flags (everything after it is positional), and a dash
+// token whose name has whitespace ("- fixed parser") is text, not a flag. A
+// value flag with no value (last token, or followed by another flag) is a
+// usage error; pass --flag=VALUE for a value that itself starts with '-'.
 func parse(argv []string) Args {
 	a := Args{flags: map[string]string{}, bools: map[string]bool{}, multi: map[string][]string{}}
+	value := func(i int, key string) string {
+		if i+1 >= len(argv) || isFlagToken(argv[i+1]) {
+			usageErr("--%s requires a value (use --%s=VALUE if it starts with '-')", key, key)
+		}
+		return argv[i+1]
+	}
 	for i := 0; i < len(argv); i++ {
 		s := argv[i]
-		if len(s) > 1 && s[0] == '-' && s != "-" {
+		if s == "--" {
+			a.pos = append(a.pos, argv[i+1:]...)
+			break
+		}
+		if isFlagToken(s) {
 			key := canonFlag(strings.TrimLeft(s, "-"))
 			if eq := strings.IndexByte(key, '='); eq >= 0 {
 				k := canonFlag(key[:eq])
@@ -66,21 +79,27 @@ func parse(argv []string) Args {
 				continue
 			}
 			if multiFlags[key] {
-				if i+1 < len(argv) {
-					a.multi[key] = append(a.multi[key], argv[i+1])
-					i++
-				}
+				a.multi[key] = append(a.multi[key], value(i, key))
+				i++
 				continue
 			}
-			if i+1 < len(argv) {
-				a.flags[key] = argv[i+1]
-				i++
-			}
+			a.flags[key] = value(i, key)
+			i++
 			continue
 		}
 		a.pos = append(a.pos, s)
 	}
 	return a
+}
+
+// isFlagToken reports whether s is a flag: it starts with '-', is not a bare
+// "-" (the unassign token), and its name (before any '=') has no whitespace.
+func isFlagToken(s string) bool {
+	if len(s) < 2 || s[0] != '-' {
+		return false
+	}
+	name, _, _ := strings.Cut(strings.TrimLeft(s, "-"), "=")
+	return !strings.ContainsAny(name, " \t\n")
 }
 
 // parseMetaFlags folds repeated --meta key=value tokens into one map for a
@@ -197,21 +216,34 @@ func cmdLs(c *Client, a Args) {
 	if k := metaKeyArg(a, "ls"); k != "" {
 		qs.Set("meta_key", k) // server validates/normalizes
 	}
-	qs.Set("limit", "50")
+	limit := 50
+	if v := a.flag("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			usageErr("ls: --limit must be a non-negative integer (0 = no limit)")
+		}
+		limit = n
+	}
+	qs.Set("limit", strconv.Itoa(limit))
 
 	data := c.doOrFail("GET", "/api/tasks?"+qs.Encode(), nil)
 	var tasks []Task
 	json.Unmarshal(data, &tasks)
+	truncated := limit > 0 && len(tasks) >= limit
+	hint := fmt.Sprintf("… %d shown; narrow with --status or -p, or raise --limit (0 = all)", limit)
 	if a.has("json") {
 		printJSON(tasks)
+		if truncated { // stderr, so stdout stays one parseable JSON array
+			fmt.Fprintln(os.Stderr, hint)
+		}
 		return
 	}
 	showProj := proj == "" || a.has("all")
 	for _, t := range tasks {
 		fmt.Println(taskLine(t, showProj))
 	}
-	if len(tasks) >= 50 {
-		fmt.Println("… 50 shown; narrow with --status or -p")
+	if truncated {
+		fmt.Println(hint)
 	}
 }
 
@@ -269,7 +301,7 @@ func cmdShow(c *Client, a Args) {
 func cmdNew(c *Client, a Args) {
 	title := a.at(0)
 	if strings.TrimSpace(title) == "" {
-		fail(5, "usage: am new \"title\" [--body ..] [-p project] [--priority N] [--assign A] [--meta k=v]...")
+		usageErr("usage: am new \"title\" [--body ..] [-p project] [--priority N] [--assign A] [--meta k=v]...")
 	}
 	proj := projectFor(a)
 	if proj == "" {
@@ -280,7 +312,7 @@ func cmdNew(c *Client, a Args) {
 		body["body"] = v
 	}
 	if v := a.flag("priority"); v != "" {
-		body["priority"] = atoiOr(v, 2)
+		body["priority"] = priorityArg(v)
 	}
 	if v := a.flag("assign"); v != "" {
 		body["assignee"] = resolveWho(v)
@@ -334,6 +366,8 @@ func cmdClaim(c *Client, a Args) {
 		fail(4, "claim: #%s held by %s", id, e.Assignee)
 	case st == 400:
 		fail(5, "claim: %s", apiErr(data, "invalid request"))
+	case st == 401:
+		fail(9, "claim: %s", apiErr(data, "invalid or revoked token"))
 	case st == 403:
 		fail(8, "claim: #%s out of scope", id)
 	default:
@@ -382,6 +416,8 @@ func cmdNext(c *Client, a Args) {
 		// An explicit -p/-c outside the agent's scope (the unfiltered form
 		// never 403s — the server narrows it silently).
 		fail(8, "next: %s", apiErr(data, "out of scope"))
+	case st == 401:
+		fail(9, "next: %s", apiErr(data, "invalid or revoked token"))
 	default:
 		fail(1, "next: %s", apiErr(data, "error"))
 	}
@@ -390,7 +426,7 @@ func cmdNext(c *Client, a Args) {
 // cmdStatus sets the status of one or more tasks: am status <id...> <status>.
 func cmdStatus(c *Client, a Args) {
 	if len(a.pos) < 2 || !validStatus[a.at(len(a.pos)-1)] {
-		fail(5, "usage: am status <id...> <todo|doing|blocked|done>")
+		usageErr("usage: am status <id...> <todo|doing|blocked|done>")
 	}
 	st := a.at(len(a.pos) - 1)
 	bulkPatch(c, "status", a.pos[:len(a.pos)-1], map[string]any{"status": st})
@@ -399,7 +435,7 @@ func cmdStatus(c *Client, a Args) {
 // cmdAssign reassigns one or more tasks: am assign <id...> <agent|me|->.
 func cmdAssign(c *Client, a Args) {
 	if len(a.pos) < 2 {
-		fail(5, "usage: am assign <id...> <agent|me|->")
+		usageErr("usage: am assign <id...> <agent|me|->")
 	}
 	who := a.at(len(a.pos) - 1)
 	bulkPatch(c, "assign", a.pos[:len(a.pos)-1], map[string]any{"assignee": resolveWho(who)})
@@ -432,7 +468,7 @@ func cmdNote(c *Client, a Args) {
 	id := needID(a, "note")
 	body := a.at(1)
 	if strings.TrimSpace(body) == "" {
-		fail(5, "usage: am note <id> \"text\"")
+		usageErr("usage: am note <id> \"text\"   (use -- before text that starts with '-')")
 	}
 	c.doOrFail("POST", "/api/tasks/"+id+"/comments", map[string]any{"body": body})
 }
@@ -447,7 +483,7 @@ func cmdEdit(c *Client, a Args) {
 		patch["body"] = v
 	}
 	if v := a.flag("priority"); v != "" {
-		patch["priority"] = atoiOr(v, 2)
+		patch["priority"] = priorityArg(v)
 	}
 	// All repeated --meta flags ride in this ONE PATCH (one tx, one event);
 	// `--meta k=` removes the key.
@@ -455,7 +491,7 @@ func cmdEdit(c *Client, a Args) {
 		patch["meta"] = m
 	}
 	if len(patch) == 0 {
-		fail(1, "edit: nothing to change (use --title/--body/--priority/--meta)")
+		usageErr("edit: nothing to change (use --title/--body/--priority/--meta)")
 	}
 	c.doOrFail("PATCH", "/api/tasks/"+id, patch)
 }
@@ -497,7 +533,7 @@ func cmdProject(c *Client, a Args) {
 	switch a.at(0) {
 	case "new":
 		if a.at(1) == "" {
-			fail(1, "usage: am project new <slug> [name] -c <category>")
+			usageErr("usage: am project new <slug> [name] -c <category>")
 		}
 		cat := categoryFor(a)
 		if cat == "" {
@@ -515,7 +551,7 @@ func cmdProject(c *Client, a Args) {
 	case "edit":
 		slug := a.at(1)
 		if slug == "" {
-			fail(1, "usage: am project edit <slug> [--slug NEW] [--name N] [--vault-id X] [--vault-path Y]")
+			usageErr("usage: am project edit <slug> [--slug NEW] [--name N] [--vault-id X] [--vault-path Y]")
 		}
 		patch := map[string]any{}
 		if v := a.flag("slug"); v != "" {
@@ -532,30 +568,30 @@ func cmdProject(c *Client, a Args) {
 			patch["vault_path"] = v
 		}
 		if len(patch) == 0 {
-			fail(1, "project edit: nothing to change (use --slug/--name/--vault-id/--vault-path)")
+			usageErr("project edit: nothing to change (use --slug/--name/--vault-id/--vault-path)")
 		}
 		c.doOrFail("PATCH", "/api/projects/"+slug, patch)
 	case "archive":
 		if a.at(1) == "" {
-			fail(1, "usage: am project archive <slug>")
+			usageErr("usage: am project archive <slug>")
 		}
 		c.doOrFail("POST", "/api/projects/"+a.at(1)+"/archive", nil)
 	case "unarchive":
 		if a.at(1) == "" {
-			fail(1, "usage: am project unarchive <slug>")
+			usageErr("usage: am project unarchive <slug>")
 		}
 		c.doOrFail("POST", "/api/projects/"+a.at(1)+"/unarchive", nil)
 	case "rm":
 		slug := a.at(1)
 		if slug == "" {
-			fail(1, "usage: am project rm <slug> --yes")
+			usageErr("usage: am project rm <slug> --yes")
 		}
 		if !a.has("yes") {
-			fail(1, "am project rm <slug> --yes  (deletes the project and ALL its tasks/comments)")
+			usageErr("am project rm <slug> --yes  (deletes the project and ALL its tasks/comments)")
 		}
 		c.doOrFail("DELETE", "/api/projects/"+slug, nil)
 	default:
-		fail(1, "usage: am project <new|edit|archive|unarchive|rm> ...")
+		usageErr("usage: am project <new|edit|archive|unarchive|rm> ...")
 	}
 }
 
@@ -584,7 +620,7 @@ func cmdCategory(c *Client, a Args) {
 	switch a.at(0) {
 	case "new":
 		if a.at(1) == "" {
-			fail(1, "usage: am category new <slug> [name]")
+			usageErr("usage: am category new <slug> [name]")
 		}
 		slug := a.at(1)
 		name := slug
@@ -597,16 +633,16 @@ func cmdCategory(c *Client, a Args) {
 		fmt.Println(cat.Slug)
 	case "archive":
 		if a.at(1) == "" {
-			fail(1, "usage: am category archive <slug>")
+			usageErr("usage: am category archive <slug>")
 		}
 		c.doOrFail("POST", "/api/categories/"+a.at(1)+"/archive", nil)
 	case "unarchive":
 		if a.at(1) == "" {
-			fail(1, "usage: am category unarchive <slug>")
+			usageErr("usage: am category unarchive <slug>")
 		}
 		c.doOrFail("POST", "/api/categories/"+a.at(1)+"/unarchive", nil)
 	default:
-		fail(1, "usage: am category <new|archive|unarchive> ...")
+		usageErr("usage: am category <new|archive|unarchive> ...")
 	}
 }
 
@@ -615,24 +651,26 @@ func cmdToken(c *Client, a Args) {
 	case "new":
 		scope := a.flag("scope")
 		if scope == "" {
-			fail(5, "usage: am token new --scope <category[/project]>")
+			usageErr("usage: am token new --scope <category[/project]>")
 		}
-		data := c.doOrFail("POST", "/api/tokens", map[string]any{"scope": scope})
+		data := tokenDo(c, "POST", "/api/tokens", map[string]any{"scope": scope})
 		var resp struct {
 			ID    string `json:"id"`
 			Scope string `json:"scope"`
 			Token string `json:"token"`
 		}
 		json.Unmarshal(data, &resp)
+		// Plaintext on stdout line 1 so `tok=$(am token new --scope work)` works.
+		// Printed BEFORE persisting: the server returns it exactly once, so a
+		// failed write must not lose it.
+		fmt.Println(resp.Token)
 		// Persist the token into the identity record (merge — never clobber the
 		// existing agent/scope), so future commands send it automatically.
 		storeToken(resp.Token)
-		// Plaintext on stdout line 1 so `tok=$(am token new --scope work)` works;
-		// the hint goes to stderr so it never pollutes the captured value.
-		fmt.Println(resp.Token)
+		// The hint goes to stderr so it never pollutes the captured value.
 		fmt.Fprintln(os.Stderr, "stored in identity; sent as Authorization: Bearer on future requests")
 	case "ls":
-		data := c.doOrFail("GET", "/api/tokens", nil)
+		data := tokenDo(c, "GET", "/api/tokens", nil)
 		var toks []Token
 		json.Unmarshal(data, &toks)
 		if a.has("json") {
@@ -648,32 +686,42 @@ func cmdToken(c *Client, a Args) {
 		}
 	case "revoke":
 		if a.at(1) == "" {
-			fail(1, "usage: am token revoke <id>")
+			usageErr("usage: am token revoke <id>")
 		}
-		c.doOrFail("POST", "/api/tokens/"+a.at(1)+"/revoke", nil)
+		tokenDo(c, "POST", "/api/tokens/"+a.at(1)+"/revoke", nil)
 	default:
-		fail(1, "usage: am token <new|ls|revoke> ...")
+		usageErr("usage: am token <new|ls|revoke> ...")
 	}
 }
 
+// tokenDo runs a token-admin request. Token admin needs an unscoped caller and
+// every token is scope-bound, so from an identity that already holds a token
+// (e.g. the directory where `am token new` stored one) the server answers
+// 403, or 401 once that token is revoked. Say where to run it instead.
+func tokenDo(c *Client, method, path string, body any) []byte {
+	st, data := c.do(method, path, body)
+	if c.token != "" && (st == 401 || st == 403) {
+		fail(exitCodeFor(st), "token: %s — this identity holds a scope token; manage tokens from an identity without one (another directory, or AGENTMAN_AGENT_FILE=<other file>)",
+			apiErr(data, "error "+strconv.Itoa(st)))
+	}
+	return c.orFail(st, data)
+}
+
 // storeToken merges a freshly-minted token into this directory's identity
-// record without disturbing the agent id or scope. If no identity file exists
-// yet (token minted before `am init`), it writes a record carrying just the
-// token — a later `am init` would overwrite it, which is acceptable since the
-// token is re-mintable.
+// file without disturbing its agent id or scope. It reads the FILE's values,
+// not the env-merged ones, so an AGENTMAN_AGENT/AGENTMAN_SCOPE in the minting
+// shell is never persisted. With no identity file yet (token minted before
+// `am init`) it writes {"token":"..."}, which resolveIdentity reads back as a
+// token; a later `am init` overwrites it (the token is re-mintable).
 func storeToken(token string) {
-	agent, scope, _ := resolveIdentity()
-	rec := identityRecord{Agent: agent, Scope: scope, Token: token}
+	rec := readIdentityFile()
+	rec.Token = token
 	b, err := json.Marshal(rec)
+	if err == nil {
+		err = writeIdentityFile(b)
+	}
 	if err != nil {
-		fail(1, "token new: %v", err)
-	}
-	f := identityFile()
-	if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
-		fail(1, "token new: %v", err)
-	}
-	if err := os.WriteFile(f, b, 0o644); err != nil {
-		fail(1, "token new: %v", err)
+		fail(1, "token new: the token printed above was NOT stored in the identity file: %v", err)
 	}
 }
 
@@ -701,11 +749,11 @@ func cmdDep(c *Client, a Args) {
 	case "add":
 		id := a.at(1)
 		if id == "" {
-			fail(1, "usage: am dep add <id> <prereq> [prereq…]")
+			usageErr("usage: am dep add <id> <prereq> [prereq…]")
 		}
 		prereqs := a.pos[2:] // remaining positionals
 		if len(prereqs) == 0 {
-			fail(1, "usage: am dep add <id> <prereq> [prereq…]")
+			usageErr("usage: am dep add <id> <prereq> [prereq…]")
 		}
 		for _, prereq := range prereqs {
 			c.doOrFail("POST", "/api/tasks/"+id+"/deps", map[string]any{"depends_on": prereq})
@@ -714,11 +762,11 @@ func cmdDep(c *Client, a Args) {
 		id := a.at(1)
 		prereq := a.at(2)
 		if id == "" || prereq == "" {
-			fail(1, "usage: am dep rm <id> <prereq>")
+			usageErr("usage: am dep rm <id> <prereq>")
 		}
 		c.doOrFail("DELETE", "/api/tasks/"+id+"/deps/"+prereq, nil)
 	default:
-		fail(1, "usage: am dep <add|rm> ...")
+		usageErr("usage: am dep <add|rm> ...")
 	}
 }
 
@@ -730,7 +778,7 @@ func cmdDep(c *Client, a Args) {
 func cmdLabel(c *Client, argv []string) {
 	const usage = "usage: am label <id> [+add ...] [-remove ...]"
 	if len(argv) == 0 {
-		fail(1, usage)
+		usageErr(usage)
 	}
 	id := argv[0]
 	if len(argv) == 1 {
@@ -797,20 +845,20 @@ func resolveWho(s string) string {
 
 func needID(a Args, verb string) string {
 	if a.at(0) == "" {
-		fail(1, "usage: am %s <id> ...", verb)
+		usageErr("usage: am %s <id> ...", verb)
 	}
 	return a.at(0)
 }
 
 func trunc(s string, n int) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	if len(s) <= n {
-		return s
+	r := []rune(strings.ReplaceAll(s, "\n", " ")) // runes, so a cut never splits a UTF-8 sequence
+	if len(r) <= n {
+		return string(r)
 	}
 	if n <= 1 {
-		return s[:n]
+		return string(r[:n])
 	}
-	return s[:n-1] + "…"
+	return string(r[:n-1]) + "…"
 }
 
 func shortTime(iso string) string {
@@ -820,11 +868,14 @@ func shortTime(iso string) string {
 	return iso
 }
 
-func atoiOr(s string, def int) int {
-	if n, err := strconv.Atoi(s); err == nil {
-		return n
+// priorityArg parses --priority; a non-integer is a usage error (the server
+// validates the range).
+func priorityArg(s string) int {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		usageErr("--priority must be an integer (got %q)", s)
 	}
-	return def
+	return n
 }
 
 func plural(n int) string {
@@ -843,3 +894,7 @@ func fail(code int, format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	osExit(code)
 }
+
+// usageErr reports a missing or malformed argument. Every usage error exits 5
+// ("invalid"), whatever the verb.
+func usageErr(format string, args ...any) { fail(5, format, args...) }

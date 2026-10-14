@@ -16,7 +16,7 @@ import (
 func main() {
 	if len(os.Args) < 2 {
 		usage()
-		os.Exit(1)
+		os.Exit(5) // usage error
 	}
 	cmd := os.Args[1]
 	rest := os.Args[2:]
@@ -95,7 +95,7 @@ func main() {
 	case "help", "-h", "--help":
 		usage()
 	default:
-		fail(1, "unknown command: %s (try `am help`)", cmd)
+		usageErr("unknown command: %s (try `am help`)", cmd)
 	}
 }
 
@@ -200,7 +200,7 @@ func usage() {
   am init <tasktype> [-c CAT [-p PROJ]]  set this session's identity, optionally scoped to a category or project
   am whoami                              print the current identity (+ scope when set)
 
-  am ls [--mine] [--status S] [-p P] [-c CAT] [--all] [--ready] [--blocked] [--stale DUR] [--grep TEXT] [--label L] [--meta KEY]   list tasks (hides done; --all = every task board-wide, ignores -p/-c; alias: list)
+  am ls [--mine] [--status S] [-p P] [-c CAT] [--all] [--ready] [--blocked] [--stale DUR] [--grep TEXT] [--label L] [--meta KEY] [--limit N]   list tasks (hides done; --all = every task board-wide, ignores -p/-c; --limit default 50, 0 = all; alias: list)
   am show <id> [-c]                            task detail (+comments +deps)
   am new "title" [--body B] [-p P] [--priority N] [--assign A] [--meta k=v]...   create, prints id
   am claim <id> [--steal-stale DUR]           assign me + ->doing (atomic; DUR is Go syntax, e.g. 30m, 48h)
@@ -226,6 +226,8 @@ func usage() {
   am category archive <slug>             soft-archive a category (hides its projects)
   am category unarchive <slug>           restore an archived category
   am token new --scope <cat[/proj]>           mint a scope-bound bearer token (prints it once; stored in identity)
+                                              token new/ls/revoke need an identity with no token: run them elsewhere
+                                              than where a token is stored (or set AGENTMAN_AGENT_FILE)
   am token ls [--json]                        list tokens (id / scope / created / [revoked])
   am token revoke <id>                        revoke a token (silent success)
   am version                                  print version (also --version, -v)
@@ -244,6 +246,7 @@ Env: AGENTMAN_URL (default http://127.0.0.1:8787), AGENTMAN_PROJECT (default pro
      AGENTMAN_TOKEN (override the identity file's bearer token; sent as Authorization: Bearer),
      AGENTMAN_PROPOSALS (serve: the carve-out project, default meta/proposals).
      Add --json to any read to parse output.
-Exit codes: 0 ok · 3 not found · 4 already claimed · 5 invalid · 6 server down · 7 timed out · 8 out of scope · 9 bad token.
+Args: '--' ends the flags (am note 12 -- "-x done"); --flag=VALUE passes a value starting with '-'.
+Exit codes: 0 ok · 3 not found · 4 already claimed · 5 invalid (incl. any usage error) · 6 server down · 7 timed out · 8 out of scope · 9 bad token · 1 other.
 `)
 }

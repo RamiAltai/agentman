@@ -3,14 +3,15 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
-// newWaitClient builds the Client cmdWait needs (it only reads base + agent;
-// the SSE connection uses its own un-timed http.Client).
+// newWaitClient builds the Client cmdWait needs (its base and identity
+// headers; the SSE connection uses its own un-timed http.Client).
 func newWaitClient(base string) *Client {
 	return &Client{base: base, agent: "tester", http: &http.Client{Timeout: time.Second}}
 }
@@ -193,8 +194,8 @@ func TestWaitUsageErrors(t *testing.T) {
 	}
 	for _, argv := range cases {
 		code := captureExit(t, func() { cmdWait(c, parse(argv)) })
-		if code != 1 {
-			t.Errorf("cmdWait(%v) exit = %d, want 1 (usage)", argv, code)
+		if code != 5 {
+			t.Errorf("cmdWait(%v) exit = %d, want 5 (usage)", argv, code)
 		}
 	}
 }
@@ -462,12 +463,12 @@ func TestWaitReadyMetaReleasedByPrereqDone(t *testing.T) {
 func TestWaitMetaUsageErrors(t *testing.T) {
 	c := newWaitClient("http://127.0.0.1:1") // never reached
 
-	// --meta only scopes --ready; with --done it is a usage error (exit 1).
+	// --meta only scopes --ready; with --done it is a usage error (exit 5).
 	code := captureExit(t, func() {
 		captureStderr(t, func() { cmdWait(c, parse([]string{"5", "--done", "--meta", "auto"})) })
 	})
-	if code != 1 {
-		t.Fatalf("wait --done --meta exit = %d, want 1", code)
+	if code != 5 {
+		t.Fatalf("wait --done --meta exit = %d, want 5", code)
 	}
 	// Two --meta keys → exit 5.
 	code = captureExit(t, func() {
@@ -564,5 +565,56 @@ func TestWaitReadyExplicitOutOfScopeExit8(t *testing.T) {
 	}
 	if !strings.Contains(msg, "out_of_scope") {
 		t.Fatalf("stderr = %q, want out_of_scope", msg)
+	}
+}
+
+// ---------- Code Witness g1: wait carries the bearer token ----------
+
+// FIND-0332 / FIND-0071: the waiter builds requests with Client.newRequest,
+// so a token identity sends Authorization: Bearer (and no X-Agent-Scope) on
+// the cursor and re-check requests, exactly like every other verb.
+func TestWaitSendsBearerToken(t *testing.T) {
+	var auth, scopeHdr []string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth = append(auth, r.Header.Get("Authorization"))
+		scopeHdr = append(scopeHdr, r.Header.Get("X-Agent-Scope"))
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/api/events") {
+			w.Write([]byte(`{"last_id":0}`))
+			return
+		}
+		w.Write([]byte(`{"id":5,"status":"done"}`))
+	}))
+	t.Cleanup(stub.Close)
+
+	c := &Client{base: stub.URL, agent: "tester", scope: "work", token: "amt_abc", http: stub.Client()}
+	code := captureExit(t, func() { cmdWait(c, parse([]string{"5", "--done"})) })
+	if code != -1 {
+		t.Fatalf("wait --done exit = %d, want normal return", code)
+	}
+	if len(auth) != 2 {
+		t.Fatalf("requests = %d, want 2 (cursor + check)", len(auth))
+	}
+	for i := range auth {
+		if auth[i] != "Bearer amt_abc" || scopeHdr[i] != "" {
+			t.Fatalf("request %d: Authorization = %q X-Agent-Scope = %q, want Bearer and no scope header", i, auth[i], scopeHdr[i])
+		}
+	}
+}
+
+// FIND-0332: a revoked/invalid token makes wait exit 9, not 1.
+func TestWaitUnauthorizedExit9(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"invalid_token"}`))
+	}))
+	t.Cleanup(stub.Close)
+	c := &Client{base: stub.URL, agent: "tester", token: "amt_revoked", http: stub.Client()}
+	for _, argv := range [][]string{{"5", "--done"}, {"--ready"}} {
+		code := captureExit(t, func() { captureStderr(t, func() { cmdWait(c, parse(argv)) }) })
+		if code != 9 {
+			t.Errorf("wait %v on 401 exit = %d, want 9", argv, code)
+		}
 	}
 }

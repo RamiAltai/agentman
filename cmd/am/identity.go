@@ -22,8 +22,9 @@ import (
 // then use `am` normally — no need to repeat its identity on every command.
 //
 // File format: a scoped init writes JSON {"agent":"...","scope":"cat[/proj]"};
-// an unscoped init keeps the legacy bare-id plain text, and any pre-Phase-Q
-// plain-text file is read as an unscoped identity (R8 compatibility).
+// `am token new` adds "token" (and writes {"token":"..."} alone before any
+// init); an unscoped init keeps the legacy bare-id plain text, and any
+// pre-Phase-Q plain-text file is read as an unscoped identity (R8 compatibility).
 
 func identityFile() string {
 	if f := os.Getenv("AGENTMAN_AGENT_FILE"); f != "" {
@@ -51,18 +52,51 @@ type identityRecord struct {
 	Token string `json:"token,omitempty"`
 }
 
+// readIdentityFile returns the identity file's own agent, scope and token,
+// without env overrides. A JSON record is accepted when any field is set (a
+// token minted before `am init` has no agent); anything else is the legacy
+// plain-text bare agent id.
+func readIdentityFile() (rec identityRecord) {
+	b, err := os.ReadFile(identityFile())
+	if err != nil {
+		return rec
+	}
+	if json.Unmarshal(b, &rec) == nil && rec != (identityRecord{}) {
+		return rec
+	}
+	return identityRecord{Agent: strings.TrimSpace(string(b))} // legacy plain text = unscoped
+}
+
+// writeIdentityFile replaces the identity file atomically (temp file in the
+// same directory, then rename), so an interrupted write never leaves a
+// truncated identity. The temp file is created 0600: the record may hold a
+// bearer token.
+func writeIdentityFile(data []byte) error {
+	f := identityFile()
+	if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(f), ".identity-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // no-op after a successful rename
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), f)
+}
+
 // resolveIdentity returns the agent id, scope, and token ("" when unset), each
 // independently overridable by env (AGENTMAN_AGENT / AGENTMAN_SCOPE /
 // AGENTMAN_TOKEN).
 func resolveIdentity() (agent, scope, token string) {
-	if b, err := os.ReadFile(identityFile()); err == nil {
-		var rec identityRecord
-		if json.Unmarshal(b, &rec) == nil && rec.Agent != "" {
-			agent, scope, token = rec.Agent, rec.Scope, rec.Token
-		} else {
-			agent = strings.TrimSpace(string(b)) // legacy plain text = unscoped
-		}
-	}
+	rec := readIdentityFile()
+	agent, scope, token = rec.Agent, rec.Scope, rec.Token
 	if a := strings.TrimSpace(os.Getenv("AGENTMAN_AGENT")); a != "" {
 		agent = a
 	}

@@ -294,3 +294,25 @@ func TestParseScope(t *testing.T) {
 		t.Error("IsZero misclassifies")
 	}
 }
+
+// FIND-0035: a JSON record with a token but no agent (token minted before
+// `am init`) is read as a token, not as a legacy bare agent id.
+func TestResolveIdentityTokenOnlyRecord(t *testing.T) {
+	idFile := filepath.Join(t.TempDir(), "id")
+	t.Setenv("AGENTMAN_AGENT_FILE", idFile)
+	t.Setenv("AGENTMAN_AGENT", "")
+	t.Setenv("AGENTMAN_SCOPE", "")
+	t.Setenv("AGENTMAN_TOKEN", "")
+	if err := os.WriteFile(idFile, []byte(`{"agent":"","token":"amt_secret"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	agent, scope, token := resolveIdentity()
+	if agent != "" || scope != "" || token != "amt_secret" {
+		t.Fatalf("resolveIdentity = (%q, %q, %q), want (\"\", \"\", amt_secret)", agent, scope, token)
+	}
+	// Legacy plain text is still a bare agent id.
+	os.WriteFile(idFile, []byte("bugfix_010126_0001\n"), 0o644)
+	if a := resolveAgent(); a != "bugfix_010126_0001" {
+		t.Fatalf("legacy resolveAgent = %q", a)
+	}
+}

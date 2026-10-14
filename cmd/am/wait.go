@@ -22,7 +22,7 @@ import (
 // Exactly these two conditions. Exit 0 when met (--done prints nothing;
 // --ready prints one ready task id; --json prints the satisfying task JSON);
 // exit 7 on timeout (default 10m); exit 3 if the task does not exist; exit 6
-// if the server is unreachable. The wait is entirely client-side — the server
+// if the server is unreachable; exit 9 on an invalid or revoked token. The wait is entirely client-side — the server
 // is untouched (ADR-023); events only trigger a REST re-check, their payloads
 // are never trusted as state.
 func cmdWait(c *Client, a Args) {
@@ -30,7 +30,7 @@ func cmdWait(c *Client, a Args) {
 	metaKey := metaKeyArg(a, "wait") // >1 key or key=value → exit 5
 	if waitDone == waitReady || (waitDone && id == "") || (waitReady && id != "") ||
 		(waitDone && metaKey != "") { // --meta scopes --ready only
-		fail(1, "usage: am wait <id> --done | am wait --ready [-p P] [-c CAT] [--meta KEY]  [--timeout D]")
+		usageErr("usage: am wait <id> --done | am wait --ready [-p P] [-c CAT] [--meta KEY]  [--timeout D]")
 	}
 
 	timeout := 10 * time.Minute
@@ -45,8 +45,9 @@ func cmdWait(c *Client, a Args) {
 	defer cancel()
 
 	// Client.http has a 10s Timeout that would kill a long SSE read; the wait
-	// uses its own un-timed http.Client and is bounded by ctx instead.
-	w := &waiter{base: c.base, agent: c.agent, scope: c.scope, hc: &http.Client{}, ctx: ctx}
+	// uses its own un-timed http.Client and is bounded by ctx instead. The
+	// headers (X-Agent, then Bearer token or X-Agent-Scope) come from c.
+	w := &waiter{c: c, hc: &http.Client{}, ctx: ctx}
 	project := projectFor(a)
 	category := categoryFor(a) // scopes --ready only; ignored under --done like -p
 
@@ -151,11 +152,9 @@ func waitPrint(a Args, t *Task, ready bool) {
 
 // waiter wraps the streaming-capable HTTP plumbing for cmdWait.
 type waiter struct {
-	base  string
-	agent string
-	scope string // sent as X-Agent-Scope; scopes the REST re-checks, never the stream
-	hc    *http.Client
-	ctx   context.Context
+	c   *Client // identity + credential headers (Client.newRequest); scope the REST re-checks
+	hc  *http.Client
+	ctx context.Context
 }
 
 // get performs a ctx-bounded GET; transport errors map to exit 7 (deadline)
@@ -171,22 +170,19 @@ func (w *waiter) get(path string) (int, []byte) {
 func (w *waiter) stream(path string) *http.Response { return w.request(path) }
 
 func (w *waiter) request(path string) *http.Response {
-	req, err := http.NewRequestWithContext(w.ctx, http.MethodGet, w.base+path, nil)
-	if err != nil {
-		fail(1, "agentman: %v", err)
-	}
-	if w.agent != "" {
-		req.Header.Set("X-Agent", w.agent)
-	}
-	if w.scope != "" {
-		req.Header.Set("X-Agent-Scope", w.scope)
-	}
-	resp, err := w.hc.Do(req)
+	resp, err := w.hc.Do(w.c.newRequest(w.ctx, http.MethodGet, path, nil))
 	if err != nil {
 		if w.ctx.Err() != nil {
 			fail(7, "wait: timeout")
 		}
-		fail(6, "agentman: cannot reach server at %s (is `am serve` running?)", w.base)
+		fail(6, "agentman: cannot reach server at %s (is `am serve` running?)", w.c.base)
+	}
+	// A bad credential hard-fails on any request (stream included), so a
+	// revoked token can neither pass a re-check nor spin the reconnect loop.
+	if resp.StatusCode == http.StatusUnauthorized {
+		data, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		fail(9, "wait: %s", apiErr(data, "invalid or revoked token"))
 	}
 	return resp
 }

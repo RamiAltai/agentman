@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -31,15 +32,16 @@ func NewClient() *Client {
 	}
 }
 
-// do performs a request. A transport error (server down) is reported by
-// returning status 0, which callers map to exit code 6.
-func (c *Client) do(method, path string, body any) (int, []byte) {
+// newRequest builds a request carrying the identity and credential headers.
+// It is the single place that decides them, shared by do() and the streaming
+// waiter (wait.go), so the two cannot drift apart.
+func (c *Client) newRequest(ctx context.Context, method, path string, body any) *http.Request {
 	var rdr io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
 		rdr = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, c.base+path, rdr)
+	req, err := http.NewRequestWithContext(ctx, method, c.base+path, rdr)
 	if err != nil {
 		fail(1, "agentman: %v", err)
 	}
@@ -58,7 +60,13 @@ func (c *Client) do(method, path string, body any) (int, []byte) {
 	} else if c.scope != "" {
 		req.Header.Set("X-Agent-Scope", c.scope)
 	}
-	resp, err := c.http.Do(req)
+	return req
+}
+
+// do performs a request. A transport error (server down) is reported by
+// returning status 0, which callers map to exit code 6.
+func (c *Client) do(method, path string, body any) (int, []byte) {
+	resp, err := c.http.Do(c.newRequest(context.Background(), method, path, body))
 	if err != nil {
 		return 0, nil
 	}
@@ -98,6 +106,12 @@ func exitCodeFor(st int) int {
 // 8 out of scope.
 func (c *Client) doOrFail(method, path string, body any) []byte {
 	st, data := c.do(method, path, body)
+	return c.orFail(st, data)
+}
+
+// orFail is doOrFail's status mapping, for callers that inspect the status
+// before falling back to the convention.
+func (c *Client) orFail(st int, data []byte) []byte {
 	switch exitCodeFor(st) {
 	case 0:
 		return data
