@@ -386,6 +386,23 @@ func TestImportRejectsOtherSchema(t *testing.T) {
 	}
 }
 
+// TestImportRejectsOtherSchemaHash: a snapshot made from a different
+// schema.sql is refused even though its schema_version matches.
+func TestImportRejectsOtherSchemaHash(t *testing.T) {
+	srcDB := filepath.Join(t.TempDir(), "stale.db")
+	st, err := OpenStore(srcDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec("UPDATE meta SET value='0000000000000000' WHERE key='schema_hash'"); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	if err := validateImportCandidate(srcDB); err == nil || !strings.Contains(err.Error(), "schema_hash") {
+		t.Fatalf("snapshot from another schema: err = %v, want a schema_hash error", err)
+	}
+}
+
 // TestExportImportWithTokens: a DB carrying tokens round-trips through
 // export/import. The tokens table rides the VACUUM INTO whole-file snapshot
 // (only sha256 hashes travel, never plaintext). After import the token still

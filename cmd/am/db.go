@@ -258,6 +258,13 @@ func validateImportCandidate(srcPath string) error {
 	if v, err := strconv.Atoi(strings.TrimSpace(raw)); err != nil || v != currentSchemaVersion {
 		return fmt.Errorf("schema_version %q, this am supports %d", raw, currentSchemaVersion)
 	}
+	// ...and made from this exact schema.sql (OpenStore would refuse it anyway).
+	if err := db.QueryRow("SELECT value FROM meta WHERE key='schema_hash'").Scan(&raw); err != nil {
+		return fmt.Errorf("no schema_hash: %w", err)
+	}
+	if raw != schemaHash {
+		return fmt.Errorf("schema_hash %s, this am %s: snapshot is from a different schema", raw, schemaHash)
+	}
 
 	return nil
 }

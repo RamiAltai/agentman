@@ -135,3 +135,33 @@ func TestEventIndexesUsed(t *testing.T) {
 		t.Errorf("category stats plan = %q, want idx_events_created", p)
 	}
 }
+
+// TestOpenStoreRejectsOtherSchemaHash: a DB created from a different schema.sql
+// is refused (its tables would not be altered), while comment and whitespace
+// edits to schema.sql keep the hash.
+func TestOpenStoreRejectsOtherSchemaHash(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "stale.db")
+	st, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored string
+	if err := st.db.QueryRow("SELECT value FROM meta WHERE key='schema_hash'").Scan(&stored); err != nil || stored != schemaHash {
+		t.Fatalf("schema_hash = %q (err %v), want %q", stored, err, schemaHash)
+	}
+	if _, err := st.db.Exec("UPDATE meta SET value='0000000000000000' WHERE key='schema_hash'"); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	if _, err := OpenStore(dbPath); err == nil || !strings.Contains(err.Error(), "different schema") {
+		t.Fatalf("OpenStore on a DB from another schema: err = %v, want a 'different schema' error", err)
+	}
+
+	edited := "-- a new comment\n" + strings.ReplaceAll(schemaSQL, "\n", "\n  ") + "\n-- trailing\n"
+	if schemaHashOf(edited) != schemaHash {
+		t.Fatal("comment/whitespace-only edit changed the schema hash")
+	}
+	if schemaHashOf(strings.Replace(schemaSQL, "created_by TEXT NOT NULL", "created_by TEXT", 1)) == schemaHash {
+		t.Fatal("a real schema change kept the same hash")
+	}
+}

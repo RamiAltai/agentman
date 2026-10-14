@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS tasks (
              CHECK (status IN ('todo','doing','blocked','done')),
   assignee   TEXT,                        -- agent id; NULL = unclaimed
   priority   INTEGER NOT NULL DEFAULT 2,  -- 0=urgent..3=low
-  created_by TEXT,                        -- creating actor (proposals carve-out: own-task comments)
+  created_by TEXT NOT NULL,               -- creating actor (proposals carve-out: own-task comments)
   claimed_at TEXT,                        -- set on (re)assign, cleared on unassign
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),

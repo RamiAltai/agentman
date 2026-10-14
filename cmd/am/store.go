@@ -241,9 +241,21 @@ func OpenStore(path string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1) // single writer => no SQLITE_BUSY, claims serialize
+	// A DB made from a different schema.sql is refused before schemaSQL runs:
+	// its CREATE ... IF NOT EXISTS lines would skip the existing tables and
+	// leave the DB silently stale. (No meta table or no row: a fresh DB.)
+	var stored string
+	if err := db.QueryRow("SELECT value FROM meta WHERE key='schema_hash'").Scan(&stored); err == nil && stored != schemaHash {
+		db.Close()
+		return nil, fmt.Errorf("database was created from a different schema (schema_hash %s, this am %s): start a fresh --db", stored, schemaHash)
+	}
 	if _, err := db.Exec(schemaSQL); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
+	}
+	if _, err := db.Exec("INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_hash', ?)", schemaHash); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("stamp schema_hash: %w", err)
 	}
 	// schema.sql is the only schema; a DB stamped with any other version was
 	// written by a different am and is refused rather than misread.
@@ -261,6 +273,23 @@ func OpenStore(path string) (*Store, error) {
 		return nil, fmt.Errorf("seed default category: %w", err)
 	}
 	return &Store{db: db}, nil
+}
+
+// schemaHash identifies the schema a DB was created from: sha256 of schema.sql
+// with comments and whitespace removed, so comment-only edits keep it.
+var schemaHash = schemaHashOf(schemaSQL)
+
+func schemaHashOf(schema string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(schema, "\n") {
+		if i := strings.Index(line, "--"); i >= 0 {
+			line = line[:i]
+		}
+		b.WriteString(strings.Join(strings.Fields(line), " "))
+		b.WriteByte(' ')
+	}
+	sum := sha256.Sum256([]byte(strings.Join(strings.Fields(b.String()), " ")))
+	return hex.EncodeToString(sum[:8])
 }
 
 // currentSchemaVersion is the version schema.sql stamps into meta. There are no

@@ -132,7 +132,7 @@ func TestCwfStoreProjectGraphLargeProject(t *testing.T) {
 	}
 	const n = 33000
 	if _, err := st.db.Exec(`WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM k WHERE i<?)
-	    INSERT INTO tasks(project_id,ref,title) SELECT ?, i, 't' FROM k`, n, p.ID); err != nil {
+	    INSERT INTO tasks(project_id,ref,title,created_by) SELECT ?, i, 't', 'test' FROM k`, n, p.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.db.Exec(`INSERT INTO task_meta(task_id,key,value)
