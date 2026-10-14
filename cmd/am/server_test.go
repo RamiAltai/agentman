@@ -2626,93 +2626,96 @@ func TestNoTokenPathUnchanged(t *testing.T) {
 }
 
 // TestTokenScopeMatrix re-verifies the Phase Q enforcement matrix with the scope
-// driven by a minted token instead of a header.
+// driven by a minted token instead of a header. Every scenario runs on its own
+// fresh board so one failure neither masks nor perturbs the others.
 func TestTokenScopeMatrix(t *testing.T) {
-	ts, store := newTestServerWithStore(t)
-	workID, personalID := scopedBoard(t, ts)
-	mustCreateProposals(t, ts)
-	pTok := mintToken(t, ts, "personal")
+	setup := func(t *testing.T) (ts *httptest.Server, store *Store, workID, personalID, pTok string) {
+		t.Helper()
+		ts, store = newTestServerWithStore(t)
+		workID, personalID = scopedBoard(t, ts)
+		mustCreateProposals(t, ts)
+		pTok = mintToken(t, ts, "personal")
+		return ts, store, workID, personalID, pTok
+	}
+
+	// Status-only scenarios; {work}/{personal} expand to the seeded task ids.
+	// The proposals carve-out allows create; other out-of-scope creates are 403.
+	for _, c := range []struct {
+		name, method, path, body string
+		want                     int
+	}{
+		{"claim out of scope", http.MethodPost, "/api/tasks/{work}/claim", "", http.StatusForbidden},
+		{"patch in scope", http.MethodPatch, "/api/tasks/{personal}", `{"status":"doing"}`, http.StatusOK},
+		{"patch out of scope", http.MethodPatch, "/api/tasks/{work}", `{"status":"doing"}`, http.StatusForbidden},
+		{"create in proposals", http.MethodPost, "/api/tasks", `{"project":"proposals","title":"idea"}`, http.StatusCreated},
+		{"create out of scope", http.MethodPost, "/api/tasks", `{"project":"wproj","title":"sneaky"}`, http.StatusForbidden},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ts, _, workID, personalID, pTok := setup(t)
+			path := strings.NewReplacer("{work}", workID, "{personal}", personalID).Replace(c.path)
+			if got := cwfStoreStatus(t, ts, c.method, path, c.body, bearer("agent-p", pTok)); got != c.want {
+				t.Fatalf("%s %s = %d, want %d", c.method, path, got, c.want)
+			}
+		})
+	}
 
 	// next never returns out-of-scope work even when work has a more urgent task.
-	ru := do(t, ts, http.MethodPost, "/api/tasks",
-		`{"project":"wproj","title":"urgent work","priority":0}`,
-		map[string]string{"Content-Type": "application/json"})
-	ru.Body.Close()
-	if ru.StatusCode != http.StatusCreated {
-		t.Fatalf("create urgent work task = %d, want 201", ru.StatusCode)
-	}
-	rn := do(t, ts, http.MethodPost, "/api/tasks/next", "", bearer("agent-p", pTok))
-	if rn.StatusCode != http.StatusOK {
-		rn.Body.Close()
-		t.Fatalf("token-scoped next = %d, want 200", rn.StatusCode)
-	}
-	var tk Task
-	json.NewDecoder(rn.Body).Decode(&tk)
-	rn.Body.Close()
-	if tk.Project != "pproj" {
-		t.Fatalf("token-scoped next picked %q, want pproj", tk.Project)
-	}
+	t.Run("next skips out-of-scope urgent work", func(t *testing.T) {
+		ts, _, _, _, pTok := setup(t)
+		if got := cwfStoreStatus(t, ts, http.MethodPost, "/api/tasks",
+			`{"project":"wproj","title":"urgent work","priority":0}`,
+			map[string]string{"Content-Type": "application/json"}); got != http.StatusCreated {
+			t.Fatalf("create urgent work task = %d, want 201", got)
+		}
+		rn := do(t, ts, http.MethodPost, "/api/tasks/next", "", bearer("agent-p", pTok))
+		defer rn.Body.Close()
+		if rn.StatusCode != http.StatusOK {
+			t.Fatalf("token-scoped next = %d, want 200", rn.StatusCode)
+		}
+		var tk Task
+		if err := json.NewDecoder(rn.Body).Decode(&tk); err != nil {
+			t.Fatal(err)
+		}
+		if tk.Project != "pproj" {
+			t.Fatalf("token-scoped next picked %q, want pproj", tk.Project)
+		}
+	})
 
-	// claim out-of-scope → 403.
-	rc := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", "", bearer("agent-p", pTok))
-	rc.Body.Close()
-	if rc.StatusCode != http.StatusForbidden {
-		t.Fatalf("token-scoped out-of-scope claim = %d, want 403", rc.StatusCode)
-	}
+	t.Run("steal stale out of scope", func(t *testing.T) {
+		ts, store, workID, _, pTok := setup(t)
+		if got := cwfStoreStatus(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", "",
+			map[string]string{"X-Agent": "agent-gone"}); got != http.StatusOK {
+			t.Fatalf("unscoped claim by agent-gone = %d, want 200", got)
+		}
+		n, _ := strconv.ParseInt(workID, 10, 64)
+		backdateTask(t, store, n)
+		if got := cwfStoreStatus(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim",
+			`{"steal_stale":"1h"}`, bearer("agent-p", pTok)); got != http.StatusForbidden {
+			t.Fatalf("token-scoped out-of-scope steal = %d, want 403", got)
+		}
+		if got, err := store.GetTask(n); err != nil || got.Assignee != "agent-gone" {
+			t.Fatalf("work task after denied steal = %+v, %v; want still assigned to agent-gone", got, err)
+		}
+	})
 
-	// steal-stale out-of-scope → 403.
-	rs0 := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", "", map[string]string{"X-Agent": "agent-gone"})
-	rs0.Body.Close()
-	if rs0.StatusCode != http.StatusOK {
-		t.Fatalf("unscoped claim by agent-gone = %d, want 200", rs0.StatusCode)
-	}
-	n, _ := strconv.ParseInt(workID, 10, 64)
-	backdateTask(t, store, n)
-	rs := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", `{"steal_stale":"1h"}`, bearer("agent-p", pTok))
-	rs.Body.Close()
-	if rs.StatusCode != http.StatusForbidden {
-		t.Fatalf("token-scoped out-of-scope steal = %d, want 403", rs.StatusCode)
-	}
-	if got, err := store.GetTask(n); err != nil || got.Assignee != "agent-gone" {
-		t.Fatalf("work task after denied steal = %+v, %v; want still assigned to agent-gone", got, err)
-	}
-
-	// bulk per-id: in-scope status succeeds, out-of-scope 403 (drive both via the token).
-	rok := do(t, ts, http.MethodPatch, "/api/tasks/"+personalID, `{"status":"doing"}`, bearer("agent-p", pTok))
-	rok.Body.Close()
-	if rok.StatusCode != http.StatusOK {
-		t.Fatalf("token-scoped in-scope patch = %d, want 200", rok.StatusCode)
-	}
-	rbad := do(t, ts, http.MethodPatch, "/api/tasks/"+workID, `{"status":"doing"}`, bearer("agent-p", pTok))
-	rbad.Body.Close()
-	if rbad.StatusCode != http.StatusForbidden {
-		t.Fatalf("token-scoped out-of-scope patch = %d, want 403", rbad.StatusCode)
-	}
-
-	// proposals carve-out under a token: create allowed, comment on own allowed,
-	// other out-of-scope create → 403.
-	rp := do(t, ts, http.MethodPost, "/api/tasks",
-		`{"project":"proposals","title":"idea"}`, bearer("agent-p", pTok))
-	if rp.StatusCode != http.StatusCreated {
-		rp.Body.Close()
-		t.Fatalf("token-scoped create in proposals = %d, want 201", rp.StatusCode)
-	}
-	var prop Task
-	json.NewDecoder(rp.Body).Decode(&prop)
-	rp.Body.Close()
-	propID := strconv.FormatInt(prop.ID, 10)
-	rcm := do(t, ts, http.MethodPost, "/api/tasks/"+propID+"/comments",
-		`{"body":"mine"}`, bearer("agent-p", pTok))
-	rcm.Body.Close()
-	if rcm.StatusCode != http.StatusCreated {
-		t.Fatalf("token-scoped comment on own proposal = %d, want 201", rcm.StatusCode)
-	}
-	roc := do(t, ts, http.MethodPost, "/api/tasks",
-		`{"project":"wproj","title":"sneaky"}`, bearer("agent-p", pTok))
-	roc.Body.Close()
-	if roc.StatusCode != http.StatusForbidden {
-		t.Fatalf("token-scoped create in wproj = %d, want 403", roc.StatusCode)
-	}
+	t.Run("comment on own proposal", func(t *testing.T) {
+		ts, _, _, _, pTok := setup(t)
+		rp := do(t, ts, http.MethodPost, "/api/tasks",
+			`{"project":"proposals","title":"idea"}`, bearer("agent-p", pTok))
+		defer rp.Body.Close()
+		if rp.StatusCode != http.StatusCreated {
+			t.Fatalf("token-scoped create in proposals = %d, want 201", rp.StatusCode)
+		}
+		var prop Task
+		if err := json.NewDecoder(rp.Body).Decode(&prop); err != nil {
+			t.Fatal(err)
+		}
+		propID := strconv.FormatInt(prop.ID, 10)
+		if got := cwfStoreStatus(t, ts, http.MethodPost, "/api/tasks/"+propID+"/comments",
+			`{"body":"mine"}`, bearer("agent-p", pTok)); got != http.StatusCreated {
+			t.Fatalf("token-scoped comment on own proposal = %d, want 201", got)
+		}
+	})
 }
 
 // TestCreateTokenResponse: the 201 body carries the plaintext once; the ls JSON

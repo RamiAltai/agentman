@@ -836,7 +836,7 @@ func setArchivedTx(tx *sql.Tx, table, slug, actor string, archive bool) (int64, 
 	}
 	set, kind := "NULL", "unarchived"
 	if archive {
-		set, kind = "strftime('%Y-%m-%dT%H:%M:%fZ','now')", "archived"
+		set, kind = sqlNow, "archived"
 	}
 	if _, err := tx.Exec("UPDATE "+table+" SET archived_at="+set+" WHERE id=?", id); err != nil {
 		return 0, nil, err
@@ -984,11 +984,9 @@ func (s *Store) CreateProjectAs(slug, name, category, actor string) (*Project, *
 	if err != nil {
 		return nil, nil, err // ErrNotFound for a bad slug
 	}
-	var catArchived sql.NullString
-	if err := s.db.QueryRow("SELECT archived_at FROM categories WHERE id=?", cid).Scan(&catArchived); err != nil {
+	if archived, err := categoryArchived(s.db, cid); err != nil {
 		return nil, nil, err
-	}
-	if catArchived.Valid && catArchived.String != "" {
+	} else if archived {
 		return nil, nil, ErrCategoryArchived
 	}
 	tx, err := s.db.Begin()
@@ -1197,11 +1195,9 @@ func (s *Store) CreateToken(sc Scope) (plaintext string, t *Token, err error) {
 	if err != nil {
 		return "", nil, err // ErrNotFound for a bad slug
 	}
-	var catArchived sql.NullString
-	if err := s.db.QueryRow("SELECT archived_at FROM categories WHERE id=?", cid).Scan(&catArchived); err != nil {
+	if archived, err := categoryArchived(s.db, cid); err != nil {
 		return "", nil, err
-	}
-	if catArchived.Valid && catArchived.String != "" {
+	} else if archived {
 		return "", nil, ErrCategoryArchived
 	}
 	if sc.Project != "" {
@@ -1240,23 +1236,20 @@ func (s *Store) CreateToken(sc Scope) (plaintext string, t *Token, err error) {
 		}
 		break
 	}
-	var tok Token
-	if err := tx.QueryRow(
-		"SELECT id, category, COALESCE(project,''), created_at, COALESCE(revoked_at,'') FROM tokens WHERE id=?", id).
-		Scan(&tok.ID, &tok.Category, &tok.Project, &tok.CreatedAt, &tok.RevokedAt); err != nil {
+	tok, err := getTokenTx(tx, id)
+	if err != nil {
 		return "", nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return "", nil, err
 	}
-	return plaintext, &tok, nil
+	return plaintext, tok, nil
 }
 
 // ListTokens returns all tokens' public metadata, newest last. token_hash is
 // NEVER selected — the hash never leaves the store.
 func (s *Store) ListTokens() ([]Token, error) {
-	rows, err := s.db.Query(
-		"SELECT id, category, COALESCE(project,''), created_at, COALESCE(revoked_at,'') FROM tokens ORDER BY created_at")
+	rows, err := s.db.Query("SELECT " + tokenCols + " FROM tokens ORDER BY created_at")
 	if err != nil {
 		return nil, err
 	}
@@ -1264,7 +1257,7 @@ func (s *Store) ListTokens() ([]Token, error) {
 	out := []Token{}
 	for rows.Next() {
 		var t Token
-		if err := rows.Scan(&t.ID, &t.Category, &t.Project, &t.CreatedAt, &t.RevokedAt); err != nil {
+		if err := rows.Scan(tokenDest(&t)...); err != nil {
 			return nil, err
 		}
 		out = append(out, t)
@@ -1276,17 +1269,29 @@ func (s *Store) ListTokens() ([]Token, error) {
 // both yield ErrNotFound (a no-op revoke is a 404, never silent success).
 func (s *Store) RevokeToken(id string) (*Token, error) {
 	res, err := s.db.Exec(
-		"UPDATE tokens SET revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND revoked_at IS NULL", id)
+		"UPDATE tokens SET revoked_at="+sqlNow+" WHERE id=? AND revoked_at IS NULL", id)
 	if err != nil {
 		return nil, err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return nil, ErrNotFound
 	}
+	return getTokenTx(s.db, id)
+}
+
+// tokenCols is the public token column list, in tokenDest order. token_hash
+// is deliberately absent — the hash never leaves the store.
+const tokenCols = "id, category, COALESCE(project,''), created_at, COALESCE(revoked_at,'')"
+
+// tokenDest returns the Scan destinations matching tokenCols.
+func tokenDest(t *Token) []any {
+	return []any{&t.ID, &t.Category, &t.Project, &t.CreatedAt, &t.RevokedAt}
+}
+
+// getTokenTx reads one token's public metadata by id.
+func getTokenTx(q queryer, id string) (*Token, error) {
 	var t Token
-	if err := s.db.QueryRow(
-		"SELECT id, category, COALESCE(project,''), created_at, COALESCE(revoked_at,'') FROM tokens WHERE id=?", id).
-		Scan(&t.ID, &t.Category, &t.Project, &t.CreatedAt, &t.RevokedAt); err != nil {
+	if err := q.QueryRow("SELECT "+tokenCols+" FROM tokens WHERE id=?", id).Scan(tokenDest(&t)...); err != nil {
 		return nil, err
 	}
 	return &t, nil
@@ -1371,11 +1376,9 @@ func (s *Store) ListTasks(f TaskFilter) ([]Task, error) {
 		if err != nil {
 			return nil, err
 		}
-		where = append(where, "EXISTS (SELECT 1 FROM task_meta m WHERE m.task_id=t.id AND m.key=?)")
+		where = append(where, metaKeyExpr)
 		args = append(args, k)
 	}
-	// open-prereq subquery reused for both Blocked and Ready filters.
-	const openPrereqExpr = `EXISTS (SELECT 1 FROM task_deps d JOIN tasks pt ON pt.id=d.depends_on_id WHERE d.task_id=t.id AND pt.status!='done')`
 	if f.Blocked {
 		where = append(where, openPrereqExpr)
 	}
@@ -1495,12 +1498,18 @@ func (s *Store) getTaskTx(q queryer, id int64) (*Task, error) {
 }
 
 // GetTask returns a task with comments, recent events, and dependency refs.
+// All sections are read in one transaction so they describe a single snapshot.
 func (s *Store) GetTask(id int64) (*Task, error) {
-	t, err := s.getTaskTx(s.db, id)
+	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
 	}
-	crows, err := s.db.Query("SELECT id,task_id,author,body,created_at FROM comments WHERE task_id=? ORDER BY id", id)
+	defer tx.Rollback()
+	t, err := s.getTaskTx(tx, id)
+	if err != nil {
+		return nil, err
+	}
+	crows, err := tx.Query("SELECT id,task_id,author,body,created_at FROM comments WHERE task_id=? ORDER BY id", id)
 	if err != nil {
 		return nil, err
 	}
@@ -1513,7 +1522,10 @@ func (s *Store) GetTask(id int64) (*Task, error) {
 		}
 		t.Comments = append(t.Comments, c)
 	}
-	erows, err := s.db.Query(`SELECT id,COALESCE(project_id,0),COALESCE(task_id,0),actor,kind,data,created_at
+	if err := crows.Err(); err != nil {
+		return nil, err
+	}
+	erows, err := tx.Query(`SELECT id,COALESCE(project_id,0),COALESCE(task_id,0),actor,kind,data,created_at
 	       FROM events WHERE task_id=? ORDER BY id DESC LIMIT 50`, id)
 	if err != nil {
 		return nil, err
@@ -1529,9 +1541,12 @@ func (s *Store) GetTask(id int64) (*Task, error) {
 		e.Data = json.RawMessage(data)
 		t.Events = append(t.Events, e)
 	}
+	if err := erows.Err(); err != nil {
+		return nil, err
+	}
 
 	// Populate DependsOn (prerequisites of this task).
-	drows, err := s.db.Query(`SELECT t.id,t.ref,p.slug,t.title,t.status
+	drows, err := tx.Query(`SELECT t.id,t.ref,p.slug,t.title,t.status
 	       FROM task_deps d JOIN tasks t ON t.id=d.depends_on_id JOIN projects p ON p.id=t.project_id
 	       WHERE d.task_id=? ORDER BY t.id`, id)
 	if err != nil {
@@ -1551,7 +1566,7 @@ func (s *Store) GetTask(id int64) (*Task, error) {
 	}
 
 	// Populate Blocks (tasks that depend on this task).
-	brows, err := s.db.Query(`SELECT t.id,t.ref,p.slug,t.title,t.status
+	brows, err := tx.Query(`SELECT t.id,t.ref,p.slug,t.title,t.status
 	       FROM task_deps d JOIN tasks t ON t.id=d.task_id JOIN projects p ON p.id=t.project_id
 	       WHERE d.depends_on_id=? ORDER BY t.id`, id)
 	if err != nil {
@@ -1571,7 +1586,7 @@ func (s *Store) GetTask(id int64) (*Task, error) {
 	}
 
 	// Populate Labels (sorted for stable output).
-	lrows, err := s.db.Query("SELECT label FROM task_labels WHERE task_id=? ORDER BY label", id)
+	lrows, err := tx.Query("SELECT label FROM task_labels WHERE task_id=? ORDER BY label", id)
 	if err != nil {
 		return nil, err
 	}
@@ -1588,7 +1603,7 @@ func (s *Store) GetTask(id int64) (*Task, error) {
 	}
 
 	// Populate Meta (the map is unordered; JSON output sorts keys on marshal).
-	mrows, err := s.db.Query("SELECT key, value FROM task_meta WHERE task_id=? ORDER BY key", id)
+	mrows, err := tx.Query("SELECT key, value FROM task_meta WHERE task_id=? ORDER BY key", id)
 	if err != nil {
 		return nil, err
 	}
@@ -1608,7 +1623,7 @@ func (s *Store) GetTask(id int64) (*Task, error) {
 	}
 
 	// Also populate the terse counts for the full task view.
-	if err := s.db.QueryRow(`SELECT
+	if err := tx.QueryRow(`SELECT
 	       COALESCE((SELECT COUNT(*) FROM task_deps d WHERE d.task_id=?),0),
 	       COALESCE((SELECT COUNT(*) FROM task_deps d JOIN tasks pt ON pt.id=d.depends_on_id WHERE d.task_id=? AND pt.status!='done'),0)`,
 		id, id).Scan(&t.NPrereqs, &t.NOpenPrereqs); err != nil {
@@ -1701,21 +1716,16 @@ func (s *Store) CreateTask(in CreateTaskInput) (*Task, *Event, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	var archivedAt sql.NullString
-	if err := s.db.QueryRow("SELECT archived_at FROM projects WHERE id=?", pid).Scan(&archivedAt); err != nil {
+	if archived, err := rowArchived(s.db, "SELECT archived_at FROM projects WHERE id=?", pid); err != nil {
 		return nil, nil, err
-	}
-	if archivedAt.Valid && archivedAt.String != "" {
+	} else if archived {
 		return nil, nil, ErrProjectArchived
 	}
 	// Archived-category cascade: a hidden board must not accept new tasks either.
-	var catArchived sql.NullString
-	if err := s.db.QueryRow(
-		"SELECT c.archived_at FROM projects p JOIN categories c ON c.id=p.category_id WHERE p.id=?", pid).
-		Scan(&catArchived); err != nil {
+	if archived, err := rowArchived(s.db,
+		"SELECT c.archived_at FROM projects p JOIN categories c ON c.id=p.category_id WHERE p.id=?", pid); err != nil {
 		return nil, nil, err
-	}
-	if catArchived.Valid && catArchived.String != "" {
+	} else if archived {
 		return nil, nil, ErrCategoryArchived
 	}
 	tx, err := s.db.Begin()
@@ -1730,7 +1740,7 @@ func (s *Store) CreateTask(in CreateTaskInput) (*Task, *Event, error) {
 	// A pre-assigned task gets claimed_at like every other assignment path
 	// (PatchTask, claim, steal, next); its status stays todo.
 	res, err := tx.Exec(`INSERT INTO tasks(project_id,ref,title,body,priority,assignee,created_by,claimed_at)
-	         VALUES(?,?,?,?,?,?,?,CASE WHEN ?6 IS NULL THEN NULL ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END)`,
+	         VALUES(?,?,?,?,?,?,?,CASE WHEN ?6 IS NULL THEN NULL ELSE `+sqlNow+` END)`,
 		pid, ref, in.Title, in.Body, in.Priority, nullStr(in.Assignee), actorOr(in.Actor))
 	if err != nil {
 		return nil, nil, err
@@ -1821,7 +1831,7 @@ func (s *Store) PatchTask(id int64, patch map[string]any, actor string) (*Task, 
 			// Keep claimed_at in step with the assignee: set on (re)assign, clear
 			// on unassign (so `am drop` resets it).
 			if as != "" {
-				sets = append(sets, "claimed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')")
+				sets = append(sets, "claimed_at="+sqlNow)
 			} else {
 				sets = append(sets, "claimed_at=NULL")
 			}
@@ -1893,7 +1903,7 @@ func (s *Store) PatchTask(id int64, patch map[string]any, actor string) (*Task, 
 	// like labels, and refreshing the activity timestamp would keep a stale
 	// claim alive (the AddLabel/dep-edge precedent, ADR-024).
 	if len(sets) > 0 {
-		sets = append(sets, "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')")
+		sets = append(sets, "updated_at="+sqlNow)
 		args = append(args, id)
 		if _, err := tx.Exec("UPDATE tasks SET "+strings.Join(sets, ",")+" WHERE id=?", args...); err != nil {
 			return nil, nil, err
@@ -1919,18 +1929,7 @@ func (s *Store) PatchTask(id int64, patch map[string]any, actor string) (*Task, 
 // hasOpenPrereqs returns the IDs of any prerequisite tasks that are not yet done.
 // It is called within an existing transaction via the queryer interface.
 func hasOpenPrereqs(q queryer, taskID int64) ([]int64, error) {
-	type txQuerier interface {
-		Query(query string, args ...any) (*sql.Rows, error)
-	}
-	// queryer only exposes QueryRow; we need Query here. Accept *sql.Tx or *sql.DB
-	// by type-asserting to the broader interface.
-	qr, ok := q.(txQuerier)
-	if !ok {
-		// Fail loud rather than silently skipping the hard-block check (which would
-		// let a blocked task be claimed/started). All current callers pass *sql.Tx/*sql.DB.
-		return nil, fmt.Errorf("hasOpenPrereqs: queryer %T does not support Query", q)
-	}
-	rows, err := qr.Query(`SELECT d.depends_on_id FROM task_deps d
+	rows, err := q.Query(`SELECT d.depends_on_id FROM task_deps d
 	       JOIN tasks pt ON pt.id=d.depends_on_id
 	       WHERE d.task_id=? AND pt.status!='done'`, taskID)
 	if err != nil {
@@ -1988,11 +1987,7 @@ func (s *Store) ClaimTask(id int64, agent string) (*Task, *Event, error) {
 	var pid int64
 	var prev any // previous assignee for the event; nil = was unclaimed
 	err = tx.QueryRow(`
-		UPDATE tasks
-		   SET assignee=?,
-		       claimed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-		       status=CASE WHEN status='todo' THEN 'doing' ELSE status END,
-		       updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		UPDATE tasks SET `+claimSet+`
 		 WHERE id=? AND assignee IS NULL AND status!='done'
 		RETURNING project_id, status`, agent, id).Scan(&pid, &newStatus)
 	if err == sql.ErrNoRows {
@@ -2009,8 +2004,7 @@ func (s *Store) ClaimTask(id int64, agent string) (*Task, *Event, error) {
 		}
 		// Pre-assigned to agent but not started: the claim starts it.
 		if _, err := tx.Exec(`UPDATE tasks
-		   SET claimed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), status='doing',
-		       updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		   SET claimed_at=`+sqlNow+`, status='doing', updated_at=`+sqlNow+`
 		 WHERE id=?`, id); err != nil {
 			return nil, nil, err
 		}
@@ -2018,8 +2012,7 @@ func (s *Store) ClaimTask(id int64, agent string) (*Task, *Event, error) {
 	} else if err != nil {
 		return nil, nil, err
 	}
-	ev, err := insertEvent(tx, pid, id, agent, "task.claimed",
-		map[string]any{"assignee": []any{prev, agent}, "status": newStatus})
+	ev, err := insertClaimedEvent(tx, pid, id, agent, prev, newStatus)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2073,11 +2066,7 @@ func (s *Store) StealStaleClaim(id int64, agent string, staleFor time.Duration) 
 	var newStatus string
 	var pid int64
 	err = tx.QueryRow(`
-		UPDATE tasks
-		   SET assignee=?,
-		       claimed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-		       status=CASE WHEN status='todo' THEN 'doing' ELSE status END,
-		       updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		UPDATE tasks SET `+claimSet+`
 		 WHERE id=? AND status!='done' AND (assignee IS NULL OR updated_at < ?)
 		RETURNING project_id, status`, agent, id, staleCutoff(staleFor)).Scan(&pid, &newStatus)
 	if err == sql.ErrNoRows {
@@ -2095,9 +2084,8 @@ func (s *Store) StealStaleClaim(id int64, agent string, staleFor time.Duration) 
 			map[string]any{"assignee": []any{cur.Assignee, agent}, "status": newStatus,
 				"stale_for": staleFor.String()})
 	} else {
-		// Unclaimed: degrade to a normal claim (same payload shape as ClaimTask).
-		ev, err = insertEvent(tx, pid, id, agent, "task.claimed",
-			map[string]any{"assignee": []any{nil, agent}, "status": newStatus})
+		// Unclaimed: degrade to a normal claim (same event as ClaimTask).
+		ev, err = insertClaimedEvent(tx, pid, id, agent, nil, newStatus)
 	}
 	if err != nil {
 		return nil, nil, err
@@ -2155,10 +2143,10 @@ func (s *Store) NextTaskContext(ctx context.Context, f NextFilter, agent string)
 		if err != nil {
 			return nil, nil, err
 		}
-		// Must stay textually equivalent to ListTasks' MetaKey predicate — the
-		// wait/next invariant: a task that releases `am wait --ready --meta K`
-		// must be pickable by `am next --meta K`. Phase Q extends scope here.
-		scope += " AND EXISTS (SELECT 1 FROM task_meta m WHERE m.task_id=t.id AND m.key=?)"
+		// Shared with ListTasks' MetaKey filter — the wait/next invariant: a
+		// task that releases `am wait --ready --meta K` must be pickable by
+		// `am next --meta K`. Phase Q extends scope here.
+		scope += " AND " + metaKeyExpr
 		args = append(args, k)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -2169,24 +2157,19 @@ func (s *Store) NextTaskContext(ctx context.Context, f NextFilter, agent string)
 
 	// Pick + claim in ONE conditional UPDATE — the project's race primitive
 	// (ADR-022/ADR-023); serialized by SetMaxOpenConns(1), so concurrent callers
-	// get distinct tasks. The NOT EXISTS open-prereq predicate matches ListTasks'
-	// Ready filter exactly. Ordering: priority ASC (0 = most urgent, matching
+	// get distinct tasks. The NOT openPrereqExpr predicate is ListTasks' Ready
+	// filter. Ordering: priority ASC (0 = most urgent, matching
 	// ListTasks), then id ASC — a FIFO tiebreak, deliberately NOT the
 	// updated_at DESC display order of `am ls`: a pickup queue drains oldest-first.
 	var id, pid int64
 	err = tx.QueryRow(`
-		UPDATE tasks
-		   SET assignee=?,
-		       claimed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-		       status='doing',
-		       updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		UPDATE tasks SET `+claimSet+`
 		 WHERE id = (
 		   SELECT t.id FROM tasks t JOIN projects p ON p.id=t.project_id
 		                           JOIN categories c ON c.id=p.category_id
 		   WHERE t.status='todo' AND t.assignee IS NULL AND p.archived_at IS NULL
 		     AND c.archived_at IS NULL`+scope+`
-		     AND NOT EXISTS (SELECT 1 FROM task_deps d JOIN tasks pt ON pt.id=d.depends_on_id
-		                     WHERE d.task_id=t.id AND pt.status!='done')
+		     AND NOT `+openPrereqExpr+`
 		   ORDER BY t.priority ASC, t.id ASC LIMIT 1)
 		RETURNING id, project_id`, args...).Scan(&id, &pid)
 	if err == sql.ErrNoRows {
@@ -2195,9 +2178,8 @@ func (s *Store) NextTaskContext(ctx context.Context, f NextFilter, agent string)
 	if err != nil {
 		return nil, nil, err
 	}
-	// Same event kind + payload shape as ClaimTask — a next pickup IS a claim.
-	ev, err := insertEvent(tx, pid, id, agent, "task.claimed",
-		map[string]any{"assignee": []any{nil, agent}, "status": "doing"})
+	// A next pickup IS a claim: same event as ClaimTask.
+	ev, err := insertClaimedEvent(tx, pid, id, agent, nil, "doing")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2270,7 +2252,7 @@ func (s *Store) DeleteComment(taskID, commentID int64, actor string) (*Event, er
 	if _, err := tx.Exec("DELETE FROM comments WHERE id=?", commentID); err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec("UPDATE tasks SET updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?", taskID); err != nil {
+	if _, err := tx.Exec("UPDATE tasks SET updated_at="+sqlNow+" WHERE id=?", taskID); err != nil {
 		return nil, err
 	}
 	return ev, tx.Commit()
@@ -2582,7 +2564,7 @@ func (s *Store) AddComment(id int64, author, body string) (*Comment, *Event, err
 		return nil, nil, err
 	}
 	cid, _ := res.LastInsertId()
-	if _, err := tx.Exec("UPDATE tasks SET updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?", id); err != nil {
+	if _, err := tx.Exec("UPDATE tasks SET updated_at="+sqlNow+" WHERE id=?", id); err != nil {
 		return nil, nil, err
 	}
 	ev, err := insertEvent(tx, cur.ProjectID, id, actorOr(author), "comment.added",
@@ -2772,9 +2754,53 @@ func (s *Store) ProjectGraph(slug string) (*ProjectGraphData, error) {
 
 // ---------- helpers ----------
 
+// sqlNow is the one SQL expression for "now" in every timestamp column. Its
+// layout (millisecond, Z) makes timestamps compare lexicographically, so
+// staleCutoff must format the same way.
+const sqlNow = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+
+// claimSet is the SET clause of every claim write (ClaimTask, StealStaleClaim,
+// NextTask); its single bind parameter is the new assignee.
+const claimSet = `assignee=?, claimed_at=` + sqlNow + `,
+		       status=CASE WHEN status='todo' THEN 'doing' ELSE status END,
+		       updated_at=` + sqlNow
+
+// openPrereqExpr is true when task t has a prerequisite that is not done.
+// ListTasks' Blocked/Ready filters and NextTask's candidate pick share it, so
+// `ls --ready`, `wait --ready` and `next` agree on what is ready.
+const openPrereqExpr = `EXISTS (SELECT 1 FROM task_deps d JOIN tasks pt ON pt.id=d.depends_on_id WHERE d.task_id=t.id AND pt.status!='done')`
+
+// metaKeyExpr is true when task t has meta key ? (ListTasks and NextTask).
+const metaKeyExpr = "EXISTS (SELECT 1 FROM task_meta m WHERE m.task_id=t.id AND m.key=?)"
+
+// insertClaimedEvent records task.claimed with the payload shared by every
+// claim path: assignee [prev, agent] (prev nil when unclaimed) and new status.
+func insertClaimedEvent(tx *sql.Tx, pid, id int64, agent string, prev any, status string) (*Event, error) {
+	return insertEvent(tx, pid, id, agent, "task.claimed",
+		map[string]any{"assignee": []any{prev, agent}, "status": status})
+}
+
 // queryer is satisfied by both *sql.DB and *sql.Tx.
 type queryer interface {
 	QueryRow(query string, args ...any) *sql.Row
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
+// rowArchived runs query (selecting one archived_at column for id) and reports
+// whether that row is archived. This is the single definition of "archived":
+// a non-NULL, non-empty archived_at.
+func rowArchived(q queryer, query string, id int64) (bool, error) {
+	var at sql.NullString
+	if err := q.QueryRow(query, id).Scan(&at); err != nil {
+		return false, err
+	}
+	return at.Valid && at.String != "", nil
+}
+
+// categoryArchived reports whether category cid is archived. Creation paths
+// call it to honour the archived-category cascade.
+func categoryArchived(q queryer, cid int64) (bool, error) {
+	return rowArchived(q, "SELECT archived_at FROM categories WHERE id=?", cid)
 }
 
 // newUID returns a stable identifier: prefix + 16 lowercase hex chars (8 bytes
@@ -2876,7 +2902,7 @@ func toInt(v any) (int, bool) {
 }
 
 // staleCutoff returns the ISO-8601 UTC timestamp staleFor ago, formatted to
-// match SQLite's strftime('%Y-%m-%dT%H:%M:%fZ','now') exactly (3-digit
+// match sqlNow, SQLite's strftime('%Y-%m-%dT%H:%M:%fZ','now'), exactly (3-digit
 // fractional seconds), so the lexicographic comparison against stored
 // updated_at values is correct. Changing the format silently breaks it.
 func staleCutoff(d time.Duration) string {

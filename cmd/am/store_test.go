@@ -32,10 +32,7 @@ func TestListEventsBefore(t *testing.T) {
 	}
 
 	// Create a task in archproj.
-	archTask, _, err := st.CreateTask(CreateTaskInput{Project: "archproj", Title: "arch-t1"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	archTask := cwfStoreNewTask(t, st, "archproj", "arch-t1")
 	_ = archTask
 
 	// Collect all event IDs in ascending order.
@@ -111,9 +108,7 @@ func TestListEventsBefore(t *testing.T) {
 
 func TestCreateProjectAndTaskHappyPath(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	task, ev, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Do a thing", Actor: "alice"})
 	if err != nil {
 		t.Fatalf("CreateTask: %v", err)
@@ -142,9 +137,7 @@ func TestCreateProjectAndTaskHappyPath(t *testing.T) {
 
 func TestCreateTaskEmptyTitleValidation(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	if _, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "   "}); !errors.Is(err, ErrValidation) {
 		t.Fatalf("empty title err = %v, want ErrValidation", err)
 	}
@@ -152,13 +145,8 @@ func TestCreateTaskEmptyTitleValidation(t *testing.T) {
 
 func TestPatchTaskInvalidStatusValidation(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "T"})
-	if err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
+	task := cwfStoreNewTask(t, st, "web", "T")
 	if _, _, err := st.PatchTask(task.ID, map[string]any{"status": "bogus"}, "alice"); !errors.Is(err, ErrValidation) {
 		t.Fatalf("invalid status err = %v, want ErrValidation", err)
 	}
@@ -166,13 +154,8 @@ func TestPatchTaskInvalidStatusValidation(t *testing.T) {
 
 func TestClaimRaceExactlyOneWinner(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Race me"})
-	if err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
+	task := cwfStoreNewTask(t, st, "web", "Race me")
 
 	agents := []string{"agent-a", "agent-b"}
 	type result struct {
@@ -243,14 +226,6 @@ func backdateTask(t *testing.T, st *Store, id int64) {
 }
 
 func TestStealStaleClaim(t *testing.T) {
-	newTask := func(t *testing.T, st *Store, title string) int64 {
-		t.Helper()
-		tk, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: title})
-		if err != nil {
-			t.Fatalf("CreateTask: %v", err)
-		}
-		return tk.ID
-	}
 	mustClaim := func(t *testing.T, st *Store, id int64, agent string) {
 		t.Helper()
 		if _, _, err := st.ClaimTask(id, agent); err != nil {
@@ -268,7 +243,7 @@ func TestStealStaleClaim(t *testing.T) {
 		{
 			name: "stale claim is stolen",
 			setup: func(t *testing.T, st *Store) int64 {
-				id := newTask(t, st, "stale")
+				id := cwfStoreNewTask(t, st, "web", "stale").ID
 				mustClaim(t, st, id, "agent-old")
 				backdateTask(t, st, id)
 				// Backdate claimed_at too, so the "bumped past" check below
@@ -308,7 +283,7 @@ func TestStealStaleClaim(t *testing.T) {
 		{
 			name: "fresh claim is not stealable",
 			setup: func(t *testing.T, st *Store) int64 {
-				id := newTask(t, st, "fresh")
+				id := cwfStoreNewTask(t, st, "web", "fresh").ID
 				mustClaim(t, st, id, "agent-old")
 				return id
 			},
@@ -330,7 +305,7 @@ func TestStealStaleClaim(t *testing.T) {
 		{
 			name: "unclaimed degrades to normal claim",
 			setup: func(t *testing.T, st *Store) int64 {
-				return newTask(t, st, "unclaimed")
+				return cwfStoreNewTask(t, st, "web", "unclaimed").ID
 			},
 			agent: "agent-new", dur: time.Hour,
 			check: func(t *testing.T, st *Store, id int64, tk *Task, ev *Event, err error) {
@@ -348,7 +323,7 @@ func TestStealStaleClaim(t *testing.T) {
 		{
 			name: "done task conflicts",
 			setup: func(t *testing.T, st *Store) int64 {
-				id := newTask(t, st, "done")
+				id := cwfStoreNewTask(t, st, "web", "done").ID
 				mustClaim(t, st, id, "agent-old")
 				if _, _, err := st.PatchTask(id, map[string]any{"status": "done"}, "agent-old"); err != nil {
 					t.Fatalf("PatchTask done: %v", err)
@@ -367,7 +342,7 @@ func TestStealStaleClaim(t *testing.T) {
 		{
 			name: "own claim is idempotent",
 			setup: func(t *testing.T, st *Store) int64 {
-				id := newTask(t, st, "mine")
+				id := cwfStoreNewTask(t, st, "web", "mine").ID
 				mustClaim(t, st, id, "agent-new")
 				return id
 			},
@@ -396,7 +371,7 @@ func TestStealStaleClaim(t *testing.T) {
 		},
 		{
 			name:  "empty agent",
-			setup: func(t *testing.T, st *Store) int64 { return newTask(t, st, "noagent") },
+			setup: func(t *testing.T, st *Store) int64 { return cwfStoreNewTask(t, st, "web", "noagent").ID },
 			agent: "", dur: time.Hour,
 			check: func(t *testing.T, st *Store, id int64, tk *Task, ev *Event, err error) {
 				if !errors.Is(err, ErrValidation) {
@@ -406,7 +381,7 @@ func TestStealStaleClaim(t *testing.T) {
 		},
 		{
 			name:  "zero duration",
-			setup: func(t *testing.T, st *Store) int64 { return newTask(t, st, "zerodur") },
+			setup: func(t *testing.T, st *Store) int64 { return cwfStoreNewTask(t, st, "web", "zerodur").ID },
 			agent: "agent-new", dur: 0,
 			check: func(t *testing.T, st *Store, id int64, tk *Task, ev *Event, err error) {
 				if !errors.Is(err, ErrValidation) {
@@ -416,7 +391,7 @@ func TestStealStaleClaim(t *testing.T) {
 		},
 		{
 			name:  "negative duration",
-			setup: func(t *testing.T, st *Store) int64 { return newTask(t, st, "negdur") },
+			setup: func(t *testing.T, st *Store) int64 { return cwfStoreNewTask(t, st, "web", "negdur").ID },
 			agent: "agent-new", dur: -time.Hour,
 			check: func(t *testing.T, st *Store, id int64, tk *Task, ev *Event, err error) {
 				if !errors.Is(err, ErrValidation) {
@@ -427,8 +402,8 @@ func TestStealStaleClaim(t *testing.T) {
 		{
 			name: "open prereq blocks the steal",
 			setup: func(t *testing.T, st *Store) int64 {
-				prereq := newTask(t, st, "prereq")
-				dep := newTask(t, st, "dependent")
+				prereq := cwfStoreNewTask(t, st, "web", "prereq").ID
+				dep := cwfStoreNewTask(t, st, "web", "dependent").ID
 				if _, err := st.AddDep(dep, prereq, "alice"); err != nil {
 					t.Fatalf("AddDep: %v", err)
 				}
@@ -447,9 +422,7 @@ func TestStealStaleClaim(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			st := openTestStore(t)
-			if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-				t.Fatalf("CreateProject: %v", err)
-			}
+			cwfStoreNewProject(t, st, "web")
 			id := c.setup(t, st)
 			tk, ev, err := st.StealStaleClaim(id, c.agent, c.dur)
 			c.check(t, st, id, tk, ev, err)
@@ -459,13 +432,8 @@ func TestStealStaleClaim(t *testing.T) {
 
 func TestStealRaceExactlyOneWinner(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Steal me"})
-	if err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
+	task := cwfStoreNewTask(t, st, "web", "Steal me")
 	if _, _, err := st.ClaimTask(task.ID, "dead-agent"); err != nil {
 		t.Fatalf("ClaimTask: %v", err)
 	}
@@ -529,40 +497,30 @@ func TestStealRaceExactlyOneWinner(t *testing.T) {
 
 func TestListTasksStaleFilter(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	mk := func(title string) int64 {
-		t.Helper()
-		tk, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: title})
-		if err != nil {
-			t.Fatalf("CreateTask %s: %v", title, err)
-		}
-		return tk.ID
-	}
+	cwfStoreNewProject(t, st, "web")
 
 	// Stale: claimed (doing+assigned) then backdated.
-	stale := mk("stale doing")
+	stale := cwfStoreNewTask(t, st, "web", "stale doing").ID
 	if _, _, err := st.ClaimTask(stale, "agent-a"); err != nil {
 		t.Fatal(err)
 	}
 	backdateTask(t, st, stale)
 
 	// Fresh: claimed just now.
-	fresh := mk("fresh doing")
+	fresh := cwfStoreNewTask(t, st, "web", "fresh doing").ID
 	if _, _, err := st.ClaimTask(fresh, "agent-b"); err != nil {
 		t.Fatal(err)
 	}
 
 	// Unassigned doing, backdated: not stale (nobody holds it).
-	unassigned := mk("unassigned doing")
+	unassigned := cwfStoreNewTask(t, st, "web", "unassigned doing").ID
 	if _, _, err := st.PatchTask(unassigned, map[string]any{"status": "doing"}, "alice"); err != nil {
 		t.Fatal(err)
 	}
 	backdateTask(t, st, unassigned)
 
 	// Assigned done, backdated: not stale (finished work is never stale).
-	done := mk("assigned done")
+	done := cwfStoreNewTask(t, st, "web", "assigned done").ID
 	if _, _, err := st.ClaimTask(done, "agent-c"); err != nil {
 		t.Fatal(err)
 	}
@@ -572,7 +530,7 @@ func TestListTasksStaleFilter(t *testing.T) {
 	backdateTask(t, st, done)
 
 	// Backdated but then commented: the comment bumps updated_at → no longer stale.
-	revived := mk("commented doing")
+	revived := cwfStoreNewTask(t, st, "web", "commented doing").ID
 	if _, _, err := st.ClaimTask(revived, "agent-d"); err != nil {
 		t.Fatal(err)
 	}
@@ -592,13 +550,8 @@ func TestListTasksStaleFilter(t *testing.T) {
 
 func TestClaimSetsClaimedAt(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "claim me"})
-	if err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
+	task := cwfStoreNewTask(t, st, "web", "claim me")
 	if task.ClaimedAt != "" {
 		t.Fatalf("claimed_at before claim = %q, want empty", task.ClaimedAt)
 	}
@@ -613,13 +566,8 @@ func TestClaimSetsClaimedAt(t *testing.T) {
 
 func TestDropClearsClaimedAt(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "drop me"})
-	if err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
+	task := cwfStoreNewTask(t, st, "web", "drop me")
 	if _, _, err := st.ClaimTask(task.ID, "agent-a"); err != nil {
 		t.Fatalf("ClaimTask: %v", err)
 	}
@@ -932,13 +880,8 @@ func TestCreateTaskRejectsArchivedProject(t *testing.T) {
 
 func TestDeleteTaskCascadesComments(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "to delete"})
-	if err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
+	task := cwfStoreNewTask(t, st, "web", "to delete")
 	c, _, err := st.AddComment(task.ID, "alice", "a comment")
 	if err != nil {
 		t.Fatalf("AddComment: %v", err)
@@ -991,13 +934,8 @@ func TestDeleteTaskNotFound(t *testing.T) {
 
 func TestDeleteCommentRemovesOnlyComment(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "task with comments"})
-	if err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
+	task := cwfStoreNewTask(t, st, "web", "task with comments")
 	c1, _, err := st.AddComment(task.ID, "alice", "first")
 	if err != nil {
 		t.Fatalf("AddComment 1: %v", err)
@@ -1049,10 +987,7 @@ func TestDeleteCommentRemovesOnlyComment(t *testing.T) {
 
 	// Wrong task id (missing, or another existing task) → ErrNotFound, and c2
 	// survives both attempts.
-	other, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "other task"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	other := cwfStoreNewTask(t, st, "web", "other task")
 	for _, tid := range []int64{task.ID + 999, other.ID} {
 		if _, err := st.DeleteComment(tid, c2.ID, "bob"); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("DeleteComment(task %d, c2) = %v, want ErrNotFound", tid, err)
@@ -1069,10 +1004,7 @@ func TestDeleteProjectCascades(t *testing.T) {
 	if _, _, err := st.CreateProject("alpha", "Alpha", ""); err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
-	task, _, err := st.CreateTask(CreateTaskInput{Project: "alpha", Title: "child task"})
-	if err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	task := cwfStoreNewTask(t, st, "alpha", "child task")
 	if _, _, err := st.AddComment(task.ID, "alice", "note"); err != nil {
 		t.Fatalf("AddComment: %v", err)
 	}
@@ -1125,13 +1057,8 @@ func TestDeleteProjectCascades(t *testing.T) {
 
 func TestEventsCursorStrictlyIncreasing(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "T"})
-	if err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
+	task := cwfStoreNewTask(t, st, "web", "T")
 	if _, _, err := st.ClaimTask(task.ID, "agent-a"); err != nil {
 		t.Fatalf("ClaimTask: %v", err)
 	}
@@ -1188,29 +1115,8 @@ func TestEventsCursorStrictlyIncreasing(t *testing.T) {
 
 // ===================== dependency tests =====================
 
-func setupDepFixture(t *testing.T) (*Store, int64, int64, int64) {
-	t.Helper()
-	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatal(err)
-	}
-	t1, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Task 1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t2, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Task 2"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t3, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Task 3"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return st, t1.ID, t2.ID, t3.ID
-}
-
 func TestAddDepHappyPath(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 
 	ev, err := st.AddDep(t2, t1, "alice") // t2 depends on t1
 	if err != nil {
@@ -1243,7 +1149,7 @@ func TestAddDepHappyPath(t *testing.T) {
 }
 
 func TestAddDepSelfRejected(t *testing.T) {
-	st, t1, _, _ := setupDepFixture(t)
+	st, t1, _, _ := cwfStoreWebTasks(t)
 	snap := cwfStoreSnapshot(t, st)
 	_, err := st.AddDep(t1, t1, "alice")
 	if !errors.Is(err, ErrValidation) {
@@ -1271,7 +1177,7 @@ func TestAddDepCrossProjectRejected(t *testing.T) {
 }
 
 func TestAddDepCycleRejected(t *testing.T) {
-	st, t1, t2, t3 := setupDepFixture(t)
+	st, t1, t2, t3 := cwfStoreWebTasks(t)
 	// t2 depends on t1
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatalf("AddDep(t2->t1): %v", err)
@@ -1290,7 +1196,7 @@ func TestAddDepCycleRejected(t *testing.T) {
 }
 
 func TestAddDepDirectCycleRejected(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatalf("AddDep(t2->t1): %v", err)
 	}
@@ -1304,7 +1210,7 @@ func TestAddDepDirectCycleRejected(t *testing.T) {
 }
 
 func TestAddDepIdempotent(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 	ev1, err := st.AddDep(t2, t1, "alice")
 	if err != nil {
 		t.Fatalf("first AddDep: %v", err)
@@ -1323,7 +1229,7 @@ func TestAddDepIdempotent(t *testing.T) {
 }
 
 func TestRemoveDep(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatalf("AddDep: %v", err)
 	}
@@ -1350,7 +1256,7 @@ func TestRemoveDep(t *testing.T) {
 }
 
 func TestGetTaskDependsOnAndBlocks(t *testing.T) {
-	st, t1, t2, t3 := setupDepFixture(t)
+	st, t1, t2, t3 := cwfStoreWebTasks(t)
 	// t2 depends on t1; t3 depends on t1
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatal(err)
@@ -1380,7 +1286,7 @@ func TestGetTaskDependsOnAndBlocks(t *testing.T) {
 }
 
 func TestDeleteTaskCascadesDeps(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -1403,7 +1309,7 @@ func TestDeleteTaskCascadesDeps(t *testing.T) {
 }
 
 func TestListTasksDepCounts(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -1441,7 +1347,7 @@ func TestListTasksDepCounts(t *testing.T) {
 }
 
 func TestListTasksReadyFilter(t *testing.T) {
-	st, t1, t2, t3 := setupDepFixture(t)
+	st, t1, t2, t3 := cwfStoreWebTasks(t)
 	// t2 depends on t1 (open prereq → not ready)
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatal(err)
@@ -1470,7 +1376,7 @@ func TestListTasksReadyFilter(t *testing.T) {
 }
 
 func TestListTasksBlockedFilter(t *testing.T) {
-	st, t1, t2, t3 := setupDepFixture(t)
+	st, t1, t2, t3 := cwfStoreWebTasks(t)
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -1492,7 +1398,7 @@ func TestListTasksBlockedFilter(t *testing.T) {
 }
 
 func TestClaimBlockedByOpenPrereq(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -1511,7 +1417,7 @@ func TestClaimBlockedByOpenPrereq(t *testing.T) {
 }
 
 func TestClaimUnblockedAfterPrereqDone(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -1530,7 +1436,7 @@ func TestClaimUnblockedAfterPrereqDone(t *testing.T) {
 }
 
 func TestPatchTaskBlockedByOpenPrereq(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -1593,9 +1499,6 @@ func TestTaskDepsTableExistsOnReopenedDB(t *testing.T) {
 	}
 }
 
-// Suppress unused import warning for fmt (used in TestAddDepCycleRejected).
-var _ = fmt.Sprintf
-
 // ===================== ProjectGraph tests =====================
 
 func TestProjectGraph(t *testing.T) {
@@ -1608,23 +1511,11 @@ func TestProjectGraph(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ta, _, err := st.CreateTask(CreateTaskInput{Project: "gproj", Title: "Task A"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	tb, _, err := st.CreateTask(CreateTaskInput{Project: "gproj", Title: "Task B"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	tc, _, err := st.CreateTask(CreateTaskInput{Project: "gproj", Title: "Task C"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	ta := cwfStoreNewTask(t, st, "gproj", "Task A")
+	tb := cwfStoreNewTask(t, st, "gproj", "Task B")
+	tc := cwfStoreNewTask(t, st, "gproj", "Task C")
 	// Task in other project — must not leak into gproj graph.
-	tOther, _, err := st.CreateTask(CreateTaskInput{Project: "other", Title: "Other Task"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	tOther := cwfStoreNewTask(t, st, "other", "Other Task")
 	_ = tOther
 
 	// Chain: B depends on A; C depends on B.
@@ -1808,9 +1699,7 @@ func TestNextTaskPicksHighestPriorityReady(t *testing.T) {
 
 func TestNextTaskFIFOWithinPriority(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	first := nextTaskMk(t, st, "web", "older", 2, "")
 	nextTaskMk(t, st, "web", "newer", 2, "")
 
@@ -1857,9 +1746,7 @@ func TestNextTaskProjectScoping(t *testing.T) {
 
 func TestNextTaskNoneReady(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	// Only an assigned todo task — not a candidate.
 	nextTaskMk(t, st, "web", "taken", 0, "someone-else")
 
@@ -1876,32 +1763,13 @@ func TestNextTaskNoneReady(t *testing.T) {
 func TestNextTaskRaceDistinctWinners(t *testing.T) {
 	// N callers, M>N ready tasks: everyone wins a DISTINCT task.
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	const n = 4
 	for i := 0; i < n+2; i++ {
 		nextTaskMk(t, st, "web", fmt.Sprintf("ready %d", i), 2, "")
 	}
 
-	type result struct {
-		task *Task
-		err  error
-	}
-	results := make([]result, n)
-	var wg sync.WaitGroup
-	start := make(chan struct{})
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			<-start
-			tk, _, err := st.NextTask(NextFilter{}, fmt.Sprintf("agent-%d", i))
-			results[i] = result{task: tk, err: err}
-		}(i)
-	}
-	close(start)
-	wg.Wait()
+	results := cwfStoreRaceNext(t, st, n, NextFilter{})
 
 	seen := map[int64]bool{}
 	for i, r := range results {
@@ -1916,24 +1784,9 @@ func TestNextTaskRaceDistinctWinners(t *testing.T) {
 
 	// N callers, 1 ready task: exactly one winner, the rest ErrNotFound.
 	st2 := openTestStore(t)
-	if _, _, err := st2.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
+	cwfStoreNewProject(t, st2, "web")
 	nextTaskMk(t, st2, "web", "only one", 2, "")
-	results2 := make([]result, n)
-	var wg2 sync.WaitGroup
-	start2 := make(chan struct{})
-	for i := 0; i < n; i++ {
-		wg2.Add(1)
-		go func(i int) {
-			defer wg2.Done()
-			<-start2
-			tk, _, err := st2.NextTask(NextFilter{}, fmt.Sprintf("agent-%d", i))
-			results2[i] = result{task: tk, err: err}
-		}(i)
-	}
-	close(start2)
-	wg2.Wait()
+	results2 := cwfStoreRaceNext(t, st2, n, NextFilter{})
 
 	winners, misses := 0, 0
 	for i, r := range results2 {
@@ -1962,16 +1815,11 @@ func TestNextTaskEmptyAgentValidation(t *testing.T) {
 
 func TestListTasksQueryFilter(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatal(err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	if _, _, err := st.CreateProject("api", "API", ""); err != nil {
 		t.Fatal(err)
 	}
-	titleHit, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Fix login page"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	titleHit := cwfStoreNewTask(t, st, "web", "Fix login page")
 	bodyHit, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Other thing", Body: "the login flow is broken"})
 	if err != nil {
 		t.Fatal(err)
@@ -1979,10 +1827,7 @@ func TestListTasksQueryFilter(t *testing.T) {
 	if _, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Unrelated"}); err != nil {
 		t.Fatal(err)
 	}
-	apiHit, _, err := st.CreateTask(CreateTaskInput{Project: "api", Title: "login throttling"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	apiHit := cwfStoreNewTask(t, st, "api", "login throttling")
 
 	ids := func(ts []Task) map[int64]bool {
 		m := map[int64]bool{}
@@ -2040,9 +1885,7 @@ func TestListTasksQueryFilter(t *testing.T) {
 
 func TestListTasksQueryEscapesLikeWildcards(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatal(err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	for _, title := range []string{"100% done", "100 done", "a_b", "axb", `back\slash`} {
 		if _, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: title}); err != nil {
 			t.Fatal(err)
@@ -2075,7 +1918,7 @@ func TestListTasksQueryEscapesLikeWildcards(t *testing.T) {
 // ===================== Phase M: label tests =====================
 
 func TestAddRemoveLabel(t *testing.T) {
-	st, t1, _, _ := setupDepFixture(t)
+	st, t1, _, _ := cwfStoreWebTasks(t)
 
 	// Add — normalized to lowercase, emits task.labeled.
 	ev, err := st.AddLabel(t1, "Bug", "alice")
@@ -2171,7 +2014,7 @@ func TestLabelValidation(t *testing.T) {
 }
 
 func TestListTasksLabelFilter(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 	if _, err := st.AddLabel(t1, "bug", "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -2219,7 +2062,7 @@ func TestListTasksLabelFilter(t *testing.T) {
 }
 
 func TestAddLabelDoesNotBumpUpdatedAt(t *testing.T) {
-	st, t1, _, _ := setupDepFixture(t)
+	st, t1, _, _ := cwfStoreWebTasks(t)
 	before, err := st.GetTask(t1)
 	if err != nil {
 		t.Fatal(err)
@@ -2240,7 +2083,7 @@ func TestAddLabelDoesNotBumpUpdatedAt(t *testing.T) {
 }
 
 func TestDeleteTaskCascadesLabels(t *testing.T) {
-	st, t1, _, _ := setupDepFixture(t)
+	st, t1, _, _ := cwfStoreWebTasks(t)
 	if _, err := st.AddLabel(t1, "bug", "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -2450,10 +2293,7 @@ func TestPatchProject(t *testing.T) {
 	if _, _, err := st.CreateProject("api", "API", ""); err != nil {
 		t.Fatal(err)
 	}
-	tk, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "T"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	tk := cwfStoreNewTask(t, st, "web", "T")
 
 	// Slug rename: uid unchanged, project.patched delta, old slug gone.
 	p2, ev, err := st.PatchProject("web", map[string]any{"slug": "frontend"}, "tester")
@@ -2521,10 +2361,7 @@ func TestCategoryArchiveCascade(t *testing.T) {
 	if _, _, err := st.CreateProject("misc", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	tk, _, err := st.CreateTask(CreateTaskInput{Project: "pentest", Title: "hidden later"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	tk := cwfStoreNewTask(t, st, "pentest", "hidden later")
 	if _, _, err := st.ArchiveCategory("work", "tester"); err != nil {
 		t.Fatal(err)
 	}
@@ -2604,21 +2441,12 @@ func TestListTasksCategoryFilterComposes(t *testing.T) {
 	if _, _, err := st.CreateProject("gproj", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	w1, _, err := st.CreateTask(CreateTaskInput{Project: "wproj", Title: "fix login"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	w2, _, err := st.CreateTask(CreateTaskInput{Project: "wproj", Title: "blocked one"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	w1 := cwfStoreNewTask(t, st, "wproj", "fix login")
+	w2 := cwfStoreNewTask(t, st, "wproj", "blocked one")
 	if _, err := st.AddDep(w2.ID, w1.ID, "t"); err != nil {
 		t.Fatal(err)
 	}
-	g1, _, err := st.CreateTask(CreateTaskInput{Project: "gproj", Title: "fix login too"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	g1 := cwfStoreNewTask(t, st, "gproj", "fix login too")
 	if _, err := st.AddLabel(w1.ID, "bug", "t"); err != nil {
 		t.Fatal(err)
 	}
@@ -2708,14 +2536,8 @@ func TestNextTaskCategoryScoping(t *testing.T) {
 	if _, _, err := st.CreateTask(CreateTaskInput{Project: "wproj", Title: "urgent work", Priority: 0}); err != nil {
 		t.Fatal(err)
 	}
-	p1, _, err := st.CreateTask(CreateTaskInput{Project: "pproj", Title: "personal one"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	p2, _, err := st.CreateTask(CreateTaskInput{Project: "pproj", Title: "personal two"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	p1 := cwfStoreNewTask(t, st, "pproj", "personal one")
+	p2 := cwfStoreNewTask(t, st, "pproj", "personal two")
 
 	tk, _, err := st.NextTask(NextFilter{Category: "personal"}, "agent-a")
 	if err != nil {
@@ -2770,9 +2592,7 @@ func TestCreateTaskArchivedCategory(t *testing.T) {
 
 func TestTaskMetaCRUD(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatal(err)
-	}
+	cwfStoreNewProject(t, st, "web")
 
 	// Create with meta — rows land, task.created data carries them.
 	tk, ev, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "carrier",
@@ -2872,9 +2692,7 @@ func TestTaskMetaValidation(t *testing.T) {
 	}
 
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatal(err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	// Oversized value at create.
 	if _, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "t",
 		Meta: map[string]string{"k": strings.Repeat("v", maxTitleLen+1)}}); !errors.Is(err, ErrValidation) {
@@ -2892,10 +2710,7 @@ func TestTaskMetaValidation(t *testing.T) {
 		t.Fatalf("colliding meta keys at create err = %v, want ErrValidation", err)
 	}
 
-	tk, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "patchee"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	tk := cwfStoreNewTask(t, st, "web", "patchee")
 	// Non-string patch value.
 	if _, _, err := st.PatchTask(tk.ID, map[string]any{"meta": map[string]any{"k": 42.0}}, "a"); !errors.Is(err, ErrValidation) {
 		t.Fatalf("non-string meta value err = %v, want ErrValidation", err)
@@ -2926,7 +2741,7 @@ func TestTaskMetaValidation(t *testing.T) {
 }
 
 func TestPatchTaskMetaAtomicOneEvent(t *testing.T) {
-	st, t1, _, _ := setupDepFixture(t)
+	st, t1, _, _ := cwfStoreWebTasks(t)
 
 	// One call, two keys → exactly ONE task.patched carrying both.
 	_, ev, err := st.PatchTask(t1, map[string]any{"meta": map[string]any{"auto": "x", "owner": "alice"}}, "alice")
@@ -2949,7 +2764,7 @@ func TestPatchTaskMetaAtomicOneEvent(t *testing.T) {
 	// Second-key validation failure rolls back the first key too (all-or-nothing).
 	// Key names are validated before any write, so the failure must come from
 	// the per-value check: "a1" sorts first and is written before "b" fails.
-	st2, ta, _, _ := setupDepFixture(t)
+	st2, ta, _, _ := cwfStoreWebTasks(t)
 	if _, _, err := st2.PatchTask(ta, map[string]any{"meta": map[string]any{"a1": "ok", "b": strings.Repeat("x", maxTitleLen+1)}}, "alice"); !errors.Is(err, ErrValidation) {
 		t.Fatalf("oversized second value err = %v, want ErrValidation", err)
 	}
@@ -2965,7 +2780,7 @@ func TestPatchTaskMetaAtomicOneEvent(t *testing.T) {
 }
 
 func TestPatchTaskMetaNoOpNoEvent(t *testing.T) {
-	st, t1, _, _ := setupDepFixture(t)
+	st, t1, _, _ := cwfStoreWebTasks(t)
 	if _, _, err := st.PatchTask(t1, map[string]any{"meta": map[string]any{"auto": "x"}}, "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -2980,7 +2795,7 @@ func TestPatchTaskMetaNoOpNoEvent(t *testing.T) {
 }
 
 func TestMetaOnlyPatchDoesNotBumpUpdatedAt(t *testing.T) {
-	st, t1, _, _ := setupDepFixture(t)
+	st, t1, _, _ := cwfStoreWebTasks(t)
 	// Backdate first: a bump landing in the creation millisecond would
 	// otherwise leave updated_at unchanged and the check would pass vacuously.
 	backdateTask(t, st, t1)
@@ -3030,9 +2845,7 @@ func TestNextTaskMetaFilter(t *testing.T) {
 	if _, _, err := st.CreateCategory("work", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatal(err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	if _, _, err := st.CreateProject("wproj", "", "work"); err != nil {
 		t.Fatal(err)
 	}
@@ -3096,9 +2909,7 @@ func TestNextTaskMetaRaceDistinctWinners(t *testing.T) {
 	// N callers race for M<N carrier tasks while ordinary ready tasks abound:
 	// exactly M succeed, each with a DISTINCT carrier; the rest miss.
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatal(err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	const n, m = 4, 2
 	for i := 0; i < n; i++ {
 		nextTaskMk(t, st, "web", fmt.Sprintf("plain %d", i), 0, "") // decoys, better priority
@@ -3108,24 +2919,7 @@ func TestNextTaskMetaRaceDistinctWinners(t *testing.T) {
 		carriers[metaTaskMk(t, st, "web", fmt.Sprintf("carrier %d", i), 2, map[string]string{"auto": "1"})] = true
 	}
 
-	type result struct {
-		task *Task
-		err  error
-	}
-	results := make([]result, n)
-	var wg sync.WaitGroup
-	start := make(chan struct{})
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			<-start
-			tk, _, err := st.NextTask(NextFilter{MetaKey: "auto"}, fmt.Sprintf("agent-%d", i))
-			results[i] = result{task: tk, err: err}
-		}(i)
-	}
-	close(start)
-	wg.Wait()
+	results := cwfStoreRaceNext(t, st, n, NextFilter{MetaKey: "auto"})
 
 	winners, misses := 0, 0
 	seen := map[int64]bool{}
@@ -3156,9 +2950,7 @@ func TestListTasksMetaKeyFilter(t *testing.T) {
 	if _, _, err := st.CreateCategory("work", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatal(err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	if _, _, err := st.CreateProject("wproj", "", "work"); err != nil {
 		t.Fatal(err)
 	}
@@ -3224,7 +3016,7 @@ func TestListTasksMetaKeyFilter(t *testing.T) {
 }
 
 func TestListTasksReturnsMeta(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 	// Values with ',' and '=' must survive the stitch (the reason meta is NOT
 	// fetched via GROUP_CONCAT like labels).
 	gnarly := "a=b,c=d, trailing"
@@ -3257,7 +3049,7 @@ func TestListTasksReturnsMeta(t *testing.T) {
 }
 
 func TestDeleteTaskCascadesMeta(t *testing.T) {
-	st, t1, _, _ := setupDepFixture(t)
+	st, t1, _, _ := cwfStoreWebTasks(t)
 	if _, _, err := st.PatchTask(t1, map[string]any{"meta": map[string]any{"auto": "x"}}, "a"); err != nil {
 		t.Fatal(err)
 	}
@@ -3335,10 +3127,7 @@ func TestTaskScopeAndProjectCategory(t *testing.T) {
 	}
 
 	// CreateTask without an actor records the actorOr default.
-	anon, _, err := st.CreateTask(CreateTaskInput{Project: "wproj", Title: "anon"})
-	if err != nil {
-		t.Fatalf("CreateTask anon: %v", err)
-	}
+	anon := cwfStoreNewTask(t, st, "wproj", "anon")
 	if _, _, createdBy, _ = st.taskScope(anon.ID); createdBy != "anon" {
 		t.Fatalf("created_by without actor = %q, want anon", createdBy)
 	}
@@ -3397,24 +3186,7 @@ func TestNextTaskRaceScopedCategoryMeta(t *testing.T) {
 		carriers[tk.ID] = true
 	}
 
-	type result struct {
-		task *Task
-		err  error
-	}
-	results := make([]result, n)
-	var wg sync.WaitGroup
-	start := make(chan struct{})
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			<-start
-			tk, _, err := st.NextTask(NextFilter{Category: "personal", MetaKey: "auto"}, fmt.Sprintf("agent-%d", i))
-			results[i] = result{task: tk, err: err}
-		}(i)
-	}
-	close(start)
-	wg.Wait()
+	results := cwfStoreRaceNext(t, st, n, NextFilter{Category: "personal", MetaKey: "auto"})
 
 	seen := map[int64]bool{}
 	for i, r := range results {

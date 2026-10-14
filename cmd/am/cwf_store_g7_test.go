@@ -250,7 +250,7 @@ func TestCwfStoreProjectGraphScope(t *testing.T) {
 // FIND-0300: AddDep with an unknown task or prerequisite id is ErrNotFound and
 // writes nothing.
 func TestCwfStoreAddDepMissingTask(t *testing.T) {
-	st, t1, _, _ := setupDepFixture(t)
+	st, t1, _, _ := cwfStoreWebTasks(t)
 	before := cwfStoreSnapshot(t, st)
 	for _, pair := range [][2]int64{{t1, 99999}, {99999, t1}} {
 		if _, err := st.AddDep(pair[0], pair[1], "alice"); !errors.Is(err, ErrNotFound) {
