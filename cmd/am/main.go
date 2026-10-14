@@ -214,7 +214,7 @@ func usage() {
   am init <tasktype> [-c CAT [-p PROJ]]  set this session's identity, optionally scoped to a category or project
   am whoami                              print the current identity (+ scope when set)
 
-  am ls [--mine] [--status S] [-p P] [-c CAT] [--all] [--ready] [--blocked] [--stale DUR] [--grep TEXT] [--label L] [--meta KEY] [--limit N]   list tasks (hides done; --all = every task board-wide, ignores -p/-c; --limit default 50, 0 = all; alias: list)
+  am ls [--mine] [--status S] [-p P] [-c CAT] [--all] [--ready] [--blocked] [--stale DUR] [--grep TEXT] [--label L] [--meta KEY] [--limit N]   list tasks (hides done; --all = every task board-wide, ignores -p/-c; --limit default 50, max 500 (0 = max); alias: list)
   am show <id> [-c]                            task detail (+comments +deps)
   am new "title" [--body B] [-p P] [--priority N] [--assign A] [--meta k=v]...   create, prints id
   am claim <id> [--steal-stale DUR]           assign me + ->doing (atomic; DUR is Go syntax, e.g. 30m, 48h)

@@ -230,17 +230,22 @@ func cmdLs(c *Client, a Args) {
 	if v := a.flag("limit"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 0 {
-			usageErr("ls: --limit must be a non-negative integer (0 = no limit)")
+			usageErr("ls: --limit must be a non-negative integer (0 = the server max, %d)", maxTaskListLimit)
 		}
 		limit = n
+	}
+	// The server caps every list at maxTaskListLimit, so 0 and larger values
+	// mean the cap, and the truncation hint must fire there too.
+	if limit == 0 || limit > maxTaskListLimit {
+		limit = maxTaskListLimit
 	}
 	qs.Set("limit", strconv.Itoa(limit))
 
 	data := c.doOrFail("GET", "/api/tasks?"+qs.Encode(), nil)
 	var tasks []Task
 	decodeResp(data, &tasks)
-	truncated := limit > 0 && len(tasks) >= limit
-	hint := fmt.Sprintf("… %d shown; narrow with --status or -p, or raise --limit (0 = all)", limit)
+	truncated := len(tasks) >= limit
+	hint := fmt.Sprintf("… %d shown; narrow with --status or -p, or raise --limit (max %d)", limit, maxTaskListLimit)
 	if a.has("json") {
 		printJSON(tasks)
 		if truncated { // stderr, so stdout stays one parseable JSON array

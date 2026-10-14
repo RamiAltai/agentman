@@ -1537,8 +1537,9 @@ func TestUsageErrorsExit5(t *testing.T) {
 	}
 }
 
-// FIND-0040: --limit reaches the query (0 = all), and a truncated --json list
-// says so on stderr while stdout stays one JSON array.
+// FIND-0040: --limit reaches the query (0 and oversized values mean the server's
+// cap), and a truncated --json list says so on stderr while stdout stays one
+// JSON array, including at the cap.
 func TestCmdLsLimitAndJSONTruncationHint(t *testing.T) {
 	var query string
 	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1569,11 +1570,13 @@ func TestCmdLsLimitAndJSONTruncationHint(t *testing.T) {
 		t.Fatalf("stdout not a 50-task JSON array: %v %q", err, out)
 	}
 
-	msg = captureStderr(t, func() {
-		captureStdout(t, func() { cmdLs(c, parse([]string{"--json", "--limit", "0"})) })
-	})
-	if !strings.Contains(query, "limit=0") || msg != "" {
-		t.Fatalf("--limit 0: query = %q stderr = %q, want limit=0 and no hint", query, msg)
+	for _, v := range []string{"0", "1000"} {
+		msg = captureStderr(t, func() {
+			captureStdout(t, func() { cmdLs(c, parse([]string{"--json", "--limit", v})) })
+		})
+		if !strings.Contains(query, "limit=500") || !strings.Contains(msg, "500 shown") {
+			t.Fatalf("--limit %s: query = %q stderr = %q, want limit=500 and a truncation hint", v, query, msg)
+		}
 	}
 }
 
