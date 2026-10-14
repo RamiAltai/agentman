@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"regexp"
 	"sort"
@@ -225,11 +226,18 @@ type NextFilter struct {
 
 type Store struct{ db *sql.DB }
 
+// storeDSN is the SQLite URI for the db at path. All pragmas ride on the DSN so
+// every (re)opened connection inherits them. The path is a URI path: the driver
+// splits the query at the first '?' and SQLite ends the path at '#' and
+// percent-decodes it, so those three characters are escaped.
+func storeDSN(path string) string {
+	path = strings.NewReplacer("%", "%25", "?", "%3F", "#", "%23").Replace(path)
+	return "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)" +
+		"&_pragma=foreign_keys(1)&_pragma=synchronous(1)"
+}
+
 func OpenStore(path string) (*Store, error) {
-	// All pragmas on the DSN so every (re)opened connection inherits them.
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"+
-		"&_pragma=foreign_keys(1)&_pragma=synchronous(1)", path)
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", storeDSN(path))
 	if err != nil {
 		return nil, err
 	}
@@ -352,6 +360,12 @@ var schemaMigrations = []migration{
 	// the safe direction.
 	{version: 5, apply: func(tx *sql.Tx) error {
 		if _, err := tx.Exec("ALTER TABLE tasks ADD COLUMN created_by TEXT"); err != nil {
+			return err
+		}
+		// The backfill looks up each task's latest creation event; without
+		// this index that is a backward scan of the whole log per task. v6
+		// rebuilds events and recreates the index under the same name.
+		if _, err := tx.Exec("CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, id)"); err != nil {
 			return err
 		}
 		_, err := tx.Exec(`UPDATE tasks SET created_by=(
@@ -514,35 +528,42 @@ func runMigrations(db *sql.DB, target int, steps []migration) (err error) {
 			err = ferr
 		}
 	}()
+	if cur < target {
+		log.Printf("agentman: migrating schema v%d -> v%d", cur, target)
+	}
 	for _, m := range steps {
 		if m.version <= cur || m.version > target {
 			continue
 		}
-		tx, err := conn.BeginTx(ctx, nil)
-		if err != nil {
-			return err
+		start := time.Now()
+		if err := applyMigration(conn, m); err != nil {
+			return fmt.Errorf("migration v%d -> v%d: %w", cur, m.version, err)
 		}
-		if err := m.apply(tx); err != nil {
-			tx.Rollback()
-			return err
-		}
-		if err := foreignKeyCheck(tx); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("migration v%d: %w", m.version, err)
-		}
-		if _, err := tx.Exec(
-			"INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?)",
-			strconv.Itoa(m.version)); err != nil {
-			tx.Rollback()
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			tx.Rollback()
-			return err
-		}
+		log.Printf("agentman: schema migration v%d applied in %s", m.version, time.Since(start).Round(time.Millisecond))
 		cur = m.version
 	}
 	return nil
+}
+
+// applyMigration runs one step and its schema_version bump in one tx on conn.
+func applyMigration(conn *sql.Conn, m migration) error {
+	tx, err := conn.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := m.apply(tx); err != nil {
+		return err
+	}
+	if err := foreignKeyCheck(tx); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		"INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?)",
+		strconv.Itoa(m.version)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // foreignKeyCheck fails if any row references a missing parent.
@@ -607,11 +628,6 @@ func (s *Store) CreateCategory(slug, name string) (*Category, *Event, error) {
 	if name == "" {
 		name = slug
 	}
-	var exists int
-	s.db.QueryRow("SELECT 1 FROM categories WHERE slug=?", slug).Scan(&exists)
-	if exists == 1 {
-		return nil, nil, ErrConflict
-	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, nil, err
@@ -622,6 +638,11 @@ func (s *Store) CreateCategory(slug, name string) (*Category, *Event, error) {
 		res, err := tx.Exec("INSERT INTO categories(uid,slug,name) VALUES(?,?,?)", newUID("amc_"), slug, name)
 		if isUniqueErr(err, "categories.uid") && attempt < 2 {
 			continue // astronomically unlikely uid collision — retry with a fresh uid
+		}
+		// The UNIQUE constraint is the duplicate check: a separate pre-check
+		// would race a concurrent create of the same slug.
+		if isUniqueErr(err, "categories.slug") {
+			return nil, nil, ErrConflict
 		}
 		if err != nil {
 			return nil, nil, err
@@ -1027,11 +1048,6 @@ func (s *Store) CreateProjectAs(slug, name, category, actor string) (*Project, *
 	if catArchived.Valid && catArchived.String != "" {
 		return nil, nil, ErrCategoryArchived
 	}
-	var exists int
-	s.db.QueryRow("SELECT 1 FROM projects WHERE slug=?", slug).Scan(&exists)
-	if exists == 1 {
-		return nil, nil, ErrConflict
-	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, nil, err
@@ -1043,6 +1059,10 @@ func (s *Store) CreateProjectAs(slug, name, category, actor string) (*Project, *
 			slug, name, cid, newUID("amp_"))
 		if isUniqueErr(err, "projects.uid") && attempt < 2 {
 			continue // astronomically unlikely uid collision — retry with a fresh uid
+		}
+		// The UNIQUE constraint is the duplicate check (see CreateCategory).
+		if isUniqueErr(err, "projects.slug") {
+			return nil, nil, ErrConflict
 		}
 		if err != nil {
 			return nil, nil, err
@@ -1662,6 +1682,7 @@ const (
 	maxTitleLen = 500     // bytes
 	maxBodyLen  = 1 << 16 // 64 KiB; also the comment-body cap
 	maxLabelLen = 50      // bytes
+	maxMetaKeys = 64      // per task; bounds one patch's statements and every meta read
 	minPriority = 0
 	maxPriority = 3
 )
@@ -1714,6 +1735,9 @@ func (s *Store) CreateTask(in CreateTaskInput) (*Task, *Event, error) {
 	// Validate every meta pair up front (all-or-nothing): keys normalized like
 	// labels; values opaque but non-empty (removal has no meaning at create)
 	// and capped like titles (they render onto board cards and SSE payloads).
+	if len(in.Meta) > maxMetaKeys {
+		return nil, nil, fmt.Errorf("%w: at most %d meta keys per task", ErrValidation, maxMetaKeys)
+	}
 	meta := make(map[string]string, len(in.Meta))
 	for k, v := range in.Meta {
 		nk, err := normalizeMetaKey(k)
@@ -1987,7 +2011,8 @@ func hasOpenPrereqs(q queryer, taskID int64) ([]int64, error) {
 // `am assign`): claiming it starts it, as ADR-023 directs; (task, nil, nil) if
 // agent already holds it in doing/blocked (idempotent); (nil,nil,*ConflictError)
 // if owned by someone else or done; ErrNotFound.
-// Returns *BlockedError if the task has open prerequisites.
+// Returns *BlockedError if the task has open prerequisites, except for the
+// idempotent re-claim, which changes nothing.
 func (s *Store) ClaimTask(id int64, agent string) (*Task, *Event, error) {
 	if agent == "" {
 		return nil, nil, ErrValidation
@@ -1998,12 +2023,21 @@ func (s *Store) ClaimTask(id int64, agent string) (*Task, *Event, error) {
 	}
 	defer tx.Rollback()
 
-	// Hard-block: check prerequisites before attempting the claim.
+	// Hard-block: check prerequisites before attempting the claim. An owner's
+	// re-claim of a started task changes nothing, so it stays idempotent even
+	// when a prerequisite was added after the original claim.
 	openIDs, err := hasOpenPrereqs(tx, id)
 	if err != nil {
 		return nil, nil, err
 	}
 	if len(openIDs) > 0 {
+		cur, err := s.getTaskTx(tx, id)
+		if err != nil {
+			return nil, nil, err
+		}
+		if cur.Assignee == agent && (cur.Status == "doing" || cur.Status == "blocked") {
+			return cur, nil, tx.Commit() // idempotent re-claim
+		}
 		return nil, nil, &BlockedError{OpenPrereqs: openIDs}
 	}
 
@@ -2071,15 +2105,6 @@ func (s *Store) StealStaleClaim(id int64, agent string, staleFor time.Duration) 
 	}
 	defer tx.Rollback()
 
-	// Hard-block: check prerequisites before attempting the takeover.
-	openIDs, err := hasOpenPrereqs(tx, id)
-	if err != nil {
-		return nil, nil, err
-	}
-	if len(openIDs) > 0 {
-		return nil, nil, &BlockedError{OpenPrereqs: openIDs}
-	}
-
 	// Prior state, read in the same tx, so the event can name the previous holder.
 	cur, err := s.getTaskTx(tx, id)
 	if err != nil {
@@ -2088,6 +2113,16 @@ func (s *Store) StealStaleClaim(id int64, agent string, staleFor time.Duration) 
 	if cur.Assignee == agent {
 		tx.Rollback() // one connection: release it before ClaimTask opens its tx
 		return s.ClaimTask(id, agent)
+	}
+
+	// Hard-block: check prerequisites before attempting the takeover (after
+	// the owner path, which ClaimTask blocks itself).
+	openIDs, err := hasOpenPrereqs(tx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(openIDs) > 0 {
+		return nil, nil, &BlockedError{OpenPrereqs: openIDs}
 	}
 
 	// Conditional UPDATE is the atomicity guarantee: only one stealer can match
@@ -2143,6 +2178,14 @@ func (s *Store) StealStaleClaim(id int64, agent string, staleFor time.Duration) 
 // of the candidate predicate inside the atomic pick+claim — a scoped agent can
 // never be handed an out-of-scope task, even racing unscoped callers.
 func (s *Store) NextTask(f NextFilter, agent string) (*Task, *Event, error) {
+	return s.NextTaskContext(context.Background(), f, agent)
+}
+
+// NextTaskContext is NextTask bound to ctx: a request abandoned before the
+// commit (client timeout or disconnect) claims nothing. next is not
+// idempotent — a retry picks a different task — so a claim the caller never
+// hears about would strand that task in doing.
+func (s *Store) NextTaskContext(ctx context.Context, f NextFilter, agent string) (*Task, *Event, error) {
 	if agent == "" {
 		return nil, nil, ErrValidation
 	}
@@ -2175,7 +2218,7 @@ func (s *Store) NextTask(f NextFilter, agent string) (*Task, *Event, error) {
 		scope += " AND EXISTS (SELECT 1 FROM task_meta m WHERE m.task_id=t.id AND m.key=?)"
 		args = append(args, k)
 	}
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2218,6 +2261,9 @@ func (s *Store) NextTask(f NextFilter, agent string) (*Task, *Event, error) {
 	t, err := s.getTaskTx(tx, id)
 	if err != nil {
 		return nil, nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err // caller gone: roll back rather than claim unseen
 	}
 	return t, ev, tx.Commit()
 }
@@ -2281,7 +2327,9 @@ func (s *Store) DeleteComment(taskID, commentID int64, actor string) (*Event, er
 	if _, err := tx.Exec("DELETE FROM comments WHERE id=?", commentID); err != nil {
 		return nil, err
 	}
-	tx.Exec("UPDATE tasks SET updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?", taskID)
+	if _, err := tx.Exec("UPDATE tasks SET updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?", taskID); err != nil {
+		return nil, err
+	}
 	return ev, tx.Commit()
 }
 
@@ -2486,6 +2534,9 @@ func (s *Store) RemoveLabel(taskID int64, label, actor string) (*Event, error) {
 // error aborts the caller's tx, so a multi-key patch is all-or-nothing. The
 // returned delta maps key → [old, new] (nil = absent) for keys that changed.
 func applyMetaTx(tx *sql.Tx, taskID int64, meta map[string]string) (map[string]any, bool, error) {
+	if len(meta) > maxMetaKeys {
+		return nil, false, fmt.Errorf("%w: at most %d meta keys per task", ErrValidation, maxMetaKeys)
+	}
 	// Normalize every key up front and reject collisions (two raw keys → one
 	// normalized key): applying both would pick a map-iteration-order winner
 	// and record a just-written value as "old" in the delta.
@@ -2506,6 +2557,7 @@ func applyMetaTx(tx *sql.Tx, taskID int64, meta map[string]string) (map[string]a
 	}
 	sort.Strings(keys)
 	delta := map[string]any{}
+	added := false // a new key was inserted, so the per-task cap needs a recount
 	for _, k := range keys {
 		var old sql.NullString
 		err := tx.QueryRow("SELECT value FROM task_meta WHERE task_id=? AND key=?", taskID, k).Scan(&old)
@@ -2535,6 +2587,16 @@ func applyMetaTx(tx *sql.Tx, taskID int64, meta map[string]string) (map[string]a
 			return nil, false, err
 		}
 		delta[k] = []any{nullable(old.String), v}
+		added = added || !old.Valid
+	}
+	if added {
+		var n int
+		if err := tx.QueryRow("SELECT COUNT(*) FROM task_meta WHERE task_id=?", taskID).Scan(&n); err != nil {
+			return nil, false, err
+		}
+		if n > maxMetaKeys {
+			return nil, false, fmt.Errorf("%w: at most %d meta keys per task", ErrValidation, maxMetaKeys)
+		}
 	}
 	return delta, len(delta) > 0, nil
 }
@@ -2577,7 +2639,9 @@ func (s *Store) AddComment(id int64, author, body string) (*Comment, *Event, err
 		return nil, nil, err
 	}
 	cid, _ := res.LastInsertId()
-	tx.Exec("UPDATE tasks SET updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?", id)
+	if _, err := tx.Exec("UPDATE tasks SET updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?", id); err != nil {
+		return nil, nil, err
+	}
 	ev, err := insertEvent(tx, cur.ProjectID, id, actorOr(author), "comment.added",
 		map[string]any{"comment_id": cid})
 	if err != nil {

@@ -641,7 +641,7 @@ func (s *Server) handleNext(w http.ResponseWriter, r *http.Request) {
 	}
 	var t *Task
 	if err := s.publish(func() (ev *Event, err error) {
-		t, ev, err = s.store.NextTask(NextFilter{Project: proj, Category: cat, MetaKey: in.MetaKey}, agent)
+		t, ev, err = s.store.NextTaskContext(r.Context(), NextFilter{Project: proj, Category: cat, MetaKey: in.MetaKey}, agent)
 		return
 	}); err != nil {
 		writeErr(w, err)
