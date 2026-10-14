@@ -41,15 +41,13 @@ let selected = new Set();    // selected project slugs; empty = "All" (within th
 let view = "overview";       // "overview" (category home) | "all" (cross-category board) | "category"
 let activeCategory = "";     // category slug when view==="category"
 let categories = [];         // CategoryStat[] for the overview (counts + active_agents)
-let overviewTimer = null;    // debounce for live overview count refresh
-let railTimer = null;        // debounce for live rail count refresh (projects + categories)
 let pendingProject = "";     // a project slug to auto-select after the next applyView() (see goProject)
 let tasks = new Map();       // id -> task (terse)
 let doneCapped = false;      // true when the done fetch hit DONE_FETCH_LIMIT (done column shows "N+")
 let cursor = 0;              // highest event id seen (SSE since=)
 let streamDropped = false;   // the stream errored; the next onopen resyncs (the server replays at most 500 missed events)
 let resyncTimer = null, resyncDelay = 1000; // retry of a failed live reconcile (capped backoff)
-let es = null, backoff = 1000, refreshTimer = null, openTaskId = null, lastFocus = null, dragId = null;
+let es = null, backoff = 1000, openTaskId = null, lastFocus = null, dragId = null;
 let filterQ = "";            // search-box text filter (server-side ?q=)
 let filterLabel = "";        // active label filter (server-side ?label=)
 let filterReady = false;     // board filter: ready tasks only (server-side ?ready=true)
@@ -59,13 +57,22 @@ let filterMine = "";         // board filter: assignee (server-side ?assignee=)
 let filterMetaKey = "";      // board filter: tasks carrying a meta key (server-side ?meta_key=)
 let searchTimer = null;      // search-box input debounce
 let feedOldest = 0;          // lowest event id currently in #feedList (0 = none loaded)
-let feedPaginated = false;   // true once the user has clicked "Load older"; trimFeed is then skipped
-                             // to avoid fighting pagination (raising the cap is the other option,
-                             // but skipping trimming is simpler since the user explicitly asked for more)
+let feedCap = 200;           // #feedList row cap; each "Load older" page raises it by the rows it added,
+                             // so live events don't pop rows the user just loaded
 let loadOlderBtn = null;     // reference to the "Load older" button element
 let boardSeq = 0, feedSeq = 0; // request generations: a load whose response is no longer the latest is dropped
+let depCandidates = null;    // {project, list: Promise<task[]>}: the prerequisite picker's tasks, reused across modal refreshes
+const coalesceTimers = {};   // key -> pending timer (see coalesce)
 
 const $ = (id) => document.getElementById(id);
+
+// coalesce runs fn once, ms after the first call for key since the last run. Live
+// event bursts share one refresh, and unlike a clear-and-rearm debounce a steady
+// stream cannot postpone it indefinitely: it fires at least every ms.
+function coalesce(key, fn, ms) {
+  if (coalesceTimers[key]) return;
+  coalesceTimers[key] = setTimeout(() => { coalesceTimers[key] = null; fn(); }, ms);
+}
 
 // Storage may be unavailable (private mode, sandboxed iframe) — never let it break the app.
 function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
@@ -256,7 +263,7 @@ async function loadFeed() {
   if (seq !== feedSeq) return; // a newer load (view/selection change) owns the feed
   const list = $("feedList");
   list.replaceChildren();
-  feedPaginated = false; // reset pagination state on full reload
+  feedCap = 200; // reset pagination state on full reload
   if (!res.events.length) {
     list.append(el("li", { class: "feed-empty" }, "No activity yet"));
     feedOldest = 0;
@@ -267,13 +274,19 @@ async function loadFeed() {
   }
   cursor = Math.max(cursor, res.last_id || 0);
 
-  // Rebuild the "Load older" button outside #feedList so trimFeed can't remove it.
+  setLoadOlder(feedOldest > 0);
+}
+
+// setLoadOlder drops the "Load older" button or the start-of-activity marker,
+// whichever is shown, and with show adds a fresh button. It lives outside
+// #feedList so trimFeed can't remove it.
+function setLoadOlder(show) {
   const feed = $("feed");
+  feed.querySelector(".feed-start-marker")?.remove();
   if (loadOlderBtn) { loadOlderBtn.remove(); loadOlderBtn = null; }
-  if (feedOldest > 0) {
-    loadOlderBtn = el("button", { class: "feed-load-older", onclick: loadOlderActivity }, "Load older activity");
-    feed.append(loadOlderBtn);
-  }
+  if (!show) return;
+  loadOlderBtn = el("button", { class: "feed-load-older", onclick: loadOlderActivity }, "Load older activity");
+  feed.append(loadOlderBtn);
 }
 
 function openCount(c) { c = c || {}; return (c.todo || 0) + (c.doing || 0) + (c.blocked || 0); }
@@ -1047,17 +1060,22 @@ function renderModal(t) {
   const addDepErr = el("div", { class: "ferr" });
   const depSel = el("select", { "aria-label": "Add prerequisite" });
   depSel.append(el("option", { value: "" }, "Add prerequisite…"));
-  // Fetch same-project candidates lazily (do it async, populate when ready)
+  // Fetch same-project candidates once per project (reconcileModal drops the cache
+  // when the list changes), not on every live refresh; populate when ready.
+  if (!depCandidates || depCandidates.project !== t.project) {
+    depCandidates = { project: t.project, list: api("GET", "/api/tasks?project=" + encodeURIComponent(t.project) + "&limit=500") };
+  }
+  const want = depCandidates;
   (async () => {
     try {
-      const candidates = await api("GET", "/api/tasks?project=" + encodeURIComponent(t.project) + "&limit=500");
+      const candidates = await want.list;
       const existingIds = new Set(prereqs.map((d) => d.id));
       existingIds.add(t.id); // exclude self
       for (const cand of candidates) {
         if (existingIds.has(cand.id)) continue;
         depSel.append(el("option", { value: String(cand.id) }, cand.project + "-" + cand.ref + " " + cand.title));
       }
-    } catch (e) { /* ignore */ }
+    } catch (e) { if (depCandidates === want) depCandidates = null; } // retry on the next render
   })();
   depSel.onchange = async () => {
     const val = depSel.value;
@@ -1205,6 +1223,7 @@ function renderModal(t) {
         cmConfirming = false;
         delCm.textContent = "×";
         delCm.classList.remove("confirming");
+        alert(e.message);
       }
     };
     cmHead.append(delCm);
@@ -1257,6 +1276,7 @@ function renderModal(t) {
       delBtn.classList.remove("confirming");
       const sibling = delBtn.nextSibling;
       if (sibling && sibling.classList && sibling.classList.contains("btn-cancel-del")) sibling.remove();
+      alert(e.message);
     }
   };
   // One-click Release: hand the task back to the unclaimed pool (clear assignee,
@@ -1300,12 +1320,13 @@ function openNew() {
     class: "save", onclick: async () => {
       if (!title.value.trim()) { err.textContent = "enter a title"; title.focus(); return; }
       if (!psel.value) { err.textContent = "create a project first (＋ in the tab bar)"; return; }
+      save.disabled = true; // a second click would create a second task (POST is not deduplicated)
       try {
         const t = await api("POST", "/api/tasks", { project: psel.value, title: title.value.trim(), body: body.value, priority: Number(pri.value) });
         closeModal();
         if (selected.size === 1 && t.project !== [...selected][0]) await toggleProject(t.project);
         else { await loadBoard().catch(() => {}); loadProjects().catch(() => {}); }
-      } catch (e) { err.textContent = e.message; }
+      } catch (e) { save.disabled = false; err.textContent = e.message; }
     }
   }, "Create task");
   s.append(title, el("div", { class: "mrow" }, label("Project", psel), label("Priority", pri)),
@@ -1333,11 +1354,13 @@ function openNewCategory() {
     class: "save", onclick: async () => {
       const sv = slugify(slug.value || name.value);
       if (!sv) { err.textContent = "enter a name"; name.focus(); return; }
+      save.disabled = true; // a second click would 409 while the first succeeds
       try {
         await api("POST", "/api/categories", { slug: sv, name: name.value.trim() || sv });
         await loadOverview();
         closeModal();
       } catch (e) {
+        save.disabled = false;
         err.textContent = e.message === "conflict" ? "a category with slug “" + sv + "” already exists" : e.message;
       }
     }
@@ -1385,12 +1408,14 @@ async function openNewProject() {
     class: "save", onclick: async () => {
       const sv = slugify(slug.value || name.value);
       if (!sv) { err.textContent = "enter a name"; name.focus(); return; }
+      save.disabled = true; // a second click would 409 while the first succeeds
       try {
         const p = await api("POST", "/api/projects", { slug: sv, name: name.value.trim() || sv, category: csel.value });
         await loadProjects();
         closeModal();
         toggleProject(p.slug);
       } catch (e) {
+        save.disabled = false;
         err.textContent = e.message === "conflict" ? "a project with slug “" + sv + "” already exists" : e.message;
       }
     }
@@ -1689,19 +1714,14 @@ function onEvent(ev) {
   // The task modal can be open in any view (overview feed refs open it too), so
   // reconcile it before the overview early return.
   reconcileModal(ev);
+  // Task, project and category kinds change open-counts (overview cards, rail).
+  const countsChanged = /^(task|project|category)\./.test(ev.kind);
   // Overview view: no board to reconcile — keep the global feed live and
-  // debounce-refresh the category cards and project counts (loadOverview) on any
-  // task/project/category change.
+  // coalesce-refresh the category cards and project counts (loadOverview).
   if (view === "overview") {
-    if (/^(task|project|category)\./.test(ev.kind)) {
-      clearTimeout(overviewTimer);
-      // Re-check the view at fire time: navigating away before the debounce
-      // elapses must not write to the now-hidden #overview element.
-      overviewTimer = setTimeout(() => {
-        if (view !== "overview") return;
-        loadOverview().catch(reconcileFailed);
-      }, 250);
-    }
+    // Re-check the view at fire time: navigating away before the timer
+    // elapses must not write to the now-hidden #overview element.
+    if (countsChanged) coalesce("overview", () => { if (view === "overview") loadOverview().catch(reconcileFailed); }, 250);
     return;
   }
   if (ev.kind === "project.archived") {
@@ -1744,16 +1764,18 @@ function onEvent(ev) {
   // only — the overview has no cards). Status moves and edits are the signals
   // worth surfacing; deletes are handled above.
   if (view !== "overview" && ev.task_id && /^task\./.test(ev.kind) && ev.kind !== "task.deleted") flashIds.add(ev.task_id);
-  clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(() => loadBoard().catch(reconcileFailed), 250); // debounced reconcile
+  coalesce("board", () => loadBoard().catch(reconcileFailed), 250); // coalesced reconcile
   // Keep the rail's open-counts live on the board views: task moves change a
-  // project's (and its category's) open count. Refresh both on the same debounce
+  // project's (and its category's) open count. Refresh both on the same
   // cadence as the board reconcile, but lightly — one projects+categories fetch.
-  if (/^(task|project|category)\./.test(ev.kind)) refreshRailCounts();
+  if (countsChanged) refreshRailCounts();
 }
 
 // reconcileModal keeps the open task modal in step with a live event.
 function reconcileModal(ev) {
+  // The prerequisite picker lists project tasks by ref + title: drop the cache when that list changes.
+  // (A title edit can ride on task.status/task.assign too, so check the data, not the kind.)
+  if (ev.kind === "task.created" || ev.kind === "task.deleted" || (ev.data || {}).title !== undefined) depCandidates = null;
   if (!openTaskId) return;
   if (ev.kind === "task.deleted") {
     if (openTaskId === ev.task_id) closeModal();
@@ -1761,14 +1783,13 @@ function reconcileModal(ev) {
   }
   // Refresh if the modal shows the task, or the prereq being linked/unlinked.
   const depId = ev.kind === "task.dep_added" || ev.kind === "task.dep_removed" ? (ev.data || {}).depends_on : null;
-  if (ev.task_id === openTaskId || depId === openTaskId) refreshModal();
+  if (ev.task_id === openTaskId || depId === openTaskId) coalesce("modal", () => refreshModal(), 150);
 }
 
 // refreshRailCounts re-fetches projects + categories (their open-counts) and
-// re-renders the rail, debounced so a burst of live events causes one refresh.
+// re-renders the rail, coalesced so a burst of live events causes one refresh.
 function refreshRailCounts() {
-  clearTimeout(railTimer);
-  railTimer = setTimeout(() => {
+  coalesce("rail", () => {
     if (view === "overview") return; // the overview path refreshes projects + categories via loadOverview()
     loadRail().catch(reconcileFailed);
   }, 300);
@@ -1786,14 +1807,14 @@ function feedItem(ev) {
 }
 
 function trimFeed() {
-  // Once the user has paginated, skip trimming so older entries they loaded are
-  // preserved. Without this, each live event would pop the oldest paginated row.
-  if (feedPaginated) return;
+  // feedCap grows with each "Load older" page, so live events pop paginated rows
+  // only after that many newer rows arrived, and the list stays bounded.
   const l = $("feedList");
-  if (l.children.length <= 200) return;
-  while (l.children.length > 200) l.removeChild(l.lastChild);
+  if (l.children.length <= feedCap) return;
+  while (l.children.length > feedCap) l.removeChild(l.lastChild);
   // "Load older" must continue from the oldest row still shown, not from rows trimmed away.
   feedOldest = Number(l.lastChild.dataset.id) || feedOldest;
+  if (!loadOlderBtn) setLoadOlder(true); // rows above the start marker were dropped: offer them again
 }
 
 async function loadOlderActivity() {
@@ -1814,7 +1835,7 @@ async function loadOlderActivity() {
     for (const ev of evs) list.append(feedItem(ev)); // already newest-first, append to bottom
     if (evs.length > 0) {
       feedOldest = evs.reduce((min, ev) => ev.id < min ? ev.id : min, evs[0].id);
-      feedPaginated = true;
+      feedCap += evs.length;
     }
     if (evs.length < limit) {
       // No more older events — replace button with an end-marker.
@@ -2097,29 +2118,8 @@ $("sheet").addEventListener("input", runDeferredRefresh);
 $("sheet").addEventListener("change", runDeferredRefresh);
 $("filterBtn").onclick = (e) => { e.stopPropagation(); toggleFilterPanel(); };
 document.addEventListener("keydown", onKey);
-initFeed();
-initRail();
-initTheme();
 
 window.addEventListener("hashchange", () => { route().catch((e) => setStatus("error: " + e.message, "warn")); });
-
-(async function init() {
-  // Show loading skeletons immediately so the first paint isn't a blank board /
-  // feed; the real renders replace them via replaceChildren() on data arrival.
-  if (!document.body.classList.contains("view-overview")) boardSkeleton();
-  feedSkeleton();
-  // Load projects + categories first so the rail can render its full tree in any
-  // view (the board views never call loadOverview, which is the other place that
-  // populates `categories`). route() then applies the URL-hash view and opens the
-  // stream; it handles its own board/overview data loads.
-  try {
-    await Promise.all([
-      loadProjects(),
-      loadCategories().catch(() => {}), // rail still works project-only if this fails
-    ]);
-  } catch (e) { setStatus("error: " + e.message, "warn"); }
-  route().catch((e) => setStatus("error: " + e.message, "warn"));
-})();
 
 // ===================== dependency graph overlay =====================
 
@@ -2273,37 +2273,28 @@ let graphKeepView = false; // false → next renderGraph resets pan/zoom (set on
 let graphFetchSeq = 0;     // generation of the latest graph fetch; older responses are dropped
 let graphDragMoved = false; // the current/last drag moved the view, so its trailing click is not a deselect
 
-// BFS upstream (ancestors) and downstream (descendants) from a node.
+// BFS upstream (ancestors) and downstream (descendants) from a node, O(V+E):
+// edges are indexed by their start end once, and the queue is walked by index.
 function graphNeighbors(nodeId, edges) {
-  const upstream = new Set();
-  const downstream = new Set();
-  const upEdges = new Set();
-  const downEdges = new Set();
-
-  // upstream: walk edges backward (to→from)
-  let q = [nodeId];
-  while (q.length) {
-    const cur = q.shift();
+  const walk = (at, next) => {
+    const adj = new Map();
     for (const e of edges) {
-      if (e.to === cur && !upstream.has(e.from)) {
-        upstream.add(e.from);
-        upEdges.add(e);
-        q.push(e.from);
+      if (!adj.has(e[at])) adj.set(e[at], []);
+      adj.get(e[at]).push(e);
+    }
+    const seen = new Set(), via = new Set(), q = [nodeId];
+    for (let i = 0; i < q.length; i++) {
+      for (const e of adj.get(q[i]) || []) {
+        if (seen.has(e[next])) continue;
+        seen.add(e[next]);
+        via.add(e);
+        q.push(e[next]);
       }
     }
-  }
-  // downstream: walk edges forward (from→to)
-  q = [nodeId];
-  while (q.length) {
-    const cur = q.shift();
-    for (const e of edges) {
-      if (e.from === cur && !downstream.has(e.to)) {
-        downstream.add(e.to);
-        downEdges.add(e);
-        q.push(e.to);
-      }
-    }
-  }
+    return [seen, via];
+  };
+  const [upstream, upEdges] = walk("to", "from"); // walk edges backward (to→from)
+  const [downstream, downEdges] = walk("from", "to"); // walk edges forward (from→to)
   return { upstream, downstream, upEdges, downEdges };
 }
 
@@ -2719,12 +2710,10 @@ function rebuildFocusAfterDetailNav() {
   const nodeEls = new Map();
   svgEl.querySelectorAll(".gnode[data-id]").forEach((el) => nodeEls.set(Number(el.dataset.id), el));
   const edgeEls = new Map();
-  // For edges we need the original edge objects — iterate all path elements.
+  // For edges we need the original edge objects — match path elements by from:to.
+  const edgesByKey = new Map(edges.map((x) => [x.from + ":" + x.to, x]));
   svgEl.querySelectorAll(".gedge").forEach((pathEl) => {
-    const from = Number(pathEl.getAttribute("data-from"));
-    const to = Number(pathEl.getAttribute("data-to"));
-    // Find matching edge.
-    const e = edges.find((x) => x.from === from && x.to === to);
+    const e = edgesByKey.get(pathEl.getAttribute("data-from") + ":" + pathEl.getAttribute("data-to"));
     if (e) edgeEls.set(e, pathEl);
   });
   applyGraphFocus(nodeEls, edgeEls, edges, nodesById);
@@ -2831,13 +2820,14 @@ const GRAPH_REFRESH_KINDS = new Set([
 function graphMaybeRefresh(ev) {
   if (!graphOpen || !graphSlug || !graphData) return;
   if (!GRAPH_REFRESH_KINDS.has(ev.kind)) return;
-  // Skip if the event clearly belongs to a different project.
-  if (ev.task_id) {
-    const node = graphData.nodes.find((n) => n.id === ev.task_id);
-    if (node && node.project !== graphSlug) return;
-  }
-  if (graphRefreshTimer) clearTimeout(graphRefreshTimer);
+  // Skip events of another project. graphData holds only this project's tasks, so
+  // compare the event's project_id with the displayed project's id instead.
+  const shown = projects.find((p) => p.slug === graphSlug);
+  if (shown && ev.project_id !== shown.id) return;
+  // Coalesce a burst into one refetch without letting a steady stream postpone it.
+  if (graphRefreshTimer) return;
   graphRefreshTimer = setTimeout(async () => {
+    graphRefreshTimer = null;
     if (!graphOpen) return;
     const prevSel = graphSelectedId;
     await fetchAndRenderGraph(graphSlug);
@@ -2877,3 +2867,30 @@ $("graphOverlay").addEventListener("keydown", (ev) => {
   if (ev.key === "Escape") { ev.stopPropagation(); closeGraphOverlay(); }
   graphTrapFocus(ev);
 });
+
+// ===================== startup =====================
+
+// Startup runs last, after every module-level declaration above (graph state
+// included) is initialized: a synchronous call from here into code that reads a
+// later `let` would otherwise throw a temporal-dead-zone ReferenceError.
+initFeed();
+initRail();
+initTheme();
+
+(async function init() {
+  // Show loading skeletons immediately so the first paint isn't a blank board /
+  // feed; the real renders replace them via replaceChildren() on data arrival.
+  if (!document.body.classList.contains("view-overview")) boardSkeleton();
+  feedSkeleton();
+  // Load projects + categories first so the rail can render its full tree in any
+  // view (the board views never call loadOverview, which is the other place that
+  // populates `categories`). route() then applies the URL-hash view and opens the
+  // stream; it handles its own board/overview data loads.
+  try {
+    await Promise.all([
+      loadProjects(),
+      loadCategories().catch(() => {}), // rail still works project-only if this fails
+    ]);
+  } catch (e) { setStatus("error: " + e.message, "warn"); }
+  route().catch((e) => setStatus("error: " + e.message, "warn"));
+})();
