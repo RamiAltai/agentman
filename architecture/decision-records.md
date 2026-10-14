@@ -902,7 +902,9 @@ record instead.
   `AGENTMAN_PROPOSALS`, `usage()` scope/exit-8 lines); the 32 Phase Q tests.
 
 ### ADR-028: Category dashboard + scoped feed — hub category fan-out resolved at Subscribe, `?category=` feed/stream filtering excluding category-level events, category stats folded into `/api/categories`, dashboard hash routing with overview-as-landing (Phase R)
-- Status: Active
+- Status: Amended by ADR-032 — item 7's navigation surface (the project-tab strip and the
+  `← Categories` breadcrumb-back button) was replaced by the left-rail navigation; the hash routes
+  remain valid.
 - Context: The agentic_brain integration (requirement R6) needs a **human** view organized by
   category — a category-home landing page showing where work is happening, drill-down into a
   single category's board, and a feed/stream that can be scoped to one category. This builds on the
@@ -1143,7 +1145,8 @@ record instead.
   `matchMedia` follow-only-while-unset listener); `cmd/am/web_test.go` (`TestDashboardThemeAssets`).
 
 ### ADR-031: Dashboard CLI↔GUI parity — filter as a popover (not a row), columns are the status axis, category lifecycle in the Manage modal, and the explicit reversal of "create is category-unaware" + "Meta is read-only"
-- Status: Active
+- Status: Amended by ADR-032 — item 3's Manage (and New project) entry points moved off the
+  header/tab bar into the left-rail action rows; the Manage modal itself is unchanged.
 - Context: Seven dashboard operations still required dropping to the `am` CLI: creating a category,
   choosing a category at project-create time, archiving/unarchiving a category, editing a project
   (rename + vault binding), filtering the board, editing task meta, and releasing a task. The HTTP
