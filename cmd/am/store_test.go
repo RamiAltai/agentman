@@ -32,10 +32,7 @@ func TestListEventsBefore(t *testing.T) {
 	}
 
 	// Create a task in archproj.
-	archTask, _, err := st.CreateTask(CreateTaskInput{Project: "archproj", Title: "arch-t1"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	archTask := cwfStoreNewTask(t, st, "archproj", "arch-t1")
 	_ = archTask
 
 	// Collect all event IDs in ascending order.
@@ -103,16 +100,15 @@ func TestListEventsBefore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListEventsBefore limited: %v", err)
 	}
-	if len(limited) > 2 {
-		t.Fatalf("expected <=2 events with limit=2, got %d", len(limited))
+	if len(limited) != 2 || len(gotAfterArchive) < 2 ||
+		limited[0].ID != gotAfterArchive[0].ID || limited[1].ID != gotAfterArchive[1].ID {
+		t.Fatalf("limit=2 returned %+v, want the newest two of %+v", limited, gotAfterArchive)
 	}
 }
 
 func TestCreateProjectAndTaskHappyPath(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	task, ev, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Do a thing", Actor: "alice"})
 	if err != nil {
 		t.Fatalf("CreateTask: %v", err)
@@ -141,9 +137,7 @@ func TestCreateProjectAndTaskHappyPath(t *testing.T) {
 
 func TestCreateTaskEmptyTitleValidation(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	if _, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "   "}); !errors.Is(err, ErrValidation) {
 		t.Fatalf("empty title err = %v, want ErrValidation", err)
 	}
@@ -151,13 +145,8 @@ func TestCreateTaskEmptyTitleValidation(t *testing.T) {
 
 func TestPatchTaskInvalidStatusValidation(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "T"})
-	if err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
+	task := cwfStoreNewTask(t, st, "web", "T")
 	if _, _, err := st.PatchTask(task.ID, map[string]any{"status": "bogus"}, "alice"); !errors.Is(err, ErrValidation) {
 		t.Fatalf("invalid status err = %v, want ErrValidation", err)
 	}
@@ -165,13 +154,8 @@ func TestPatchTaskInvalidStatusValidation(t *testing.T) {
 
 func TestClaimRaceExactlyOneWinner(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Race me"})
-	if err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
+	task := cwfStoreNewTask(t, st, "web", "Race me")
 
 	agents := []string{"agent-a", "agent-b"}
 	type result struct {
@@ -242,14 +226,6 @@ func backdateTask(t *testing.T, st *Store, id int64) {
 }
 
 func TestStealStaleClaim(t *testing.T) {
-	newTask := func(t *testing.T, st *Store, title string) int64 {
-		t.Helper()
-		tk, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: title})
-		if err != nil {
-			t.Fatalf("CreateTask: %v", err)
-		}
-		return tk.ID
-	}
 	mustClaim := func(t *testing.T, st *Store, id int64, agent string) {
 		t.Helper()
 		if _, _, err := st.ClaimTask(id, agent); err != nil {
@@ -267,9 +243,14 @@ func TestStealStaleClaim(t *testing.T) {
 		{
 			name: "stale claim is stolen",
 			setup: func(t *testing.T, st *Store) int64 {
-				id := newTask(t, st, "stale")
+				id := cwfStoreNewTask(t, st, "web", "stale").ID
 				mustClaim(t, st, id, "agent-old")
 				backdateTask(t, st, id)
+				// Backdate claimed_at too, so the "bumped past" check below
+				// fails if the steal keeps the previous holder's claimed_at.
+				if _, err := st.db.Exec("UPDATE tasks SET claimed_at=? WHERE id=?", staleISO, id); err != nil {
+					t.Fatal(err)
+				}
 				return id
 			},
 			agent: "agent-new", dur: time.Hour,
@@ -293,7 +274,7 @@ func TestStealStaleClaim(t *testing.T) {
 					t.Fatalf("event data %s does not name previous assignee", ev.Data)
 				}
 				var n int
-				st.db.QueryRow("SELECT COUNT(*) FROM events WHERE kind='task.reclaimed' AND task_id=?", id).Scan(&n)
+				n = cwfStoreCount(t, st, "SELECT COUNT(*) FROM events WHERE kind='task.reclaimed' AND task_id=?", id)
 				if n != 1 {
 					t.Fatalf("task.reclaimed event rows = %d, want 1", n)
 				}
@@ -302,7 +283,7 @@ func TestStealStaleClaim(t *testing.T) {
 		{
 			name: "fresh claim is not stealable",
 			setup: func(t *testing.T, st *Store) int64 {
-				id := newTask(t, st, "fresh")
+				id := cwfStoreNewTask(t, st, "web", "fresh").ID
 				mustClaim(t, st, id, "agent-old")
 				return id
 			},
@@ -324,7 +305,7 @@ func TestStealStaleClaim(t *testing.T) {
 		{
 			name: "unclaimed degrades to normal claim",
 			setup: func(t *testing.T, st *Store) int64 {
-				return newTask(t, st, "unclaimed")
+				return cwfStoreNewTask(t, st, "web", "unclaimed").ID
 			},
 			agent: "agent-new", dur: time.Hour,
 			check: func(t *testing.T, st *Store, id int64, tk *Task, ev *Event, err error) {
@@ -342,7 +323,7 @@ func TestStealStaleClaim(t *testing.T) {
 		{
 			name: "done task conflicts",
 			setup: func(t *testing.T, st *Store) int64 {
-				id := newTask(t, st, "done")
+				id := cwfStoreNewTask(t, st, "web", "done").ID
 				mustClaim(t, st, id, "agent-old")
 				if _, _, err := st.PatchTask(id, map[string]any{"status": "done"}, "agent-old"); err != nil {
 					t.Fatalf("PatchTask done: %v", err)
@@ -361,7 +342,7 @@ func TestStealStaleClaim(t *testing.T) {
 		{
 			name: "own claim is idempotent",
 			setup: func(t *testing.T, st *Store) int64 {
-				id := newTask(t, st, "mine")
+				id := cwfStoreNewTask(t, st, "web", "mine").ID
 				mustClaim(t, st, id, "agent-new")
 				return id
 			},
@@ -390,7 +371,7 @@ func TestStealStaleClaim(t *testing.T) {
 		},
 		{
 			name:  "empty agent",
-			setup: func(t *testing.T, st *Store) int64 { return newTask(t, st, "noagent") },
+			setup: func(t *testing.T, st *Store) int64 { return cwfStoreNewTask(t, st, "web", "noagent").ID },
 			agent: "", dur: time.Hour,
 			check: func(t *testing.T, st *Store, id int64, tk *Task, ev *Event, err error) {
 				if !errors.Is(err, ErrValidation) {
@@ -400,7 +381,7 @@ func TestStealStaleClaim(t *testing.T) {
 		},
 		{
 			name:  "zero duration",
-			setup: func(t *testing.T, st *Store) int64 { return newTask(t, st, "zerodur") },
+			setup: func(t *testing.T, st *Store) int64 { return cwfStoreNewTask(t, st, "web", "zerodur").ID },
 			agent: "agent-new", dur: 0,
 			check: func(t *testing.T, st *Store, id int64, tk *Task, ev *Event, err error) {
 				if !errors.Is(err, ErrValidation) {
@@ -410,7 +391,7 @@ func TestStealStaleClaim(t *testing.T) {
 		},
 		{
 			name:  "negative duration",
-			setup: func(t *testing.T, st *Store) int64 { return newTask(t, st, "negdur") },
+			setup: func(t *testing.T, st *Store) int64 { return cwfStoreNewTask(t, st, "web", "negdur").ID },
 			agent: "agent-new", dur: -time.Hour,
 			check: func(t *testing.T, st *Store, id int64, tk *Task, ev *Event, err error) {
 				if !errors.Is(err, ErrValidation) {
@@ -421,8 +402,8 @@ func TestStealStaleClaim(t *testing.T) {
 		{
 			name: "open prereq blocks the steal",
 			setup: func(t *testing.T, st *Store) int64 {
-				prereq := newTask(t, st, "prereq")
-				dep := newTask(t, st, "dependent")
+				prereq := cwfStoreNewTask(t, st, "web", "prereq").ID
+				dep := cwfStoreNewTask(t, st, "web", "dependent").ID
 				if _, err := st.AddDep(dep, prereq, "alice"); err != nil {
 					t.Fatalf("AddDep: %v", err)
 				}
@@ -441,9 +422,7 @@ func TestStealStaleClaim(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			st := openTestStore(t)
-			if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-				t.Fatalf("CreateProject: %v", err)
-			}
+			cwfStoreNewProject(t, st, "web")
 			id := c.setup(t, st)
 			tk, ev, err := st.StealStaleClaim(id, c.agent, c.dur)
 			c.check(t, st, id, tk, ev, err)
@@ -453,13 +432,8 @@ func TestStealStaleClaim(t *testing.T) {
 
 func TestStealRaceExactlyOneWinner(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Steal me"})
-	if err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
+	task := cwfStoreNewTask(t, st, "web", "Steal me")
 	if _, _, err := st.ClaimTask(task.ID, "dead-agent"); err != nil {
 		t.Fatalf("ClaimTask: %v", err)
 	}
@@ -515,7 +489,7 @@ func TestStealRaceExactlyOneWinner(t *testing.T) {
 		t.Fatalf("final owner = %q, want winner %q", final.Assignee, winner)
 	}
 	var n int
-	st.db.QueryRow("SELECT COUNT(*) FROM events WHERE kind='task.reclaimed' AND task_id=?", task.ID).Scan(&n)
+	n = cwfStoreCount(t, st, "SELECT COUNT(*) FROM events WHERE kind='task.reclaimed' AND task_id=?", task.ID)
 	if n != 1 {
 		t.Fatalf("task.reclaimed event rows = %d, want exactly 1", n)
 	}
@@ -523,40 +497,30 @@ func TestStealRaceExactlyOneWinner(t *testing.T) {
 
 func TestListTasksStaleFilter(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	mk := func(title string) int64 {
-		t.Helper()
-		tk, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: title})
-		if err != nil {
-			t.Fatalf("CreateTask %s: %v", title, err)
-		}
-		return tk.ID
-	}
+	cwfStoreNewProject(t, st, "web")
 
 	// Stale: claimed (doing+assigned) then backdated.
-	stale := mk("stale doing")
+	stale := cwfStoreNewTask(t, st, "web", "stale doing").ID
 	if _, _, err := st.ClaimTask(stale, "agent-a"); err != nil {
 		t.Fatal(err)
 	}
 	backdateTask(t, st, stale)
 
 	// Fresh: claimed just now.
-	fresh := mk("fresh doing")
+	fresh := cwfStoreNewTask(t, st, "web", "fresh doing").ID
 	if _, _, err := st.ClaimTask(fresh, "agent-b"); err != nil {
 		t.Fatal(err)
 	}
 
 	// Unassigned doing, backdated: not stale (nobody holds it).
-	unassigned := mk("unassigned doing")
+	unassigned := cwfStoreNewTask(t, st, "web", "unassigned doing").ID
 	if _, _, err := st.PatchTask(unassigned, map[string]any{"status": "doing"}, "alice"); err != nil {
 		t.Fatal(err)
 	}
 	backdateTask(t, st, unassigned)
 
 	// Assigned done, backdated: not stale (finished work is never stale).
-	done := mk("assigned done")
+	done := cwfStoreNewTask(t, st, "web", "assigned done").ID
 	if _, _, err := st.ClaimTask(done, "agent-c"); err != nil {
 		t.Fatal(err)
 	}
@@ -566,7 +530,7 @@ func TestListTasksStaleFilter(t *testing.T) {
 	backdateTask(t, st, done)
 
 	// Backdated but then commented: the comment bumps updated_at → no longer stale.
-	revived := mk("commented doing")
+	revived := cwfStoreNewTask(t, st, "web", "commented doing").ID
 	if _, _, err := st.ClaimTask(revived, "agent-d"); err != nil {
 		t.Fatal(err)
 	}
@@ -586,13 +550,8 @@ func TestListTasksStaleFilter(t *testing.T) {
 
 func TestClaimSetsClaimedAt(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "claim me"})
-	if err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
+	task := cwfStoreNewTask(t, st, "web", "claim me")
 	if task.ClaimedAt != "" {
 		t.Fatalf("claimed_at before claim = %q, want empty", task.ClaimedAt)
 	}
@@ -607,32 +566,48 @@ func TestClaimSetsClaimedAt(t *testing.T) {
 
 func TestDropClearsClaimedAt(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "drop me"})
-	if err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
+	task := cwfStoreNewTask(t, st, "web", "drop me")
 	if _, _, err := st.ClaimTask(task.ID, "agent-a"); err != nil {
 		t.Fatalf("ClaimTask: %v", err)
 	}
 	// am drop = PATCH {assignee:"", status:"todo"}.
-	dropped, _, err := st.PatchTask(task.ID, map[string]any{"assignee": "", "status": "todo"}, "agent-a")
+	dropped, ev, err := st.PatchTask(task.ID, map[string]any{"assignee": "", "status": "todo"}, "agent-a")
 	if err != nil {
 		t.Fatalf("PatchTask drop: %v", err)
 	}
 	if dropped.ClaimedAt != "" {
 		t.Fatalf("claimed_at after drop = %q, want cleared", dropped.ClaimedAt)
 	}
+	// The dashboard feed keys on these kinds and [old,new] pairs: a status
+	// change outranks an assignee change in the same patch.
+	wantEvent := func(ev *Event, kind, data string) {
+		t.Helper()
+		if ev == nil || ev.Kind != kind || string(ev.Data) != data {
+			t.Fatalf("event = %+v, want %s %s", ev, kind, data)
+		}
+	}
+	wantEvent(ev, "task.status", `{"assignee":["agent-a",null],"status":["doing","todo"]}`)
 	// Reassigning via PATCH sets it again.
-	reassigned, _, err := st.PatchTask(task.ID, map[string]any{"assignee": "agent-b"}, "alice")
+	reassigned, ev, err := st.PatchTask(task.ID, map[string]any{"assignee": "agent-b"}, "alice")
 	if err != nil {
 		t.Fatalf("PatchTask assign: %v", err)
 	}
 	if reassigned.ClaimedAt == "" {
 		t.Fatal("claimed_at not set on PATCH reassign")
 	}
+	wantEvent(ev, "task.assign", `{"assignee":[null,"agent-b"]}`)
+	// Status alone, and an assignee change riding along with a title.
+	_, ev, err = st.PatchTask(task.ID, map[string]any{"status": "done"}, "agent-b")
+	if err != nil {
+		t.Fatalf("PatchTask status: %v", err)
+	}
+	wantEvent(ev, "task.status", `{"status":["todo","done"]}`)
+	_, ev, err = st.PatchTask(task.ID, map[string]any{"assignee": "agent-c", "title": "renamed"}, "alice")
+	if err != nil {
+		t.Fatalf("PatchTask assign+title: %v", err)
+	}
+	wantEvent(ev, "task.assign", `{"assignee":["agent-b","agent-c"],"title":["drop me","renamed"]}`)
 }
 
 func TestArchiveUnarchiveProject(t *testing.T) {
@@ -788,10 +763,22 @@ func TestFeedHidesArchivedProjectEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Resolve alpha's project id for assertion checks.
+	// Resolve both project ids for assertion checks.
 	alphaPID, err := st.projectID("alpha")
 	if err != nil {
 		t.Fatal(err)
+	}
+	betaPID, err := st.projectID("beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasBeta := func(evs []Event) bool {
+		for _, e := range evs {
+			if e.ProjectID == betaPID {
+				return true
+			}
+		}
+		return false
 	}
 
 	// Archive alpha.
@@ -809,6 +796,9 @@ func TestFeedHidesArchivedProjectEvents(t *testing.T) {
 			t.Errorf("RecentEvents(\"\") returned event with archived project_id %d (kind=%s)", alphaPID, e.Kind)
 		}
 	}
+	if !hasBeta(recent) {
+		t.Error("RecentEvents(\"\") hides beta's events while only alpha is archived")
+	}
 
 	// Unfiltered ListEvents must NOT include alpha's events.
 	all, _, err := st.ListEvents(0, "", "", 200)
@@ -819,6 +809,9 @@ func TestFeedHidesArchivedProjectEvents(t *testing.T) {
 		if e.ProjectID == alphaPID {
 			t.Errorf("ListEvents(0,\"\") returned event with archived project_id %d (kind=%s)", alphaPID, e.Kind)
 		}
+	}
+	if !hasBeta(all) {
+		t.Error("ListEvents(0,\"\") hides beta's events while only alpha is archived")
 	}
 
 	// Explicit project=alpha MUST still return alpha's events.
@@ -868,10 +861,12 @@ func TestCreateTaskRejectsArchivedProject(t *testing.T) {
 	}
 
 	// Creating into an archived project must return ErrProjectArchived.
+	snap := cwfStoreSnapshot(t, st)
 	_, _, err := st.CreateTask(CreateTaskInput{Project: "archived", Title: "should fail"})
 	if !errors.Is(err, ErrProjectArchived) {
 		t.Fatalf("CreateTask into archived project: got %v, want ErrProjectArchived", err)
 	}
+	cwfStoreAssertUnchanged(t, st, snap, "rejected create in archived project")
 
 	// Creating into an active project must still succeed.
 	task, ev, err := st.CreateTask(CreateTaskInput{Project: "active", Title: "should work"})
@@ -885,13 +880,8 @@ func TestCreateTaskRejectsArchivedProject(t *testing.T) {
 
 func TestDeleteTaskCascadesComments(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "to delete"})
-	if err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
+	task := cwfStoreNewTask(t, st, "web", "to delete")
 	c, _, err := st.AddComment(task.ID, "alice", "a comment")
 	if err != nil {
 		t.Fatalf("AddComment: %v", err)
@@ -913,7 +903,7 @@ func TestDeleteTaskCascadesComments(t *testing.T) {
 
 	// Comment must also be gone (cascade).
 	var count int
-	st.db.QueryRow("SELECT COUNT(*) FROM comments WHERE task_id=?", task.ID).Scan(&count)
+	count = cwfStoreCount(t, st, "SELECT COUNT(*) FROM comments WHERE task_id=?", task.ID)
 	if count != 0 {
 		t.Fatalf("comments after task delete = %d, want 0", count)
 	}
@@ -944,13 +934,8 @@ func TestDeleteTaskNotFound(t *testing.T) {
 
 func TestDeleteCommentRemovesOnlyComment(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "task with comments"})
-	if err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
+	task := cwfStoreNewTask(t, st, "web", "task with comments")
 	c1, _, err := st.AddComment(task.ID, "alice", "first")
 	if err != nil {
 		t.Fatalf("AddComment 1: %v", err)
@@ -958,6 +943,15 @@ func TestDeleteCommentRemovesOnlyComment(t *testing.T) {
 	c2, _, err := st.AddComment(task.ID, "bob", "second")
 	if err != nil {
 		t.Fatalf("AddComment 2: %v", err)
+	}
+	// A stale claim: deleting a comment counts as activity and must bump
+	// updated_at, taking the task out of the stale list.
+	if _, _, err := st.ClaimTask(task.ID, "agent-a"); err != nil {
+		t.Fatalf("ClaimTask: %v", err)
+	}
+	backdateTask(t, st, task.ID)
+	if stale, err := st.ListTasks(TaskFilter{Stale: time.Hour}); err != nil || len(stale) != 1 {
+		t.Fatalf("stale before delete = %d, %v; want the backdated task", len(stale), err)
 	}
 
 	ev, err := st.DeleteComment(task.ID, c1.ID, "alice")
@@ -970,24 +964,38 @@ func TestDeleteCommentRemovesOnlyComment(t *testing.T) {
 
 	// First comment gone, second still present.
 	var count int
-	st.db.QueryRow("SELECT COUNT(*) FROM comments WHERE id=?", c1.ID).Scan(&count)
+	count = cwfStoreCount(t, st, "SELECT COUNT(*) FROM comments WHERE id=?", c1.ID)
 	if count != 0 {
 		t.Fatalf("comment c1 still exists after delete")
 	}
-	st.db.QueryRow("SELECT COUNT(*) FROM comments WHERE id=?", c2.ID).Scan(&count)
+	count = cwfStoreCount(t, st, "SELECT COUNT(*) FROM comments WHERE id=?", c2.ID)
 	if count != 1 {
 		t.Fatalf("comment c2 should still exist, count=%d", count)
 	}
 
-	// Task itself is still present.
-	if _, err := st.GetTask(task.ID); err != nil {
+	// Task itself is still present, with updated_at bumped past the backdate.
+	got, err := st.GetTask(task.ID)
+	if err != nil {
 		t.Fatalf("task should still exist: %v", err)
 	}
+	if got.UpdatedAt <= staleISO {
+		t.Fatalf("updated_at = %q after DeleteComment, want bumped past %s", got.UpdatedAt, staleISO)
+	}
+	if stale, err := st.ListTasks(TaskFilter{Stale: time.Hour}); err != nil || len(stale) != 0 {
+		t.Fatalf("stale after delete = %d, %v; want none", len(stale), err)
+	}
 
-	// Wrong task id → ErrNotFound.
-	_, err = st.DeleteComment(task.ID+999, c2.ID, "bob")
-	if !errors.Is(err, ErrNotFound) {
-		t.Fatalf("DeleteComment wrong taskID = %v, want ErrNotFound", err)
+	// Wrong task id (missing, or another existing task) → ErrNotFound, and c2
+	// survives both attempts.
+	other := cwfStoreNewTask(t, st, "web", "other task")
+	for _, tid := range []int64{task.ID + 999, other.ID} {
+		if _, err := st.DeleteComment(tid, c2.ID, "bob"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("DeleteComment(task %d, c2) = %v, want ErrNotFound", tid, err)
+		}
+	}
+	count = cwfStoreCount(t, st, "SELECT COUNT(*) FROM comments WHERE id=? AND task_id=?", c2.ID, task.ID)
+	if count != 1 {
+		t.Fatalf("c2 deleted by a wrong-task DeleteComment, count=%d", count)
 	}
 }
 
@@ -996,15 +1004,12 @@ func TestDeleteProjectCascades(t *testing.T) {
 	if _, _, err := st.CreateProject("alpha", "Alpha", ""); err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
-	task, _, err := st.CreateTask(CreateTaskInput{Project: "alpha", Title: "child task"})
-	if err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	task := cwfStoreNewTask(t, st, "alpha", "child task")
 	if _, _, err := st.AddComment(task.ID, "alice", "note"); err != nil {
 		t.Fatalf("AddComment: %v", err)
 	}
 
-	ev, err := st.DeleteProject("alpha", "alice")
+	ev, err := st.DeleteProject("alpha", "", "alice")
 	if err != nil {
 		t.Fatalf("DeleteProject: %v", err)
 	}
@@ -1030,7 +1035,7 @@ func TestDeleteProjectCascades(t *testing.T) {
 
 	// Comments gone (cascade).
 	var count int
-	st.db.QueryRow("SELECT COUNT(*) FROM comments WHERE task_id=?", task.ID).Scan(&count)
+	count = cwfStoreCount(t, st, "SELECT COUNT(*) FROM comments WHERE task_id=?", task.ID)
 	if count != 0 {
 		t.Fatalf("comments after project delete = %d, want 0", count)
 	}
@@ -1038,13 +1043,13 @@ func TestDeleteProjectCascades(t *testing.T) {
 	// project.deleted event persists in event log (events are NOT deleted).
 	// Use direct DB query since ListEvents filters by archived projects.
 	var evCount int
-	st.db.QueryRow("SELECT COUNT(*) FROM events WHERE kind='project.deleted'").Scan(&evCount)
+	evCount = cwfStoreCount(t, st, "SELECT COUNT(*) FROM events WHERE kind='project.deleted'")
 	if evCount == 0 {
 		t.Error("project.deleted event not found in event log")
 	}
 
 	// ErrNotFound on re-delete.
-	_, err = st.DeleteProject("alpha", "alice")
+	_, err = st.DeleteProject("alpha", "", "alice")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("DeleteProject re-delete = %v, want ErrNotFound", err)
 	}
@@ -1052,13 +1057,8 @@ func TestDeleteProjectCascades(t *testing.T) {
 
 func TestEventsCursorStrictlyIncreasing(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	task, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "T"})
-	if err != nil {
-		t.Fatalf("CreateTask: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
+	task := cwfStoreNewTask(t, st, "web", "T")
 	if _, _, err := st.ClaimTask(task.ID, "agent-a"); err != nil {
 		t.Fatalf("ClaimTask: %v", err)
 	}
@@ -1115,29 +1115,8 @@ func TestEventsCursorStrictlyIncreasing(t *testing.T) {
 
 // ===================== dependency tests =====================
 
-func setupDepFixture(t *testing.T) (*Store, int64, int64, int64) {
-	t.Helper()
-	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatal(err)
-	}
-	t1, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Task 1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t2, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Task 2"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t3, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Task 3"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return st, t1.ID, t2.ID, t3.ID
-}
-
 func TestAddDepHappyPath(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 
 	ev, err := st.AddDep(t2, t1, "alice") // t2 depends on t1
 	if err != nil {
@@ -1170,11 +1149,13 @@ func TestAddDepHappyPath(t *testing.T) {
 }
 
 func TestAddDepSelfRejected(t *testing.T) {
-	st, t1, _, _ := setupDepFixture(t)
+	st, t1, _, _ := cwfStoreWebTasks(t)
+	snap := cwfStoreSnapshot(t, st)
 	_, err := st.AddDep(t1, t1, "alice")
 	if !errors.Is(err, ErrValidation) {
 		t.Fatalf("self-dep err = %v, want ErrValidation", err)
 	}
+	cwfStoreAssertUnchanged(t, st, snap, "rejected self-dep")
 }
 
 func TestAddDepCrossProjectRejected(t *testing.T) {
@@ -1187,14 +1168,16 @@ func TestAddDepCrossProjectRejected(t *testing.T) {
 	}
 	ta, _, _ := st.CreateTask(CreateTaskInput{Project: "proj1", Title: "A"})
 	tb, _, _ := st.CreateTask(CreateTaskInput{Project: "proj2", Title: "B"})
+	snap := cwfStoreSnapshot(t, st)
 	_, err := st.AddDep(ta.ID, tb.ID, "alice")
 	if !errors.Is(err, ErrValidation) {
 		t.Fatalf("cross-project dep err = %v, want ErrValidation", err)
 	}
+	cwfStoreAssertUnchanged(t, st, snap, "rejected cross-project dep")
 }
 
 func TestAddDepCycleRejected(t *testing.T) {
-	st, t1, t2, t3 := setupDepFixture(t)
+	st, t1, t2, t3 := cwfStoreWebTasks(t)
 	// t2 depends on t1
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatalf("AddDep(t2->t1): %v", err)
@@ -1204,26 +1187,30 @@ func TestAddDepCycleRejected(t *testing.T) {
 		t.Fatalf("AddDep(t3->t2): %v", err)
 	}
 	// t1 depends on t3 would form a cycle: t1->t3->t2->t1
+	snap := cwfStoreSnapshot(t, st)
 	_, err := st.AddDep(t1, t3, "alice")
 	if !errors.Is(err, ErrValidation) {
 		t.Fatalf("cycle dep err = %v, want ErrValidation", err)
 	}
+	cwfStoreAssertUnchanged(t, st, snap, "rejected cycle")
 }
 
 func TestAddDepDirectCycleRejected(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatalf("AddDep(t2->t1): %v", err)
 	}
 	// t1 depends on t2 would form a direct cycle
+	snap := cwfStoreSnapshot(t, st)
 	_, err := st.AddDep(t1, t2, "alice")
 	if !errors.Is(err, ErrValidation) {
 		t.Fatalf("direct cycle err = %v, want ErrValidation", err)
 	}
+	cwfStoreAssertUnchanged(t, st, snap, "rejected direct cycle")
 }
 
 func TestAddDepIdempotent(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 	ev1, err := st.AddDep(t2, t1, "alice")
 	if err != nil {
 		t.Fatalf("first AddDep: %v", err)
@@ -1242,7 +1229,7 @@ func TestAddDepIdempotent(t *testing.T) {
 }
 
 func TestRemoveDep(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatalf("AddDep: %v", err)
 	}
@@ -1269,7 +1256,7 @@ func TestRemoveDep(t *testing.T) {
 }
 
 func TestGetTaskDependsOnAndBlocks(t *testing.T) {
-	st, t1, t2, t3 := setupDepFixture(t)
+	st, t1, t2, t3 := cwfStoreWebTasks(t)
 	// t2 depends on t1; t3 depends on t1
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatal(err)
@@ -1299,7 +1286,7 @@ func TestGetTaskDependsOnAndBlocks(t *testing.T) {
 }
 
 func TestDeleteTaskCascadesDeps(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -1309,7 +1296,7 @@ func TestDeleteTaskCascadesDeps(t *testing.T) {
 		t.Fatalf("DeleteTask: %v", err)
 	}
 	var count int
-	st.db.QueryRow("SELECT COUNT(*) FROM task_deps WHERE depends_on_id=?", t1).Scan(&count)
+	count = cwfStoreCount(t, st, "SELECT COUNT(*) FROM task_deps WHERE depends_on_id=?", t1)
 	if count != 0 {
 		t.Fatalf("task_deps row survived deletion of prereq, count=%d", count)
 	}
@@ -1322,7 +1309,7 @@ func TestDeleteTaskCascadesDeps(t *testing.T) {
 }
 
 func TestListTasksDepCounts(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -1360,7 +1347,7 @@ func TestListTasksDepCounts(t *testing.T) {
 }
 
 func TestListTasksReadyFilter(t *testing.T) {
-	st, t1, t2, t3 := setupDepFixture(t)
+	st, t1, t2, t3 := cwfStoreWebTasks(t)
 	// t2 depends on t1 (open prereq → not ready)
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatal(err)
@@ -1389,7 +1376,7 @@ func TestListTasksReadyFilter(t *testing.T) {
 }
 
 func TestListTasksBlockedFilter(t *testing.T) {
-	st, t1, t2, t3 := setupDepFixture(t)
+	st, t1, t2, t3 := cwfStoreWebTasks(t)
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -1411,12 +1398,13 @@ func TestListTasksBlockedFilter(t *testing.T) {
 }
 
 func TestClaimBlockedByOpenPrereq(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatal(err)
 	}
 
 	// Claim t2 while t1 is todo → must be blocked.
+	snap := cwfStoreSnapshot(t, st)
 	_, _, err := st.ClaimTask(t2, "agent-a")
 	var be *BlockedError
 	if !errors.As(err, &be) {
@@ -1425,10 +1413,11 @@ func TestClaimBlockedByOpenPrereq(t *testing.T) {
 	if len(be.OpenPrereqs) == 0 {
 		t.Fatal("BlockedError.OpenPrereqs should be non-empty")
 	}
+	cwfStoreAssertUnchanged(t, st, snap, "blocked claim")
 }
 
 func TestClaimUnblockedAfterPrereqDone(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -1447,12 +1436,13 @@ func TestClaimUnblockedAfterPrereqDone(t *testing.T) {
 }
 
 func TestPatchTaskBlockedByOpenPrereq(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 	if _, err := st.AddDep(t2, t1, "alice"); err != nil {
 		t.Fatal(err)
 	}
 
 	// Cannot patch t2 to doing while t1 is todo.
+	snap := cwfStoreSnapshot(t, st)
 	_, _, err := st.PatchTask(t2, map[string]any{"status": "doing"}, "alice")
 	var be *BlockedError
 	if !errors.As(err, &be) {
@@ -1464,6 +1454,7 @@ func TestPatchTaskBlockedByOpenPrereq(t *testing.T) {
 	if !errors.As(err, &be) {
 		t.Fatalf("PatchTask(done) with open prereq: got %v, want *BlockedError", err)
 	}
+	cwfStoreAssertUnchanged(t, st, snap, "blocked status patches")
 
 	// Allowed to patch title even with open prereq.
 	_, _, err = st.PatchTask(t2, map[string]any{"title": "New Title"}, "alice")
@@ -1508,9 +1499,6 @@ func TestTaskDepsTableExistsOnReopenedDB(t *testing.T) {
 	}
 }
 
-// Suppress unused import warning for fmt (used in TestAddDepCycleRejected).
-var _ = fmt.Sprintf
-
 // ===================== ProjectGraph tests =====================
 
 func TestProjectGraph(t *testing.T) {
@@ -1523,23 +1511,11 @@ func TestProjectGraph(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ta, _, err := st.CreateTask(CreateTaskInput{Project: "gproj", Title: "Task A"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	tb, _, err := st.CreateTask(CreateTaskInput{Project: "gproj", Title: "Task B"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	tc, _, err := st.CreateTask(CreateTaskInput{Project: "gproj", Title: "Task C"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	ta := cwfStoreNewTask(t, st, "gproj", "Task A")
+	tb := cwfStoreNewTask(t, st, "gproj", "Task B")
+	tc := cwfStoreNewTask(t, st, "gproj", "Task C")
 	// Task in other project — must not leak into gproj graph.
-	tOther, _, err := st.CreateTask(CreateTaskInput{Project: "other", Title: "Other Task"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	tOther := cwfStoreNewTask(t, st, "other", "Other Task")
 	_ = tOther
 
 	// Chain: B depends on A; C depends on B.
@@ -1723,9 +1699,7 @@ func TestNextTaskPicksHighestPriorityReady(t *testing.T) {
 
 func TestNextTaskFIFOWithinPriority(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	first := nextTaskMk(t, st, "web", "older", 2, "")
 	nextTaskMk(t, st, "web", "newer", 2, "")
 
@@ -1772,9 +1746,7 @@ func TestNextTaskProjectScoping(t *testing.T) {
 
 func TestNextTaskNoneReady(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	// Only an assigned todo task — not a candidate.
 	nextTaskMk(t, st, "web", "taken", 0, "someone-else")
 
@@ -1782,7 +1754,7 @@ func TestNextTaskNoneReady(t *testing.T) {
 		t.Fatalf("NextTask err = %v, want ErrNotFound", err)
 	}
 	var n int
-	st.db.QueryRow("SELECT COUNT(*) FROM events WHERE kind='task.claimed'").Scan(&n)
+	n = cwfStoreCount(t, st, "SELECT COUNT(*) FROM events WHERE kind='task.claimed'")
 	if n != 0 {
 		t.Fatalf("task.claimed event rows = %d, want 0 (no event on miss)", n)
 	}
@@ -1791,32 +1763,13 @@ func TestNextTaskNoneReady(t *testing.T) {
 func TestNextTaskRaceDistinctWinners(t *testing.T) {
 	// N callers, M>N ready tasks: everyone wins a DISTINCT task.
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	const n = 4
 	for i := 0; i < n+2; i++ {
 		nextTaskMk(t, st, "web", fmt.Sprintf("ready %d", i), 2, "")
 	}
 
-	type result struct {
-		task *Task
-		err  error
-	}
-	results := make([]result, n)
-	var wg sync.WaitGroup
-	start := make(chan struct{})
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			<-start
-			tk, _, err := st.NextTask(NextFilter{}, fmt.Sprintf("agent-%d", i))
-			results[i] = result{task: tk, err: err}
-		}(i)
-	}
-	close(start)
-	wg.Wait()
+	results := cwfStoreRaceNext(t, st, n, NextFilter{})
 
 	seen := map[int64]bool{}
 	for i, r := range results {
@@ -1831,24 +1784,9 @@ func TestNextTaskRaceDistinctWinners(t *testing.T) {
 
 	// N callers, 1 ready task: exactly one winner, the rest ErrNotFound.
 	st2 := openTestStore(t)
-	if _, _, err := st2.CreateProject("web", "Web", ""); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
+	cwfStoreNewProject(t, st2, "web")
 	nextTaskMk(t, st2, "web", "only one", 2, "")
-	results2 := make([]result, n)
-	var wg2 sync.WaitGroup
-	start2 := make(chan struct{})
-	for i := 0; i < n; i++ {
-		wg2.Add(1)
-		go func(i int) {
-			defer wg2.Done()
-			<-start2
-			tk, _, err := st2.NextTask(NextFilter{}, fmt.Sprintf("agent-%d", i))
-			results2[i] = result{task: tk, err: err}
-		}(i)
-	}
-	close(start2)
-	wg2.Wait()
+	results2 := cwfStoreRaceNext(t, st2, n, NextFilter{})
 
 	winners, misses := 0, 0
 	for i, r := range results2 {
@@ -1877,16 +1815,11 @@ func TestNextTaskEmptyAgentValidation(t *testing.T) {
 
 func TestListTasksQueryFilter(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatal(err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	if _, _, err := st.CreateProject("api", "API", ""); err != nil {
 		t.Fatal(err)
 	}
-	titleHit, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Fix login page"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	titleHit := cwfStoreNewTask(t, st, "web", "Fix login page")
 	bodyHit, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Other thing", Body: "the login flow is broken"})
 	if err != nil {
 		t.Fatal(err)
@@ -1894,10 +1827,7 @@ func TestListTasksQueryFilter(t *testing.T) {
 	if _, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "Unrelated"}); err != nil {
 		t.Fatal(err)
 	}
-	apiHit, _, err := st.CreateTask(CreateTaskInput{Project: "api", Title: "login throttling"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	apiHit := cwfStoreNewTask(t, st, "api", "login throttling")
 
 	ids := func(ts []Task) map[int64]bool {
 		m := map[int64]bool{}
@@ -1955,9 +1885,7 @@ func TestListTasksQueryFilter(t *testing.T) {
 
 func TestListTasksQueryEscapesLikeWildcards(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatal(err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	for _, title := range []string{"100% done", "100 done", "a_b", "axb", `back\slash`} {
 		if _, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: title}); err != nil {
 			t.Fatal(err)
@@ -1990,7 +1918,7 @@ func TestListTasksQueryEscapesLikeWildcards(t *testing.T) {
 // ===================== Phase M: label tests =====================
 
 func TestAddRemoveLabel(t *testing.T) {
-	st, t1, _, _ := setupDepFixture(t)
+	st, t1, _, _ := cwfStoreWebTasks(t)
 
 	// Add — normalized to lowercase, emits task.labeled.
 	ev, err := st.AddLabel(t1, "Bug", "alice")
@@ -2086,7 +2014,7 @@ func TestLabelValidation(t *testing.T) {
 }
 
 func TestListTasksLabelFilter(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 	if _, err := st.AddLabel(t1, "bug", "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -2134,7 +2062,7 @@ func TestListTasksLabelFilter(t *testing.T) {
 }
 
 func TestAddLabelDoesNotBumpUpdatedAt(t *testing.T) {
-	st, t1, _, _ := setupDepFixture(t)
+	st, t1, _, _ := cwfStoreWebTasks(t)
 	before, err := st.GetTask(t1)
 	if err != nil {
 		t.Fatal(err)
@@ -2155,7 +2083,7 @@ func TestAddLabelDoesNotBumpUpdatedAt(t *testing.T) {
 }
 
 func TestDeleteTaskCascadesLabels(t *testing.T) {
-	st, t1, _, _ := setupDepFixture(t)
+	st, t1, _, _ := cwfStoreWebTasks(t)
 	if _, err := st.AddLabel(t1, "bug", "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -2163,7 +2091,7 @@ func TestDeleteTaskCascadesLabels(t *testing.T) {
 		t.Fatalf("DeleteTask: %v", err)
 	}
 	var count int
-	st.db.QueryRow("SELECT COUNT(*) FROM task_labels WHERE task_id=?", t1).Scan(&count)
+	count = cwfStoreCount(t, st, "SELECT COUNT(*) FROM task_labels WHERE task_id=?", t1)
 	if count != 0 {
 		t.Fatalf("task_labels rows survived task deletion, count=%d", count)
 	}
@@ -2365,10 +2293,7 @@ func TestPatchProject(t *testing.T) {
 	if _, _, err := st.CreateProject("api", "API", ""); err != nil {
 		t.Fatal(err)
 	}
-	tk, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "T"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	tk := cwfStoreNewTask(t, st, "web", "T")
 
 	// Slug rename: uid unchanged, project.patched delta, old slug gone.
 	p2, ev, err := st.PatchProject("web", map[string]any{"slug": "frontend"}, "tester")
@@ -2436,10 +2361,7 @@ func TestCategoryArchiveCascade(t *testing.T) {
 	if _, _, err := st.CreateProject("misc", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	tk, _, err := st.CreateTask(CreateTaskInput{Project: "pentest", Title: "hidden later"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	tk := cwfStoreNewTask(t, st, "pentest", "hidden later")
 	if _, _, err := st.ArchiveCategory("work", "tester"); err != nil {
 		t.Fatal(err)
 	}
@@ -2519,21 +2441,12 @@ func TestListTasksCategoryFilterComposes(t *testing.T) {
 	if _, _, err := st.CreateProject("gproj", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	w1, _, err := st.CreateTask(CreateTaskInput{Project: "wproj", Title: "fix login"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	w2, _, err := st.CreateTask(CreateTaskInput{Project: "wproj", Title: "blocked one"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	w1 := cwfStoreNewTask(t, st, "wproj", "fix login")
+	w2 := cwfStoreNewTask(t, st, "wproj", "blocked one")
 	if _, err := st.AddDep(w2.ID, w1.ID, "t"); err != nil {
 		t.Fatal(err)
 	}
-	g1, _, err := st.CreateTask(CreateTaskInput{Project: "gproj", Title: "fix login too"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	g1 := cwfStoreNewTask(t, st, "gproj", "fix login too")
 	if _, err := st.AddLabel(w1.ID, "bug", "t"); err != nil {
 		t.Fatal(err)
 	}
@@ -2623,14 +2536,8 @@ func TestNextTaskCategoryScoping(t *testing.T) {
 	if _, _, err := st.CreateTask(CreateTaskInput{Project: "wproj", Title: "urgent work", Priority: 0}); err != nil {
 		t.Fatal(err)
 	}
-	p1, _, err := st.CreateTask(CreateTaskInput{Project: "pproj", Title: "personal one"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	p2, _, err := st.CreateTask(CreateTaskInput{Project: "pproj", Title: "personal two"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	p1 := cwfStoreNewTask(t, st, "pproj", "personal one")
+	p2 := cwfStoreNewTask(t, st, "pproj", "personal two")
 
 	tk, _, err := st.NextTask(NextFilter{Category: "personal"}, "agent-a")
 	if err != nil {
@@ -2685,9 +2592,7 @@ func TestCreateTaskArchivedCategory(t *testing.T) {
 
 func TestTaskMetaCRUD(t *testing.T) {
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatal(err)
-	}
+	cwfStoreNewProject(t, st, "web")
 
 	// Create with meta — rows land, task.created data carries them.
 	tk, ev, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "carrier",
@@ -2787,9 +2692,7 @@ func TestTaskMetaValidation(t *testing.T) {
 	}
 
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatal(err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	// Oversized value at create.
 	if _, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "t",
 		Meta: map[string]string{"k": strings.Repeat("v", maxTitleLen+1)}}); !errors.Is(err, ErrValidation) {
@@ -2807,10 +2710,7 @@ func TestTaskMetaValidation(t *testing.T) {
 		t.Fatalf("colliding meta keys at create err = %v, want ErrValidation", err)
 	}
 
-	tk, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "patchee"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	tk := cwfStoreNewTask(t, st, "web", "patchee")
 	// Non-string patch value.
 	if _, _, err := st.PatchTask(tk.ID, map[string]any{"meta": map[string]any{"k": 42.0}}, "a"); !errors.Is(err, ErrValidation) {
 		t.Fatalf("non-string meta value err = %v, want ErrValidation", err)
@@ -2841,7 +2741,7 @@ func TestTaskMetaValidation(t *testing.T) {
 }
 
 func TestPatchTaskMetaAtomicOneEvent(t *testing.T) {
-	st, t1, _, _ := setupDepFixture(t)
+	st, t1, _, _ := cwfStoreWebTasks(t)
 
 	// One call, two keys → exactly ONE task.patched carrying both.
 	_, ev, err := st.PatchTask(t1, map[string]any{"meta": map[string]any{"auto": "x", "owner": "alice"}}, "alice")
@@ -2856,29 +2756,31 @@ func TestPatchTaskMetaAtomicOneEvent(t *testing.T) {
 		t.Fatalf("delta = %s, want both keys", ev.Data)
 	}
 	var n int
-	st.db.QueryRow("SELECT COUNT(*) FROM events WHERE kind='task.patched' AND task_id=?", t1).Scan(&n)
+	n = cwfStoreCount(t, st, "SELECT COUNT(*) FROM events WHERE kind='task.patched' AND task_id=?", t1)
 	if n != 1 {
 		t.Fatalf("task.patched events = %d, want 1", n)
 	}
 
 	// Second-key validation failure rolls back the first key too (all-or-nothing).
-	st2, ta, _, _ := setupDepFixture(t)
-	if _, _, err := st2.PatchTask(ta, map[string]any{"meta": map[string]any{"a1": "ok", "bad key": "y"}}, "alice"); !errors.Is(err, ErrValidation) {
-		t.Fatalf("invalid second key err = %v, want ErrValidation", err)
+	// Key names are validated before any write, so the failure must come from
+	// the per-value check: "a1" sorts first and is written before "b" fails.
+	st2, ta, _, _ := cwfStoreWebTasks(t)
+	if _, _, err := st2.PatchTask(ta, map[string]any{"meta": map[string]any{"a1": "ok", "b": strings.Repeat("x", maxTitleLen+1)}}, "alice"); !errors.Is(err, ErrValidation) {
+		t.Fatalf("oversized second value err = %v, want ErrValidation", err)
 	}
 	var rows int
-	st2.db.QueryRow("SELECT COUNT(*) FROM task_meta WHERE task_id=?", ta).Scan(&rows)
+	rows = cwfStoreCount(t, st2, "SELECT COUNT(*) FROM task_meta WHERE task_id=?", ta)
 	if rows != 0 {
 		t.Fatalf("task_meta rows after failed patch = %d, want 0 (tx rollback)", rows)
 	}
-	st2.db.QueryRow("SELECT COUNT(*) FROM events WHERE kind='task.patched' AND task_id=?", ta).Scan(&rows)
+	rows = cwfStoreCount(t, st2, "SELECT COUNT(*) FROM events WHERE kind='task.patched' AND task_id=?", ta)
 	if rows != 0 {
 		t.Fatalf("events after failed patch = %d, want 0", rows)
 	}
 }
 
 func TestPatchTaskMetaNoOpNoEvent(t *testing.T) {
-	st, t1, _, _ := setupDepFixture(t)
+	st, t1, _, _ := cwfStoreWebTasks(t)
 	if _, _, err := st.PatchTask(t1, map[string]any{"meta": map[string]any{"auto": "x"}}, "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -2893,7 +2795,10 @@ func TestPatchTaskMetaNoOpNoEvent(t *testing.T) {
 }
 
 func TestMetaOnlyPatchDoesNotBumpUpdatedAt(t *testing.T) {
-	st, t1, _, _ := setupDepFixture(t)
+	st, t1, _, _ := cwfStoreWebTasks(t)
+	// Backdate first: a bump landing in the creation millisecond would
+	// otherwise leave updated_at unchanged and the check would pass vacuously.
+	backdateTask(t, st, t1)
 	before, err := st.GetTask(t1)
 	if err != nil {
 		t.Fatal(err)
@@ -2912,9 +2817,7 @@ func TestMetaOnlyPatchDoesNotBumpUpdatedAt(t *testing.T) {
 		t.Fatalf("updated_at changed %q → %q; meta edits must not refresh a stale claim", before.UpdatedAt, after.UpdatedAt)
 	}
 
-	// A mixed patch (field + meta) still bumps. Sleep past the millisecond
-	// resolution of strftime('%f') so the bump is observable.
-	time.Sleep(10 * time.Millisecond)
+	// A mixed patch (field + meta) still bumps past the backdated value.
 	if _, _, err := st.PatchTask(t1, map[string]any{"priority": 1, "meta": map[string]any{"auto": "y"}}, "alice"); err != nil {
 		t.Fatalf("mixed patch: %v", err)
 	}
@@ -2942,9 +2845,7 @@ func TestNextTaskMetaFilter(t *testing.T) {
 	if _, _, err := st.CreateCategory("work", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatal(err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	if _, _, err := st.CreateProject("wproj", "", "work"); err != nil {
 		t.Fatal(err)
 	}
@@ -3008,9 +2909,7 @@ func TestNextTaskMetaRaceDistinctWinners(t *testing.T) {
 	// N callers race for M<N carrier tasks while ordinary ready tasks abound:
 	// exactly M succeed, each with a DISTINCT carrier; the rest miss.
 	st := openTestStore(t)
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatal(err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	const n, m = 4, 2
 	for i := 0; i < n; i++ {
 		nextTaskMk(t, st, "web", fmt.Sprintf("plain %d", i), 0, "") // decoys, better priority
@@ -3020,24 +2919,7 @@ func TestNextTaskMetaRaceDistinctWinners(t *testing.T) {
 		carriers[metaTaskMk(t, st, "web", fmt.Sprintf("carrier %d", i), 2, map[string]string{"auto": "1"})] = true
 	}
 
-	type result struct {
-		task *Task
-		err  error
-	}
-	results := make([]result, n)
-	var wg sync.WaitGroup
-	start := make(chan struct{})
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			<-start
-			tk, _, err := st.NextTask(NextFilter{MetaKey: "auto"}, fmt.Sprintf("agent-%d", i))
-			results[i] = result{task: tk, err: err}
-		}(i)
-	}
-	close(start)
-	wg.Wait()
+	results := cwfStoreRaceNext(t, st, n, NextFilter{MetaKey: "auto"})
 
 	winners, misses := 0, 0
 	seen := map[int64]bool{}
@@ -3068,9 +2950,7 @@ func TestListTasksMetaKeyFilter(t *testing.T) {
 	if _, _, err := st.CreateCategory("work", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := st.CreateProject("web", "Web", ""); err != nil {
-		t.Fatal(err)
-	}
+	cwfStoreNewProject(t, st, "web")
 	if _, _, err := st.CreateProject("wproj", "", "work"); err != nil {
 		t.Fatal(err)
 	}
@@ -3136,7 +3016,7 @@ func TestListTasksMetaKeyFilter(t *testing.T) {
 }
 
 func TestListTasksReturnsMeta(t *testing.T) {
-	st, t1, t2, _ := setupDepFixture(t)
+	st, t1, t2, _ := cwfStoreWebTasks(t)
 	// Values with ',' and '=' must survive the stitch (the reason meta is NOT
 	// fetched via GROUP_CONCAT like labels).
 	gnarly := "a=b,c=d, trailing"
@@ -3169,15 +3049,19 @@ func TestListTasksReturnsMeta(t *testing.T) {
 }
 
 func TestDeleteTaskCascadesMeta(t *testing.T) {
-	st, t1, _, _ := setupDepFixture(t)
+	st, t1, _, _ := cwfStoreWebTasks(t)
 	if _, _, err := st.PatchTask(t1, map[string]any{"meta": map[string]any{"auto": "x"}}, "a"); err != nil {
 		t.Fatal(err)
+	}
+	// The row must exist first, or the zero count below proves nothing.
+	if n := cwfStoreCount(t, st, "SELECT COUNT(*) FROM task_meta WHERE task_id=?", t1); n != 1 {
+		t.Fatalf("task_meta rows before delete = %d, want 1", n)
 	}
 	if _, err := st.DeleteTask(t1, "alice"); err != nil {
 		t.Fatalf("DeleteTask: %v", err)
 	}
 	var count int
-	st.db.QueryRow("SELECT COUNT(*) FROM task_meta WHERE task_id=?", t1).Scan(&count)
+	count = cwfStoreCount(t, st, "SELECT COUNT(*) FROM task_meta WHERE task_id=?", t1)
 	if count != 0 {
 		t.Fatalf("task_meta rows survived task deletion, count=%d", count)
 	}
@@ -3243,10 +3127,7 @@ func TestTaskScopeAndProjectCategory(t *testing.T) {
 	}
 
 	// CreateTask without an actor records the actorOr default.
-	anon, _, err := st.CreateTask(CreateTaskInput{Project: "wproj", Title: "anon"})
-	if err != nil {
-		t.Fatalf("CreateTask anon: %v", err)
-	}
+	anon := cwfStoreNewTask(t, st, "wproj", "anon")
 	if _, _, createdBy, _ = st.taskScope(anon.ID); createdBy != "anon" {
 		t.Fatalf("created_by without actor = %q, want anon", createdBy)
 	}
@@ -3305,24 +3186,7 @@ func TestNextTaskRaceScopedCategoryMeta(t *testing.T) {
 		carriers[tk.ID] = true
 	}
 
-	type result struct {
-		task *Task
-		err  error
-	}
-	results := make([]result, n)
-	var wg sync.WaitGroup
-	start := make(chan struct{})
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			<-start
-			tk, _, err := st.NextTask(NextFilter{Category: "personal", MetaKey: "auto"}, fmt.Sprintf("agent-%d", i))
-			results[i] = result{task: tk, err: err}
-		}(i)
-	}
-	close(start)
-	wg.Wait()
+	results := cwfStoreRaceNext(t, st, n, NextFilter{Category: "personal", MetaKey: "auto"})
 
 	seen := map[int64]bool{}
 	for i, r := range results {
@@ -3375,6 +3239,11 @@ func TestListCategoriesCounts(t *testing.T) {
 	mk("alpha", "a2", "todo")
 	mk("alpha", "a3", "doing")
 	mk("alpha", "a4", "done")
+	// Three blocked, so the blocked count differs from every other column and
+	// from the zero default.
+	mk("alpha", "a5", "blocked")
+	mk("alpha", "a6", "blocked")
+	mk("alpha", "a7", "blocked")
 	mk("beta", "b1", "todo")
 	mk("beta", "b2", "todo")
 	mk("beta", "b3", "todo")
@@ -3397,8 +3266,8 @@ func TestListCategoriesCounts(t *testing.T) {
 	if work == nil {
 		t.Fatalf("work category not found in %+v", cats)
 	}
-	// Only alpha contributes (beta archived): 2 todo, 1 doing, 0 blocked, 1 done.
-	want := map[string]int{"todo": 2, "doing": 1, "blocked": 0, "done": 1}
+	// Only alpha contributes (beta archived): 2 todo, 1 doing, 3 blocked, 1 done.
+	want := map[string]int{"todo": 2, "doing": 1, "blocked": 3, "done": 1}
 	for k, v := range want {
 		if work.Counts[k] != v {
 			t.Fatalf("work counts[%s] = %d, want %d (counts=%+v)", k, work.Counts[k], v, work.Counts)
@@ -3441,6 +3310,52 @@ func TestListCategoriesCounts(t *testing.T) {
 	}
 	if len(work.ActiveAgents) != 1 || work.ActiveAgents[0] != "robo-fresh" {
 		t.Fatalf("active_agents = %v, want [robo-fresh] (human excluded, robo-old aged out)", work.ActiveAgents)
+	}
+
+	// Window edges: an event 29 minutes old is inside a 30-minute window, one
+	// 31 minutes old is outside it.
+	for actor, age := range map[string]time.Duration{"robo-29m": 29 * time.Minute, "robo-31m": 31 * time.Minute} {
+		if _, _, err := st.AddComment(freshTask, actor, "edge"); err != nil {
+			t.Fatalf("AddComment %s: %v", actor, err)
+		}
+		at := time.Now().Add(-age).UTC().Format("2006-01-02T15:04:05.000Z")
+		if _, err := st.db.Exec("UPDATE events SET created_at=? WHERE actor=?", at, actor); err != nil {
+			t.Fatalf("backdate %s: %v", actor, err)
+		}
+	}
+	// An archived category is listed only with includeArchived, and its counts
+	// still come from its non-archived projects (alpha, not beta).
+	if _, _, err := st.ArchiveCategory("work", "human"); err != nil {
+		t.Fatalf("ArchiveCategory work: %v", err)
+	}
+	for _, includeArchived := range []bool{false, true} {
+		cats, err = st.ListCategoriesWithStats(includeArchived, 30*time.Minute)
+		if err != nil {
+			t.Fatalf("ListCategoriesWithStats(%v): %v", includeArchived, err)
+		}
+		work = nil
+		for i := range cats {
+			if cats[i].Slug == "work" {
+				work = &cats[i]
+			}
+		}
+		if !includeArchived {
+			if work != nil {
+				t.Fatalf("archived work category listed without includeArchived")
+			}
+			continue
+		}
+		if work == nil {
+			t.Fatalf("archived work category missing with includeArchived")
+		}
+		// alpha's tasks plus "fresh"; fmt prints maps with sorted keys.
+		want := map[string]int{"todo": 3, "doing": 1, "blocked": 3, "done": 1}
+		if fmt.Sprint(work.Counts) != fmt.Sprint(want) {
+			t.Fatalf("archived work counts = %v, want %v", work.Counts, want)
+		}
+		if got := strings.Join(work.ActiveAgents, ","); got != "robo-29m,robo-fresh" {
+			t.Fatalf("active_agents = %s, want robo-29m,robo-fresh", got)
+		}
 	}
 }
 
@@ -3563,7 +3478,8 @@ func TestCreateToken_ScopeValidation(t *testing.T) {
 	}
 }
 
-// TestRevokeToken: unknown id and double-revoke both 404.
+// TestRevokeToken: unknown id and double-revoke both 404; a revoke sets
+// revoked_at (returned and listed) and leaves other tokens resolvable.
 func TestRevokeToken(t *testing.T) {
 	st := openTestStore(t)
 	seedScopeWorld(t, st)
@@ -3576,10 +3492,150 @@ func TestRevokeToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateToken: %v", err)
 	}
-	if _, err := st.RevokeToken(tok.ID); err != nil {
+	keepPlain, keep, err := st.CreateToken(Scope{Category: "work"})
+	if err != nil {
+		t.Fatalf("CreateToken keep: %v", err)
+	}
+	revoked, err := st.RevokeToken(tok.ID)
+	if err != nil {
 		t.Fatalf("first revoke: %v", err)
+	}
+	if revoked.ID != tok.ID || revoked.RevokedAt == "" {
+		t.Fatalf("RevokeToken returned %+v, want id %s with revoked_at set", revoked, tok.ID)
+	}
+	// ListTokens must show the revocation too (it is what `am token ls` and
+	// the dashboard render), and leave the other token active.
+	toks, err := st.ListTokens()
+	if err != nil {
+		t.Fatalf("ListTokens: %v", err)
+	}
+	got := map[string]string{}
+	for _, lt := range toks {
+		got[lt.ID] = lt.RevokedAt
+	}
+	if got[tok.ID] != revoked.RevokedAt {
+		t.Fatalf("listed revoked_at = %q, want %q", got[tok.ID], revoked.RevokedAt)
+	}
+	if ra, ok := got[keep.ID]; !ok || ra != "" {
+		t.Fatalf("unrevoked token listed=%v revoked_at=%q, want listed and active", ok, ra)
+	}
+	if sc, err := st.ResolveToken(keepPlain); err != nil || sc.Category != "work" {
+		t.Fatalf("ResolveToken(unrevoked) = %+v, %v; want work scope", sc, err)
 	}
 	if _, err := st.RevokeToken(tok.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("double revoke err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestPatchTaskRejectsWrongTypes: a wrong-typed assignee/body/priority is a
+// validation error, never read as "" (unassign / wipe) or ignored.
+func TestPatchTaskRejectsWrongTypes(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("web", "web", ""); err != nil {
+		t.Fatal(err)
+	}
+	tk, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "x", Body: "keep me", Assignee: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, patch := range []map[string]any{
+		{"assignee": float64(5)},
+		{"assignee": []any{"a"}},
+		{"assignee": nil},
+		{"body": float64(123)},
+		{"body": nil},
+		{"priority": "high"},
+		{"priority": 1.9},
+		{"priority": nil},
+	} {
+		if _, _, err := st.PatchTask(tk.ID, patch, "bob"); !errors.Is(err, ErrValidation) {
+			t.Errorf("PatchTask(%v) err = %v, want ErrValidation", patch, err)
+		}
+	}
+	got, err := st.GetTask(tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Assignee != "alice" || got.Body != "keep me" || got.Priority != tk.Priority {
+		t.Fatalf("task changed by rejected patches: assignee=%q body=%q priority=%d", got.Assignee, got.Body, got.Priority)
+	}
+	// The documented forms still work: "" unassigns, JSON numbers set priority.
+	got, _, err = st.PatchTask(tk.ID, map[string]any{"assignee": "", "priority": float64(1)}, "bob")
+	if err != nil || got.Assignee != "" || got.Priority != 1 {
+		t.Fatalf("valid patch = %+v, %v; want unassigned, priority 1", got, err)
+	}
+}
+
+// TestClaimPreAssignedTodoStartsIt: claiming a task already assigned to you
+// but still todo (am new --assign / am assign) moves it to doing, stamps
+// claimed_at and emits task.claimed — ADR-023 tells agents to claim these.
+// Re-claiming your own done task is a conflict, via ClaimTask and steal alike.
+func TestClaimPreAssignedTodoStartsIt(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateProject("web", "web", ""); err != nil {
+		t.Fatal(err)
+	}
+	tk, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "x", Assignee: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tk.Status != "todo" {
+		t.Fatalf("pre-assigned task status = %q, want todo", tk.Status)
+	}
+	got, ev, err := st.ClaimTask(tk.ID, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev == nil || ev.Kind != "task.claimed" {
+		t.Fatalf("claim of pre-assigned todo task emitted %v, want task.claimed", ev)
+	}
+	if got.Status != "doing" || got.ClaimedAt == "" {
+		t.Fatalf("after claim: status=%q claimed_at=%q, want doing + timestamp", got.Status, got.ClaimedAt)
+	}
+	// Already doing: idempotent, no event.
+	if _, ev, err := st.ClaimTask(tk.ID, "alice"); err != nil || ev != nil {
+		t.Fatalf("re-claim of doing task = %v, %v; want no event, nil", ev, err)
+	}
+	if _, _, err := st.PatchTask(tk.ID, map[string]any{"status": "done"}, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	var ce *ConflictError
+	if _, _, err := st.ClaimTask(tk.ID, "alice"); !errors.As(err, &ce) {
+		t.Fatalf("owner re-claim of done task err = %v, want ConflictError", err)
+	}
+	if _, _, err := st.StealStaleClaim(tk.ID, "alice", time.Minute); !errors.As(err, &ce) {
+		t.Fatalf("owner steal of done task err = %v, want ConflictError", err)
+	}
+
+	// The steal path starts a pre-assigned todo task the same way.
+	tk2, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "y", Assignee: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ev, err = st.StealStaleClaim(tk2.ID, "alice", time.Minute)
+	if err != nil || ev == nil || got.Status != "doing" {
+		t.Fatalf("owner steal of pre-assigned todo = %+v, %v, %v; want doing + event", got, ev, err)
+	}
+}
+
+// TestDeleteProjectRechecksCategory: the scope category passed by the server
+// is verified inside DeleteProject's tx, so a slug recreated in another
+// category after the handler's check is not deleted.
+func TestDeleteProjectRechecksCategory(t *testing.T) {
+	st := openTestStore(t)
+	if _, _, err := st.CreateCategory("work", "Work"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateProject("api", "api", "work"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DeleteProject("api", "general", "agent"); !errors.Is(err, ErrOutOfScope) {
+		t.Fatalf("delete with wrong category err = %v, want ErrOutOfScope", err)
+	}
+	if _, err := st.projectID("api"); err != nil {
+		t.Fatalf("project gone after refused delete: %v", err)
+	}
+	if _, err := st.DeleteProject("api", "work", "agent"); err != nil {
+		t.Fatalf("delete with matching category: %v", err)
 	}
 }

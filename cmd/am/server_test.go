@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -15,9 +17,7 @@ import (
 
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	store := openTestStore(t)
-	ts := httptest.NewServer(NewServer(store).Handler())
-	t.Cleanup(ts.Close)
+	ts, _ := newTestServerWithStore(t)
 	return ts
 }
 
@@ -65,7 +65,7 @@ func TestCreateTaskEmptyTitle400(t *testing.T) {
 }
 
 func TestLostClaim409(t *testing.T) {
-	ts := newTestServer(t)
+	ts, st := newTestServerWithStore(t)
 	mustCreateProject(t, ts, "web")
 	id := mustCreateTask(t, ts, "web", "Claimable")
 
@@ -76,12 +76,17 @@ func TestLostClaim409(t *testing.T) {
 	if r1.StatusCode != http.StatusOK {
 		t.Fatalf("first claim = %d, want 200", r1.StatusCode)
 	}
-	// Second claim by agent-b loses.
+	// Second claim by agent-b loses and changes nothing (agent-a keeps it).
+	before := cwfStoreSnapshot(t, st)
 	r2 := do(t, ts, http.MethodPost, "/api/tasks/"+id+"/claim", "",
 		map[string]string{"X-Agent": "agent-b"})
 	defer r2.Body.Close()
 	if r2.StatusCode != http.StatusConflict {
 		t.Fatalf("lost claim = %d, want 409", r2.StatusCode)
+	}
+	cwfStoreAssertUnchanged(t, st, before, "lost claim")
+	if got := cwfStoreGetTask(t, ts, id); got.Assignee != "agent-a" {
+		t.Fatalf("assignee after lost claim = %q, want agent-a", got.Assignee)
 	}
 }
 
@@ -168,16 +173,8 @@ func TestStealStaleEndpoint(t *testing.T) {
 	if stolen.Assignee != "agent-b" {
 		t.Fatalf("assignee after steal = %q, want agent-b", stolen.Assignee)
 	}
-	re := do(t, ts, http.MethodGet, "/api/events?tail=50", "", nil)
-	defer re.Body.Close()
-	var feed struct {
-		Events []Event `json:"events"`
-	}
-	if err := json.NewDecoder(re.Body).Decode(&feed); err != nil {
-		t.Fatalf("decode events: %v", err)
-	}
 	found := false
-	for _, e := range feed.Events {
+	for _, e := range eventKinds(t, do(t, ts, http.MethodGet, "/api/events?tail=50", "", nil)) {
 		if e.Kind == "task.reclaimed" && strconv.FormatInt(e.TaskID, 10) == staleID {
 			found = true
 		}
@@ -186,7 +183,8 @@ func TestStealStaleEndpoint(t *testing.T) {
 		t.Fatal("task.reclaimed event not found in /api/events")
 	}
 
-	// Fresh → 409 not_stale naming the holder.
+	// Fresh → 409 not_stale naming the holder; neither rejection below writes.
+	before := cwfStoreSnapshot(t, store)
 	rf := do(t, ts, http.MethodPost, "/api/tasks/"+freshID+"/claim",
 		`{"steal_stale":"1h"}`,
 		map[string]string{"X-Agent": "agent-b", "Content-Type": "application/json"})
@@ -201,6 +199,7 @@ func TestStealStaleEndpoint(t *testing.T) {
 	if body["error"] != "not_stale" || body["assignee"] != "agent-a" {
 		t.Fatalf("409 body = %v, want error=not_stale assignee=agent-a", body)
 	}
+	cwfStoreAssertUnchanged(t, store, before, "steal of a fresh claim")
 
 	// Malformed duration → 400.
 	rb := do(t, ts, http.MethodPost, "/api/tasks/"+freshID+"/claim",
@@ -210,6 +209,7 @@ func TestStealStaleEndpoint(t *testing.T) {
 	if rb.StatusCode != http.StatusBadRequest {
 		t.Fatalf("steal bad duration = %d, want 400", rb.StatusCode)
 	}
+	cwfStoreAssertUnchanged(t, store, before, "steal with a bad duration")
 }
 
 func TestHostGuard(t *testing.T) {
@@ -248,7 +248,7 @@ func TestCSRFGuard(t *testing.T) {
 
 	// Cross-site write → 403.
 	r := do(t, ts, http.MethodPost, "/api/tasks",
-		`{"project":"web","title":"x"}`,
+		`{"project":"web","title":"cross site task"}`,
 		map[string]string{"Sec-Fetch-Site": "cross-site"})
 	gotCross := r.StatusCode
 	r.Body.Close()
@@ -256,13 +256,13 @@ func TestCSRFGuard(t *testing.T) {
 		t.Fatalf("cross-site POST = %d, want 403", gotCross)
 	}
 
-	// CLI-like write: no Origin / no Sec-Fetch headers → allowed (not 403).
+	// CLI-like write: no Origin / no Sec-Fetch headers → allowed and created.
 	r = do(t, ts, http.MethodPost, "/api/tasks",
 		`{"project":"web","title":"cli task"}`, nil)
 	gotCLI := r.StatusCode
 	r.Body.Close()
-	if gotCLI == http.StatusForbidden {
-		t.Fatalf("CLI-like POST = 403, want allowed")
+	if gotCLI != http.StatusCreated {
+		t.Fatalf("CLI-like POST = %d, want 201", gotCLI)
 	}
 
 	// Same-origin browser write → allowed.
@@ -271,8 +271,37 @@ func TestCSRFGuard(t *testing.T) {
 		map[string]string{"Sec-Fetch-Site": "same-origin"})
 	gotSame := r.StatusCode
 	r.Body.Close()
-	if gotSame == http.StatusForbidden {
-		t.Fatalf("same-origin POST = 403, want allowed")
+	if gotSame != http.StatusCreated {
+		t.Fatalf("same-origin POST = %d, want 201", gotSame)
+	}
+
+	// Origin check (browsers without Sec-Fetch-Site): a foreign or malformed
+	// Origin is refused before the handler runs; the server's own is allowed.
+	for _, c := range []struct {
+		origin, title string
+		want          int
+	}{
+		{"http://evil.com", "evil origin", http.StatusForbidden},
+		{"http://%zz", "malformed origin", http.StatusForbidden},
+		{ts.URL, "own origin", http.StatusCreated},
+	} {
+		r = do(t, ts, http.MethodPost, "/api/tasks", `{"project":"web","title":"`+c.title+`"}`,
+			map[string]string{"Origin": c.origin})
+		b, _ := io.ReadAll(r.Body)
+		r.Body.Close()
+		if r.StatusCode != c.want {
+			t.Fatalf("POST with Origin %q = %d, want %d", c.origin, r.StatusCode, c.want)
+		}
+		if c.want == http.StatusForbidden && !strings.Contains(string(b), "cross_origin") {
+			t.Fatalf("Origin %q 403 body = %s, want cross_origin", c.origin, b)
+		}
+	}
+	r = do(t, ts, http.MethodGet, "/api/tasks?project=web", "", nil)
+	b, _ := io.ReadAll(r.Body)
+	r.Body.Close()
+	if strings.Contains(string(b), "evil origin") || strings.Contains(string(b), "malformed origin") ||
+		strings.Contains(string(b), "cross site task") {
+		t.Fatalf("a refused cross-origin POST created a task: %s", b)
 	}
 
 	// GET read is never blocked by csrf even with a cross-site hint.
@@ -309,24 +338,32 @@ func TestListenAddrLoopback(t *testing.T) {
 	}
 }
 
+// projectListed reports whether GET /api/projects<query> lists slug.
+func projectListed(t *testing.T, ts *httptest.Server, query, slug string) bool {
+	t.Helper()
+	r := do(t, ts, http.MethodGet, "/api/projects"+query, "", nil)
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/projects%s = %d, want 200", query, r.StatusCode)
+	}
+	var ps []Project
+	if err := json.NewDecoder(r.Body).Decode(&ps); err != nil {
+		t.Fatalf("decode projects%s: %v", query, err)
+	}
+	for _, p := range ps {
+		if p.Slug == slug {
+			return true
+		}
+	}
+	return false
+}
+
 func TestArchiveUnarchiveEndpoints(t *testing.T) {
 	ts := newTestServer(t)
 	mustCreateProject(t, ts, "archivedemo")
 
 	// Initially visible in default list
-	r := do(t, ts, http.MethodGet, "/api/projects", "", nil)
-	defer r.Body.Close()
-	var ps []Project
-	if err := json.NewDecoder(r.Body).Decode(&ps); err != nil {
-		t.Fatalf("decode projects: %v", err)
-	}
-	found := false
-	for _, p := range ps {
-		if p.Slug == "archivedemo" {
-			found = true
-		}
-	}
-	if !found {
+	if !projectListed(t, ts, "", "archivedemo") {
 		t.Fatal("project should appear in default list before archive")
 	}
 
@@ -345,32 +382,12 @@ func TestArchiveUnarchiveEndpoints(t *testing.T) {
 	}
 
 	// No longer visible in default list
-	r3 := do(t, ts, http.MethodGet, "/api/projects", "", nil)
-	defer r3.Body.Close()
-	var ps2 []Project
-	if err := json.NewDecoder(r3.Body).Decode(&ps2); err != nil {
-		t.Fatalf("decode projects: %v", err)
-	}
-	for _, p := range ps2 {
-		if p.Slug == "archivedemo" {
-			t.Fatal("archived project should not appear in default list")
-		}
+	if projectListed(t, ts, "", "archivedemo") {
+		t.Fatal("archived project should not appear in default list")
 	}
 
 	// Visible with ?archived=true
-	r4 := do(t, ts, http.MethodGet, "/api/projects?archived=true", "", nil)
-	defer r4.Body.Close()
-	var ps3 []Project
-	if err := json.NewDecoder(r4.Body).Decode(&ps3); err != nil {
-		t.Fatalf("decode projects all: %v", err)
-	}
-	found = false
-	for _, p := range ps3 {
-		if p.Slug == "archivedemo" {
-			found = true
-		}
-	}
-	if !found {
+	if !projectListed(t, ts, "?archived=true", "archivedemo") {
 		t.Fatal("archived project should appear in ?archived=true list")
 	}
 
@@ -389,19 +406,7 @@ func TestArchiveUnarchiveEndpoints(t *testing.T) {
 	}
 
 	// Visible again in default list
-	r6 := do(t, ts, http.MethodGet, "/api/projects", "", nil)
-	defer r6.Body.Close()
-	var ps4 []Project
-	if err := json.NewDecoder(r6.Body).Decode(&ps4); err != nil {
-		t.Fatalf("decode projects: %v", err)
-	}
-	found = false
-	for _, p := range ps4 {
-		if p.Slug == "archivedemo" {
-			found = true
-		}
-	}
-	if !found {
+	if !projectListed(t, ts, "", "archivedemo") {
 		t.Fatal("unarchived project should appear in default list again")
 	}
 
@@ -414,7 +419,7 @@ func TestArchiveUnarchiveEndpoints(t *testing.T) {
 }
 
 func TestCreateTaskIntoArchivedProject400(t *testing.T) {
-	ts := newTestServer(t)
+	ts, st := newTestServerWithStore(t)
 	mustCreateProject(t, ts, "archproj")
 
 	// Archive the project.
@@ -424,7 +429,9 @@ func TestCreateTaskIntoArchivedProject400(t *testing.T) {
 		t.Fatalf("archive = %d, want 200", r.StatusCode)
 	}
 
-	// Attempt to create a task into the archived project — must get 400.
+	// Attempt to create a task into the archived project — must get 400 and
+	// write no task or event.
+	before := cwfStoreSnapshot(t, st)
 	resp := do(t, ts, http.MethodPost, "/api/tasks",
 		`{"project":"archproj","title":"blocked task"}`,
 		map[string]string{"Content-Type": "application/json"})
@@ -439,6 +446,7 @@ func TestCreateTaskIntoArchivedProject400(t *testing.T) {
 	if body["error"] != "project_archived" {
 		t.Fatalf("error body = %q, want project_archived", body["error"])
 	}
+	cwfStoreAssertUnchanged(t, st, before, "create into archived project")
 }
 
 func TestDeleteTaskEndpoint(t *testing.T) {
@@ -488,16 +496,8 @@ func TestDeleteProjectEndpoint(t *testing.T) {
 	}
 
 	// Project no longer in list.
-	r2 := do(t, ts, http.MethodGet, "/api/projects?archived=true", "", nil)
-	defer r2.Body.Close()
-	var ps []Project
-	if err := json.NewDecoder(r2.Body).Decode(&ps); err != nil {
-		t.Fatalf("decode projects: %v", err)
-	}
-	for _, p := range ps {
-		if p.Slug == "toberemoved" {
-			t.Fatal("deleted project still in list")
-		}
+	if projectListed(t, ts, "?archived=true", "toberemoved") {
+		t.Fatal("deleted project still in list")
 	}
 
 	// DELETE again → 404.
@@ -622,6 +622,11 @@ func TestEventsBeforeEndpoint(t *testing.T) {
 	if err := json.NewDecoder(r2.Body).Decode(&beforeResp); err != nil {
 		t.Fatalf("decode before response: %v", err)
 	}
+	// Every event but the newest comes back, starting with the second-newest.
+	if len(beforeResp.Events) != len(tailResp.Events)-1 || beforeResp.Events[0].ID != tailResp.Events[1].ID {
+		t.Fatalf("?before=%d returned %+v, want the %d events after the newest of %+v",
+			newestID, beforeResp.Events, len(tailResp.Events)-1, tailResp.Events)
+	}
 	for _, e := range beforeResp.Events {
 		if e.ID >= newestID {
 			t.Errorf("?before=%d returned event id %d >= cutoff", newestID, e.ID)
@@ -683,7 +688,7 @@ func TestAddDepEndpoint(t *testing.T) {
 }
 
 func TestAddDepCycleEndpoint(t *testing.T) {
-	ts := newTestServer(t)
+	ts, st := newTestServerWithStore(t)
 	mustCreateProject(t, ts, "cyc")
 	id1 := mustCreateTask(t, ts, "cyc", "T1")
 	id2 := mustCreateTask(t, ts, "cyc", "T2")
@@ -697,7 +702,8 @@ func TestAddDepCycleEndpoint(t *testing.T) {
 		t.Fatalf("first dep = %d, want 200", r1.StatusCode)
 	}
 
-	// id1 depends on id2 → cycle → 400
+	// id1 depends on id2 → cycle → 400, and no edge or event is added.
+	before := cwfStoreSnapshot(t, st)
 	r2 := do(t, ts, http.MethodPost, "/api/tasks/"+id1+"/deps",
 		`{"depends_on":`+id2+`}`,
 		map[string]string{"Content-Type": "application/json"})
@@ -705,6 +711,7 @@ func TestAddDepCycleEndpoint(t *testing.T) {
 	if r2.StatusCode != http.StatusBadRequest {
 		t.Fatalf("cycle dep = %d, want 400", r2.StatusCode)
 	}
+	cwfStoreAssertUnchanged(t, st, before, "cyclic dep")
 }
 
 func TestRemoveDepEndpoint(t *testing.T) {
@@ -739,7 +746,7 @@ func TestRemoveDepEndpoint(t *testing.T) {
 }
 
 func TestClaimBlockedEndpoint(t *testing.T) {
-	ts := newTestServer(t)
+	ts, st := newTestServerWithStore(t)
 	mustCreateProject(t, ts, "blkproj")
 	id1 := mustCreateTask(t, ts, "blkproj", "Prereq")
 	id2 := mustCreateTask(t, ts, "blkproj", "Blocked task")
@@ -750,7 +757,8 @@ func TestClaimBlockedEndpoint(t *testing.T) {
 		map[string]string{"Content-Type": "application/json"})
 	r.Body.Close()
 
-	// Attempt to claim id2 → 409 blocked.
+	// Attempt to claim id2 → 409 blocked; the task stays unassigned.
+	before := cwfStoreSnapshot(t, st)
 	rc := do(t, ts, http.MethodPost, "/api/tasks/"+id2+"/claim", "",
 		map[string]string{"X-Agent": "agent-x"})
 	defer rc.Body.Close()
@@ -766,6 +774,10 @@ func TestClaimBlockedEndpoint(t *testing.T) {
 	}
 	if _, ok := body["open_prereqs"]; !ok {
 		t.Fatal("response missing open_prereqs field")
+	}
+	cwfStoreAssertUnchanged(t, st, before, "blocked claim")
+	if got := cwfStoreGetTask(t, ts, id2); got.Assignee != "" || got.Status != "todo" {
+		t.Fatalf("blocked task after claim = assignee %q status %q, want unassigned todo", got.Assignee, got.Status)
 	}
 }
 
@@ -885,19 +897,31 @@ func TestWriteErrHidesInternalDetail(t *testing.T) {
 // ---------- D2: requestLogger middleware ----------
 
 func TestRequestLoggerPassesThrough(t *testing.T) {
+	var logged bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTeapot)
 		w.Write([]byte("hello"))
 	})
 	handler := requestLogger(inner)
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req := httptest.NewRequest(http.MethodGet, "/test?secret=1", nil)
+	req.Header.Set("X-Agent", "agent-log")
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusTeapot {
 		t.Fatalf("status = %d, want 418", rec.Code)
 	}
 	if got := rec.Body.String(); got != "hello" {
 		t.Fatalf("body = %q, want hello", got)
+	}
+	// One line: method, path (no query string), status, latency, actor.
+	line := strings.TrimSpace(logged.String())
+	if !strings.Contains(line, "GET /test 418 ") || !strings.HasSuffix(line, " agent-log") ||
+		strings.Contains(line, "secret") || strings.Count(line, "\n") != 0 {
+		t.Fatalf("request log = %q, want one \"GET /test 418 <latency> agent-log\" line", line)
 	}
 }
 
@@ -1030,6 +1054,13 @@ func TestListTasksQueryParam(t *testing.T) {
 		t.Fatalf("?q=login returned %+v, want only task %s", tasks, hitID)
 	}
 
+	// A query at the limit (500 bytes) is accepted.
+	ra := do(t, ts, http.MethodGet, "/api/tasks?q="+strings.Repeat("a", 500), "", nil)
+	ra.Body.Close()
+	if ra.StatusCode != http.StatusOK {
+		t.Fatalf("GET 500-byte ?q= = %d, want 200", ra.StatusCode)
+	}
+
 	// Oversized query (501 bytes) → 400 validation.
 	long := strings.Repeat("a", 501)
 	rb := do(t, ts, http.MethodGet, "/api/tasks?q="+long, "", nil)
@@ -1115,16 +1146,8 @@ func TestLabelEndpoints(t *testing.T) {
 	}
 
 	// Exactly one task.labeled and one task.unlabeled event (dup add emitted none).
-	r = do(t, ts, http.MethodGet, "/api/events?since=0", "", nil)
-	defer r.Body.Close()
-	var feed struct {
-		Events []Event `json:"events"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&feed); err != nil {
-		t.Fatalf("decode events: %v", err)
-	}
 	var labeled, unlabeled int
-	for _, ev := range feed.Events {
+	for _, ev := range eventKinds(t, do(t, ts, http.MethodGet, "/api/events?since=0", "", nil)) {
 		switch ev.Kind {
 		case "task.labeled":
 			labeled++
@@ -1297,9 +1320,7 @@ func TestProjectPayloadAndCategoryFilter(t *testing.T) {
 func TestListTasksCategoryParam(t *testing.T) {
 	ts := newTestServer(t)
 	mustCreateCategory(t, ts, "work")
-	r := do(t, ts, http.MethodPost, "/api/projects", `{"slug":"wproj","category":"work"}`,
-		map[string]string{"Content-Type": "application/json"})
-	r.Body.Close()
+	mustCreateProjectIn(t, ts, "wproj", "work")
 	mustCreateProject(t, ts, "gproj")
 	wID := mustCreateTask(t, ts, "wproj", "work task")
 	mustCreateTask(t, ts, "gproj", "general task")
@@ -1327,9 +1348,7 @@ func TestListTasksCategoryParam(t *testing.T) {
 func TestNextEndpointCategoryBody(t *testing.T) {
 	ts := newTestServer(t)
 	mustCreateCategory(t, ts, "work")
-	r := do(t, ts, http.MethodPost, "/api/projects", `{"slug":"wproj","category":"work"}`,
-		map[string]string{"Content-Type": "application/json"})
-	r.Body.Close()
+	mustCreateProjectIn(t, ts, "wproj", "work")
 	mustCreateProject(t, ts, "gproj")
 	// The general task is more urgent — a category-scoped next must skip it.
 	rg := do(t, ts, http.MethodPost, "/api/tasks",
@@ -1412,9 +1431,7 @@ func TestPatchProjectEndpoint(t *testing.T) {
 func TestCreateTaskArchivedCategory400(t *testing.T) {
 	ts := newTestServer(t)
 	mustCreateCategory(t, ts, "work")
-	r := do(t, ts, http.MethodPost, "/api/projects", `{"slug":"wproj","category":"work"}`,
-		map[string]string{"Content-Type": "application/json"})
-	r.Body.Close()
+	mustCreateProjectIn(t, ts, "wproj", "work")
 	ra := do(t, ts, http.MethodPost, "/api/categories/work/archive", "", nil)
 	ra.Body.Close()
 
@@ -1462,16 +1479,8 @@ func TestCreateTaskWithMeta(t *testing.T) {
 	}
 
 	// The task.created event data carries the meta.
-	r = do(t, ts, http.MethodGet, "/api/events?since=0", "", nil)
-	var feed struct {
-		Events []Event `json:"events"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&feed); err != nil {
-		t.Fatalf("decode events: %v", err)
-	}
-	r.Body.Close()
 	var found bool
-	for _, ev := range feed.Events {
+	for _, ev := range eventKinds(t, do(t, ts, http.MethodGet, "/api/events?since=0", "", nil)) {
 		if ev.Kind == "task.created" && strings.Contains(string(ev.Data), `"auto":"packet-7"`) {
 			found = true
 		}
@@ -1529,16 +1538,8 @@ func TestPatchTaskMetaEndpoint(t *testing.T) {
 	}
 
 	// Exactly two task.patched events (set + removal), the first carrying both keys.
-	r = do(t, ts, http.MethodGet, "/api/events?since=0", "", nil)
-	var feed struct {
-		Events []Event `json:"events"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&feed); err != nil {
-		t.Fatalf("decode events: %v", err)
-	}
-	r.Body.Close()
 	var patched []Event
-	for _, ev := range feed.Events {
+	for _, ev := range eventKinds(t, do(t, ts, http.MethodGet, "/api/events?since=0", "", nil)) {
 		if ev.Kind == "task.patched" {
 			patched = append(patched, ev)
 		}
@@ -1648,15 +1649,8 @@ func scopedBoard(t *testing.T, ts *httptest.Server) (workID, personalID string) 
 	t.Helper()
 	mustCreateCategory(t, ts, "work")
 	mustCreateCategory(t, ts, "personal")
-	for _, pair := range [][2]string{{"wproj", "work"}, {"pproj", "personal"}} {
-		r := do(t, ts, http.MethodPost, "/api/projects",
-			`{"slug":"`+pair[0]+`","category":"`+pair[1]+`"}`,
-			map[string]string{"Content-Type": "application/json"})
-		r.Body.Close()
-		if r.StatusCode != http.StatusCreated {
-			t.Fatalf("create project %s = %d, want 201", pair[0], r.StatusCode)
-		}
-	}
+	mustCreateProjectIn(t, ts, "wproj", "work")
+	mustCreateProjectIn(t, ts, "pproj", "personal")
 	return mustCreateTask(t, ts, "wproj", "work task"), mustCreateTask(t, ts, "pproj", "personal task")
 }
 
@@ -1664,13 +1658,7 @@ func scopedBoard(t *testing.T, ts *httptest.Server) (workID, personalID string) 
 func mustCreateProposals(t *testing.T, ts *httptest.Server) {
 	t.Helper()
 	mustCreateCategory(t, ts, "meta")
-	r := do(t, ts, http.MethodPost, "/api/projects",
-		`{"slug":"proposals","category":"meta"}`,
-		map[string]string{"Content-Type": "application/json"})
-	r.Body.Close()
-	if r.StatusCode != http.StatusCreated {
-		t.Fatalf("create proposals project = %d, want 201", r.StatusCode)
-	}
+	mustCreateProjectIn(t, ts, "proposals", "meta")
 }
 
 // scoped builds the request headers for a scoped agent.
@@ -1859,15 +1847,8 @@ func TestScopeProposalsConfigurable(t *testing.T) {
 
 	mustCreateCategory(t, ts, "ops")
 	mustCreateCategory(t, ts, "personal")
-	for _, pair := range [][2]string{{"inbox", "ops"}, {"pproj", "personal"}} {
-		r := do(t, ts, http.MethodPost, "/api/projects",
-			`{"slug":"`+pair[0]+`","category":"`+pair[1]+`"}`,
-			map[string]string{"Content-Type": "application/json"})
-		r.Body.Close()
-		if r.StatusCode != http.StatusCreated {
-			t.Fatalf("create project %s = %d, want 201", pair[0], r.StatusCode)
-		}
-	}
+	mustCreateProjectIn(t, ts, "inbox", "ops")
+	mustCreateProjectIn(t, ts, "pproj", "personal")
 
 	// The custom carve-out works from any scope…
 	r := do(t, ts, http.MethodPost, "/api/tasks",
@@ -1878,10 +1859,7 @@ func TestScopeProposalsConfigurable(t *testing.T) {
 	}
 	// …and the default name is no longer special on this server.
 	mustCreateCategory(t, ts, "meta")
-	rp := do(t, ts, http.MethodPost, "/api/projects",
-		`{"slug":"proposals","category":"meta"}`,
-		map[string]string{"Content-Type": "application/json"})
-	rp.Body.Close()
+	mustCreateProjectIn(t, ts, "proposals", "meta")
 	rd := do(t, ts, http.MethodPost, "/api/tasks",
 		`{"project":"proposals","title":"not special here"}`, scoped("agent-p", "personal"))
 	rd.Body.Close()
@@ -1912,13 +1890,7 @@ func TestScopeProposalsWrongCategoryNoCarveOut(t *testing.T) {
 	ts := newTestServer(t)
 	scopedBoard(t, ts)
 	// "proposals" exists, but under work — NOT the designated meta/proposals.
-	r := do(t, ts, http.MethodPost, "/api/projects",
-		`{"slug":"proposals","category":"work"}`,
-		map[string]string{"Content-Type": "application/json"})
-	r.Body.Close()
-	if r.StatusCode != http.StatusCreated {
-		t.Fatalf("create work/proposals = %d, want 201", r.StatusCode)
-	}
+	mustCreateProjectIn(t, ts, "proposals", "work")
 
 	// Out-of-scope create: 403, not the carve-out's 201.
 	rc := do(t, ts, http.MethodPost, "/api/tasks",
@@ -1940,6 +1912,29 @@ func TestScopeProposalsWrongCategoryNoCarveOut(t *testing.T) {
 	rg.Body.Close()
 	if rg.StatusCode != http.StatusForbidden {
 		t.Fatalf("scoped graph of work/proposals = %d, want 403", rg.StatusCode)
+	}
+
+	// The inline pair checks (checkTaskRead, checkComment): a task agent-p
+	// created in work/proposals is neither readable nor commentable by it
+	// under its personal scope.
+	rt := do(t, ts, http.MethodPost, "/api/tasks", `{"project":"proposals","title":"mine"}`,
+		map[string]string{"X-Agent": "agent-p", "Content-Type": "application/json"})
+	var tk Task
+	json.NewDecoder(rt.Body).Decode(&tk)
+	rt.Body.Close()
+	if rt.StatusCode != http.StatusCreated || tk.CreatedBy != "agent-p" {
+		t.Fatalf("unscoped create in work/proposals = %d, created_by %q", rt.StatusCode, tk.CreatedBy)
+	}
+	id := strconv.FormatInt(tk.ID, 10)
+	rgt := do(t, ts, http.MethodGet, "/api/tasks/"+id, "", scoped("agent-p", "personal"))
+	rgt.Body.Close()
+	if rgt.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped GET of a work/proposals task = %d, want 403", rgt.StatusCode)
+	}
+	rcm := do(t, ts, http.MethodPost, "/api/tasks/"+id+"/comments", `{"body":"follow-up"}`, scoped("agent-p", "personal"))
+	rcm.Body.Close()
+	if rcm.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped comment on own work/proposals task = %d, want 403", rcm.StatusCode)
 	}
 
 	// The normal rules still apply: the agent whose scope covers it creates fine.
@@ -2041,13 +2036,37 @@ func TestScopeMutationSweep(t *testing.T) {
 		if r.StatusCode != http.StatusForbidden {
 			t.Fatalf("%s out-of-scope = %d, want 403", c.name, r.StatusCode)
 		}
-		// Sanity: the 403 left the work task untouched (still todo/unassigned)
-		// is implied by later legs succeeding against it unscoped elsewhere.
 		ri := do(t, ts, c.method, c.inPath, c.body, hdr)
 		ri.Body.Close()
 		if ri.StatusCode != c.wantInStatus {
 			t.Fatalf("%s in-scope = %d, want %d", c.name, ri.StatusCode, c.wantInStatus)
 		}
+	}
+
+	getTask := func(id string) (Task, int) {
+		r := do(t, ts, http.MethodGet, "/api/tasks/"+id, "", nil)
+		defer r.Body.Close()
+		var tk Task
+		json.NewDecoder(r.Body).Decode(&tk)
+		return tk, r.StatusCode
+	}
+	// Every 403 left the work task exactly as seeded.
+	w, code := getTask(workID)
+	if code != http.StatusOK || w.Status != "todo" || w.Assignee != "" ||
+		strings.Join(w.Labels, ",") != "seed" ||
+		len(w.Comments) != 1 || strconv.FormatInt(w.Comments[0].ID, 10) != workCID ||
+		len(w.DependsOn) != 1 || strconv.FormatInt(w.DependsOn[0].ID, 10) != workID2 {
+		t.Fatalf("work task after denied sweep = %d %+v, want the seeded state", code, w)
+	}
+	// Every in-scope leg took effect.
+	p, code := getTask(personalID)
+	if code != http.StatusOK || p.Status != "doing" || p.Assignee != "agent-p" ||
+		strings.Join(p.Labels, ",") != "bug" ||
+		len(p.Comments) != 1 || p.Comments[0].Body != "hi" || len(p.DependsOn) != 0 {
+		t.Fatalf("personal task after sweep = %d %+v, want doing/agent-p, label bug, comment hi, no deps", code, p)
+	}
+	if _, code := getTask(personalID2); code != http.StatusNotFound {
+		t.Fatalf("deleted personal task = %d, want 404", code)
 	}
 }
 
@@ -2055,15 +2074,8 @@ func TestScopeMutationSweep(t *testing.T) {
 func TestScopeProjectScopedAgent(t *testing.T) {
 	ts := newTestServer(t)
 	mustCreateCategory(t, ts, "work")
-	for _, slug := range []string{"api", "web"} {
-		r := do(t, ts, http.MethodPost, "/api/projects",
-			`{"slug":"`+slug+`","category":"work"}`,
-			map[string]string{"Content-Type": "application/json"})
-		r.Body.Close()
-		if r.StatusCode != http.StatusCreated {
-			t.Fatalf("create project %s = %d, want 201", slug, r.StatusCode)
-		}
-	}
+	mustCreateProjectIn(t, ts, "api", "work")
+	mustCreateProjectIn(t, ts, "web", "work")
 	webID := mustCreateTask(t, ts, "web", "web task")
 	apiID := mustCreateTask(t, ts, "api", "api task")
 
@@ -2261,6 +2273,31 @@ func TestScopeProjectCategoryEndpoints(t *testing.T) {
 	if ru.StatusCode != http.StatusOK {
 		t.Fatalf("scoped unarchive of own project = %d, want 200", ru.StatusCode)
 	}
+	// Out-of-scope archive/unarchive: 403 and the archive state is untouched.
+	activeProjects := func() string {
+		r := do(t, ts, http.MethodGet, "/api/projects", "", nil)
+		defer r.Body.Close()
+		b, _ := io.ReadAll(r.Body)
+		return string(b)
+	}
+	rao := do(t, ts, http.MethodPost, "/api/projects/wproj/archive", "", hdr)
+	rao.Body.Close()
+	if rao.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped archive of other project = %d, want 403", rao.StatusCode)
+	}
+	if !strings.Contains(activeProjects(), `"slug":"wproj"`) {
+		t.Fatal("denied archive still archived wproj")
+	}
+	do(t, ts, http.MethodPost, "/api/projects/wproj/archive", "", nil).Body.Close()
+	ruo := do(t, ts, http.MethodPost, "/api/projects/wproj/unarchive", "", hdr)
+	ruo.Body.Close()
+	if ruo.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped unarchive of other project = %d, want 403", ruo.StatusCode)
+	}
+	if strings.Contains(activeProjects(), `"slug":"wproj"`) {
+		t.Fatal("denied unarchive still unarchived wproj")
+	}
+	do(t, ts, http.MethodPost, "/api/projects/wproj/unarchive", "", nil).Body.Close()
 	rd := do(t, ts, http.MethodDelete, "/api/projects/wproj", "", hdr)
 	rd.Body.Close()
 	if rd.StatusCode != http.StatusForbidden {
@@ -2316,11 +2353,35 @@ func TestEventsCategoryFilter(t *testing.T) {
 	if len(got) == 0 {
 		t.Fatalf("?category=acat returned no events")
 	}
+	// Every event in every mode must belong to aproj (acat's only project):
+	// that rules out category.* (NULL project) and all of bproj's events.
+	var aprojID int64
+	r := do(t, ts, http.MethodGet, "/api/projects", "", nil)
+	var projects []Project
+	json.NewDecoder(r.Body).Decode(&projects)
+	r.Body.Close()
+	for _, p := range projects {
+		if p.Slug == "aproj" {
+			aprojID = p.ID
+		}
+	}
+	if aprojID == 0 {
+		t.Fatalf("aproj missing from /api/projects: %+v", projects)
+	}
+	onlyAproj := func(mode string, evs []Event) {
+		t.Helper()
+		if len(evs) == 0 {
+			t.Fatalf("%s with ?category=acat returned no events", mode)
+		}
+		for _, e := range evs {
+			if e.ProjectID != aprojID {
+				t.Fatalf("%s with ?category=acat leaked a non-aproj event: %+v", mode, e)
+			}
+		}
+	}
+	onlyAproj("?since=0", got)
 	aTaskID, _ := strconv.ParseInt(aTask, 10, 64)
 	for _, e := range got {
-		if strings.HasPrefix(e.Kind, "category.") {
-			t.Fatalf("category-level event leaked into ?category=acat: %+v", e)
-		}
 		if e.TaskID != 0 && e.TaskID != aTaskID {
 			t.Fatalf("foreign-task event leaked into ?category=acat: %+v", e)
 		}
@@ -2340,14 +2401,7 @@ func TestEventsCategoryFilter(t *testing.T) {
 
 	// ?tail= (newest-first bootstrap) honors the filter too.
 	tail := eventKinds(t, do(t, ts, http.MethodGet, "/api/events?category=acat&tail=50", "", nil))
-	for _, e := range tail {
-		if strings.HasPrefix(e.Kind, "category.") {
-			t.Fatalf("?tail with category leaked category-level event: %+v", e)
-		}
-		if e.ProjectID == 0 {
-			t.Fatalf("?tail with category leaked NULL-project event: %+v", e)
-		}
-	}
+	onlyAproj("?tail", tail)
 
 	// ?before= (older-page) honors the filter.
 	maxID := int64(0)
@@ -2358,10 +2412,9 @@ func TestEventsCategoryFilter(t *testing.T) {
 	}
 	before := eventKinds(t, do(t, ts, http.MethodGet,
 		"/api/events?category=acat&before="+strconv.FormatInt(maxID+1, 10), "", nil))
-	for _, e := range before {
-		if e.ProjectID == 0 {
-			t.Fatalf("?before with category leaked NULL-project event: %+v", e)
-		}
+	onlyAproj("?before", before)
+	if len(before) != len(got) || len(tail) != len(got) {
+		t.Fatalf("?category=acat: since=%d tail=%d before=%d events, want the same set", len(got), len(tail), len(before))
 	}
 
 	// Unknown category → ErrNotFound surfaces as 404 (the categoryID sentinel).
@@ -2394,6 +2447,33 @@ func mintToken(t *testing.T, ts *httptest.Server, scope string) string {
 		t.Fatalf("mint response carried no token")
 	}
 	return body.Token
+}
+
+// tokenIDByScope returns the id of the one listed token bound to scope
+// ("category" or "category/project"), failing with the list body when the
+// list does not decode or holds no single such token.
+func tokenIDByScope(t *testing.T, ts *httptest.Server, scope string) string {
+	t.Helper()
+	r := do(t, ts, http.MethodGet, "/api/tokens", "", nil)
+	defer r.Body.Close()
+	raw, err := io.ReadAll(r.Body)
+	if err != nil || r.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/tokens = %d (%v): %s", r.StatusCode, err, raw)
+	}
+	var toks []Token
+	if err := json.Unmarshal(raw, &toks); err != nil {
+		t.Fatalf("decode token list: %v: %s", err, raw)
+	}
+	var ids []string
+	for _, tk := range toks {
+		if tk.Scope().String() == scope {
+			ids = append(ids, tk.ID)
+		}
+	}
+	if len(ids) != 1 {
+		t.Fatalf("tokens with scope %q = %v, want exactly one: %s", scope, ids, raw)
+	}
+	return ids[0]
 }
 
 // bearer builds request headers carrying a bearer token (and agent).
@@ -2444,34 +2524,19 @@ func TestTokenAdmin_RequiresUnscoped(t *testing.T) {
 	}
 
 	// revoke: mint one unscoped first, then prove scoped revoke is refused.
-	revokeTok := mintToken(t, ts, "personal")
-	var rb struct{ ID string }
-	{
-		r := do(t, ts, http.MethodGet, "/api/tokens", "", map[string]string{"Content-Type": "application/json"})
-		var toks []Token
-		json.NewDecoder(r.Body).Decode(&toks)
-		r.Body.Close()
-		for _, tk := range toks {
-			if tk.Category == "personal" {
-				rb.ID = tk.ID
-			}
-		}
-	}
-	_ = revokeTok
-	if rb.ID == "" {
-		t.Fatalf("could not find the personal token id to revoke")
-	}
-	rh := do(t, ts, http.MethodPost, "/api/tokens/"+rb.ID+"/revoke", "", scoped("agent-w", "work"))
+	mintToken(t, ts, "personal")
+	revokeID := tokenIDByScope(t, ts, "personal")
+	rh := do(t, ts, http.MethodPost, "/api/tokens/"+revokeID+"/revoke", "", scoped("agent-w", "work"))
 	rh.Body.Close()
 	if rh.StatusCode != http.StatusForbidden {
 		t.Fatalf("scoped revoke = %d, want 403", rh.StatusCode)
 	}
-	rs := do(t, ts, http.MethodPost, "/api/tokens/"+rb.ID+"/revoke", "", bearer("agent-w", scopedTok))
+	rs := do(t, ts, http.MethodPost, "/api/tokens/"+revokeID+"/revoke", "", bearer("agent-w", scopedTok))
 	rs.Body.Close()
 	if rs.StatusCode != http.StatusForbidden {
 		t.Fatalf("scoped-token revoke = %d, want 403", rs.StatusCode)
 	}
-	ru := do(t, ts, http.MethodPost, "/api/tokens/"+rb.ID+"/revoke", "", map[string]string{"Content-Type": "application/json"})
+	ru := do(t, ts, http.MethodPost, "/api/tokens/"+revokeID+"/revoke", "", map[string]string{"Content-Type": "application/json"})
 	ru.Body.Close()
 	if ru.StatusCode != http.StatusOK {
 		t.Fatalf("unscoped revoke = %d, want 200", ru.StatusCode)
@@ -2514,22 +2579,16 @@ func TestInvalidTokenRejected(t *testing.T) {
 		t.Fatalf("bogus-token claim = %d, want 401", rb.StatusCode)
 	}
 	var body map[string]string
-	json.NewDecoder(rb.Body).Decode(&body)
+	if err := json.NewDecoder(rb.Body).Decode(&body); err != nil {
+		t.Fatalf("decode 401 body: %v", err)
+	}
 	if body["error"] != "unauthorized" {
 		t.Fatalf("401 body = %v, want unauthorized", body)
 	}
 
 	// Revoked token → 401 too.
 	tok := mintToken(t, ts, "work")
-	var id string
-	{
-		r := do(t, ts, http.MethodGet, "/api/tokens", "", nil)
-		var toks []Token
-		json.NewDecoder(r.Body).Decode(&toks)
-		r.Body.Close()
-		id = toks[0].ID
-	}
-	rr := do(t, ts, http.MethodPost, "/api/tokens/"+id+"/revoke", "", nil)
+	rr := do(t, ts, http.MethodPost, "/api/tokens/"+tokenIDByScope(t, ts, "work")+"/revoke", "", nil)
 	rr.Body.Close()
 	rv := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", "", bearer("agent-x", tok))
 	rv.Body.Close()
@@ -2567,83 +2626,96 @@ func TestNoTokenPathUnchanged(t *testing.T) {
 }
 
 // TestTokenScopeMatrix re-verifies the Phase Q enforcement matrix with the scope
-// driven by a minted token instead of a header.
+// driven by a minted token instead of a header. Every scenario runs on its own
+// fresh board so one failure neither masks nor perturbs the others.
 func TestTokenScopeMatrix(t *testing.T) {
-	ts, store := newTestServerWithStore(t)
-	workID, personalID := scopedBoard(t, ts)
-	mustCreateProposals(t, ts)
-	pTok := mintToken(t, ts, "personal")
+	setup := func(t *testing.T) (ts *httptest.Server, store *Store, workID, personalID, pTok string) {
+		t.Helper()
+		ts, store = newTestServerWithStore(t)
+		workID, personalID = scopedBoard(t, ts)
+		mustCreateProposals(t, ts)
+		pTok = mintToken(t, ts, "personal")
+		return ts, store, workID, personalID, pTok
+	}
+
+	// Status-only scenarios; {work}/{personal} expand to the seeded task ids.
+	// The proposals carve-out allows create; other out-of-scope creates are 403.
+	for _, c := range []struct {
+		name, method, path, body string
+		want                     int
+	}{
+		{"claim out of scope", http.MethodPost, "/api/tasks/{work}/claim", "", http.StatusForbidden},
+		{"patch in scope", http.MethodPatch, "/api/tasks/{personal}", `{"status":"doing"}`, http.StatusOK},
+		{"patch out of scope", http.MethodPatch, "/api/tasks/{work}", `{"status":"doing"}`, http.StatusForbidden},
+		{"create in proposals", http.MethodPost, "/api/tasks", `{"project":"proposals","title":"idea"}`, http.StatusCreated},
+		{"create out of scope", http.MethodPost, "/api/tasks", `{"project":"wproj","title":"sneaky"}`, http.StatusForbidden},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ts, _, workID, personalID, pTok := setup(t)
+			path := strings.NewReplacer("{work}", workID, "{personal}", personalID).Replace(c.path)
+			if got := cwfStoreStatus(t, ts, c.method, path, c.body, bearer("agent-p", pTok)); got != c.want {
+				t.Fatalf("%s %s = %d, want %d", c.method, path, got, c.want)
+			}
+		})
+	}
 
 	// next never returns out-of-scope work even when work has a more urgent task.
-	do(t, ts, http.MethodPost, "/api/tasks",
-		`{"project":"wproj","title":"urgent work","priority":0}`,
-		map[string]string{"Content-Type": "application/json"}).Body.Close()
-	rn := do(t, ts, http.MethodPost, "/api/tasks/next", "", bearer("agent-p", pTok))
-	if rn.StatusCode != http.StatusOK {
-		rn.Body.Close()
-		t.Fatalf("token-scoped next = %d, want 200", rn.StatusCode)
-	}
-	var tk Task
-	json.NewDecoder(rn.Body).Decode(&tk)
-	rn.Body.Close()
-	if tk.Project != "pproj" {
-		t.Fatalf("token-scoped next picked %q, want pproj", tk.Project)
-	}
+	t.Run("next skips out-of-scope urgent work", func(t *testing.T) {
+		ts, _, _, _, pTok := setup(t)
+		if got := cwfStoreStatus(t, ts, http.MethodPost, "/api/tasks",
+			`{"project":"wproj","title":"urgent work","priority":0}`,
+			map[string]string{"Content-Type": "application/json"}); got != http.StatusCreated {
+			t.Fatalf("create urgent work task = %d, want 201", got)
+		}
+		rn := do(t, ts, http.MethodPost, "/api/tasks/next", "", bearer("agent-p", pTok))
+		defer rn.Body.Close()
+		if rn.StatusCode != http.StatusOK {
+			t.Fatalf("token-scoped next = %d, want 200", rn.StatusCode)
+		}
+		var tk Task
+		if err := json.NewDecoder(rn.Body).Decode(&tk); err != nil {
+			t.Fatal(err)
+		}
+		if tk.Project != "pproj" {
+			t.Fatalf("token-scoped next picked %q, want pproj", tk.Project)
+		}
+	})
 
-	// claim out-of-scope → 403.
-	rc := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", "", bearer("agent-p", pTok))
-	rc.Body.Close()
-	if rc.StatusCode != http.StatusForbidden {
-		t.Fatalf("token-scoped out-of-scope claim = %d, want 403", rc.StatusCode)
-	}
+	t.Run("steal stale out of scope", func(t *testing.T) {
+		ts, store, workID, _, pTok := setup(t)
+		if got := cwfStoreStatus(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", "",
+			map[string]string{"X-Agent": "agent-gone"}); got != http.StatusOK {
+			t.Fatalf("unscoped claim by agent-gone = %d, want 200", got)
+		}
+		n, _ := strconv.ParseInt(workID, 10, 64)
+		backdateTask(t, store, n)
+		if got := cwfStoreStatus(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim",
+			`{"steal_stale":"1h"}`, bearer("agent-p", pTok)); got != http.StatusForbidden {
+			t.Fatalf("token-scoped out-of-scope steal = %d, want 403", got)
+		}
+		if got, err := store.GetTask(n); err != nil || got.Assignee != "agent-gone" {
+			t.Fatalf("work task after denied steal = %+v, %v; want still assigned to agent-gone", got, err)
+		}
+	})
 
-	// steal-stale out-of-scope → 403.
-	rs0 := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", "", map[string]string{"X-Agent": "agent-gone"})
-	rs0.Body.Close()
-	n, _ := strconv.ParseInt(workID, 10, 64)
-	backdateTask(t, store, n)
-	rs := do(t, ts, http.MethodPost, "/api/tasks/"+workID+"/claim", `{"steal_stale":"1h"}`, bearer("agent-p", pTok))
-	rs.Body.Close()
-	if rs.StatusCode != http.StatusForbidden {
-		t.Fatalf("token-scoped out-of-scope steal = %d, want 403", rs.StatusCode)
-	}
-
-	// bulk per-id: in-scope status succeeds, out-of-scope 403 (drive both via the token).
-	rok := do(t, ts, http.MethodPatch, "/api/tasks/"+personalID, `{"status":"doing"}`, bearer("agent-p", pTok))
-	rok.Body.Close()
-	if rok.StatusCode != http.StatusOK {
-		t.Fatalf("token-scoped in-scope patch = %d, want 200", rok.StatusCode)
-	}
-	rbad := do(t, ts, http.MethodPatch, "/api/tasks/"+workID, `{"status":"doing"}`, bearer("agent-p", pTok))
-	rbad.Body.Close()
-	if rbad.StatusCode != http.StatusForbidden {
-		t.Fatalf("token-scoped out-of-scope patch = %d, want 403", rbad.StatusCode)
-	}
-
-	// proposals carve-out under a token: create allowed, comment on own allowed,
-	// other out-of-scope create → 403.
-	rp := do(t, ts, http.MethodPost, "/api/tasks",
-		`{"project":"proposals","title":"idea"}`, bearer("agent-p", pTok))
-	if rp.StatusCode != http.StatusCreated {
-		rp.Body.Close()
-		t.Fatalf("token-scoped create in proposals = %d, want 201", rp.StatusCode)
-	}
-	var prop Task
-	json.NewDecoder(rp.Body).Decode(&prop)
-	rp.Body.Close()
-	propID := strconv.FormatInt(prop.ID, 10)
-	rcm := do(t, ts, http.MethodPost, "/api/tasks/"+propID+"/comments",
-		`{"body":"mine"}`, bearer("agent-p", pTok))
-	rcm.Body.Close()
-	if rcm.StatusCode != http.StatusCreated {
-		t.Fatalf("token-scoped comment on own proposal = %d, want 201", rcm.StatusCode)
-	}
-	roc := do(t, ts, http.MethodPost, "/api/tasks",
-		`{"project":"wproj","title":"sneaky"}`, bearer("agent-p", pTok))
-	roc.Body.Close()
-	if roc.StatusCode != http.StatusForbidden {
-		t.Fatalf("token-scoped create in wproj = %d, want 403", roc.StatusCode)
-	}
+	t.Run("comment on own proposal", func(t *testing.T) {
+		ts, _, _, _, pTok := setup(t)
+		rp := do(t, ts, http.MethodPost, "/api/tasks",
+			`{"project":"proposals","title":"idea"}`, bearer("agent-p", pTok))
+		defer rp.Body.Close()
+		if rp.StatusCode != http.StatusCreated {
+			t.Fatalf("token-scoped create in proposals = %d, want 201", rp.StatusCode)
+		}
+		var prop Task
+		if err := json.NewDecoder(rp.Body).Decode(&prop); err != nil {
+			t.Fatal(err)
+		}
+		propID := strconv.FormatInt(prop.ID, 10)
+		if got := cwfStoreStatus(t, ts, http.MethodPost, "/api/tasks/"+propID+"/comments",
+			`{"body":"mine"}`, bearer("agent-p", pTok)); got != http.StatusCreated {
+			t.Fatalf("token-scoped comment on own proposal = %d, want 201", got)
+		}
+	})
 }
 
 // TestCreateTokenResponse: the 201 body carries the plaintext once; the ls JSON
@@ -2681,5 +2753,113 @@ func TestCreateTokenResponse(t *testing.T) {
 	}
 	if strings.Contains(s, tokVal) {
 		t.Fatalf("ls JSON leaked the plaintext token value: %s", s)
+	}
+}
+
+// TestTokenProjectScopeFollowsCategory: a token minted for work/api must not
+// reach a project recreated under the same slug in another category — the
+// project-scoped branches compare the (category, project) pair like
+// scopeAllows does.
+func TestTokenProjectScopeFollowsCategory(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateCategory(t, ts, "work")
+	mustCreateCategory(t, ts, "personal")
+	mustCreateProjectIn(t, ts, "api", "work")
+	tok := mintToken(t, ts, "work/api")
+
+	r := do(t, ts, http.MethodDelete, "/api/projects/api", "", nil)
+	r.Body.Close()
+	mustCreateProjectIn(t, ts, "api", "personal")
+	mustCreateTask(t, ts, "api", "personal task")
+
+	hdr := bearer("agent-a", tok)
+	for _, c := range []struct{ method, path, body string }{
+		{http.MethodPost, "/api/tasks", `{"project":"api","title":"x"}`},
+		{http.MethodPost, "/api/tasks/next", `{"project":"api"}`},
+		{http.MethodGet, "/api/tasks?project=api", ""},
+		{http.MethodPatch, "/api/projects/api", `{"name":"pwned"}`},
+		{http.MethodPost, "/api/projects/api/archive", ""},
+		{http.MethodDelete, "/api/projects/api", ""},
+	} {
+		r := do(t, ts, c.method, c.path, c.body, hdr)
+		r.Body.Close()
+		if r.StatusCode != http.StatusForbidden {
+			t.Errorf("%s %s with stale work/api token = %d, want 403", c.method, c.path, r.StatusCode)
+		}
+	}
+	// Unfiltered next narrows to (work, api): nothing there, so 404 — the
+	// personal task is never handed out.
+	r = do(t, ts, http.MethodPost, "/api/tasks/next", "", hdr)
+	r.Body.Close()
+	if r.StatusCode != http.StatusNotFound {
+		t.Errorf("unfiltered next = %d, want 404", r.StatusCode)
+	}
+}
+
+// TestAuthorizationWithoutBearerTokenRejected: an Authorization header that
+// yields no Bearer token (empty variable, other scheme) is a 401, not a silent
+// downgrade to the unscoped (allow-all) scope.
+func TestAuthorizationWithoutBearerTokenRejected(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+	for _, auth := range []string{"Bearer", "Bearer ", "Basic dXNlcjpwdw==", "Token amt_x"} {
+		r := do(t, ts, http.MethodPost, "/api/tasks", `{"project":"web","title":"x"}`,
+			map[string]string{"Authorization": auth, "Content-Type": "application/json"})
+		r.Body.Close()
+		if r.StatusCode != http.StatusUnauthorized {
+			t.Errorf("Authorization %q = %d, want 401", auth, r.StatusCode)
+		}
+	}
+}
+
+// TestClaimAndNextRejectMalformedBody: a body that is present but not valid
+// JSON is a 400 — it must not degrade to a plain claim or an unfiltered next.
+// An empty body stays allowed.
+func TestClaimAndNextRejectMalformedBody(t *testing.T) {
+	ts := newTestServer(t)
+	mustCreateProject(t, ts, "web")
+	id := mustCreateTask(t, ts, "web", "t")
+	hdr := map[string]string{"X-Agent": "agent-a", "Content-Type": "application/json"}
+	for _, path := range []string{"/api/tasks/" + id + "/claim", "/api/tasks/next"} {
+		r := do(t, ts, http.MethodPost, path, `{"steal_stale":"1h","project":"web"`, hdr)
+		r.Body.Close()
+		if r.StatusCode != http.StatusBadRequest {
+			t.Errorf("POST %s with truncated JSON = %d, want 400", path, r.StatusCode)
+		}
+	}
+	r := do(t, ts, http.MethodPost, "/api/tasks/"+id+"/claim", "", hdr)
+	r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("claim with empty body = %d, want 200", r.StatusCode)
+	}
+}
+
+// TestListTasksLimitCapped: an absent, negative or oversized limit returns
+// at most maxTaskListLimit rows.
+func TestListTasksLimitCapped(t *testing.T) {
+	ts, st := newTestServerWithStore(t)
+	if _, _, err := st.CreateProject("web", "web", ""); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i <= maxTaskListLimit; i++ {
+		if _, _, err := st.CreateTask(CreateTaskInput{Project: "web", Title: "t" + strconv.Itoa(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, q := range []string{"", "?limit=0", "?limit=-1", "?limit=100000"} {
+		r := do(t, ts, http.MethodGet, "/api/tasks"+q, "", nil)
+		var tasks []Task
+		json.NewDecoder(r.Body).Decode(&tasks)
+		r.Body.Close()
+		if len(tasks) != maxTaskListLimit {
+			t.Errorf("GET /api/tasks%s returned %d tasks, want %d", q, len(tasks), maxTaskListLimit)
+		}
+	}
+	r := do(t, ts, http.MethodGet, "/api/tasks?limit=3", "", nil)
+	var tasks []Task
+	json.NewDecoder(r.Body).Decode(&tasks)
+	r.Body.Close()
+	if len(tasks) != 3 {
+		t.Errorf("limit=3 returned %d tasks", len(tasks))
 	}
 }

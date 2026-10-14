@@ -3,8 +3,10 @@ package main
 import "sync"
 
 // Hub fans out committed events to connected SSE subscribers (dashboards).
-// Delivery is best-effort: a stalled client gets events dropped rather than
-// blocking the hub — clients recover missed events via /api/events?since=.
+// Delivery never blocks the hub: when a stalled client's buffer is full the
+// event is dropped and the subscriber is marked lagged, so handleStream ends
+// the connection and the client's reconnect (Last-Event-ID / ?since=) replays
+// the gap from the durable events table.
 type Hub struct {
 	mu   sync.RWMutex
 	subs map[*subscriber]struct{}
@@ -15,6 +17,8 @@ type subscriber struct {
 	projectID  int64          // 0 = all projects
 	categoryID int64          // 0 = not category-scoped
 	projectIDs map[int64]bool // category's project-id set, resolved once at Subscribe
+	lagged     chan struct{}  // closed once, on the first dropped event
+	lagOnce    sync.Once
 }
 
 // subFilter is the scope a subscriber wants. projectID narrows to one project;
@@ -37,6 +41,7 @@ func (h *Hub) Subscribe(f subFilter) *subscriber {
 		projectID:  f.projectID,
 		categoryID: f.categoryID,
 		projectIDs: f.projectIDs,
+		lagged:     make(chan struct{}),
 	}
 	h.mu.Lock()
 	h.subs[s] = struct{}{}
@@ -80,7 +85,9 @@ func (h *Hub) Broadcast(e *Event) {
 		}
 		select {
 		case s.ch <- e:
-		default: // slow/dead client: drop, don't block other subscribers
+		default: // slow/dead client: drop, don't block other subscribers, and
+			// flag it so its stream reconnects and replays the dropped event.
+			s.lagOnce.Do(func() { close(s.lagged) })
 		}
 	}
 }

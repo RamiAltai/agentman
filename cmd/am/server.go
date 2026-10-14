@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -27,6 +28,8 @@ type Server struct {
 	// creation there — and commenting on one's OWN tasks there — is allowed
 	// from any scope, so scoped agents can always file proposals (R4).
 	proposals Scope
+	// commitMu spans each mutation's commit and its Broadcast (see publish).
+	commitMu sync.Mutex
 }
 
 func NewServer(store *Store) *Server {
@@ -185,13 +188,7 @@ func (s *Server) handleListCategories(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateCategory(w http.ResponseWriter, r *http.Request) {
-	sc, err := s.scopeOf(r)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	if !sc.IsZero() { // the category layer is above every scope
-		writeErr(w, denyScope(r, sc))
+	if !s.unscopedGuard(w, r) { // the category layer is above every scope
 		return
 	}
 	var in struct{ Slug, Name string }
@@ -199,55 +196,43 @@ func (s *Server) handleCreateCategory(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, ErrValidation)
 		return
 	}
-	c, ev, err := s.store.CreateCategory(in.Slug, in.Name)
-	if err != nil {
+	var c *Category
+	if err := s.publish(func() (ev *Event, err error) {
+		c, ev, err = s.store.CreateCategory(in.Slug, in.Name)
+		return
+	}); err != nil {
 		writeErr(w, err)
 		return
 	}
-	s.hub.Broadcast(ev)
 	writeJSON(w, http.StatusCreated, c)
 }
 
 func (s *Server) handleArchiveCategory(w http.ResponseWriter, r *http.Request) {
-	sc, err := s.scopeOf(r)
-	if err != nil {
+	if !s.unscopedGuard(w, r) {
+		return
+	}
+	var c *Category
+	if err := s.publish(func() (ev *Event, err error) {
+		c, ev, err = s.store.ArchiveCategory(r.PathValue("slug"), actorOf(r))
+		return
+	}); err != nil {
 		writeErr(w, err)
 		return
-	}
-	if !sc.IsZero() { // the category layer is above every scope
-		writeErr(w, denyScope(r, sc))
-		return
-	}
-	slug := r.PathValue("slug")
-	c, ev, err := s.store.ArchiveCategory(slug, actorOf(r))
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	if ev != nil {
-		s.hub.Broadcast(ev)
 	}
 	writeJSON(w, http.StatusOK, c)
 }
 
 func (s *Server) handleUnarchiveCategory(w http.ResponseWriter, r *http.Request) {
-	sc, err := s.scopeOf(r)
-	if err != nil {
+	if !s.unscopedGuard(w, r) {
+		return
+	}
+	var c *Category
+	if err := s.publish(func() (ev *Event, err error) {
+		c, ev, err = s.store.UnarchiveCategory(r.PathValue("slug"), actorOf(r))
+		return
+	}); err != nil {
 		writeErr(w, err)
 		return
-	}
-	if !sc.IsZero() { // the category layer is above every scope
-		writeErr(w, denyScope(r, sc))
-		return
-	}
-	slug := r.PathValue("slug")
-	c, ev, err := s.store.UnarchiveCategory(slug, actorOf(r))
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	if ev != nil {
-		s.hub.Broadcast(ev)
 	}
 	writeJSON(w, http.StatusOK, c)
 }
@@ -265,13 +250,7 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePatchProject(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
-	sc, err := s.scopeOf(r)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	if err := s.checkProjectMut(r, sc, slug); err != nil {
-		writeErr(w, err)
+	if !s.mutableProject(w, r, slug) {
 		return
 	}
 	var patch map[string]any
@@ -279,57 +258,45 @@ func (s *Server) handlePatchProject(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, ErrValidation)
 		return
 	}
-	p, ev, err := s.store.PatchProject(slug, patch, actorOf(r))
-	if err != nil {
+	var p *Project
+	if err := s.publish(func() (ev *Event, err error) {
+		p, ev, err = s.store.PatchProject(slug, patch, actorOf(r))
+		return
+	}); err != nil {
 		writeErr(w, err)
 		return
-	}
-	if ev != nil { // no-op patch returns no event
-		s.hub.Broadcast(ev)
 	}
 	writeJSON(w, http.StatusOK, p)
 }
 
 func (s *Server) handleArchiveProject(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
-	sc, err := s.scopeOf(r)
-	if err != nil {
-		writeErr(w, err)
+	if !s.mutableProject(w, r, slug) {
 		return
 	}
-	if err := s.checkProjectMut(r, sc, slug); err != nil {
+	var p *Project
+	if err := s.publish(func() (ev *Event, err error) {
+		p, ev, err = s.store.ArchiveProject(slug, actorOf(r))
+		return
+	}); err != nil {
 		writeErr(w, err)
 		return
-	}
-	p, ev, err := s.store.ArchiveProject(slug, actorOf(r))
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	if ev != nil {
-		s.hub.Broadcast(ev)
 	}
 	writeJSON(w, http.StatusOK, p)
 }
 
 func (s *Server) handleUnarchiveProject(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
-	sc, err := s.scopeOf(r)
-	if err != nil {
-		writeErr(w, err)
+	if !s.mutableProject(w, r, slug) {
 		return
 	}
-	if err := s.checkProjectMut(r, sc, slug); err != nil {
+	var p *Project
+	if err := s.publish(func() (ev *Event, err error) {
+		p, ev, err = s.store.UnarchiveProject(slug, actorOf(r))
+		return
+	}); err != nil {
 		writeErr(w, err)
 		return
-	}
-	p, ev, err := s.store.UnarchiveProject(slug, actorOf(r))
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	if ev != nil {
-		s.hub.Broadcast(ev)
 	}
 	writeJSON(w, http.StatusOK, p)
 }
@@ -360,14 +327,20 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	}
 	// Empty category defaults to "general" in the store — keeps the dashboard's
 	// existing {slug,name} POST working unchanged.
-	p, ev, err := s.store.CreateProject(in.Slug, in.Name, in.Category)
-	if err != nil {
+	var p *Project
+	if err := s.publish(func() (ev *Event, err error) {
+		p, ev, err = s.store.CreateProjectAs(in.Slug, in.Name, in.Category, actorOf(r))
+		return
+	}); err != nil {
 		writeErr(w, err)
 		return
 	}
-	s.hub.Broadcast(ev)
 	writeJSON(w, http.StatusCreated, p)
 }
+
+// maxTaskListLimit caps GET /api/tasks. It equals the largest page any
+// first-party client asks for (the dashboard's limit=500; the CLI sends 50).
+const maxTaskListLimit = 500
 
 func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
@@ -409,6 +382,11 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	// Absent, non-positive or oversized limits all mean the cap: the whole
+	// result is built and encoded in memory on the single DB connection.
+	if f.Limit <= 0 || f.Limit > maxTaskListLimit {
+		f.Limit = maxTaskListLimit
+	}
 	ts, err := s.store.ListTasks(f)
 	if err != nil {
 		writeErr(w, err)
@@ -418,20 +396,10 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAddDep(w http.ResponseWriter, r *http.Request) {
-	taskID, err := s.store.resolveTaskID(r.PathValue("id"))
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	sc, err := s.scopeOf(r)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
 	// One check on the dependent task suffices: the store's same-project rule
 	// already forces the prereq into the same (in-scope) project.
-	if err := s.checkTaskMut(r, sc, taskID); err != nil {
-		writeErr(w, err)
+	taskID, ok := s.mutableTask(w, r)
+	if !ok {
 		return
 	}
 	var in struct {
@@ -457,30 +425,16 @@ func (s *Server) handleAddDep(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	ev, err := s.store.AddDep(taskID, depID, actorOf(r))
-	if err != nil {
+	if err := s.publish(func() (*Event, error) { return s.store.AddDep(taskID, depID, actorOf(r)) }); err != nil {
 		writeErr(w, err)
 		return
-	}
-	if ev != nil {
-		s.hub.Broadcast(ev)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleRemoveDep(w http.ResponseWriter, r *http.Request) {
-	taskID, err := s.store.resolveTaskID(r.PathValue("id"))
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	sc, err := s.scopeOf(r)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	if err := s.checkTaskMut(r, sc, taskID); err != nil {
-		writeErr(w, err)
+	taskID, ok := s.mutableTask(w, r)
+	if !ok {
 		return
 	}
 	depID, err := s.store.resolveTaskID(r.PathValue("depId"))
@@ -488,30 +442,16 @@ func (s *Server) handleRemoveDep(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	ev, err := s.store.RemoveDep(taskID, depID, actorOf(r))
-	if err != nil {
+	if err := s.publish(func() (*Event, error) { return s.store.RemoveDep(taskID, depID, actorOf(r)) }); err != nil {
 		writeErr(w, err)
 		return
-	}
-	if ev != nil {
-		s.hub.Broadcast(ev)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleAddLabel(w http.ResponseWriter, r *http.Request) {
-	taskID, err := s.store.resolveTaskID(r.PathValue("id"))
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	sc, err := s.scopeOf(r)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	if err := s.checkTaskMut(r, sc, taskID); err != nil {
-		writeErr(w, err)
+	taskID, ok := s.mutableTask(w, r)
+	if !ok {
 		return
 	}
 	var in struct {
@@ -521,39 +461,23 @@ func (s *Server) handleAddLabel(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, ErrValidation)
 		return
 	}
-	ev, err := s.store.AddLabel(taskID, in.Label, actorOf(r))
-	if err != nil {
+	if err := s.publish(func() (*Event, error) { return s.store.AddLabel(taskID, in.Label, actorOf(r)) }); err != nil {
 		writeErr(w, err)
 		return
-	}
-	if ev != nil {
-		s.hub.Broadcast(ev)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleRemoveLabel(w http.ResponseWriter, r *http.Request) {
-	taskID, err := s.store.resolveTaskID(r.PathValue("id"))
-	if err != nil {
-		writeErr(w, err)
+	taskID, ok := s.mutableTask(w, r)
+	if !ok {
 		return
 	}
-	sc, err := s.scopeOf(r)
-	if err != nil {
+	if err := s.publish(func() (*Event, error) {
+		return s.store.RemoveLabel(taskID, r.PathValue("label"), actorOf(r))
+	}); err != nil {
 		writeErr(w, err)
 		return
-	}
-	if err := s.checkTaskMut(r, sc, taskID); err != nil {
-		writeErr(w, err)
-		return
-	}
-	ev, err := s.store.RemoveLabel(taskID, r.PathValue("label"), actorOf(r))
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	if ev != nil {
-		s.hub.Broadcast(ev)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -584,15 +508,17 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	if in.Priority != nil {
 		pr = *in.Priority
 	}
-	t, ev, err := s.store.CreateTask(CreateTaskInput{
-		Project: in.Project, Title: in.Title, Body: in.Body,
-		Priority: pr, Assignee: in.Assignee, Actor: actorOf(r), Meta: in.Meta,
-	})
-	if err != nil {
+	var t *Task
+	if err := s.publish(func() (ev *Event, err error) {
+		t, ev, err = s.store.CreateTask(CreateTaskInput{
+			Project: in.Project, Title: in.Title, Body: in.Body,
+			Priority: pr, Assignee: in.Assignee, Actor: actorOf(r), Meta: in.Meta,
+		})
+		return
+	}); err != nil {
 		writeErr(w, err)
 		return
 	}
-	s.hub.Broadcast(ev)
 	writeJSON(w, http.StatusCreated, t)
 }
 
@@ -620,20 +546,10 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePatchTask(w http.ResponseWriter, r *http.Request) {
-	id, err := s.store.resolveTaskID(r.PathValue("id"))
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	sc, err := s.scopeOf(r)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
 	// Covers status/assign/edit/drop AND each id of a bulk status/assign —
 	// the CLI loops per id, so partial-failure semantics fall out for free.
-	if err := s.checkTaskMut(r, sc, id); err != nil {
-		writeErr(w, err)
+	id, ok := s.mutableTask(w, r)
+	if !ok {
 		return
 	}
 	var patch map[string]any
@@ -641,30 +557,22 @@ func (s *Server) handlePatchTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, ErrValidation)
 		return
 	}
-	t, ev, err := s.store.PatchTask(id, patch, actorOf(r))
-	if err != nil {
+	var t *Task
+	if err := s.publish(func() (ev *Event, err error) {
+		t, ev, err = s.store.PatchTask(id, patch, actorOf(r))
+		return
+	}); err != nil {
 		writeErr(w, err)
 		return
 	}
-	s.hub.Broadcast(ev)
 	writeJSON(w, http.StatusOK, t)
 }
 
 func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
-	id, err := s.store.resolveTaskID(r.PathValue("id"))
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	sc, err := s.scopeOf(r)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
 	// One check covers both claim AND steal_stale — stealing is scope-checked
 	// exactly like a claim (R4).
-	if err := s.checkTaskMut(r, sc, id); err != nil {
-		writeErr(w, err)
+	id, ok := s.mutableTask(w, r)
+	if !ok {
 		return
 	}
 	agent := actorOf(r)
@@ -672,28 +580,33 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 		Assignee   string `json:"assignee"`
 		StealStale string `json:"steal_stale"`
 	}
-	_ = decode(r, &in)
+	if err := decode(r, &in); err != nil { // an empty body is fine; malformed JSON is not
+		writeErr(w, ErrValidation)
+		return
+	}
 	if in.Assignee != "" {
 		agent = in.Assignee
 	}
-	var t *Task
-	var ev *Event
+	var stale time.Duration
 	if in.StealStale != "" {
 		d, perr := time.ParseDuration(in.StealStale)
 		if perr != nil || d <= 0 {
 			writeErr(w, ErrValidation)
 			return
 		}
-		t, ev, err = s.store.StealStaleClaim(id, agent, d)
-	} else {
-		t, ev, err = s.store.ClaimTask(id, agent)
+		stale = d
 	}
-	if err != nil {
+	var t *Task
+	if err := s.publish(func() (ev *Event, err error) { // idempotent re-claim returns no event
+		if stale > 0 {
+			t, ev, err = s.store.StealStaleClaim(id, agent, stale)
+		} else {
+			t, ev, err = s.store.ClaimTask(id, agent)
+		}
+		return
+	}); err != nil {
 		writeErr(w, err)
 		return
-	}
-	if ev != nil { // idempotent re-claim returns no event
-		s.hub.Broadcast(ev)
 	}
 	writeJSON(w, http.StatusOK, t)
 }
@@ -706,7 +619,10 @@ func (s *Server) handleNext(w http.ResponseWriter, r *http.Request) {
 		Assignee string `json:"assignee"`
 		MetaKey  string `json:"meta_key"`
 	}
-	_ = decode(r, &in)
+	if err := decode(r, &in); err != nil { // an empty body is fine; malformed JSON is not
+		writeErr(w, ErrValidation)
+		return
+	}
 	if in.Assignee != "" {
 		agent = in.Assignee
 	}
@@ -723,13 +639,13 @@ func (s *Server) handleNext(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	t, ev, err := s.store.NextTask(NextFilter{Project: proj, Category: cat, MetaKey: in.MetaKey}, agent)
-	if err != nil {
+	var t *Task
+	if err := s.publish(func() (ev *Event, err error) {
+		t, ev, err = s.store.NextTaskContext(r.Context(), NextFilter{Project: proj, Category: cat, MetaKey: in.MetaKey}, agent)
+		return
+	}); err != nil {
 		writeErr(w, err)
 		return
-	}
-	if ev != nil { // symmetry with handleClaim; NextTask always emits on success
-		s.hub.Broadcast(ev)
 	}
 	writeJSON(w, http.StatusOK, t)
 }
@@ -756,52 +672,32 @@ func (s *Server) handleComment(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, ErrValidation)
 		return
 	}
-	c, ev, err := s.store.AddComment(id, actorOf(r), in.Body)
-	if err != nil {
+	var c *Comment
+	if err := s.publish(func() (ev *Event, err error) {
+		c, ev, err = s.store.AddComment(id, actorOf(r), in.Body)
+		return
+	}); err != nil {
 		writeErr(w, err)
 		return
 	}
-	s.hub.Broadcast(ev)
 	writeJSON(w, http.StatusCreated, c)
 }
 
 func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
-	id, err := s.store.resolveTaskID(r.PathValue("id"))
-	if err != nil {
+	id, ok := s.mutableTask(w, r)
+	if !ok {
+		return
+	}
+	if err := s.publish(func() (*Event, error) { return s.store.DeleteTask(id, actorOf(r)) }); err != nil {
 		writeErr(w, err)
 		return
 	}
-	sc, err := s.scopeOf(r)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	if err := s.checkTaskMut(r, sc, id); err != nil {
-		writeErr(w, err)
-		return
-	}
-	ev, err := s.store.DeleteTask(id, actorOf(r))
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	s.hub.Broadcast(ev)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
 func (s *Server) handleDeleteComment(w http.ResponseWriter, r *http.Request) {
-	taskID, err := s.store.resolveTaskID(r.PathValue("id"))
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	sc, err := s.scopeOf(r)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	if err := s.checkTaskMut(r, sc, taskID); err != nil {
-		writeErr(w, err)
+	taskID, ok := s.mutableTask(w, r)
+	if !ok {
 		return
 	}
 	cid, err := strconv.ParseInt(r.PathValue("cid"), 10, 64)
@@ -809,12 +705,10 @@ func (s *Server) handleDeleteComment(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, ErrNotFound)
 		return
 	}
-	ev, err := s.store.DeleteComment(taskID, cid, actorOf(r))
-	if err != nil {
+	if err := s.publish(func() (*Event, error) { return s.store.DeleteComment(taskID, cid, actorOf(r)) }); err != nil {
 		writeErr(w, err)
 		return
 	}
-	s.hub.Broadcast(ev)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -829,12 +723,10 @@ func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	ev, err := s.store.DeleteProject(slug, actorOf(r))
-	if err != nil {
+	if err := s.publish(func() (*Event, error) { return s.store.DeleteProject(slug, sc.Category, actorOf(r)) }); err != nil {
 		writeErr(w, err)
 		return
 	}
-	s.hub.Broadcast(ev)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -890,6 +782,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleStream is the SSE endpoint that drives the live dashboard.
+// streamPingInterval spaces the keep-alive comments on an idle stream; a var
+// so tests can shorten it.
+var streamPingInterval = 15 * time.Second
+
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -898,16 +794,20 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
+	// An unknown ?project= or ?category= is dropped for BOTH the live filter
+	// and the replay, so the two agree: the subscriber simply sees the
+	// unfiltered stream (am wait re-checks via REST on every event).
+	proj := q.Get("project")
 	var pid int64
-	if p := q.Get("project"); p != "" {
-		if id, err := s.store.projectID(p); err == nil {
+	if proj != "" {
+		if id, err := s.store.projectID(proj); err == nil {
 			pid = id
+		} else {
+			proj = ""
 		}
 	}
 	// ?category= scopes the stream to one category's projects. Resolve the
-	// project-id set ONCE here so Broadcast stays a pure in-memory check. An
-	// unknown category is ignored silently (matches the unknown-project swallow
-	// above) — the subscriber simply sees the unfiltered stream.
+	// project-id set ONCE here so Broadcast stays a pure in-memory check.
 	cat := q.Get("category")
 	var cid int64
 	var projectIDs map[int64]bool
@@ -934,29 +834,46 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	// Resume point: Last-Event-ID header (set by EventSource on reconnect) or ?since=.
 	since := atoi64Default(r.Header.Get("Last-Event-ID"), atoi64Default(q.Get("since"), 0))
-	lastSent := since
 	maxAtSub, _ := s.store.MaxEventID()
+	// A cursor beyond the log's end belongs to another history (the DB was
+	// replaced by `am db import`, or emptied by `am db prune`): keeping it
+	// would dedupe away every live event until ids climb past it. Replay
+	// from the start instead.
+	if since > maxAtSub {
+		since = 0
+	}
+	lastSent := since
 
 	fmt.Fprint(w, "retry: 3000\n\n")
 	flusher.Flush()
 
-	// Replay the gap [since, maxAtSub] from the durable log.
-	if since < maxAtSub {
-		if evs, _, err := s.store.ListEvents(since, q.Get("project"), cat, 500); err == nil {
-			for i := range evs {
-				if evs[i].ID > maxAtSub {
-					break
-				}
-				if writeEvent(w, &evs[i]) != nil {
-					return
-				}
-				lastSent = evs[i].ID
+	// Replay the gap (since, maxAtSub] from the durable log, page by page:
+	// live delivery only covers events broadcast after Subscribe, so a gap
+	// event skipped here would never reach this client. A failed page ends
+	// the response; the client reconnects from lastSent and retries it.
+	const replayPage = 500
+	for lastSent < maxAtSub {
+		evs, _, err := s.store.ListEvents(lastSent, proj, cat, replayPage)
+		if err != nil {
+			log.Printf("agentman: stream replay: %v", err)
+			return
+		}
+		for i := range evs {
+			if evs[i].ID > maxAtSub {
+				break
 			}
-			flusher.Flush()
+			if writeEvent(w, &evs[i]) != nil {
+				return
+			}
+			lastSent = evs[i].ID
+		}
+		flusher.Flush()
+		if len(evs) < replayPage || evs[len(evs)-1].ID > maxAtSub {
+			break
 		}
 	}
 
-	ping := time.NewTicker(15 * time.Second)
+	ping := time.NewTicker(streamPingInterval)
 	defer ping.Stop()
 	for {
 		select {
@@ -970,6 +887,15 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		case e, ok := <-sub.ch:
 			if !ok {
 				return
+			}
+			// The hub dropped an event for this subscriber (buffer full, so
+			// sub.ch is never empty here). Writing anything later would move
+			// the client's cursor past the hole; ending the response instead
+			// makes it reconnect from lastSent, which replays the gap.
+			select {
+			case <-sub.lagged:
+				return
+			default:
 			}
 			if e.ID <= lastSent { // dedupe overlap with replay
 				continue
@@ -991,15 +917,15 @@ func writeEvent(w io.Writer, e *Event) error {
 
 // ---------- token admin (Phase S) ----------
 
-// tokenAdminGuard is the mint-requires-unscoped boundary crux: the three
-// token-admin endpoints are refused for ANY request that carries a scope —
-// whether asserted by an X-Agent-Scope header or derived from a (valid) bearer
-// token. Only a fully unscoped caller (the human at the CLI / dashboard) may
-// administer tokens, so a confined agent can never forge a token for another
-// scope. A bad bearer token still 401s here (scopeOf surfaces ErrInvalidToken)
-// rather than being mistaken for "unscoped". Returns ok=false after writing the
-// error response (mirrors handleCreateCategory's precedent).
-func (s *Server) tokenAdminGuard(w http.ResponseWriter, r *http.Request) (ok bool) {
+// unscopedGuard admits only a fully unscoped caller (the human at the CLI /
+// dashboard). It gates the category layer (above every scope) and the
+// mint-requires-unscoped boundary crux: the three token-admin endpoints are
+// refused for ANY request that carries a scope — whether asserted by an
+// X-Agent-Scope header or derived from a (valid) bearer token — so a confined
+// agent can never forge a token for another scope. A bad bearer token still
+// 401s here (scopeOf surfaces ErrInvalidToken) rather than being mistaken for
+// "unscoped". Returns ok=false after writing the error response.
+func (s *Server) unscopedGuard(w http.ResponseWriter, r *http.Request) (ok bool) {
 	sc, err := s.scopeOf(r)
 	if err != nil {
 		writeErr(w, err) // bad/revoked token → 401
@@ -1013,7 +939,7 @@ func (s *Server) tokenAdminGuard(w http.ResponseWriter, r *http.Request) (ok boo
 }
 
 func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
-	if !s.tokenAdminGuard(w, r) {
+	if !s.unscopedGuard(w, r) {
 		return
 	}
 	var in struct {
@@ -1044,7 +970,7 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListTokens(w http.ResponseWriter, r *http.Request) {
-	if !s.tokenAdminGuard(w, r) {
+	if !s.unscopedGuard(w, r) {
 		return
 	}
 	toks, err := s.store.ListTokens()
@@ -1056,7 +982,7 @@ func (s *Server) handleListTokens(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
-	if !s.tokenAdminGuard(w, r) {
+	if !s.unscopedGuard(w, r) {
 		return
 	}
 	tok, err := s.store.RevokeToken(r.PathValue("id"))
@@ -1068,6 +994,23 @@ func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------- helpers ----------
+
+// publish runs one store mutation and broadcasts its event under commitMu,
+// so events reach the hub in commit (= id) order. Without it two handlers
+// could commit N and N+1 but broadcast N+1 first, and the id high-water
+// dedupe in handleStream (and the dashboard's cursor) would drop N for good.
+// The lock covers only the DB call and the non-blocking Broadcast, never
+// client I/O; writes already serialize on the single DB connection.
+func (s *Server) publish(mutate func() (*Event, error)) error {
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
+	ev, err := mutate()
+	if err != nil {
+		return err
+	}
+	s.hub.Broadcast(ev) // nil-safe: no-op mutations return no event
+	return nil
+}
 
 func actorOf(r *http.Request) string {
 	if a := r.Header.Get("X-Agent"); a != "" {
@@ -1081,12 +1024,18 @@ func actorOf(r *http.Request) string {
 // scopeOf is the SOLE reader of request scope — no handler reads the
 // Authorization header or X-Agent-Scope directly. Precedence (Phase S):
 //   - A bearer token WINS: its server-side bound scope is authoritative and any
-//     X-Agent-Scope header is ignored. An unknown/revoked token is ErrInvalidToken
-//     (→ 401 → exit 9), NEVER a silent fallthrough to the header or zero scope.
+//     X-Agent-Scope header is ignored. An unknown/revoked token — or an
+//     Authorization header that carries no Bearer token at all (empty value,
+//     other scheme) — is ErrInvalidToken (→ 401 → exit 9), NEVER a silent
+//     fallthrough to the header or zero scope.
 //   - With no token, the X-Agent-Scope header is the scope: absent is the zero
 //     (unscoped) Scope; a malformed one is a 400.
 func (s *Server) scopeOf(r *http.Request) (Scope, error) {
-	if tok := bearerToken(r); tok != "" {
+	if r.Header.Get("Authorization") != "" {
+		tok := bearerToken(r)
+		if tok == "" {
+			return Scope{}, ErrInvalidToken
+		}
 		return s.store.ResolveToken(tok)
 	}
 	raw := r.Header.Get("X-Agent-Scope")
@@ -1125,8 +1074,10 @@ func denyScope(r *http.Request, sc Scope) error {
 }
 
 // checkTaskMut gates every mutation of an existing task (claim/steal, patch,
-// delete, deps, labels, comment deletion). Relies on task→project and
-// project→category immutability — see the PatchTask scope note.
+// delete, deps, labels, comment deletion). It reads outside the mutation's
+// tx, which relies on task→project and project→category immutability AND on
+// task ids never being reused (AUTOINCREMENT, schema v6) — see the PatchTask
+// scope note.
 func (s *Server) checkTaskMut(r *http.Request, sc Scope, taskID int64) error {
 	if sc.IsZero() {
 		return nil
@@ -1141,6 +1092,38 @@ func (s *Server) checkTaskMut(r *http.Request, sc Scope, taskID int64) error {
 	return denyScope(r, sc)
 }
 
+// mutableTask resolves the {id} path value and runs scopeOf + checkTaskMut,
+// the shared preamble of every handler that mutates an existing task.
+// Returns ok=false after writing the error response.
+func (s *Server) mutableTask(w http.ResponseWriter, r *http.Request) (id int64, ok bool) {
+	id, err := s.store.resolveTaskID(r.PathValue("id"))
+	if err == nil {
+		var sc Scope
+		if sc, err = s.scopeOf(r); err == nil {
+			err = s.checkTaskMut(r, sc, id)
+		}
+	}
+	if err != nil {
+		writeErr(w, err)
+		return 0, false
+	}
+	return id, true
+}
+
+// mutableProject runs scopeOf + checkProjectMut for patch/archive/unarchive.
+// Returns false after writing the error response.
+func (s *Server) mutableProject(w http.ResponseWriter, r *http.Request, slug string) bool {
+	sc, err := s.scopeOf(r)
+	if err == nil {
+		err = s.checkProjectMut(r, sc, slug)
+	}
+	if err != nil {
+		writeErr(w, err)
+		return false
+	}
+	return true
+}
+
 // checkTaskRead gates single-task reads: in scope, or in the proposals
 // project (readable by all — proposals are meant to be seen).
 func (s *Server) checkTaskRead(r *http.Request, sc Scope, taskID int64) error {
@@ -1151,7 +1134,7 @@ func (s *Server) checkTaskRead(r *http.Request, sc Scope, taskID int64) error {
 	if err != nil {
 		return err
 	}
-	if scopeAllows(sc, cat, proj) || (cat == s.proposals.Category && proj == s.proposals.Project) {
+	if scopeAllows(sc, cat, proj) || s.isProposalsPair(cat, proj) {
 		return nil
 	}
 	return denyScope(r, sc)
@@ -1172,8 +1155,7 @@ func (s *Server) checkComment(r *http.Request, sc Scope, taskID int64) error {
 	if scopeAllows(sc, cat, proj) {
 		return nil
 	}
-	if cat == s.proposals.Category && proj == s.proposals.Project &&
-		createdBy != "" && createdBy == actorOf(r) {
+	if s.isProposalsPair(cat, proj) && createdBy != "" && createdBy == actorOf(r) {
 		return nil
 	}
 	return denyScope(r, sc)
@@ -1187,8 +1169,8 @@ func (s *Server) checkComment(r *http.Request, sc Scope, taskID int64) error {
 // other agent's proposals. A missing project still counts (ErrNotFound
 // passes through as true): the gate stays open and the store 404s, keeping
 // the carve-out inert rather than special-cased. Every site that consults
-// the carve-out goes through here or checks the (category, project) pair
-// directly (checkTaskRead, checkComment) — the five sites must agree.
+// the carve-out goes through here or, when it already holds a task's
+// (category, project) pair, through isProposalsPair.
 func (s *Server) isProposals(slug string) (bool, error) {
 	if slug != s.proposals.Project {
 		return false, nil
@@ -1200,7 +1182,30 @@ func (s *Server) isProposals(slug string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return cat == s.proposals.Category, nil
+	return s.isProposalsPair(cat, slug), nil
+}
+
+// isProposalsPair reports whether (cat, proj) is the designated carve-out
+// project.
+func (s *Server) isProposalsPair(cat, proj string) bool {
+	return cat == s.proposals.Category && proj == s.proposals.Project
+}
+
+// projectInScope reports whether project slug lies inside the non-zero scope
+// sc: a project scope must name slug, and the project's actual category must
+// be sc.Category. The category is checked for project scopes too: slugs are
+// freed by delete, so a same-named project recreated in another category must
+// not inherit a token minted for the old one (scopeAllows compares the pair).
+// Store errors, ErrNotFound for an unknown slug included, pass through.
+func (s *Server) projectInScope(sc Scope, slug string) (bool, error) {
+	if sc.Project != "" && slug != sc.Project {
+		return false, nil
+	}
+	cat, err := s.store.projectCategory(slug)
+	if err != nil {
+		return false, err
+	}
+	return cat == sc.Category, nil
 }
 
 // checkCreate gates task creation: the target project must be in scope, OR be
@@ -1217,20 +1222,8 @@ func (s *Server) checkCreate(r *http.Request, sc Scope, projectSlug string) erro
 	} else if ok {
 		return nil
 	}
-	if sc.Project != "" {
-		if projectSlug == sc.Project {
-			return nil
-		}
-		return denyScope(r, sc)
-	}
-	cat, err := s.store.projectCategory(projectSlug)
-	if err != nil {
-		return err // unknown slug stays a 404, matching unscoped create
-	}
-	if cat == sc.Category {
-		return nil
-	}
-	return denyScope(r, sc)
+	// An unknown slug stays a 404, matching unscoped create.
+	return s.checkProjectMut(r, sc, projectSlug)
 }
 
 // checkProjectRead gates project-level reads (graph): in scope or the
@@ -1250,25 +1243,21 @@ func (s *Server) checkProjectRead(r *http.Request, sc Scope, slug string) error 
 
 // checkProjectMut gates project mutations (patch/archive/unarchive/delete):
 // the project itself must be in scope — no proposals carve-out (proposing is
-// creating tasks, never reshaping the project).
+// creating tasks, never reshaping the project). Unlike task ids, slugs are
+// reused after a delete, so this read can race a delete+recreate; delete (the
+// irreversible one) re-checks the category inside its own tx.
 func (s *Server) checkProjectMut(r *http.Request, sc Scope, slug string) error {
 	if sc.IsZero() {
 		return nil
 	}
-	if sc.Project != "" {
-		if slug == sc.Project {
-			return nil
-		}
-		return denyScope(r, sc)
-	}
-	cat, err := s.store.projectCategory(slug)
+	ok, err := s.projectInScope(sc, slug)
 	if err != nil {
 		return err // unknown slug stays a 404
 	}
-	if cat == sc.Category {
-		return nil
+	if !ok {
+		return denyScope(r, sc)
 	}
-	return denyScope(r, sc)
+	return nil
 }
 
 // narrowScope merges the caller's scope into explicit list/next filters.
@@ -1296,23 +1285,17 @@ func (s *Server) narrowScope(r *http.Request, sc Scope, proj, cat string, allowP
 				return proj, cat, nil
 			}
 		}
-		if sc.Project != "" {
-			if proj != sc.Project {
-				return "", "", denyScope(r, sc)
-			}
-			return proj, cat, nil
-		}
-		pcat, err := s.store.projectCategory(proj)
-		if err != nil {
-			if errors.Is(err, ErrNotFound) {
-				return "", "", denyScope(r, sc) // unknown explicit slug: not provably in scope
-			}
+		ok, err := s.projectInScope(sc, proj)
+		if err != nil && !errors.Is(err, ErrNotFound) {
 			return "", "", err
 		}
-		if pcat != sc.Category {
+		if !ok { // an unknown explicit slug is not provably in scope either
 			return "", "", denyScope(r, sc)
 		}
-		return proj, cat, nil
+		// Hand the scope's category to the store as well, so its own query
+		// re-checks the pair (the project could be deleted and its slug
+		// recreated elsewhere between this read and the store call).
+		return proj, sc.Category, nil
 	}
 	return sc.Project, sc.Category, nil
 }

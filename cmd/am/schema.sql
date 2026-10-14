@@ -1,5 +1,10 @@
 -- AgentMan schema. Pragmas are set on the DSN (see store.go), not here,
 -- so journal_mode=WAL is applied at connection open (never inside a tx).
+-- projects, tasks and events are rebuilt with AUTOINCREMENT (ids never
+-- reused) by migration v6 in store.go; their CREATE TABLEs below stay the
+-- frozen v1 baseline. Migration v7 makes idx_tasks_assignee partial (assignee
+-- IS NOT NULL) and adds idx_tasks_next and idx_events_project; the
+-- IF NOT EXISTS index lines below are then no-ops.
 
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
