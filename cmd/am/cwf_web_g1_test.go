@@ -96,27 +96,27 @@ func TestCwfWebModalReconciledOnOverview(t *testing.T) {
 	cwfWebLacks(t, "onEvent", oe, "closeModal()")
 }
 
-// FIND-0355: the feed (which sets the stream cursor) is read before the board.
+// FIND-0355: the feed (which sets the stream cursor) is read before the board,
+// and before the stream reopens. FIND-0418: the view/selection changes all
+// reload through reloadView.
 func TestCwfWebCursorReadBeforeBoard(t *testing.T) {
 	js := cwfWebAppJS(t)
+	rs := cwfWebFunc(t, js, "resync")
+	cwfWebBefore(t, "resync board branch", rs[strings.Index(rs, "else {"):], "await loadFeed()", "await loadBoard()")
+	cwfWebBefore(t, "reloadView", cwfWebFunc(t, js, "reloadView"), "await resync()", "connect()")
 	for _, fn := range []string{"applyView", "goProject", "toggleProject"} {
-		body := cwfWebFunc(t, js, fn)
-		if fn == "applyView" {
-			body = body[strings.Index(body, "} else {"):] // board branch
-		}
-		cwfWebBefore(t, fn, body, "await loadFeed()", "await loadBoard()")
+		cwfWebHas(t, fn, cwfWebFunc(t, js, fn), "await reloadView()")
 	}
 }
 
-// FIND-0358: project.patched has feed/history text and the default branch never
-// appends a null ref.
+// FIND-0358: project.patched has feed/history text (both renderers word events
+// through evParts since FIND-0427; the null-ref default branch is exercised by
+// TestCwfWebG5HarnessEventWordingShared).
 func TestCwfWebProjectPatchedFeedText(t *testing.T) {
 	js := cwfWebAppJS(t)
-	ev := cwfWebFunc(t, js, "evText")
-	cwfWebHas(t, "evText", ev, `case "project.patched":`)
-	cwfWebLacks(t, "evText", ev, `" " + ev.kind + " ", ref)`)
-	cwfWebHas(t, "evText", ev, "if (ref) span.append")
-	cwfWebHas(t, "describeText", cwfWebFunc(t, js, "describeText"), `case "project.patched":`)
+	cwfWebHas(t, "evParts", cwfWebFunc(t, js, "evParts"), `case "project.patched":`)
+	cwfWebHas(t, "evText", cwfWebFunc(t, js, "evText"), "evParts(ev)")
+	cwfWebHas(t, "describeText", cwfWebFunc(t, js, "describeText"), "evParts(ev)")
 	top := cwfWebFunc(t, js, "onEvent")
 	cwfWebBefore(t, "onEvent", top, `ev.kind === "project.patched") loadProjects()`, "reconcileModal(ev)")
 }
@@ -149,7 +149,7 @@ func TestCwfWebInPlaceSelectionUpdatesTitle(t *testing.T) {
 func TestCwfWebLabelChipKeyboard(t *testing.T) {
 	js := cwfWebAppJS(t)
 	ck := cwfWebFunc(t, js, "onCardKey")
-	cwfWebBefore(t, "onCardKey", ck, "e.target !== e.currentTarget", `e.key === "Enter"`)
+	cwfWebBefore(t, "onCardKey", ck, "e.target !== e.currentTarget", "onActivate(")
 	c := cwfWebFunc(t, js, "card")
 	chip := c[strings.Index(c, `class: "tag-label", role: "button"`):]
 	cwfWebBefore(t, "label chip", chip, "onkeydown:", "}, l));")

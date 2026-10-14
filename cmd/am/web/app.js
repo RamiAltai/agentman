@@ -1,25 +1,22 @@
 "use strict";
 
 const COLS = [["todo", "Todo"], ["doing", "In Progress"], ["blocked", "Blocked"], ["done", "Done"]];
-const STALE_MS = 30 * 60 * 1000; // a doing+assigned card with no activity this long gets a stale badge
-const STALE_FILTER = "30m";      // ?stale= duration sent when the Stale board-filter is on (matches STALE_MS)
+const STALE_MINUTES = 30;                   // a doing+assigned card with no activity this long is stale
+const STALE_MS = STALE_MINUTES * 60 * 1000; // the card's Stale badge
+const STALE_FILTER = STALE_MINUTES + "m";   // ?stale= duration sent when the Stale board-filter is on
 const DONE_FETCH_LIMIT = 500;    // done tasks accumulate forever, so only they are capped; open work never is
 const ST = { todo: "var(--st-todo)", doing: "var(--st-doing)", blocked: "var(--st-blocked)", done: "var(--st-done)" };
 const ST_LABEL = { todo: "Todo", doing: "Doing", blocked: "Blocked", done: "Done" };
-const PRIO = ["#f4756b", "#f8b738", "#8b93a4", "#6e7681"]; // 0 urgent .. 3 low
-// Themed priority colors (mirror the --prio-N CSS custom properties, which carry
-// AA-clearing light/dark values). Use these — not the raw PRIO[] hex — anywhere a
-// priority color is painted as text/border (e.g. the graph nodes, detail chip, and
-// legend), so the color adapts per theme. var() resolves in both inline style and
-// SVG presentation attributes (same as ST[]/var(--st-*)).
-const PRIO_VAR = ["var(--prio-0)", "var(--prio-1)", "var(--prio-2)", "var(--prio-3)"];
-const PRIO_LABEL = ["Urgent", "High", "", ""];
-// Always-present rank token for EVERY priority level (text, not color-only). The
-// rank ("P0".."P3") plus the word make priority readable for all four levels;
-// Normal/Low used to render nothing.
-const PRIO_RANK = ["P0", "P1", "P2", "P3"];
-const PRIO_WORD = ["Urgent", "High", "Normal", "Low"];
-const PRIO_OPTS = ["0 — Urgent", "1 — High", "2 — Normal", "3 — Low"];
+// Priority levels by rank (0 urgent .. 3 low): the word, the always-present rank
+// token ("P0".."P3", so priority is readable as text, not color alone) and the
+// themed --prio-N color (AA-clearing light/dark values in app.css; var() resolves
+// in inline style and SVG presentation attributes alike). Every priority label,
+// option and color is derived from this table.
+const PRIORITIES = ["Urgent", "High", "Normal", "Low"].map((word, rank) =>
+  ({ rank, word, token: "P" + rank, color: "var(--prio-" + rank + ")" }));
+// prio returns a task's priority level; an unknown value reads as Low.
+function prio(n) { return PRIORITIES[n] || PRIORITIES[PRIORITIES.length - 1]; }
+
 // Per-kind feed glyphs (decorative; .ev-text states the event in words). These
 // carry the non-color-only meaning the design asks for.
 const EV_GLYPH = { claimed: "▸", status: "⇄", done: "✓", blocked: "⏸", comment: "💬", other: "•" };
@@ -97,6 +94,12 @@ function el(tag, props, ...kids) {
     n.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
   }
   return n;
+}
+
+// onActivate returns a keydown handler that runs fn on Enter or Space, the keys
+// that activate a role="button"/"link" element. Pass the same fn as its onclick.
+function onActivate(fn) {
+  return (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fn(e); } };
 }
 
 // ---------- loading skeletons + toasts (additive, el()-only) ----------
@@ -471,7 +474,7 @@ function boardEmpty() {
 function card(t) {
   const c = el("div", {
     class: "card", role: "button", tabindex: "0", draggable: "true", "data-id": String(t.id),
-    style: "--prio:" + (PRIO[t.priority] || PRIO[3]),
+    style: "--prio:" + prio(t.priority).color,
     "aria-label": "#" + t.id + " " + t.title + " — " + t.status + ". Press Enter to open, or [ and ] to change status.",
     onclick: () => openTask(t.id),
     onkeydown: (e) => onCardKey(e, t),
@@ -488,10 +491,10 @@ function card(t) {
     },
   });
   // ROW 1 (head): #id · priority rank (all levels) · status pill.
-  const pr = PRIO_RANK[t.priority] != null ? t.priority : 3;
+  const pr = prio(t.priority);
   const crow = el("div", { class: "crow" },
     el("span", { class: "cid" }, "#" + t.id),
-    el("span", { class: "chip-prio p" + pr, title: "Priority: " + PRIO_WORD[pr] }, PRIO_RANK[pr]),
+    el("span", { class: "chip-prio p" + pr.rank, title: "Priority: " + pr.word }, pr.token),
     el("span", { class: "status-pill st-" + t.status }, ST_LABEL[t.status] || t.status));
   c.append(crow);
 
@@ -513,17 +516,17 @@ function card(t) {
   if (t.nopen > 0) trouble.append(el("span", { class: "tag-blocked", title: t.nopen + " open prerequisite(s)" }, "🔒 Blocked " + t.nopen));
   else if (t.nprereq > 0) trouble.append(el("span", { class: "tag-ready" }, "✓ Ready"));
   if (t.status === "doing" && t.assignee && Date.now() - Date.parse(t.updated_at) > STALE_MS)
-    trouble.append(el("span", { class: "tag-stale", title: "no activity for 30+ min" }, "⏳ Stale"));
+    trouble.append(el("span", { class: "tag-stale", title: "no activity for " + STALE_MINUTES + "+ min" }, "⏳ Stale"));
   c.append(trouble);
 
   // ROW 3c (tags): label chips · comment count.
   const tags = el("div", { class: "ctags" });
   const labels = t.labels || [];
   for (const l of labels.slice(0, 3)) {
+    const filter = (e) => { e.stopPropagation(); setLabelFilter(l); }; // the card must not open too
     tags.append(el("span", {
       class: "tag-label", role: "button", tabindex: "0", title: "Filter by " + l,
-      onclick: (e) => { e.stopPropagation(); setLabelFilter(l); },
-      onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); setLabelFilter(l); } },
+      onclick: filter, onkeydown: onActivate(filter),
     }, l));
   }
   if (labels.length > 3) tags.append(el("span", { class: "tag-label" }, "+" + (labels.length - 3)));
@@ -536,14 +539,15 @@ function initials(name) { const m = (name || "").replace(/[^a-zA-Z0-9]/g, ""); r
 
 function onCardKey(e, t) {
   if (e.target !== e.currentTarget) return; // keys on a nested control (label chip) are not card keys
-  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTask(t.id); return; }
   if (e.key === "[" || e.key === "]") {           // keyboard equivalent of drag between columns
     e.preventDefault();
     const order = COLS.map((c) => c[0]);
     let i = order.indexOf(t.status) + (e.key === "]" ? 1 : -1);
     i = Math.max(0, Math.min(order.length - 1, i));
     moveTask(t.id, order[i]);
+    return;
   }
+  onActivate(() => openTask(t.id))(e);
 }
 
 // moveTask optimistically moves a card to a new status, then persists it.
@@ -577,8 +581,7 @@ async function goProject(p) {
     selected = new Set([p.slug]);
     setBreadcrumb();
     renderRail();
-    try { await loadFeed(); await loadBoard(); } catch (e) { setStatus("error", "warn"); }
-    connect();
+    await reloadView();
     return;
   }
   pendingProject = p.slug;
@@ -597,8 +600,20 @@ async function toggleProject(slug) {
   }
   setBreadcrumb();
   renderRail();
-  try { await loadFeed(); await loadBoard(); } catch (e) { setStatus("error", "warn"); }
+  await reloadView();
+}
+
+// dropSelectedProject takes an archived or deleted project out of the selection.
+// If it was selected the scope widens, so the title, rail, stream, feed and board
+// follow. The Manage modal's archive/delete and the live project.archived/deleted
+// events all go through here. The stream reopens first: unlike a view load (see
+// reloadView), the live cursor is already current.
+function dropSelectedProject(slug) {
+  if (!selected.delete(slug)) return;
+  setBreadcrumb();
+  renderRail();
   connect();
+  resync().catch(reconcileFailed);
 }
 
 // ---------- view routing (hash) ----------
@@ -638,20 +653,17 @@ async function applyView(next, cat) {
   document.body.classList.toggle("view-overview", view === "overview");
   setBreadcrumb();
   renderRail(); // keep the rail's active highlight in sync in every view
-  try {
-    if (view === "overview") {
-      await loadOverview();
-      await loadFeed(); // one global, unfiltered recent-activity feed on the overview
-    } else {
-      // Feed first: loadFeed sets the stream cursor, so anything committed while
-      // the board is read is replayed by connect() instead of skipped.
-      await loadFeed();
-      await loadBoard();
-    }
-  } catch (e) {
-    setStatus("error: " + e.message, "warn");
-  }
-  connect(); // re-open the stream with the new scope (?category= or unfiltered)
+  await reloadView();
+}
+
+// reloadView reloads the current view from REST (resync: feed first, so the
+// stream cursor covers anything committed while the board is read) and then
+// reopens the stream with the new scope. Every view or selection change reloads
+// through here. A failure is toasted: connect() immediately replaces the header
+// status, so a status message alone would never be seen.
+async function reloadView() {
+  try { await resync(); } catch (e) { showToast("Couldn't load the view: " + e.message); }
+  connect();
 }
 
 // setBreadcrumb fills the lean top-bar TITLE (#breadcrumb) with the current scope
@@ -701,8 +713,7 @@ function renderOverview() {
 function newCatCard() {
   const card = el("div", {
     class: "cat-card cat-card-add", role: "button", tabindex: "0",
-    onclick: openNewCategory,
-    onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openNewCategory(); } },
+    onclick: openNewCategory, onkeydown: onActivate(openNewCategory),
   });
   card.append(el("div", { class: "cat-name" }, "＋ New category"));
   return card;
@@ -710,11 +721,8 @@ function newCatCard() {
 
 function allCard() {
   const total = projects.reduce((n, p) => n + openCount(p.counts), 0);
-  const card = el("div", {
-    class: "cat-card cat-card-all", role: "link", tabindex: "0",
-    onclick: () => navigate("#/all"),
-    onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); navigate("#/all"); } },
-  });
+  const go = () => navigate("#/all");
+  const card = el("div", { class: "cat-card cat-card-all", role: "link", tabindex: "0", onclick: go, onkeydown: onActivate(go) });
   card.append(el("div", { class: "cat-name" }, "All"));
   card.append(el("div", { class: "cat-sub" }, total + " open across all categories"));
   return card;
@@ -722,11 +730,8 @@ function allCard() {
 
 function catCard(c) {
   const slug = c.slug;
-  const card = el("div", {
-    class: "cat-card", role: "link", tabindex: "0",
-    onclick: () => navigate("#/cat/" + encodeURIComponent(slug)),
-    onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); navigate("#/cat/" + encodeURIComponent(slug)); } },
-  });
+  const go = () => navigate("#/cat/" + encodeURIComponent(slug));
+  const card = el("div", { class: "cat-card", role: "link", tabindex: "0", onclick: go, onkeydown: onActivate(go) });
   card.append(el("div", { class: "cat-name" }, c.name || slug));
   const counts = c.counts || {};
   const chips = el("div", { class: "count-chips" });
@@ -989,11 +994,11 @@ function label(text, node) { return el("label", { class: "lbl" }, el("span", {},
 
 function prioSelect(value, onchange) {
   const sel = el("select", { onchange, "aria-label": "Priority" });
-  PRIO_OPTS.forEach((l, i) => {
-    const o = el("option", { value: String(i) }, l);
-    if (i === value) o.setAttribute("selected", "selected");
+  for (const p of PRIORITIES) {
+    const o = el("option", { value: String(p.rank) }, p.rank + " — " + p.word);
+    if (p.rank === value) o.setAttribute("selected", "selected");
     sel.append(o);
-  });
+  }
   return sel;
 }
 
@@ -1027,8 +1032,28 @@ function renderModal(t) {
   body.onchange = () => { body.defaultValue = body.value; patch(t.id, { body: body.value }); };
   s.append(el("label", { class: "lbl" }, el("span", {}, "Description"), body));
 
-  // ---- Dependencies section ----
-  s.append(el("h3", {}, "Dependencies"));
+  s.append(...renderTaskDeps(t), ...renderTaskLabels(t), ...renderTaskMeta(t), ...renderTaskComments(t));
+
+  s.append(el("h3", {}, "History"));
+  const hl = el("ul", { class: "hist" });
+  for (const ev of t.events || []) hl.append(el("li", {}, el("span", { class: "t" }, fmtTime(ev.created_at)), el("span", {}, describeText(ev))));
+  s.append(hl);
+
+  s.append(renderTaskActions(t));
+  // Baseline for modalDirty(): el() sets .value, which leaves defaultValue empty.
+  for (const x of s.querySelectorAll("input, textarea")) x.defaultValue = x.value;
+}
+
+// The task modal's sections. Each takes the task and returns its nodes (heading
+// first); renderModal appends them in order.
+
+// depRef is a dependency's project-ref link; activating it opens that task.
+function depRef(dep) {
+  const open = (e) => { e.stopPropagation(); openTask(dep.id); };
+  return el("span", { class: "dep-ref", role: "link", tabindex: "0", onclick: open, onkeydown: onActivate(open) }, dep.project + "-" + dep.ref);
+}
+
+function renderTaskDeps(t) {
   const depsSection = el("div", { class: "deps-section" });
 
   // "Depends on" chips
@@ -1037,8 +1062,8 @@ function renderModal(t) {
   if (prereqs.length) {
     prereqs.forEach((dep) => {
       const chip = el("div", { class: "dep-chip" + (dep.status !== "done" ? " dep-open" : " dep-done") });
-      chip.append(el("span", { class: "dep-dot", style: "background:" + (dep.status === "done" ? "var(--st-done)" : dep.status === "doing" ? "var(--st-doing)" : dep.status === "blocked" ? "var(--st-blocked)" : "var(--st-todo)") }));
-      chip.append(el("span", { class: "dep-ref", role: "link", tabindex: "0", onclick: (e) => { e.stopPropagation(); openTask(dep.id); } }, dep.project + "-" + dep.ref));
+      chip.append(el("span", { class: "dep-dot", style: "background:" + (ST[dep.status] || ST.todo) }));
+      chip.append(depRef(dep));
       chip.append(el("span", { class: "dep-title" }, dep.title));
       chip.append(el("span", { class: "dep-status" }, dep.status));
       const rmBtn = el("button", { class: "dep-rm", "aria-label": "Remove prerequisite", title: "Remove" }, "✕");
@@ -1099,25 +1124,21 @@ function renderModal(t) {
   const blocks = t.blocks || [];
   if (blocks.length) {
     const blocksDiv = el("div", { class: "deps-blocks" });
-    blocks.forEach((dep) => {
-      const row = el("div", { class: "dep-block-row" });
-      row.append(
-        el("span", { class: "dep-ref", role: "link", tabindex: "0", onclick: (e) => { e.stopPropagation(); openTask(dep.id); } }, dep.project + "-" + dep.ref),
+    for (const dep of blocks) {
+      blocksDiv.append(el("div", { class: "dep-block-row" },
+        depRef(dep),
         el("span", { class: "dep-title" }, dep.title),
-        el("span", { class: "dep-status" }, "(" + dep.status + ")")
-      );
-      blocksDiv.append(row);
-    });
+        el("span", { class: "dep-status" }, "(" + dep.status + ")")));
+    }
     depsSection.append(el("div", { class: "deps-group" }, el("span", { class: "deps-label" }, "Blocks"), blocksDiv));
   }
-  s.append(depsSection);
+  return [el("h3", {}, "Dependencies"), depsSection];
+}
 
-  // ---- Labels section ----
-  s.append(el("h3", {}, "Labels"));
+function renderTaskLabels(t) {
   const labelsDiv = el("div", { class: "labels-row" });
   const labelErr = el("div", { class: "ferr" });
-  const tLabels = t.labels || [];
-  for (const l of tLabels) {
+  for (const l of t.labels || []) {
     const chip = el("span", { class: "tag-label tag-label-modal" }, l);
     const rmLbl = el("button", { class: "dep-rm", "aria-label": "Remove label " + l, title: "Remove" }, "✕");
     rmLbl.onclick = async () => {
@@ -1149,10 +1170,11 @@ function renderModal(t) {
     }
   };
   labelsDiv.append(labelBox);
-  s.append(labelsDiv, labelErr);
+  return [el("h3", {}, "Labels"), labelsDiv, labelErr];
+}
 
-  // ---- Meta section (editable key=value pairs; mirrors the Labels section) ----
-  s.append(el("h3", {}, "Meta"));
+// renderTaskMeta lists the editable key=value pairs (it mirrors renderTaskLabels).
+function renderTaskMeta(t) {
   const metaWrap = el("div", { class: "meta-section" });
   const metaErr = el("div", { class: "ferr" });
   const tMeta = t.meta || {};
@@ -1196,43 +1218,21 @@ function renderModal(t) {
   valBox.onkeydown = onMetaKey;
   metaWrap.append(el("div", { class: "meta-add-row" }, keyBox, valBox,
     el("button", { class: "btn-primary meta-add-btn", onclick: addMeta }, "Add")));
-  s.append(metaWrap, metaErr);
+  return [el("h3", {}, "Meta"), metaWrap, metaErr];
+}
 
-  s.append(el("h3", {}, "Comments" + (t.comments && t.comments.length ? " (" + t.comments.length + ")" : "")));
+function renderTaskComments(t) {
+  const comments = t.comments || [];
   const cl = el("div", { class: "comments" });
-  if (!t.comments || !t.comments.length) cl.append(el("div", { class: "feed-empty" }, "No comments yet"));
-  for (const cm of t.comments || []) {
-    const cmDiv = el("div", { class: "cm" });
-    const cmHead = el("div", { class: "cm-head" },
-      el("b", {}, cm.author),
-      el("span", { class: "t" }, fmtTime(cm.created_at)));
-    // Inline two-step delete for each comment.
-    const delCm = el("button", { class: "btn-del-cm", "aria-label": "Delete comment" }, "×");
-    let cmConfirming = false;
-    delCm.onclick = async () => {
-      if (!cmConfirming) {
-        cmConfirming = true;
-        delCm.textContent = "Confirm delete?";
-        delCm.classList.add("confirming");
-        setTimeout(() => { if (cmConfirming) { cmConfirming = false; delCm.textContent = "×"; delCm.classList.remove("confirming"); } }, 4000);
-        return;
-      }
-      delCm.disabled = true;
-      try {
-        await api("DELETE", "/api/tasks/" + t.id + "/comments/" + cm.id);
-      } catch (e) {
-        delCm.disabled = false;
-        cmConfirming = false;
-        delCm.textContent = "×";
-        delCm.classList.remove("confirming");
-        alert(e.message);
-      }
-    };
-    cmHead.append(delCm);
-    cmDiv.append(cmHead, el("div", { class: "cbody" }, cm.body));
-    cl.append(cmDiv);
+  if (!comments.length) cl.append(el("div", { class: "feed-empty" }, "No comments yet"));
+  for (const cm of comments) {
+    const delCm = armButton(el("button", { class: "btn-del-cm", "aria-label": "Delete comment" }, "×"),
+      () => api("DELETE", "/api/tasks/" + t.id + "/comments/" + cm.id),
+      (e) => alert(e.message));
+    cl.append(el("div", { class: "cm" },
+      el("div", { class: "cm-head" }, el("b", {}, cm.author), el("span", { class: "t" }, fmtTime(cm.created_at)), delCm),
+      el("div", { class: "cbody" }, cm.body)));
   }
-  s.append(cl);
 
   const cbox = el("input", { class: "field cbox", placeholder: "Add a comment…", "aria-label": "Add a comment" });
   const submit = () => {
@@ -1242,45 +1242,15 @@ function renderModal(t) {
     api("POST", "/api/tasks/" + t.id + "/comments", { body: v }).catch((err) => alert(err.message));
   };
   cbox.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } };
-  s.append(el("div", { class: "cm-row" }, cbox, el("button", { class: "btn-primary", onclick: submit }, "Send")));
+  return [el("h3", {}, "Comments" + (comments.length ? " (" + comments.length + ")" : "")), cl,
+    el("div", { class: "cm-row" }, cbox, el("button", { class: "btn-primary", onclick: submit }, "Send"))];
+}
 
-  s.append(el("h3", {}, "History"));
-  const hl = el("ul", { class: "hist" });
-  for (const ev of t.events || []) hl.append(el("li", {}, el("span", { class: "t" }, fmtTime(ev.created_at)), el("span", {}, describeText(ev))));
-  s.append(hl);
-
-  // Inline two-step delete for the task itself.
-  const delBtn = el("button", { class: "btn-danger-task" }, "Delete task");
-  let delConfirming = false;
-  delBtn.onclick = async () => {
-    if (!delConfirming) {
-      delConfirming = true;
-      delBtn.textContent = "Confirm delete?";
-      delBtn.classList.add("confirming");
-      const cancelEl = el("button", { class: "btn-cancel-del" }, "Cancel");
-      cancelEl.onclick = () => {
-        delConfirming = false;
-        delBtn.textContent = "Delete task";
-        delBtn.classList.remove("confirming");
-        cancelEl.remove();
-      };
-      delBtn.after(cancelEl);
-      return;
-    }
-    delBtn.disabled = true;
-    try {
-      await api("DELETE", "/api/tasks/" + t.id);
-      closeModal();
-    } catch (e) {
-      delBtn.disabled = false;
-      delConfirming = false;
-      delBtn.textContent = "Delete task";
-      delBtn.classList.remove("confirming");
-      const sibling = delBtn.nextSibling;
-      if (sibling && sibling.classList && sibling.classList.contains("btn-cancel-del")) sibling.remove();
-      alert(e.message);
-    }
-  };
+// renderTaskActions is the Release + Delete row at the foot of the modal.
+function renderTaskActions(t) {
+  const delBtn = armButton(el("button", { class: "btn-danger-task" }, "Delete task"),
+    async () => { await api("DELETE", "/api/tasks/" + t.id); closeModal(); },
+    (e) => alert(e.message));
   // One-click Release: hand the task back to the unclaimed pool (clear assignee,
   // reset to todo). Only shown when there's something to release.
   const relBtn = el("button", { class: "btn-release" }, "Release");
@@ -1294,9 +1264,39 @@ function renderModal(t) {
     }
   };
   const showRelease = !!t.assignee || t.status !== "todo";
-  s.append(el("div", { class: "del-task-row" }, showRelease ? relBtn : null, delBtn));
-  // Baseline for modalDirty(): el() sets .value, which leaves defaultValue empty.
-  for (const x of s.querySelectorAll("input, textarea")) x.defaultValue = x.value;
+  return el("div", { class: "del-task-row" }, showRelease ? relBtn : null, delBtn);
+}
+
+const CONFIRM_MS = 5000; // how long an armed delete button waits for its confirming click
+
+// armButton makes btn a two-step delete: the first click arms it ("Confirm
+// delete?", .confirming) for CONFIRM_MS, after which it disarms; a click while
+// armed disables it and runs confirm(). If confirm() fails, the button is
+// re-enabled and disarmed and onError reports why. The comment, task and project
+// deletes all use it. Returns btn.
+function armButton(btn, confirm, onError) {
+  const idle = btn.textContent;
+  let armed = false, timer = null;
+  const disarm = () => { armed = false; clearTimeout(timer); btn.textContent = idle; btn.classList.remove("confirming"); };
+  btn.onclick = async () => {
+    if (!armed) {
+      armed = true;
+      btn.textContent = "Confirm delete?";
+      btn.classList.add("confirming");
+      timer = setTimeout(disarm, CONFIRM_MS);
+      return;
+    }
+    clearTimeout(timer); // the label must not revert while the delete is in flight
+    btn.disabled = true;
+    try {
+      await confirm();
+    } catch (e) {
+      btn.disabled = false;
+      disarm();
+      onError(e);
+    }
+  };
+  return btn;
 }
 
 function openNew() {
@@ -1540,13 +1540,7 @@ async function renderManageList(list, err) {
             await api("POST", "/api/projects/" + p.slug + "/unarchive");
           } else {
             await api("POST", "/api/projects/" + p.slug + "/archive");
-            // If this project was selected, remove it from selection.
-            if (selected.has(p.slug)) {
-              selected.delete(p.slug);
-              loadBoard().catch(() => {});
-              loadFeed().catch(() => {});
-              connect();
-            }
+            dropSelectedProject(p.slug);
           }
           // Refresh tab bar.
           await loadProjects();
@@ -1559,31 +1553,12 @@ async function renderManageList(list, err) {
       },
     }, isArchived ? "Unarchive" : "Archive");
 
-    // Inline two-step delete button for the project.
-    const rmBtn = el("button", { class: "btn-danger-proj" }, "Delete");
-    let rmConfirming = false;
-    rmBtn.onclick = async () => {
-      if (!rmConfirming) {
-        rmConfirming = true;
-        rmBtn.textContent = "Confirm delete?";
-        rmBtn.classList.add("confirming");
-        setTimeout(() => { if (rmConfirming) { rmConfirming = false; rmBtn.textContent = "Delete"; rmBtn.classList.remove("confirming"); } }, 5000);
-        return;
-      }
-      rmBtn.disabled = true;
-      try {
-        await api("DELETE", "/api/projects/" + p.slug);
-        if (selected.has(p.slug)) { selected.delete(p.slug); loadBoard().catch(() => {}); loadFeed().catch(() => {}); connect(); }
-        await loadProjects();
-        await renderManageList(list, err);
-      } catch (e) {
-        err.textContent = e.message;
-        rmBtn.disabled = false;
-        rmConfirming = false;
-        rmBtn.textContent = "Delete";
-        rmBtn.classList.remove("confirming");
-      }
-    };
+    const rmBtn = armButton(el("button", { class: "btn-danger-proj" }, "Delete"), async () => {
+      await api("DELETE", "/api/projects/" + p.slug);
+      dropSelectedProject(p.slug);
+      await loadProjects();
+      await renderManageList(list, err);
+    }, (e) => { err.textContent = e.message; });
 
     if (isArchived) row.append(nameSpan, slugSpan, el("span", { class: "badge-archived" }, "Archived"), countSpan, editBtn, archBtn, rmBtn);
     else row.append(nameSpan, slugSpan, countSpan, editBtn, archBtn, rmBtn);
@@ -1639,7 +1614,9 @@ function openEditProject(p) {
 
 // ---------- live stream ----------
 
-// resync reloads the current view from REST (the loads applyView does, minus the stream).
+// resync reloads the current view from REST (reloadView, minus the stream). The
+// overview shows one global, unfiltered feed; a board view reads the feed first,
+// since loadFeed sets the stream cursor.
 async function resync() {
   if (view === "overview") { await loadOverview(); await loadFeed(); }
   else { await loadFeed(); await loadBoard(); }
@@ -1727,15 +1704,9 @@ function onEvent(ev) {
     if (countsChanged) coalesce("overview", () => { if (view === "overview") loadOverview().catch(reconcileFailed); }, 250);
     return;
   }
-  if (ev.kind === "project.archived") {
-    const archivedSlug = (ev.data || {}).slug;
-    if (selected.has(archivedSlug)) {
-      selected.delete(archivedSlug);
-      renderRail();
-      loadBoard().catch(() => {});
-      loadFeed().catch(() => {});
-      connect();
-    }
+  // The coalesced board reconcile below drops an unselected project's cards.
+  if (ev.kind === "project.archived" || ev.kind === "project.deleted") {
+    dropSelectedProject((ev.data || {}).slug);
     loadProjects().catch(() => {});
   }
   if (ev.kind === "project.patched") {
@@ -1752,16 +1723,6 @@ function onEvent(ev) {
     tasks.delete(ev.task_id);
     renderBoard();
     loadProjects().catch(() => {});
-  }
-  if (ev.kind === "project.deleted") {
-    const deletedSlug = (ev.data || {}).slug;
-    if (selected.has(deletedSlug)) {
-      selected.delete(deletedSlug);
-      renderRail();
-      connect();
-    }
-    loadProjects().catch(() => {});
-    loadBoard().catch(() => {});
   }
   // Mark the touched task so the next board render flashes it once (board views
   // only — the overview has no cards). Status moves and edits are the signals
@@ -1864,43 +1825,47 @@ function evKind(ev) {
 }
 
 function refLink(id) {
-  return el("span", { class: "ref", role: "link", tabindex: "0", onclick: (e) => { e.stopPropagation(); openTask(id); }, onkeydown: (e) => { if (e.key === "Enter") openTask(id); } }, "#" + id);
+  const open = (e) => { e.stopPropagation(); openTask(id); };
+  return el("span", { class: "ref", role: "link", tabindex: "0", onclick: open, onkeydown: onActivate(open) }, "#" + id);
+}
+
+// evParts words an event once for both renderers: plain strings, {ref: id} for
+// the task, and {name: slug} for a project or category. evText renders the ref as
+// a link and the name in bold (the activity feed); describeText flattens both to
+// text (the task modal's history). Kinds without a task ref get no ref part.
+function evParts(ev) {
+  const d = ev.data || {};
+  const t = ev.task_id ? { ref: ev.task_id } : "";
+  const slug = { name: String(d.slug || "") };
+  switch (ev.kind) {
+    case "task.created": return ["created ", t];
+    case "task.claimed": return ["claimed ", t];
+    case "task.reclaimed": return ["reclaimed ", t, " from " + ((d.assignee || [])[0] || "—")];
+    case "task.status": return ["moved ", t, " → " + last(d.status)];
+    case "task.assign": return ["assigned ", t, " → " + (last(d.assignee) || "—")];
+    case "task.patched": return ["edited ", t, d.meta ? " (meta: " + Object.keys(d.meta).sort().join(", ") + ")" : ""];
+    case "task.deleted": return ["deleted ", t];
+    case "task.dep_added": return ["linked ", t, " → depends on #" + (d.depends_on || "")];
+    case "task.dep_removed": return ["unlinked ", t, " dep #" + (d.depends_on || "")];
+    case "task.labeled": return ["labeled ", t, " +" + (d.label || "")];
+    case "task.unlabeled": return ["unlabeled ", t, " -" + (d.label || "")];
+    case "comment.added": return ["commented on ", t];
+    case "comment.deleted": return ["deleted a comment on ", t];
+    case "project.created": return ["created project ", slug];
+    case "project.archived": return ["archived project ", slug];
+    case "project.unarchived": return ["unarchived project ", slug];
+    case "project.patched": return ["edited project ", { name: patchedProjectSlug(ev) }];
+    case "project.deleted": return ["deleted project ", slug];
+    case "category.created": return ["created category ", slug];
+    case "category.archived": return ["archived category ", slug];
+    case "category.unarchived": return ["unarchived category ", slug];
+    default: return [ev.kind, t ? " " : "", t];
+  }
 }
 
 function evText(ev) {
-  const span = el("span", { class: "ev-text" });
-  const who = el("b", {}, ev.actor || "someone");
-  const d = ev.data || {};
-  const ref = ev.task_id ? refLink(ev.task_id) : null;
-  switch (ev.kind) {
-    case "task.created": span.append(who, " created ", ref); break;
-    case "task.claimed": span.append(who, " claimed ", ref); break;
-    case "task.reclaimed": span.append(who, " reclaimed ", ref, " from ", String((d.assignee || [])[0] || "—")); break;
-    case "task.status": span.append(who, " moved ", ref, " → ", String(last(d.status))); break;
-    case "task.assign": span.append(who, " assigned ", ref, " → ", String(last(d.assignee) || "—")); break;
-    case "task.patched":
-      span.append(who, " edited ", ref);
-      if (d.meta) span.append(" (meta: " + Object.keys(d.meta).sort().join(", ") + ")");
-      break;
-    case "comment.added": span.append(who, " commented on ", ref); break;
-    case "project.created": span.append(who, " created project ", el("b", {}, d.slug || "")); break;
-    case "project.archived": span.append(who, " archived project ", el("b", {}, d.slug || "")); break;
-    case "project.unarchived": span.append(who, " unarchived project ", el("b", {}, d.slug || "")); break;
-    case "project.patched": span.append(who, " edited project ", el("b", {}, patchedProjectSlug(ev))); break;
-    // category.* events carry no project/task ref, so the default branch would
-    // render a literal "null" ref — they need explicit cases.
-    case "category.created": span.append(who, " created category ", el("b", {}, d.slug || "")); break;
-    case "category.archived": span.append(who, " archived category ", el("b", {}, d.slug || "")); break;
-    case "category.unarchived": span.append(who, " unarchived category ", el("b", {}, d.slug || "")); break;
-    case "task.deleted": span.append(who, " deleted ", ref || document.createTextNode("#" + ev.task_id)); break;
-    case "comment.deleted": span.append(who, " deleted a comment on ", ref || document.createTextNode("#" + ev.task_id)); break;
-    case "project.deleted": span.append(who, " deleted project ", el("b", {}, d.slug || "")); break;
-    case "task.dep_added": span.append(who, " linked ", ref, " → depends on #", String(d.depends_on || "")); break;
-    case "task.dep_removed": span.append(who, " unlinked ", ref, " dep #", String(d.depends_on || "")); break;
-    case "task.labeled": span.append(who, " labeled ", ref, " +" + (d.label || "")); break;
-    case "task.unlabeled": span.append(who, " unlabeled ", ref, " -" + (d.label || "")); break;
-    default: span.append(who, " " + ev.kind); if (ref) span.append(" ", ref); // unknown kinds may carry no task ref
-  }
+  const span = el("span", { class: "ev-text" }, el("b", {}, ev.actor || "someone"), " ");
+  for (const p of evParts(ev)) span.append(p.ref ? refLink(p.ref) : p.name != null ? el("b", {}, p.name) : p);
   return span;
 }
 
@@ -1914,33 +1879,8 @@ function patchedProjectSlug(ev) {
 }
 
 function describeText(ev) {
-  const who = ev.actor || "someone";
-  const t = ev.task_id ? "#" + ev.task_id : "";
-  const d = ev.data || {};
-  switch (ev.kind) {
-    case "task.created": return `${who} created ${t}`;
-    case "task.claimed": return `${who} claimed ${t}`;
-    case "task.reclaimed": return `${who} reclaimed ${t} from ${(d.assignee || [])[0] || "—"}`;
-    case "task.status": return `${who} moved ${t} → ${last(d.status)}`;
-    case "task.assign": return `${who} assigned ${t} → ${last(d.assignee) || "—"}`;
-    case "task.patched": return `${who} edited ${t}` + (d.meta ? ` (meta: ${Object.keys(d.meta).sort().join(", ")})` : "");
-    case "comment.added": return `${who} commented on ${t}`;
-    case "project.created": return `${who} created project ${d.slug || ""}`;
-    case "project.archived": return `${who} archived project ${d.slug || ""}`;
-    case "project.unarchived": return `${who} unarchived project ${d.slug || ""}`;
-    case "project.patched": return `${who} edited project ${patchedProjectSlug(ev)}`;
-    case "category.created": return `${who} created category ${d.slug || ""}`;
-    case "category.archived": return `${who} archived category ${d.slug || ""}`;
-    case "category.unarchived": return `${who} unarchived category ${d.slug || ""}`;
-    case "task.deleted": return `${who} deleted ${t}`;
-    case "comment.deleted": return `${who} deleted a comment on ${t}`;
-    case "project.deleted": return `${who} deleted project ${d.slug || ""}`;
-    case "task.dep_added": return `${who} linked ${t} depends on #${d.depends_on || ""}`;
-    case "task.dep_removed": return `${who} unlinked ${t} dep #${d.depends_on || ""}`;
-    case "task.labeled": return `${who} labeled ${t} +${d.label || ""}`;
-    case "task.unlabeled": return `${who} unlabeled ${t} -${d.label || ""}`;
-    default: return `${who} ${ev.kind} ${t}`;
-  }
+  const parts = evParts(ev).map((p) => p.ref ? "#" + p.ref : p.name != null ? p.name : p);
+  return (ev.actor || "someone") + " " + parts.join("");
 }
 
 function last(v) { return Array.isArray(v) ? v[v.length - 1] : v; }
@@ -2390,29 +2330,13 @@ function renderGraph() {
   const svgEl = $("graphSvg");
   svgEl.replaceChildren();
   svgEl.setAttribute("viewBox", viewBoxStr(graphViewState));
+  svgEl.append(graphArrowDefs());
 
-  // Arrowhead markers (two: green for cleared, amber for blocking).
-  const defs = svg("defs");
-
-  function makeArrow(id, color) {
-    const m = svg("marker", {
-      id, viewBox: "0 0 10 10", refX: "9", refY: "5",
-      markerWidth: "6", markerHeight: "6", orient: "auto-start-reverse",
-    });
-    const p = svg("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: color });
-    m.append(p);
-    return m;
-  }
-  defs.append(makeArrow("gArrowCleared", "var(--st-done)"));
-  defs.append(makeArrow("gArrowBlocking", "var(--warn)"));
-  defs.append(makeArrow("gArrowUp", "var(--accent)"));
-  defs.append(makeArrow("gArrowDown", "var(--violet)"));
-  svgEl.append(defs);
-
-  // Pan surface (transparent background for drag/click).
+  // Pan surface (transparent background for drag/click; a click on it deselects).
   const panSurface = svg("rect", {
     x: "0", y: "0", width: String(width), height: String(height), class: "graph-pan-surface",
   });
+  panSurface.addEventListener("click", () => selectGraphNode(null));
   svgEl.append(panSurface);
 
   // Divider + label between the dependency DAG and the dependency-free lane.
@@ -2428,138 +2352,107 @@ function renderGraph() {
   }
 
   const edgeGroup = svg("g", { class: "gedge-group" });
-  const nodeGroup = svg("g", { class: "gnode-group" });
-  svgEl.append(edgeGroup);
-  svgEl.append(nodeGroup);
-
-  // --- draw edges ---
-  const edgeEls = new Map();  // Map<GraphEdge, SVGElement>
-
   for (const e of edges) {
-    const fp = positions.get(e.from);
-    const tp = positions.get(e.to);
-    if (!fp || !tp) continue;
-
-    const sx = fp.x + fp.w;
-    const sy = fp.y + fp.h / 2;
-    const tx = tp.x;
-    const ty = tp.y + tp.h / 2;
-    const delta = tx - sx;
-    const bend = Math.max(58, Math.abs(delta) * 0.42);
-    const d = delta >= 0
-      ? `M ${sx} ${sy} C ${sx + bend} ${sy}, ${tx - bend} ${ty}, ${tx} ${ty}`
-      : `M ${sx} ${sy} C ${sx + bend} ${sy}, ${tx - bend} ${ty - 80}, ${tx} ${ty}`;
-
-    const fromNode = nodesById.get(e.from);
-    const cleared = fromNode && fromNode.status === "done";
-    const marker = cleared ? "url(#gArrowCleared)" : "url(#gArrowBlocking)";
-    const edgeCls = "gedge " + (cleared ? "gedge-cleared" : "gedge-blocking");
-
-    const path = svg("path", { d, class: edgeCls, "marker-end": marker,
-      "data-from": String(e.from), "data-to": String(e.to) });
-    edgeGroup.append(path);
-    edgeEls.set(e, path);
+    const fp = positions.get(e.from), tp = positions.get(e.to);
+    if (fp && tp) edgeGroup.append(drawGraphEdge(e, fp, tp, nodesById));
   }
-
-  // --- draw nodes ---
-  const nodeEls = new Map();  // Map<id, SVGElement>
-
+  const nodeGroup = svg("g", { class: "gnode-group" });
   for (const n of nodes) {
     const pos = positions.get(n.id);
-    if (!pos) continue;
-
-    const prioColor = PRIO_VAR[n.priority] || PRIO_VAR[3];
-    const statusColor = ST[n.status] || "var(--faint)";
-    const isDone = n.status === "done";
-    const isBlocked = n.nopen > 0;
-    const isReady = n.nprereq > 0 && n.nopen === 0;
-
-    const g = svg("g", {
-      class: "gnode" + (isDone ? " gnode-done" : ""),
-      transform: `translate(${pos.x}, ${pos.y})`,
-      "data-id": String(n.id),
-      role: "button",
-      tabindex: "0",
-      "aria-label": n.project + "-" + n.ref + " " + n.title + " (" + n.status + ")",
-    });
-
-    const rect = svg("rect", {
-      x: "0", y: "0", width: String(pos.w), height: String(pos.h),
-      rx: "9", class: "gnode-rect",
-      stroke: prioColor,
-    });
-    g.append(rect);
-
-    // Status dot.
-    const dot = svg("circle", { cx: "14", cy: "16", r: "5", class: "gnode-dot", fill: statusColor });
-    g.append(dot);
-
-    // Ready/blocked indicator text.
-    if (isBlocked) {
-      const ind = svg("text", { x: String(pos.w - 10), y: "16", class: "gnode-ind gnode-ind-blocked",
-        "text-anchor": "end", "dominant-baseline": "middle" });
-      ind.textContent = "🔒";  // lock emoji
-      g.append(ind);
-    } else if (isReady) {
-      const ind = svg("text", { x: String(pos.w - 10), y: "16", class: "gnode-ind gnode-ind-ready",
-        "text-anchor": "end", "dominant-baseline": "middle" });
-      ind.textContent = "✓";
-      g.append(ind);
-    }
-
-    // Label: #ref + title wrapped.
-    const refLine = n.project + "-" + n.ref;
-    const refT = svg("text", { x: "26", y: "16", class: "gnode-ref", "dominant-baseline": "middle" });
-    refT.textContent = refLine;
-    g.append(refT);
-
-    const titleLines = wrapTextLines(n.title, 22, 2);
-    const titleGroup = svg("text", { x: "8", y: "36", class: "gnode-title" });
-    titleLines.forEach((line, i) => {
-      const span = svg("tspan", { x: "8", dy: i === 0 ? "0" : "14" });
-      span.textContent = line;
-      titleGroup.append(span);
-    });
-    g.append(titleGroup);
-
-    nodeGroup.append(g);
-    nodeEls.set(n.id, g);
-
-    g.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      if (graphSelectedId === n.id) {
-        graphSelectedId = null;
-      } else {
-        graphSelectedId = n.id;
-      }
-      applyGraphFocus(nodeEls, edgeEls, edges, nodesById);
-      if (graphSelectedId != null) renderGraphDetail(n, edges, nodesById);
-      else clearGraphDetail();
-    });
-    g.addEventListener("keydown", (ev) => {
-      if (ev.key === "Enter" || ev.key === " ") {
-        ev.preventDefault();
-        g.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      }
-    });
+    if (pos) nodeGroup.append(drawGraphNode(n, pos));
   }
+  svgEl.append(edgeGroup, nodeGroup);
 
-  // Pan-surface click clears selection (panSurface is a new element each render; no leak).
-  panSurface.addEventListener("click", () => {
-    graphSelectedId = null;
-    rebuildFocusAfterDetailNav(); // uses current DOM, not stale closure
-    clearGraphDetail();
-  });
-
-  // Restore selection if the node still exists.
-  if (graphSelectedId != null && nodesById.has(graphSelectedId)) {
-    applyGraphFocus(nodeEls, edgeEls, edges, nodesById);
-    renderGraphDetail(nodesById.get(graphSelectedId), edges, nodesById);
-  } else {
-    graphSelectedId = null;
-    clearGraphDetail();
-  }
+  // A live refresh keeps graphSelectedId; this is the one place it is restored
+  // (or dropped, when the node is gone) after a render.
+  selectGraphNode(nodesById.has(graphSelectedId) ? graphSelectedId : null);
   buildGraphLegend();
+}
+
+// graphArrowDefs builds the arrowhead markers: cleared (green), blocking (amber),
+// and the upstream/downstream path highlights.
+function graphArrowDefs() {
+  const defs = svg("defs");
+  const arrows = [["gArrowCleared", "var(--st-done)"], ["gArrowBlocking", "var(--warn)"], ["gArrowUp", "var(--accent)"], ["gArrowDown", "var(--violet)"]];
+  for (const [id, color] of arrows) {
+    const m = svg("marker", {
+      id, viewBox: "0 0 10 10", refX: "9", refY: "5",
+      markerWidth: "6", markerHeight: "6", orient: "auto-start-reverse",
+    });
+    m.append(svg("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: color }));
+    defs.append(m);
+  }
+  return defs;
+}
+
+// graphEdgeCleared reports whether an edge's prerequisite is done (its resting
+// arrow is then the cleared one, else the blocking one).
+function graphEdgeCleared(e, nodesById) {
+  const from = nodesById.get(e.from);
+  return !!from && from.status === "done";
+}
+
+// drawGraphEdge draws the curve from the prerequisite (fp) to the dependent (tp).
+function drawGraphEdge(e, fp, tp, nodesById) {
+  const sx = fp.x + fp.w;
+  const sy = fp.y + fp.h / 2;
+  const tx = tp.x;
+  const ty = tp.y + tp.h / 2;
+  const delta = tx - sx;
+  const bend = Math.max(58, Math.abs(delta) * 0.42);
+  const d = delta >= 0
+    ? `M ${sx} ${sy} C ${sx + bend} ${sy}, ${tx - bend} ${ty}, ${tx} ${ty}`
+    : `M ${sx} ${sy} C ${sx + bend} ${sy}, ${tx - bend} ${ty - 80}, ${tx} ${ty}`;
+  const cleared = graphEdgeCleared(e, nodesById);
+  return svg("path", {
+    d, class: "gedge " + (cleared ? "gedge-cleared" : "gedge-blocking"),
+    "marker-end": cleared ? "url(#gArrowCleared)" : "url(#gArrowBlocking)",
+    "data-from": String(e.from), "data-to": String(e.to),
+  });
+}
+
+// drawGraphNode draws one task box (priority border, status dot, ready/blocked
+// indicator, ref, wrapped title); clicking or activating it toggles its selection.
+function drawGraphNode(n, pos) {
+  const g = svg("g", {
+    class: "gnode" + (n.status === "done" ? " gnode-done" : ""),
+    transform: `translate(${pos.x}, ${pos.y})`,
+    "data-id": String(n.id),
+    role: "button",
+    tabindex: "0",
+    "aria-label": n.project + "-" + n.ref + " " + n.title + " (" + n.status + ")",
+  });
+  g.append(svg("rect", {
+    x: "0", y: "0", width: String(pos.w), height: String(pos.h),
+    rx: "9", class: "gnode-rect", stroke: prio(n.priority).color,
+  }));
+  g.append(svg("circle", { cx: "14", cy: "16", r: "5", class: "gnode-dot", fill: ST[n.status] || "var(--faint)" }));
+
+  // Ready/blocked indicator text.
+  const ready = n.nprereq > 0 && n.nopen === 0;
+  if (n.nopen > 0 || ready) {
+    const ind = svg("text", { x: String(pos.w - 10), y: "16", class: "gnode-ind " + (ready ? "gnode-ind-ready" : "gnode-ind-blocked"),
+      "text-anchor": "end", "dominant-baseline": "middle" });
+    ind.textContent = ready ? "✓" : "🔒";
+    g.append(ind);
+  }
+
+  const refT = svg("text", { x: "26", y: "16", class: "gnode-ref", "dominant-baseline": "middle" });
+  refT.textContent = n.project + "-" + n.ref;
+  g.append(refT);
+
+  const titleGroup = svg("text", { x: "8", y: "36", class: "gnode-title" });
+  wrapTextLines(n.title, 22, 2).forEach((line, i) => {
+    const span = svg("tspan", { x: "8", dy: i === 0 ? "0" : "14" });
+    span.textContent = line;
+    titleGroup.append(span);
+  });
+  g.append(titleGroup);
+
+  const toggle = () => selectGraphNode(graphSelectedId === n.id ? null : n.id);
+  g.addEventListener("click", (ev) => { ev.stopPropagation(); toggle(); }); // not a background (deselect) click
+  g.addEventListener("keydown", onActivate(toggle));
+  return g;
 }
 
 function viewBoxStr(vs) {
@@ -2572,9 +2465,7 @@ function applyGraphFocus(nodeEls, edgeEls, edges, nodesById) {
   edgeEls.forEach((el) => el.classList.remove("gedge-up", "gedge-down", "gedge-dim"));
   // Reset marker refs on edges to their original markers.
   edgeEls.forEach((pathEl, e) => {
-    const fromNode = nodesById.get(e.from);
-    const cleared = fromNode && fromNode.status === "done";
-    pathEl.setAttribute("marker-end", cleared ? "url(#gArrowCleared)" : "url(#gArrowBlocking)");
+    pathEl.setAttribute("marker-end", graphEdgeCleared(e, nodesById) ? "url(#gArrowCleared)" : "url(#gArrowBlocking)");
   });
 
   if (graphSelectedId == null) return;
@@ -2627,7 +2518,7 @@ function renderGraphDetail(node, edges, nodesById) {
   const d = $("graphDetail");
   d.replaceChildren();
 
-  const prioColor = PRIO_VAR[node.priority] || PRIO_VAR[3];
+  const p = prio(node.priority);
   const statusColor = ST[node.status] || "var(--faint)";
 
   const head = el("div", { class: "gd-head" });
@@ -2641,8 +2532,7 @@ function renderGraphDetail(node, edges, nodesById) {
   // the resolved color with transparent to get a real ~14% soft background.
   chips.append(el("span", { class: "gd-chip",
     style: "background:color-mix(in srgb, " + statusColor + " 14%, transparent);color:" + statusColor }, node.status));
-  chips.append(el("span", { class: "gd-chip", style: "border-color:" + prioColor + ";color:" + prioColor },
-    PRIO_LABEL[node.priority] || ("P" + node.priority)));
+  chips.append(el("span", { class: "gd-chip", style: "border-color:" + p.color + ";color:" + p.color }, p.word));
   if (node.assignee) chips.append(el("span", { class: "gd-chip gd-assignee" }, node.assignee));
   d.append(chips);
 
@@ -2656,47 +2546,15 @@ function renderGraphDetail(node, edges, nodesById) {
   }
   d.append(blockedLine);
 
-  // Prerequisites (incoming edges from→this node).
-  const prereqs = edges.filter((e) => e.to === node.id).map((e) => nodesById.get(e.from)).filter(Boolean);
-  const prereqSec = el("div", { class: "gd-section" });
-  prereqSec.append(el("div", { class: "gd-section-label" }, "Prerequisites (" + prereqs.length + ")"));
-  if (!prereqs.length) {
-    prereqSec.append(el("div", { class: "gd-none" }, "None"));
-  } else {
-    for (const p of prereqs) {
-      const row = el("div", { class: "gd-dep-row", role: "link", tabindex: "0",
-        onclick: () => { graphSelectedId = p.id; renderGraphDetail(p, edges, nodesById); rebuildFocusAfterDetailNav(); },
-        onkeydown: (ev) => { if (ev.key === "Enter") { graphSelectedId = p.id; renderGraphDetail(p, edges, nodesById); rebuildFocusAfterDetailNav(); } },
-      });
-      const dot = el("span", { class: "gd-dep-dot", style: "background:" + (ST[p.status] || "var(--faint)") });
-      row.append(dot, el("span", { class: "gd-dep-ref" }, p.project + "-" + p.ref),
-        el("span", { class: "gd-dep-title" }, p.title),
-        el("span", { class: "gd-dep-status" }, p.status === "done" ? "✓" : p.status));
-      prereqSec.append(row);
-    }
-  }
-  d.append(prereqSec);
-
-  // Unblocks (outgoing edges this→to).
-  const unblocks = edges.filter((e) => e.from === node.id).map((e) => nodesById.get(e.to)).filter(Boolean);
-  const unblockSec = el("div", { class: "gd-section" });
-  unblockSec.append(el("div", { class: "gd-section-label" }, "Unblocks (" + unblocks.length + ")"));
-  if (!unblocks.length) {
-    unblockSec.append(el("div", { class: "gd-none" }, "None"));
-  } else {
-    for (const u of unblocks) {
-      const row = el("div", { class: "gd-dep-row", role: "link", tabindex: "0",
-        onclick: () => { graphSelectedId = u.id; renderGraphDetail(u, edges, nodesById); rebuildFocusAfterDetailNav(); },
-        onkeydown: (ev) => { if (ev.key === "Enter") { graphSelectedId = u.id; renderGraphDetail(u, edges, nodesById); rebuildFocusAfterDetailNav(); } },
-      });
-      const dot = el("span", { class: "gd-dep-dot", style: "background:" + (ST[u.status] || "var(--faint)") });
-      row.append(dot, el("span", { class: "gd-dep-ref" }, u.project + "-" + u.ref),
-        el("span", { class: "gd-dep-title" }, u.title),
-        el("span", { class: "gd-dep-status" }, u.status === "done" ? "✓" : u.status));
-      unblockSec.append(row);
-    }
-  }
-  d.append(unblockSec);
+  const section = (label, deps) => {
+    const sec = el("div", { class: "gd-section" }, el("div", { class: "gd-section-label" }, label + " (" + deps.length + ")"));
+    if (!deps.length) sec.append(el("div", { class: "gd-none" }, "None"));
+    for (const dep of deps) sec.append(graphDepRow(dep));
+    return sec;
+  };
+  // Prerequisites are the incoming edges (from → this node), Unblocks the outgoing ones.
+  d.append(section("Prerequisites", edges.filter((e) => e.to === node.id).map((e) => nodesById.get(e.from)).filter(Boolean)));
+  d.append(section("Unblocks", edges.filter((e) => e.from === node.id).map((e) => nodesById.get(e.to)).filter(Boolean)));
 
   // Leave the graph and open the full task: close the overlay first so the task
   // modal isn't hidden behind it, then open the task on the board.
@@ -2704,22 +2562,39 @@ function renderGraphDetail(node, edges, nodesById) {
   d.append(openBtn);
 }
 
-function rebuildFocusAfterDetailNav() {
-  if (!graphData) return;
-  const { nodes, edges } = graphData;
+// graphDepRow is one Prerequisites/Unblocks row of the detail panel; activating
+// it selects that task in the graph.
+function graphDepRow(n) {
+  const go = () => selectGraphNode(n.id);
+  return el("div", { class: "gd-dep-row", role: "link", tabindex: "0", onclick: go, onkeydown: onActivate(go) },
+    el("span", { class: "gd-dep-dot", style: "background:" + (ST[n.status] || "var(--faint)") }),
+    el("span", { class: "gd-dep-ref" }, n.project + "-" + n.ref),
+    el("span", { class: "gd-dep-title" }, n.title),
+    el("span", { class: "gd-dep-status" }, n.status === "done" ? "✓" : n.status));
+}
+
+// selectGraphNode selects a node (null clears the selection) and redraws the path
+// highlight and the detail panel from graphData and the drawn SVG. Every selection
+// change goes through here: node and detail-row activation, background clicks, and
+// renderGraph restoring the selection after a live refresh.
+function selectGraphNode(id) {
+  graphSelectedId = id;
+  const { nodes, edges } = graphData || { nodes: [], edges: [] };
   const nodesById = new Map(nodes.map((n) => [n.id, n]));
-  // Re-collect SVG elements by data-id.
+  // Collect the drawn elements: nodes by data-id, edges back to their edge objects by from:to.
   const svgEl = $("graphSvg");
   const nodeEls = new Map();
-  svgEl.querySelectorAll(".gnode[data-id]").forEach((el) => nodeEls.set(Number(el.dataset.id), el));
+  svgEl.querySelectorAll(".gnode[data-id]").forEach((g) => nodeEls.set(Number(g.dataset.id), g));
   const edgeEls = new Map();
-  // For edges we need the original edge objects — match path elements by from:to.
   const edgesByKey = new Map(edges.map((x) => [x.from + ":" + x.to, x]));
   svgEl.querySelectorAll(".gedge").forEach((pathEl) => {
     const e = edgesByKey.get(pathEl.getAttribute("data-from") + ":" + pathEl.getAttribute("data-to"));
     if (e) edgeEls.set(e, pathEl);
   });
   applyGraphFocus(nodeEls, edgeEls, edges, nodesById);
+  const node = id == null ? null : nodesById.get(id);
+  if (node) renderGraphDetail(node, edges, nodesById);
+  else clearGraphDetail();
 }
 
 // installGraphPanZoom wires pan/zoom and click-to-deselect on the static #graphSvg.
@@ -2775,13 +2650,7 @@ function installGraphPanZoom(svgEl) {
   svgEl.addEventListener("click", (ev) => {
     if (graphDragMoved) { graphDragMoved = false; ev.stopPropagation(); }
   }, true);
-  svgEl.addEventListener("click", (ev) => {
-    if (ev.target === svgEl) {
-      graphSelectedId = null;
-      rebuildFocusAfterDetailNav();
-      clearGraphDetail();
-    }
-  });
+  svgEl.addEventListener("click", (ev) => { if (ev.target === svgEl) selectGraphNode(null); });
 }
 
 function buildGraphLegend() {
@@ -2789,10 +2658,7 @@ function buildGraphLegend() {
   leg.replaceChildren();
 
   const items = [
-    { color: PRIO_VAR[0], label: "Urgent" },
-    { color: PRIO_VAR[1], label: "High" },
-    { color: PRIO_VAR[2], label: "Normal" },
-    { color: PRIO_VAR[3], label: "Low" },
+    ...PRIORITIES.map((p) => ({ color: p.color, label: p.word })),
     { color: "var(--st-done)", label: "Cleared edge", isLine: true },
     { color: "var(--warn)", label: "Blocking edge", isLine: true, dashed: true },
     { color: "var(--st-done)", label: "Done task", isDot: true },
@@ -2829,21 +2695,9 @@ function graphMaybeRefresh(ev) {
   if (shown && ev.project_id !== shown.id) return;
   // Coalesce a burst into one refetch without letting a steady stream postpone it.
   if (graphRefreshTimer) return;
-  graphRefreshTimer = setTimeout(async () => {
+  graphRefreshTimer = setTimeout(() => {
     graphRefreshTimer = null;
-    if (!graphOpen) return;
-    const prevSel = graphSelectedId;
-    await fetchAndRenderGraph(graphSlug);
-    // Restore selection if the node still exists after refresh.
-    if (prevSel != null && graphData && graphData.nodes.find((n) => n.id === prevSel)) {
-      graphSelectedId = prevSel;
-      rebuildFocusAfterDetailNav();
-      const n = graphData.nodes.find((x) => x.id === prevSel);
-      if (n) {
-        const nodesById = new Map(graphData.nodes.map((x) => [x.id, x]));
-        renderGraphDetail(n, graphData.edges, nodesById);
-      }
-    }
+    if (graphOpen) fetchAndRenderGraph(graphSlug); // renderGraph restores the selection
   }, 350);
 }
 

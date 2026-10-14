@@ -69,9 +69,9 @@ func TestCwfWebLiveRefreshesCannotStarve(t *testing.T) {
 	rm := cwfWebFunc(t, js, "reconcileModal")
 	cwfWebHas(t, "reconcileModal", rm, `coalesce("modal", () => refreshModal(), 150)`)
 	cwfWebBefore(t, "reconcileModal", rm, "depCandidates = null;", "if (!openTaskId) return;")
-	md := cwfWebFunc(t, js, "renderModal")
-	cwfWebBefore(t, "renderModal", md, "if (!depCandidates || depCandidates.project !== t.project) {", `api("GET", "/api/tasks?project="`)
-	cwfWebHas(t, "renderModal", md, "await want.list;")
+	md := cwfWebFunc(t, js, "renderTaskDeps")
+	cwfWebBefore(t, "renderTaskDeps", md, "if (!depCandidates || depCandidates.project !== t.project) {", `api("GET", "/api/tasks?project="`)
+	cwfWebHas(t, "renderTaskDeps", md, "await want.list;")
 }
 
 // FIND-0412: the dependency BFS indexes edges once and walks the queue by index.
@@ -93,19 +93,13 @@ func TestCwfWebGraphRefreshSkipsOtherProjects(t *testing.T) {
 
 // FIND-0414: edge elements are matched to edge objects through a from:to map.
 func TestCwfWebGraphFocusEdgeLookupKeyed(t *testing.T) {
-	r := cwfWebFunc(t, cwfWebAppJS(t), "rebuildFocusAfterDetailNav")
-	cwfWebLacks(t, "rebuildFocusAfterDetailNav", r, "edges.find(")
-	cwfWebHas(t, "rebuildFocusAfterDetailNav", r, `new Map(edges.map((x) => [x.from + ":" + x.to, x]))`)
+	r := cwfWebFunc(t, cwfWebAppJS(t), "selectGraphNode")
+	cwfWebLacks(t, "selectGraphNode", r, "edges.find(")
+	cwfWebHas(t, "selectGraphNode", r, `new Map(edges.map((x) => [x.from + ":" + x.to, x]))`)
 }
 
-// FIND-0422: failed comment and task deletes tell the user why, like Release does.
-func TestCwfWebDeleteFailuresShown(t *testing.T) {
-	md := cwfWebFunc(t, cwfWebAppJS(t), "renderModal")
-	cm := cwfWebSpan(t, "comment delete", md, `"/comments/" + cm.id`, "};")
-	cwfWebHas(t, "comment delete catch", cm, "alert(e.message);")
-	td := cwfWebSpan(t, "task delete", md, `await api("DELETE", "/api/tasks/" + t.id);`, "};")
-	cwfWebHas(t, "task delete catch", td, "alert(e.message);")
-}
+// FIND-0422 (failed comment and task deletes tell the user why) is exercised by
+// TestCwfWebG5HarnessArmedDeletes since the deletes share armButton (FIND-0421).
 
 // FIND-0425: the "kind changes open-counts" rule is encoded once in onEvent.
 func TestCwfWebOnEventCountKindsOnce(t *testing.T) {
